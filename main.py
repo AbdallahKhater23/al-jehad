@@ -1,7 +1,6 @@
 from fastapi import APIRouter, File, Form, UploadFile, HTTPException, FastAPI
 from fastapi.concurrency import run_in_threadpool
 from deepface import DeepFace 
-import odoolib
 import os
 import uuid
 import shutil
