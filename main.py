@@ -3,11 +3,11 @@ from fastapi.concurrency import run_in_threadpool
 from deepface import DeepFace 
 import os
 import uuid
-import shutil
 import sqlite3
 from datetime import datetime
 import math
-
+import io
+from PIL import Image, ImageOps
 
 def init_db():
     conn = sqlite3.connect("times.db")
@@ -41,24 +41,34 @@ def get_distance_meters(lat1, lon1, lat2, lon2):
     return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 # ---------------------------------------------------------
-# HELPER FUNCTION (Global Scope - Loaded once)
+# HELPER FUNCTION 
 # ---------------------------------------------------------
 def compare_faces_sync(reference_path: str, selfie_path: str) -> dict:
-    """Runs DeepFace synchronously."""
+    """Runs DeepFace synchronously and checks for faces first."""
     try:
+        # 1. Count faces first
+        faces = DeepFace.extract_faces(img_path=selfie_path, enforce_detection=True)
+        
+        if len(faces) > 1:
+            return {"verified": False, "distance": 99.9, "error": "Multiple faces detected. Please step forward alone."}
+            
+        # 2. If exactly 1 face, run verification
         result = DeepFace.verify(
             img1_path=reference_path,
             img2_path=selfie_path,
-            enforce_detection=False
+            enforce_detection=True 
         )
         return {
             "verified": result.get("verified", False),
-            "distance": result.get("distance", 99.9) 
+            "distance": result.get("distance", 99.9),
+            "error": None
         }
+    except ValueError:
+        return {"verified": False, "distance": 99.9, "error": "No face detected. Make sure the lighting is good!"}
     except Exception as e:
         print(f"⚠️ DEEPFACE ERROR: {e}")
-        return {"verified": False, "distance": 99.9}
-
+        return {"verified": False, "distance": 99.9, "error": "Internal processing error."}
+    
 # ---------------------------------------------------------
 # MAIN ROUTE
 # ---------------------------------------------------------
@@ -71,15 +81,10 @@ async def verify_worker(
     selfie: UploadFile = File(...)
 ):
 
-    
-# STEP 1: Initial Validation (The Bouncer & GPS Check)
-    allowed_types = ["image/jpeg", "image/png"]
-    
-# STEP 1: Initial Validation (The Bouncer & GPS Check)
+    # STEP 1: Initial Validation (The Bouncer & GPS Check)
     if latitude is None or longitude is None:
         raise HTTPException(status_code=400, detail="GPS coordinates are missing.")
         
-    # Safely force them into high-precision floats
     try:
         lat_float = float(latitude)
         lon_float = float(longitude)
@@ -89,33 +94,35 @@ async def verify_worker(
     if not (-90 <= lat_float <= 90) or not (-180 <= lon_float <= 180):
         raise HTTPException(status_code=400, detail="Invalid GPS Coordinates")
 
-    # The exact center of the construction site
     SITE_LAT = 30.050000 
     SITE_LON = 31.230000
 
-    # Calculate distance using our converted floats!
     distance_from_site = get_distance_meters(SITE_LAT, SITE_LON, lat_float, lon_float)
 
     if distance_from_site > 65:
-        raise HTTPException(
-            status_code=403, 
-            detail=f"Location Rejected. You are {int(distance_from_site)}m away. You must be at the site."
-        )
+        raise HTTPException(status_code=403, detail=f"Location Rejected. You are {int(distance_from_site)}m away. You must be at the site.")
     elif distance_from_site > 40:
-        raise HTTPException(
-            status_code=403, 
-            detail=f"Almost there! You are {int(distance_from_site)}m away. Please step inside the site (under 40m) to clock in."
-        )
-    # If the distance is <= 40, the code just ignores this and continues to Step 2!
+        raise HTTPException(status_code=403, detail=f"Almost there! You are {int(distance_from_site)}m away. Please step inside the site (under 40m) to clock in.")
 
-    # STEP 2: Save the UploadFile securely to a temporary file
+    # STEP 2: Save, Rotate, and Shrink the UploadFile securely
     unique_filename = f"{uuid.uuid4()}.jpg"
     temp_filepath = f"./temp/{unique_filename}"
 
-    print("🚨 DEBUG: Saving temporary image...") 
+    print("🚨 DEBUG: Saving image, fixing rotation, and resizing...") 
     file_bytes = await selfie.read()
-    with open(temp_filepath, "wb") as buffer:
-        buffer.write(file_bytes)
+    
+    try:
+        image = Image.open(io.BytesIO(file_bytes))
+        # Physically rotate upright based on phone orientation tag
+        image = ImageOps.exif_transpose(image)
+        image = image.convert("RGB")
+        # Shrink massive phone resolutions down so the AI can read it
+        image.thumbnail((800, 800))
+        image.save(temp_filepath, format="JPEG")
+    except Exception as e:
+        print(f"🚨 DEBUG: Image processing failed: {e}")
+        with open(temp_filepath, "wb") as buffer:
+            buffer.write(file_bytes)
 
     # STEP 3: DeepFace Verification (Threaded)
     reference_filepath = f"./local_references/{worker_id}.jpg"
@@ -128,13 +135,17 @@ async def verify_worker(
     print("🚨 DEBUG: Sending to DeepFace (This might take a few seconds)...") 
     face_data = await run_in_threadpool(compare_faces_sync, reference_filepath, temp_filepath)
 
+    if face_data.get("error"):
+        if os.path.exists(temp_filepath):
+            os.remove(temp_filepath)
+        raise HTTPException(status_code=400, detail=face_data["error"])
+    
     print(f"🚨 DEBUG: DeepFace Finished! Result: {face_data}") 
 
-    # Delete the temp file immediately!
+    # Delete the temp file immediately on success
     if os.path.exists(temp_filepath):
         os.remove(temp_filepath)
 
-    # Extract our variables
     similarity_score = face_data["distance"]
 
     # --- TRAFFIC LIGHT LOGIC ---
@@ -145,10 +156,7 @@ async def verify_worker(
         status_val = "flagged"
         status_msg = "Flagged for HR Manual Review"
     else:
-        raise HTTPException(
-            status_code=401, 
-            detail=f"Face verification failed. Score: {similarity_score}"
-        )
+        raise HTTPException(status_code=401, detail=f"Face verification failed. Score: {similarity_score}")
         
     # --- SQLITE TIME TRACKING LOGIC ---
     conn = sqlite3.connect("times.db")
@@ -158,23 +166,14 @@ async def verify_worker(
     hours_worked = 0.0
 
     if action == "Clock In":
-        # 1. Check if they are already clocked in
         cursor.execute("SELECT clock_in_time FROM active_sessions WHERE worker_id = ?", (worker_id,))
         existing_session = cursor.fetchone()
         
         if existing_session:
-            # They are already in the database! Block them.
             conn.close()
-            raise HTTPException(
-                status_code=400, 
-                detail="You are already clocked in! Please Clock Out first."
-            )
+            raise HTTPException(status_code=400, detail="You are already clocked in! Please Clock Out first.")
             
-        # 2. If they are not clocked in, safely INSERT them
-        cursor.execute("""
-            INSERT INTO active_sessions (worker_id, clock_in_time) 
-            VALUES (?, ?)
-        """, (worker_id, str(now)))
+        cursor.execute("INSERT INTO active_sessions (worker_id, clock_in_time) VALUES (?, ?)", (worker_id, str(now)))
         conn.commit()
         status_msg += " (Clocked In successfully)"
         
@@ -184,20 +183,16 @@ async def verify_worker(
         
         if result:
             clock_in_str = result[0]
-            
-            # Safely convert string back to time (handles with or without milliseconds)
             try:
                 clock_in_time = datetime.strptime(clock_in_str, "%Y-%m-%d %H:%M:%S.%f")
             except ValueError:
                 clock_in_time = datetime.strptime(clock_in_str, "%Y-%m-%d %H:%M:%S")
                 
             duration = now - clock_in_time
-            hours_worked = round(duration.total_seconds() / 3600, 4) # Rounded to 4 decimals for precision testing
+            hours_worked = round(duration.total_seconds() / 3600, 4)
             
-            # Delete their session
             cursor.execute("DELETE FROM active_sessions WHERE worker_id = ?", (worker_id,))
             conn.commit()
-            
             status_msg += f" (Clocked Out. Total Hours: {hours_worked})"
         else:
             conn.close()
@@ -205,7 +200,6 @@ async def verify_worker(
 
     conn.close()
 
-    # Final Return to Streamlit
     return {
         "status": status_val,
         "message": status_msg,
