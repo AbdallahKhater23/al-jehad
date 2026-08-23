@@ -1,7 +1,6 @@
+streamlit
+requests
 fastapi
 uvicorn
 python-multipart
-deepface
-tf-keras
 opencv-python-headless
-requests
