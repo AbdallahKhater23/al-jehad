@@ -159,9 +159,21 @@ async def verify_worker(
     hours_worked = 0.0
 
     if action == "Clock In":
-        # Save exact time as a string
+        # 1. Check if they are already clocked in
+        cursor.execute("SELECT clock_in_time FROM active_sessions WHERE worker_id = ?", (worker_id,))
+        existing_session = cursor.fetchone()
+        
+        if existing_session:
+            # They are already in the database! Block them.
+            conn.close()
+            raise HTTPException(
+                status_code=400, 
+                detail="You are already clocked in! Please Clock Out first."
+            )
+            
+        # 2. If they are not clocked in, safely INSERT them
         cursor.execute("""
-            REPLACE INTO active_sessions (worker_id, clock_in_time) 
+            INSERT INTO active_sessions (worker_id, clock_in_time) 
             VALUES (?, ?)
         """, (worker_id, str(now)))
         conn.commit()

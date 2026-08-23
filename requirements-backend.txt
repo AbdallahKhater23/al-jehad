@@ -5,3 +5,4 @@ deepface
 tf-keras
 opencv-python-headless
 requests
+odoolib

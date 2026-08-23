@@ -50,7 +50,7 @@ if picture is not None:
         
         try:
             response = requests.post(
-                "http://127.0.0.1:8000/api/v1/attendance/verify",
+                "https://check-in-check-out-s43i.onrender.com",
                 data=data_payload,
                 files=file_payload,
                 timeout=60
