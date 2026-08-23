@@ -3,3 +3,6 @@ uvicorn
 python-multipart
 deepface
 opencv-python-headless
+streamlit
+requests
+tf-keras
