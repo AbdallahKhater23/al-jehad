@@ -2,3 +2,8 @@ __pycache__/
 temp/
 times.db
 .env
+worker_photos
+local_references
+.vscode
+Dockerfile
+test_odoo.py

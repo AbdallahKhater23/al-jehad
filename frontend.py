@@ -1,6 +1,7 @@
 import streamlit as st
 import requests
 import time
+from streamlit_geolocation import streamlit_geolocation
 
 # Configure the page layout for a cleaner, modern look
 st.set_page_config(page_title="Site Attendance", page_icon="🏗️", layout="centered")
@@ -15,8 +16,19 @@ with col1:
     action = st.radio("Select Action:", ["Clock In", "Clock Out"], horizontal=True)
     worker_id = st.text_input("Worker ID", value="1")
 with col2:
-    mock_lat = st.number_input("Latitude", value=30.050000, format="%.6f") 
-    mock_lon = st.number_input("Longitude", value=31.230000, format="%.6f")
+    st.markdown("**GPS Location**")
+    # This renders a button asking the phone browser for GPS permissions
+    location = streamlit_geolocation()
+    
+    # Extract coordinates if the user clicked "Allow"
+    if location and location.get('latitude') and location.get('longitude'):
+        lat = location['latitude']
+        lon = location['longitude']
+        st.success("📍 Location Verified")
+    else:
+        lat = None
+        lon = None
+        st.warning("⚠️ Please click the button to allow location access")
 
 st.divider()
 
@@ -34,15 +46,22 @@ def camera_scanner():
         # Primary, full-width button makes the UI feel tactile and alive
         if st.button(f"Confirm {action}", use_container_width=True, type="primary"):
             
+            # --- GPS BLOCKER ---
+            # Stop the user from clocking in if they denied location access
+            if lat is None or lon is None:
+                st.error("❌ We need your GPS coordinates first! Click the location button above.")
+                return
+                
             with st.spinner("Processing biometric data..."):
                 data_payload = {
                     "worker_id": worker_id,
                     "action": action,
-                    "latitude": mock_lat,
-                    "longitude": mock_lon
+                    "latitude": lat,
+                    "longitude": lon
                 }
                 
-                file_payload = {"selfie": ("selfie.jpg", picture, "image/jpeg")}
+                # --- THE FIX: Extracting the raw bytes before sending ---
+                file_payload = {"selfie": ("selfie.jpg", picture.getvalue(), "image/jpeg")}
                 
                 try:
                     response = requests.post(
@@ -73,7 +92,7 @@ def camera_scanner():
                         st.error(f"Failed! Backend says: {response.text}")
                         
                 except Exception as e:
-                    st.error(f"Network error: Could not reach backend. {e}")
+                    st.error(f"Network error: Could not reach backend. Is the server running? {e}")
 
 # 3. Call the fragment
 camera_scanner()
