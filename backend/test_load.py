@@ -1,15 +1,19 @@
-import requests
-import time
+import glob
 import os
+import time
 
-url = "http://127.0.0.1:8000/api/v1/attendance/verify"
+import requests
 
-# CRITICAL FIX: You must upload a REAL image (the simulated "live" selfie).
-# The server will automatically find the matching .json using the worker_id="1".
-test_image_path = "./worker_photos/1.jpg" 
+url = "https://sixth-subpanel-resample.ngrok-free.dev/"
 
-if not os.path.exists(test_image_path):
-    print(f"❌ Error: Cannot find test image at {test_image_path}")
+#: The reference selfies in ``worker_photos/`` are named after each account's immutable
+#: biometric id, not after the account id, so this takes whichever one is there instead of
+#: assuming ``1.jpg`` (which no longer exists - see ``biometrics``).
+_photos = sorted(glob.glob("../worker_photos/*.jpg"))
+test_image_path = _photos[0] if _photos else None
+
+if test_image_path is None:
+    print("❌ Error: no .jpg in ../worker_photos to use as a live selfie.")
     print("Please provide a real .jpg file to simulate the live selfie.")
     exit()
 
@@ -18,13 +22,14 @@ success_count, fail_count = 0, 0
 total_time = 0.0
 
 for i in range(1, 51):
-    # Alternate Clock In/Out so SQLite doesn't block us for being "already clocked in"
     action = "Clock In" if i % 2 != 0 else "Clock Out"
     
     data_payload = {
         "worker_id": "1",
+        'email_or_phone' : 'test@example.com',
+        "password": "testpassword", 
         "action": action,
-        "latitude": "30.050010", # Valid location for the site
+        "latitude": "30.050010", 
         "longitude": "31.230010"
     }
     
@@ -33,14 +38,11 @@ for i in range(1, 51):
         start_time = time.time()
         
         try:
-            # Send the request to your FastAPI server
             response = requests.post(url, data=data_payload, files=file_payload, timeout=20)
-            
-            # Calculate how long the server took to respond
             latency = round(time.time() - start_time, 2)
-            total_time += latency
             
             if response.status_code == 200:
+                total_time += latency
                 print(f"✅ Request {i:02d} [{action}] - Success ({latency}s)")
                 success_count += 1
             else:
@@ -51,9 +53,8 @@ for i in range(1, 51):
             print(f"⚠️ Request {i:02d} - Error: {e}")
             fail_count += 1
             
-    time.sleep(0.5) # Slight delay to mimic real-world spacing
+    time.sleep(0.5)
 
-# Calculate the new average speed
 avg_latency = round(total_time / success_count, 2) if success_count > 0 else 0
 
 print("\n" + "="*40)

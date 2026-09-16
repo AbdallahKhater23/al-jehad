@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Al-Jehad International Co. - the column mark.
+
+  A vector redrawing of the company's lockup, not a copy of the PNG: the raster
+  original carries its own dark-green background, which is wrong everywhere this
+  mark is used (the login panel is already that green, the console rail puts it on
+  a green tile, and a browser tab is neither). Drawn on a transparent ground, the
+  gold can sit on any surface and stays sharp at 20px and at 200px.
+
+  The palette is sampled from the supplied artwork rather than guessed:
+  the green it was drawn on is #162F29, and the metal runs #FBF0CB -> #B9945A.
+
+  Geometry, top to bottom, so the next person can change a number and know what
+  moves: an abacus (the slab the capital carries), a flared echinus, two volutes
+  scrolling outward, a necking ring, three fluted shaft bars, and a base slab.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 264" width="200" height="264" role="img" aria-label="Al-Jehad International Co.">
+    <defs>
+        <linearGradient id="jehadGold" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="264">
+            <stop offset="0" stop-color="#FBF0CB"/>
+            <stop offset="0.35" stop-color="#E3CB93"/>
+            <stop offset="0.72" stop-color="#D3B478"/>
+            <stop offset="1" stop-color="#B9945A"/>
+        </linearGradient>
+        <linearGradient id="jehadLit" gradientUnits="userSpaceOnUse" x1="0" y1="8" x2="0" y2="30">
+            <stop offset="0" stop-color="#FFF8DF"/>
+            <stop offset="1" stop-color="#EEDCAB"/>
+        </linearGradient>
+    </defs>
+
+    <g fill="url(#jehadGold)">
+        <!-- The abacus: brighter than the rest, because it is the face the light lands on. -->
+        <path d="M12 10 H188 L180 26 H20 Z" fill="url(#jehadLit)"/>
+
+        <!-- Echinus and the necking ring under it. -->
+        <path d="M70 26 H130 V44 H70 Z"/>
+        <path d="M64 44 H136 V52 H64 Z"/>
+    </g>
+
+    <!-- The volutes: an arm out to each end that curls down and back in on itself,
+         with the eye of the scroll left open. -->
+    <g fill="none" stroke="url(#jehadGold)" stroke-width="8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M60 34 H36 a15 15 0 0 0 0 30 h6"/>
+        <path d="M140 34 H164 a15 15 0 0 1 0 30 h-6"/>
+    </g>
+    <g fill="url(#jehadGold)">
+        <circle cx="30" cy="49" r="3.5"/>
+        <circle cx="170" cy="49" r="3.5"/>
+    </g>
+
+    <g fill="url(#jehadGold)">
+        <!-- The shaft, in three flutes. The ground shows through the gaps, so the
+             column reads as fluted on any surface instead of carrying a second colour. -->
+        <rect x="70" y="54" width="18" height="192"/>
+        <rect x="91" y="54" width="18" height="192"/>
+        <rect x="112" y="54" width="18" height="192"/>
+
+        <!-- Base slab. -->
+        <path d="M62 246 H138 V252 H62 Z"/>
+        <path d="M54 252 H146 V262 H54 Z"/>
+    </g>
+</svg>

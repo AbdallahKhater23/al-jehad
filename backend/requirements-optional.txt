@@ -1,0 +1,23 @@
+# Optional extras. Each one degrades gracefully when missing, so none of them is
+# allowed to become a hard startup requirement:
+#
+#   onnxruntime -> passive liveness (MiniFASNet). Without it the check reports
+#                  available=false; see backend/models/README.md for what LIVENESS_MODE
+#                  does with that.
+#   qrcode      -> renders the self-service enrollment QR code. Without it the invite
+#                  endpoint still returns the URL, so enrollment continues.
+#   openpyxl    -> XLSX report export. Without it /admin/reports/export answers 501 with
+#                  an install instruction, and CSV export keeps working.
+#   prometheus_client -> the /metrics endpoint and every counter in telemetry.py. Without
+#                  it the application behaves identically, every helper is a no-op, and
+#                  /metrics answers 501 with the install command (see the README).
+#                  A deployment running uvicorn with --workers must also set
+#                  PROMETHEUS_MULTIPROC_DIR, or a scrape sees one worker's share of the
+#                  traffic and reports it as the whole.
+#
+# Pin these to whatever the deployment validates. Versions below are the ones the code
+# was written against.
+onnxruntime>=1.17
+qrcode>=7.4
+openpyxl>=3.1
+prometheus_client>=0.20

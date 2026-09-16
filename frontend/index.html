@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <!-- viewport-fit=cover + no zoom is what makes it feel like a native app on phones -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <!-- The company's green, not generic blue: this is the colour the phone paints
+         its status bar with, and it is the first thing the brand touches. -->
+    <meta name="theme-color" content="#162F29">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Al-Jehad">
+    <meta name="format-detection" content="telephone=no">
+    <title>Al-Jehad - Site Attendance</title>
+    <!--
+      The company mark, not an emoji. icon.svg is a real file (the column on the
+      company's green) so the browser has something to cache; without any icon it
+      asked for /favicon.ico on every load and logged a 404 in a clean console.
+      The apple-touch-icon is the same file, which iOS renders as a home-screen tile.
+    -->
+    <link rel="icon" type="image/svg+xml" href="icon.svg">
+    <link rel="apple-touch-icon" href="icon.svg">
+
+    <!--
+      Everything below uses RELATIVE paths on purpose. The page is served from the
+      site root by backend/main.py, but it also has to work when the frontend
+      folder is hosted on its own (VS Code Live Server, a static host, file://).
+      Absolute "/static/..." paths 404 in those setups, which left a blank page.
+    -->
+    <script>
+        // --- Diagnostics first: a blank page must never be silent again. ---
+        window.__bootErrors = [];
+        (function () {
+            function panel(title, lines) {
+                var existing = document.getElementById('bootError');
+                if (existing) existing.remove();
+                var box = document.createElement('div');
+                box.id = 'bootError';
+                box.setAttribute('style',
+                    'position:fixed;inset:0;z-index:9999;overflow:auto;background:#fff;color:#111;' +
+                    'font:14px/1.5 system-ui,-apple-system,sans-serif;padding:20px');
+                box.innerHTML =
+                    '<h2 style="margin:0 0 8px;color:#b91c1c;font-size:18px">' + title + '</h2>' +
+                    '<p style="margin:0 0 12px;color:#374151">Something stopped the app from starting. ' +
+                    'Send this text to whoever set the app up:</p>' +
+                    '<pre style="white-space:pre-wrap;background:#f3f4f6;border:1px solid #e5e7eb;' +
+                    'border-radius:8px;padding:12px;font-size:12px">' + lines.join('\n') + '</pre>' +
+                    '<p style="color:#374151">This page URL: <b>' + location.href + '</b></p>';
+                document.body.appendChild(box);
+            }
+            window.__showBootPanel = panel;
+
+            window.addEventListener('error', function (event) {
+                var where = (event.filename || '').split('/').pop();
+                window.__bootErrors.push(
+                    (event.message || 'Script error') + (where ? '  (' + where + ':' + event.lineno + ')' : ''));
+            }, true);
+            window.addEventListener('unhandledrejection', function (event) {
+                var reason = event.reason;
+                window.__bootErrors.push('Unhandled promise rejection: ' +
+                    ((reason && (reason.message || reason.detail)) || String(reason)));
+            });
+
+            window.addEventListener('load', function () {
+                setTimeout(function () {
+                    var app = document.getElementById('app');
+                    if (app && app.children.length > 0) return; // app rendered fine
+                    var files = [['I18n', 'i18n.js'], ['UI', 'frontendjavascript.js'],
+                                 ['WORKER_MODULES', 'worker_modules.js'], ['UI_MODULES', 'admin_modules.js'],
+                                 ['OFFLINE', 'offline_queue.js']];
+                    var missing = [];
+                    files.forEach(function (pair) {
+                        var loaded = false;
+                        try { loaded = new Function('return typeof ' + pair[0])() !== 'undefined'; }
+                        catch (e) { loaded = false; }
+                        if (!loaded) missing.push(pair[1]);
+                    });
+                    panel('The app did not start',
+                        ['Missing scripts: ' + (missing.length ? missing.join(', ') : 'none')]
+                        .concat(window.__bootErrors.length ? ['Errors: ' + window.__bootErrors.join(' | ')] : ['No JavaScript error was reported.'])
+                        .concat(['Tailwind loaded: ' + (!!window.tailwind),
+                                 'Secure context (GPS/camera allowed): ' + (window.isSecureContext === true),
+                                 'Scripts expected next to: ' + location.href.replace(/[?#].*$/, '')]));
+                }, 2500);
+            });
+        })();
+    </script>
+
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        // The app toggles `dark` on <html>, so Tailwind must run in class mode
+        // (the CDN default is 'media', which silently ignored the theme switch).
+        if (window.tailwind) {
+            tailwind.config = { darkMode: 'class' };
+        }
+        // No internet? Warn, but keep the (unstyled) app usable offline on site.
+        window.addEventListener('load', function () {
+            if (window.tailwind) return;
+            var banner = document.createElement('div');
+            banner.setAttribute('style',
+                'position:fixed;top:0;left:0;right:0;z-index:9998;background:#b45309;color:#fff;' +
+                'font:13px system-ui,sans-serif;padding:8px 12px;text-align:center');
+            banner.textContent = 'Styles could not be downloaded — the app works but looks plain. ' +
+                'Connect to the internet once and reload.';
+            document.body.appendChild(banner);
+        });
+    </script>
+    <link rel="stylesheet" href="style.css">
+    <noscript>
+        <p style="font-family:system-ui,sans-serif;padding:20px">
+            This app needs JavaScript. Please enable it in your browser settings.
+        </p>
+    </noscript>
+</head>
+<body>
+    <div id="app"></div>
+    <div id="modalRoot"></div>
+    <div id="toastRoot" class="toast-root" aria-live="polite"></div>
+
+    <script src="i18n.js"></script>
+    <script src="frontendjavascript.js"></script>
+    <script src="offline_queue.js"></script>
+    <script src="worker_modules.js"></script>
+    <script src="admin_modules.js"></script>
+</body>
+</html>

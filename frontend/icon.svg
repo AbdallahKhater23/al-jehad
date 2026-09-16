@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The browser-tab / home-screen icon.
+  The capital only, and on the company's green rather than on nothing: a gold
+  outline on a white browser tab is nearly invisible, and on a dark one it is the
+  green that disappears. The mark itself is the same geometry as logo-mark.svg -
+  duplicated deliberately, because an <img>-loaded SVG cannot reach into another
+  file, and one badge icon is a smaller cost than a sprite pipeline.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Al-Jehad International Co.">
+    <defs>
+        <linearGradient id="badgeGold" gradientUnits="userSpaceOnUse" x1="0" y1="10" x2="0" y2="56">
+            <stop offset="0" stop-color="#FBF0CB"/>
+            <stop offset="0.5" stop-color="#DFC68C"/>
+            <stop offset="1" stop-color="#B9945A"/>
+        </linearGradient>
+    </defs>
+
+    <rect width="64" height="64" rx="12" fill="#162F29"/>
+
+    <g transform="translate(4 16) scale(0.28)">
+        <g fill="url(#badgeGold)">
+            <path d="M12 10 H188 L180 26 H20 Z"/>
+            <path d="M70 26 H130 V44 H70 Z"/>
+            <path d="M64 44 H136 V52 H64 Z"/>
+        </g>
+        <g fill="none" stroke="url(#badgeGold)" stroke-width="8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M60 34 H36 a15 15 0 0 0 0 30 h6"/>
+            <path d="M140 34 H164 a15 15 0 0 1 0 30 h-6"/>
+        </g>
+        <g fill="url(#badgeGold)">
+            <circle cx="30" cy="49" r="3.5"/>
+            <circle cx="170" cy="49" r="3.5"/>
+        </g>
+    </g>
+</svg>

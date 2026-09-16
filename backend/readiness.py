@@ -1,0 +1,1176 @@
+"""Readiness reporting and the fail-closed startup gate.
+
+Two surfaces, two trust levels:
+
+* ``GET /api/v1/readiness``            public  - the verdict only: whether the
+  deployment is ready, and ``ok``/``tier`` for each check. HTTP 200 when ready,
+  **503 when not**, so ``curl -f`` works on the status code alone. The check
+  *names* are public vocabulary; nothing else is, because anything this route
+  returns is world-readable and a check's ``detail`` string routinely embeds an
+  absolute path (the database, the backup directory, the liveness model, the
+  biometric directories).
+* ``GET /api/v1/admin/readiness``      admin   - the full picture, behind
+  ``admin_only``: per-check ``detail``/``value``, the code fingerprint, the
+  secret-key fingerprint, the schema/migration inventory, the absolute database
+  path, PID/uptime and the row counts; ``?deep=1`` also runs an integrity check.
+
+Readiness self-reporting is *not* a place for self-attestation: a public
+``hardened_build_live: true`` is exactly the kind of constant this module exists
+to refuse, so the public route answers with evidence-derived booleans and hides
+the internals behind the admin surface.
+
+The governing rule: **readiness is evidence read from the running process, never
+a constant.** A probe that answers "hardened: true" because someone typed that
+string is worse than no probe, because it reports health while the old
+unauthenticated process still serves traffic.
+
+``run_startup_gate`` is the same registry used to *refuse to serve* traffic when
+a critical check fails. Three tiers, because blocking boot is a blunt instrument:
+
+* FATAL      - serving traffic would be actively wrong; raise (uvicorn exits 3).
+* REPAIRABLE - a documented, additive repair is attempted, then re-checked.
+* ADVISORY   - boot anyway, report ``degraded``; a legitimate deployment may
+  differ from ours (for example serving the SPA from nginx instead).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import platform
+import sqlite3
+import sys
+import tempfile
+import time
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, Request, Response
+from fastapi.responses import JSONResponse
+
+import database
+import migrations
+import notifications
+import schema_guard
+import shift_windows
+from config import PROJECT_ROOT, settings
+from security import CurrentUser, admin_only, create_access_token, decode_access_token, hash_password, verify_password
+
+TIER_FATAL = "fatal"
+TIER_REPAIRABLE = "repairable"
+TIER_ADVISORY = "advisory"
+
+#: Checks no override may bypass. A missing signing key has no safe degraded mode
+#: (the app would either refuse everything or sign forgeable tokens), and nothing
+#: works without a database.
+NON_OVERRIDABLE = frozenset({"secret_key_configured", "database_reachable"})
+
+_STARTED_AT = time.time()
+
+router = APIRouter()
+
+
+@dataclass
+class Check:
+    name: str
+    tier: str
+    ok: bool
+    detail: str = ""
+    value: object = None
+    repaired: bool = False
+
+    def public(self) -> dict:
+        """The anonymous projection of a check: the verdict, never the plumbing.
+
+        ``detail`` is written for an operator reading a startup log - it names
+        files, versions and error text - so it stays on the admin-only route.
+        """
+        return {"ok": self.ok, "tier": self.tier}
+
+    def as_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "tier": self.tier,
+            "ok": self.ok,
+            "detail": self.detail,
+            "value": self.value,
+            "repaired": self.repaired,
+        }
+
+
+@dataclass
+class GateReport:
+    checks: list[Check] = field(default_factory=list)
+    repaired: list[dict] = field(default_factory=list)
+    override_used: bool = False
+    duration_ms: float = 0.0
+
+    @property
+    def failed(self) -> list[Check]:
+        return [check for check in self.checks if not check.ok]
+
+    @property
+    def fatal_failures(self) -> list[Check]:
+        return [check for check in self.checks if not check.ok and check.tier == TIER_FATAL]
+
+    @property
+    def advisory_failures(self) -> list[Check]:
+        return [check for check in self.checks if not check.ok and check.tier == TIER_ADVISORY]
+
+    @property
+    def degraded(self) -> bool:
+        return bool(self.advisory_failures or self.override_used)
+
+    def as_dict(self) -> dict:
+        return {
+            "ready": not self.fatal_failures,
+            "degraded": self.degraded,
+            "override_used": self.override_used,
+            "duration_ms": round(self.duration_ms, 1),
+            "failed_checks": [check.name for check in self.failed],
+            "repaired": self.repaired,
+            "checks": [check.as_dict() for check in self.checks],
+        }
+
+
+# ---------------------------------------------------------------------------
+# individual checks
+# ---------------------------------------------------------------------------
+def _open(db_path: Path | None = None, *, read_only: bool = False) -> sqlite3.Connection:
+    target = Path(db_path or settings.database_path)
+    if read_only:
+        return sqlite3.connect(f"file:{target}?mode=ro", uri=True)
+    return sqlite3.connect(str(target))
+
+
+def _check_secret_key(ctx: dict) -> Check:
+    return Check(
+        "secret_key_configured",
+        TIER_FATAL,
+        True,
+        "signing key present",
+        {"fingerprint": settings.secret_key_fingerprint, "algorithm": settings.jwt_algorithm},
+    )
+
+
+def _check_database_reachable(ctx: dict) -> Check:
+    try:
+        conn = _open(ctx.get("db_path"), read_only=True)
+        try:
+            conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return Check("database_reachable", TIER_FATAL, False, f"cannot open the database: {exc}")
+    return Check("database_reachable", TIER_FATAL, True, "database opened read-only")
+
+
+def _check_database_writable(ctx: dict) -> Check:
+    ok, error = database.writable(db_path=ctx.get("db_path"))
+    return Check(
+        "database_writable",
+        TIER_FATAL,
+        ok,
+        "write lock acquired and released" if ok else f"write probe failed: {error}",
+    )
+
+
+def _check_schema_version(ctx: dict) -> Check:
+    try:
+        conn = _open(ctx.get("db_path"), read_only=True)
+        try:
+            live = migrations.current_version(conn)
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return Check("schema_current", TIER_FATAL, False, f"cannot read schema version: {exc}")
+
+    expected = migrations.SCHEMA_VERSION
+    if live == expected:
+        return Check("schema_current", TIER_FATAL, True, f"schema version {live}", {"live": live, "expected": expected})
+    if live > expected:
+        return Check(
+            "schema_current",
+            TIER_FATAL,
+            False,
+            f"database is at schema {live} but the running code only knows {expected}: code and data "
+            "have diverged, most likely an older build was deployed against a migrated database",
+            {"live": live, "expected": expected},
+        )
+    return Check(
+        "schema_current",
+        TIER_FATAL,
+        False,
+        f"database is at schema {live}, expected {expected}: migrations have not been applied",
+        {"live": live, "expected": expected},
+    )
+
+
+def _check_migrations(ctx: dict) -> Check:
+    try:
+        conn = _open(ctx.get("db_path"), read_only=True)
+        try:
+            pending = migrations.pending_migrations(conn)
+            applied = migrations.applied_versions(conn)
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return Check("migrations_all_applied", TIER_FATAL, False, f"cannot read schema_migrations: {exc}")
+    ok = not pending
+    detail = "all migrations applied" if ok else f"pending: {[version for version, _ in pending]}"
+    return Check(
+        "migrations_all_applied",
+        TIER_FATAL,
+        ok,
+        detail,
+        {"applied": sorted(applied), "pending": [version for version, _ in pending]},
+    )
+
+
+def _check_schema_drift(ctx: dict) -> Check:
+    report = schema_guard.enforce(db_path=ctx.get("db_path"))
+    ctx.setdefault("repaired", []).extend(report.repaired)
+    if report.error:
+        return Check("schema_drift", TIER_FATAL, False, report.error)
+    blocking = report.blocking
+    if blocking:
+        return Check(
+            "schema_drift",
+            TIER_FATAL,
+            False,
+            "; ".join(item.detail for item in blocking),
+            report.as_dict(),
+        )
+    return Check(
+        "schema_drift",
+        TIER_FATAL,
+        True,
+        f"live schema matches baseline + migrations ({len(report.drift)} informational difference(s))",
+        {"severity": report.severity, "differences": [item.name for item in report.drift]},
+        repaired=bool(report.repaired),
+    )
+
+
+def _check_shift_rules(ctx: dict) -> Check:
+    try:
+        conn = _open(ctx.get("db_path"))
+        try:
+            row = conn.execute("SELECT COUNT(*) FROM shift_rules WHERE id = 1").fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return Check("shift_rules_present", TIER_REPAIRABLE, False, f"shift_rules unreadable: {exc}")
+    if row and row[0]:
+        return Check("shift_rules_present", TIER_REPAIRABLE, True, "shift rules row present")
+    return Check(
+        "shift_rules_present",
+        TIER_REPAIRABLE,
+        False,
+        "no shift_rules row; the documented defaults will be re-seeded",
+    )
+
+
+def _repair_shift_rules(ctx: dict) -> bool:
+    try:
+        conn = _open(ctx.get("db_path"))
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO shift_rules (id, updated_at) VALUES (1, ?)",
+                (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return True
+    except sqlite3.Error:
+        return False
+
+
+def _check_site_windows(ctx: dict) -> Check:
+    """Every site's stored clock-in window must be a time the application can parse.
+
+    Advisory, not blocking, because the punch path is deliberately total: an unparseable value
+    falls back to the global rule rather than refusing a worker's arrival (see
+    ``shift_windows``). That fallback is what makes this check necessary - without it, a typo in
+    one site's hours is invisible. The site simply stops having its own window, everyone there
+    is measured against the company default, and the only symptom is late flags appearing on a
+    shift nobody changed.
+
+    The admin API refuses these values where they are typed and the column has a CHECK behind
+    it, so a bad value here means it arrived some other way: a hand-edited database, a restored
+    dump, or an import that bypassed both.
+    """
+    try:
+        conn = _open(ctx.get("db_path"))
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT site_name, clock_in_window_start, clock_in_window_end, site_timezone "
+                "FROM construction_sites"
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return Check("site_clock_in_windows", TIER_ADVISORY, True, f"could not be checked: {exc}")
+
+    # The rows are re-fetched with names so the problem can be attributed to a site: an
+    # operator reading "07" needs to know which site to open.
+    broken: list[str] = []
+    for row in rows:
+        broken.extend(shift_windows.window_problems(row))
+
+    if broken:
+        return Check(
+            "site_clock_in_windows",
+            TIER_ADVISORY,
+            False,
+            "these sites' windows cannot be applied, so the global rule is used instead: "
+            + ", ".join(broken),
+            {"sites": len(rows), "unusable": broken},
+        )
+    return Check(
+        "site_clock_in_windows",
+        TIER_ADVISORY,
+        True,
+        f"{len(rows)} site(s) checked; every configured window is usable",
+        {"sites": len(rows)},
+    )
+
+
+def _check_journal_mode(ctx: dict) -> Check:
+    try:
+        conn = _open(ctx.get("db_path"))
+        try:
+            mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return Check("journal_mode", TIER_REPAIRABLE, False, f"cannot read journal_mode: {exc}")
+    ok = mode == "wal"
+    return Check(
+        "journal_mode",
+        TIER_REPAIRABLE,
+        ok,
+        f"journal_mode={mode}" + ("" if ok else " (readers can block the writer; will enable WAL)"),
+        {"journal_mode": mode},
+    )
+
+
+def _repair_journal_mode(ctx: dict) -> bool:
+    result = database.configure(db_path=ctx.get("db_path"), repair=True)
+    return str(result.get("journal_mode", "")).lower() == "wal"
+
+
+def _check_password_hashing(ctx: dict) -> Check:
+    sample = "readiness-probe-passphrase"
+    try:
+        hashed = hash_password(sample)
+        ok = verify_password(sample, hashed) and not verify_password(sample + "x", hashed)
+    except Exception as exc:  # pragma: no cover - defensive
+        return Check("password_hashing_ok", TIER_FATAL, False, f"password hashing is broken: {exc}")
+    return Check(
+        "password_hashing_ok",
+        TIER_FATAL,
+        ok,
+        "bcrypt round-trip verified" if ok else "the stored hash did not verify against its own password",
+    )
+
+
+def _check_jwt_roundtrip(ctx: dict) -> Check:
+    try:
+        token, expires = create_access_token("readiness-probe", "worker", 0, ttl_hours=0.01)
+        claims = decode_access_token(token)
+        ok = claims.get("sub") == "readiness-probe" and claims.get("role") == "worker"
+    except Exception as exc:  # pragma: no cover - defensive
+        return Check("jwt_roundtrip_ok", TIER_FATAL, False, f"token sign/verify failed: {exc}")
+    return Check(
+        "jwt_roundtrip_ok",
+        TIER_FATAL,
+        ok,
+        "token signed and verified with the configured secret",
+        {"algorithm": settings.jwt_algorithm},
+    )
+
+
+def iter_api_routes(node, prefix: str = ""):
+    """Every ``APIRoute`` reachable from ``node``, with its effective path.
+
+    This exists because ``app.routes`` is **not** a flat list any more: an included
+    router is stored as a wrapper (``_IncludedRouter``) that holds the original router
+    and the prefix it was included with, and the endpoints are only materialised
+    elsewhere. Walking it as a flat list therefore found *no* ``/admin/`` route at all -
+    which made ``auth_enforced_on_admin_routes``, a FATAL-tier check, pass vacuously:
+    it reported "0 admin routes guarded, 0 missing" and the gate believed the whole
+    admin surface had been verified when nothing had been looked at.
+
+    The traversal is written against attributes rather than the private classes: an
+    ``APIRoute`` yields its path, a wrapper exposes ``original_router`` /
+    ``include_context``, and anything with ``routes`` (a plain ``APIRouter``, a
+    ``Mount``) is walked through. A future FastAPI that flattens again simply hits the
+    first branch.
+    """
+    from fastapi.routing import APIRoute
+
+    for route in getattr(node, "routes", []) or []:
+        if isinstance(route, APIRoute):
+            yield prefix + (getattr(route, "path", "") or ""), route
+            continue
+        inner = getattr(route, "original_router", None)
+        if inner is not None:
+            context = getattr(route, "include_context", None)
+            yield from iter_api_routes(inner, prefix + str(getattr(context, "prefix", "") or ""))
+            continue
+        yield from iter_api_routes(route, prefix)
+
+
+def _check_admin_routes_guarded(ctx: dict) -> Check:
+    app = ctx.get("app")
+    if app is None:  # pragma: no cover - only when called without an app
+        return Check("auth_enforced_on_admin_routes", TIER_FATAL, True, "no app supplied; skipped")
+
+    guarded = 0
+    missing: list[str] = []
+    for path, route in iter_api_routes(app):
+        if "/admin/" not in path:
+            continue
+        enforced = any(
+            getattr(dependency.call, "_auth_marker", None) == "require_role"
+            and set(getattr(dependency.call, "_allowed_roles", ())) <= {"admin", "head_admin"}
+            for dependency in route.dependant.dependencies
+        )
+        if enforced:
+            guarded += 1
+        else:
+            missing.append(f"{'|'.join(sorted(route.methods))} {path}")
+    # "Nothing was found" is not the same as "nothing is wrong": a traversal that stops
+    # working must fail the gate, not quietly vouch for a surface it never looked at.
+    ok = bool(guarded) and not missing
+    if ok:
+        detail = f"{guarded} admin route(s) guarded by require_role"
+    elif not guarded and not missing:
+        detail = (
+            "no admin routes could be enumerated from the app, so this check verified "
+            "nothing; the route traversal is broken"
+        )
+    else:
+        detail = "admin routes without an admin guard dependency: " + ", ".join(missing)
+    return Check(
+        "auth_enforced_on_admin_routes",
+        TIER_FATAL,
+        ok,
+        detail,
+        {"guarded": guarded, "missing": missing},
+    )
+
+
+def _check_no_unprefixed_admin_routes(ctx: dict) -> Check:
+    app = ctx.get("app")
+    # Effective paths, so this sees a route that was mounted without ``/api/v1`` - which
+    # is exactly what it is looking for, and which a top-level walk cannot see at all.
+    duplicated = sorted(
+        {path for path, _ in iter_api_routes(app) if path.startswith("/admin")}
+    ) if app is not None else []
+    return Check(
+        "no_unprefixed_duplicate_routes",
+        TIER_FATAL,
+        not duplicated,
+        "the admin surface exists only under /api/v1"
+        if not duplicated
+        else f"the admin API is also mounted without the version prefix: {duplicated}",
+        {"duplicates": duplicated},
+    )
+
+
+def _check_static_mounts(ctx: dict) -> Check:
+    app = ctx.get("app")
+    paths = {getattr(route, "path", "") for route in getattr(app, "routes", [])} if app is not None else set()
+    present = {"/static"} & paths
+    frontend_present = "/" in paths
+    ok = bool(present) and frontend_present
+    return Check(
+        "static_mounts_present",
+        TIER_ADVISORY,
+        ok,
+        "SPA and legacy /static mounts are registered"
+        if ok
+        else "a static mount is missing; valid when the SPA is served by a reverse proxy",
+        {"mounts": sorted(paths & {"/", "/static"})},
+    )
+
+
+def _check_api_docs_disabled(ctx: dict) -> Check:
+    app = ctx.get("app")
+    if app is None:  # pragma: no cover
+        return Check("api_docs_disabled", TIER_ADVISORY, True, "no app supplied; skipped")
+    exposed = [name for name in ("docs_url", "redoc_url", "openapi_url") if getattr(app, name, None)]
+    return Check(
+        "api_docs_disabled",
+        TIER_ADVISORY,
+        not exposed,
+        "interactive docs and the schema are disabled"
+        if not exposed
+        else f"the API schema is public through {exposed}",
+        {"exposed": exposed, "enabled_by_setting": settings.enable_api_docs},
+    )
+
+
+def _check_biometric_dirs(ctx: dict) -> Check:
+    from main import LOCAL_REFS_DIR, WORKER_PHOTOS_DIR
+
+    problems = []
+    for label, directory in (("local_references", LOCAL_REFS_DIR), ("worker_photos", WORKER_PHOTOS_DIR)):
+        try:
+            Path(directory).mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=directory, prefix=".readiness_", delete=True):
+                pass
+        except OSError as exc:
+            problems.append(f"{label}: {exc}")
+    return Check(
+        "biometric_dirs_writable",
+        TIER_ADVISORY,
+        not problems,
+        "biometric directories are writable" if not problems else "; ".join(problems),
+    )
+
+
+def _check_biometric_file_naming(ctx: dict) -> Check:
+    """Whether any face is still filed under the account id it used to be named by.
+
+    Migration 11 gives every account an immutable id, and ``main.init_db`` renames the
+    files already on disk to match. The readers keep a fallback to the old names so that an
+    interrupted rename cannot take a worker's clock-in away mid-shift - but that fallback
+    is a migration path, not a resting state. While it is in use, a filename still says
+    which account a face belongs to, and says it from a number anybody can iterate; zero is
+    the only answer that means the change is finished on this deployment.
+
+    Advisory rather than fatal, and it never repairs: deciding what to do with somebody
+    else's template - rename it, re-enroll the worker, delete it - is an operator's call.
+    """
+    try:
+        import biometrics
+
+        remaining = biometrics.legacy_files_remaining()
+    except Exception as exc:  # noqa: BLE001 - a report must never fail on one check
+        return Check("biometric_file_naming", TIER_ADVISORY, True, f"could not be checked: {exc}")
+    total = sum(remaining.values())
+    return Check(
+        "biometric_file_naming",
+        TIER_ADVISORY,
+        total == 0,
+        "every biometric file is named by its account's immutable id"
+        if total == 0
+        else (
+            f"{total} biometric file(s) are still named after their account id; "
+            "restart the service to retry the rename, then check again"
+        ),
+        remaining,
+    )
+
+
+def _check_retention_sweep(ctx: dict) -> Check:
+    """Whether the retention policy is actually being enforced, or merely configured.
+
+    This is the check that distinguishes the two. A retention period in ``.env`` with nothing
+    running it is the same finding an auditor writes as indefinite retention, and the failure
+    is silent by construction - the schedule is in a file, the timer is in a thread, and
+    neither leaves evidence when it stops. The evidence that it *is* running is the row the
+    sweeper writes at the end of every applied sweep, so this reads it.
+
+    Advisory, never fatal: a deployment that runs ``python -m retention --apply`` from cron
+    with ``RETENTION_ENABLED=0`` has no row in this process's first minutes, and a database
+    that has just been created has one. Neither is a reason to refuse to serve attendance.
+
+    Overdue is 2x the interval plus the startup delay: one missed pass is noise (a sweep at
+    boot, a slow disk), two is a timer that is not running.
+    """
+    try:
+        import retention
+    except Exception as exc:  # noqa: BLE001 - a report must never fail on one check
+        return Check("retention_sweep", TIER_ADVISORY, True, f"could not be checked: {exc}")
+
+    try:
+        last = retention.last_run()
+    except Exception as exc:  # noqa: BLE001
+        return Check("retention_sweep", TIER_ADVISORY, True, f"could not be checked: {exc}")
+
+    value = {
+        "policy": retention.policy().as_dict(),
+        "dry_run": bool(settings.retention_dry_run),
+        "scheduler": {
+            "enabled": bool(settings.retention_enabled),
+            "running": retention.watcher_running(),
+        },
+        "last_run": last,
+    }
+    if last is None:
+        if not settings.retention_enabled:
+            # The timer is off and nothing has been recorded from anywhere else. Report it as
+            # a decision rather than a fault - but say it, because "off" is the answer that
+            # has to be deliberate, and because the alternative is a deployment that believes
+            # a retention policy is being enforced by a process that is not running.
+            return Check(
+                "retention_sweep",
+                TIER_ADVISORY,
+                True,
+                "the in-process sweeper is disabled (RETENTION_ENABLED=0) and no sweep has been "
+                "recorded: run 'python -m retention --apply' on a schedule",
+                value,
+            )
+        return Check(
+            "retention_sweep",
+            TIER_ADVISORY,
+            True,
+            "no retention sweep has been recorded yet (the first one runs shortly after boot)",
+            value,
+        )
+
+    overdue_after = 2 * int(settings.retention_interval_seconds) + int(settings.retention_initial_delay_seconds)
+    try:
+        age = (datetime.now() - datetime.strptime(str(last["started_at"]), "%Y-%m-%d %H:%M:%S")).total_seconds()
+    except (TypeError, ValueError):  # pragma: no cover - a hand-edited row
+        return Check("retention_sweep", TIER_ADVISORY, True, "the last sweep row has no usable timestamp", value)
+    value["seconds_since_last_sweep"] = int(age)
+    value["overdue_after_seconds"] = overdue_after
+
+    # ``failures_total`` counts both shapes of failure - an item that could not be removed, and
+    # a target that could not run at all - because either one means data is being kept past its
+    # period, and the operator's next action is the same: read the compliance event.
+    failures = int(last.get("failures_total") or 0)
+    if failures:
+        return Check(
+            "retention_sweep",
+            TIER_ADVISORY,
+            False,
+            f"the last retention sweep reported {failures} failure(s); read the audit event "
+            "action=retention_sweep for what could not be removed",
+            value,
+        )
+    if age > overdue_after:
+        return Check(
+            "retention_sweep",
+            TIER_ADVISORY,
+            False,
+            f"the last retention sweep was {int(age // 3600)}h ago, past the {int(overdue_after // 3600)}h "
+            "overdue threshold: data is being retained past its period",
+            value,
+        )
+    return Check(
+        "retention_sweep",
+        TIER_ADVISORY,
+        True,
+        f"retention is enforced; the last sweep was {int(age // 60)}m ago and removed "
+        f"{int(last.get('deleted_total') or 0)} item(s)",
+        value,
+    )
+
+
+def _check_retention_residue(ctx: dict) -> Check:
+    """Whether anything is still on disk that the policy says should be gone.
+
+    Counted from the directories, not from the database, which is the entire value of it: a
+    face whose row is gone is invisible to a query and perfectly visible to ``os.listdir``.
+    The classes are a template for an account that no longer exists, a quarantined legacy
+    file, a half-written staging file, and a punch selfie nothing references.
+
+    Advisory: residue is nearly always a *failure to delete* - a file held open by a backup,
+    a permissions problem - and the next sweep retries it. What must not happen is that it is
+    never mentioned, since "we deleted it" and "we believe we deleted it" differ by exactly
+    this count.
+    """
+    try:
+        import retention
+
+        found = retention.residue()
+    except Exception as exc:  # noqa: BLE001
+        return Check("retention_residue", TIER_ADVISORY, True, f"could not be checked: {exc}")
+    if found.get("error"):
+        return Check("retention_residue", TIER_ADVISORY, True, f"could not be checked: {found['error']}")
+
+    total = sum(
+        int(found.get(key) or 0)
+        for key in (
+            "biometric_files_for_deactivated_accounts",
+            "orphaned_biometric_files",
+            "biometric_staging_files",
+            "orphaned_punch_photos",
+        )
+    )
+    return Check(
+        "retention_residue",
+        TIER_ADVISORY,
+        total == 0,
+        "no biometric files or punch selfies are still on disk past their retention window"
+        if total == 0
+        else f"{total} file(s) are past their retention window and still on disk: {found.get('listed')}",
+        found,
+    )
+
+
+def _check_metrics(ctx: dict) -> Check:
+    """Whether this process can be monitored, and whether that is exposed safely.
+
+    Advisory, never fatal, for a reason worth stating: Prometheus metrics are an operational
+    extra, and a deployment that has none is *unmonitored*, not broken. Refusing to serve
+    attendance because a monitoring library is missing would be the tail wagging the dog.
+
+    What it does report is the thing that actually goes wrong here, which is a **silent**
+    gap: a scrape that lands on one of several uvicorn workers reports a fraction of the
+    traffic, and an alert threshold tuned to that number fires late or not at all. The mode
+    is therefore stated in the check's value rather than left to be discovered.
+    """
+    import telemetry
+
+    detail = telemetry.describe()
+    if not detail["available"]:
+        return Check(
+            "metrics",
+            TIER_ADVISORY,
+            True,
+            "Prometheus metrics are not installed; GET /metrics answers 501 with the install "
+            f"instruction ({detail['import_error']})",
+            detail,
+        )
+    if not detail["enabled"]:
+        return Check(
+            "metrics",
+            TIER_ADVISORY,
+            True,
+            "metrics are disabled (METRICS_ENABLED=0); GET /metrics answers 404",
+            detail,
+        )
+    if settings.metrics_token:
+        return Check(
+            "metrics",
+            TIER_ADVISORY,
+            True,
+            "metrics are served at /metrics to the configured scrape token"
+            + (
+                " (single-process registry; set PROMETHEUS_MULTIPROC_DIR before running more "
+                "than one uvicorn worker)"
+                if detail["single_process_registry"]
+                else f" (multiprocess registry: {detail['multiprocess_dir']})"
+            ),
+            detail,
+        )
+    return Check(
+        "metrics",
+        TIER_ADVISORY,
+        True,
+        "metrics are served at /metrics to administrators only: no METRICS_TOKEN is set, so a "
+        "scrape job cannot authenticate. Set it (or disable metrics) before pointing "
+        "Prometheus at this host.",
+        detail,
+    )
+
+
+def _check_face_engine(ctx: dict) -> Check:
+    """How loaded the face-verification pool is, and whether it is refusing work.
+
+    Advisory, and it never stops the server: a saturated queue is a *load* condition, not a
+    broken deployment, and refusing to start because a whole site arrived at once would be
+    worse than being slow. What this is for is the question an operator actually asks when
+    punches crawl - "what is it doing?" - which the snapshot answers in one line (two
+    workers, 64 waiting, twelve refused since boot) instead of leaving it to be guessed at.
+    """
+    try:
+        import face_engine
+
+        snapshot = face_engine.stats()
+    except Exception as exc:  # noqa: BLE001 - a report must never fail on one check
+        return Check("face_engine", TIER_ADVISORY, True, f"could not be checked: {exc}")
+    refused = int(snapshot.get("refused") or 0)
+    detail = (
+        f"{snapshot.get('in_flight', 0)}/{snapshot.get('capacity', 0)} verifying, "
+        f"{snapshot.get('queued', 0)} waiting"
+    )
+    if refused:
+        detail += f", {refused} refused since start"
+    return Check("face_engine", TIER_ADVISORY, not snapshot.get("busy"), detail, snapshot)
+
+
+def _check_clock_sanity(ctx: dict) -> Check:
+    try:
+        conn = _open(ctx.get("db_path"), read_only=True)
+        try:
+            row = conn.execute("SELECT MAX(timestamp) FROM attendance_logs").fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return Check("clock_sanity", TIER_ADVISORY, True, f"no attendance history to compare: {exc}")
+    newest = row[0] if row else None
+    if not newest:
+        return Check("clock_sanity", TIER_ADVISORY, True, "no attendance history yet")
+    try:
+        newest_dt = datetime.strptime(str(newest), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return Check("clock_sanity", TIER_ADVISORY, True, f"unparseable newest timestamp {newest!r}")
+    skew_hours = (newest_dt - datetime.now()).total_seconds() / 3600.0
+    ok = skew_hours < 24
+    return Check(
+        "clock_sanity",
+        TIER_ADVISORY,
+        ok,
+        f"newest attendance record is {skew_hours:.1f}h ahead of this host's clock"
+        if not ok
+        else "host clock is consistent with the attendance history",
+        {"skew_hours": round(skew_hours, 2), "newest": str(newest)},
+    )
+
+
+def _check_database_path(ctx: dict) -> Check:
+    expected = (PROJECT_ROOT / "times.db").resolve()
+    actual = Path(ctx.get("db_path") or settings.database_path).resolve()
+    ok = actual == expected
+    return Check(
+        "database_path_is_project_root",
+        TIER_ADVISORY,
+        ok,
+        "database resolves to the canonical project-root file"
+        if ok
+        else f"database resolves to {actual} rather than {expected} (valid for a migration or a test run)",
+        {"actual": str(actual), "expected": str(expected)},
+    )
+
+
+def _check_head_admin_exists(ctx: dict) -> Check:
+    try:
+        conn = _open(ctx.get("db_path"), read_only=True)
+        try:
+            count = conn.execute("SELECT COUNT(*) FROM users WHERE role = 'head_admin'").fetchone()[0]
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return Check("database_has_head_admin", TIER_ADVISORY, True, f"users unreadable: {exc}")
+    return Check(
+        "database_has_head_admin",
+        TIER_ADVISORY,
+        count > 0,
+        "a head admin account exists" if count else "no head admin account: nobody can administer this installation",
+        {"count": count},
+    )
+
+
+def _check_liveness(ctx: dict) -> Check:
+    """Anti-spoofing posture.
+
+    ``enforce`` with no usable MiniFASNet model is **fatal**: it would reject every
+    genuine punch, which is a self-inflicted outage far worse than the spoofing it
+    is trying to stop. A missing model in ``advisory``/``off`` is only advisory,
+    because the model is an optional extra and must never stop the API from serving
+    attendance.
+    """
+    import liveness
+
+    report = liveness.readiness()
+    tier = {"fatal": TIER_FATAL, "advisory": TIER_ADVISORY}.get(report.get("severity"), TIER_ADVISORY)
+    if tier == TIER_FATAL and report.get("ready"):
+        tier = TIER_ADVISORY
+    return Check(
+        "liveness_anti_spoofing",
+        tier,
+        bool(report.get("ready")),
+        str(report.get("reason")),
+        {
+            "mode": report.get("mode"),
+            "available": report.get("available"),
+            "model_path": report.get("model_path"),
+            "error": report.get("error"),
+        },
+    )
+
+
+#: Registry order is the order presented in the report.
+CHECKS = (
+    _check_secret_key,
+    _check_database_reachable,
+    _check_database_writable,
+    _check_schema_version,
+    _check_migrations,
+    _check_schema_drift,
+    _check_shift_rules,
+    _check_site_windows,
+    _check_journal_mode,
+    _check_password_hashing,
+    _check_jwt_roundtrip,
+    _check_admin_routes_guarded,
+    _check_no_unprefixed_admin_routes,
+    _check_static_mounts,
+    _check_api_docs_disabled,
+    _check_biometric_dirs,
+    _check_biometric_file_naming,
+    _check_retention_sweep,
+    _check_retention_residue,
+    _check_metrics,
+    _check_face_engine,
+    _check_liveness,
+    _check_clock_sanity,
+    _check_database_path,
+    _check_head_admin_exists,
+)
+
+REPAIRS = {
+    "shift_rules_present": _repair_shift_rules,
+    "journal_mode": _repair_journal_mode,
+}
+
+
+def run_checks(app=None, *, db_path: Path | None = None) -> tuple[list[Check], list[dict]]:
+    ctx: dict = {"app": app, "db_path": db_path, "repaired": []}
+    checks: list[Check] = []
+    for function in CHECKS:
+        try:
+            checks.append(function(ctx))
+        except Exception as exc:  # pragma: no cover - a broken check must not hide the others
+            checks.append(
+                Check(function.__name__.removeprefix("_check_"), TIER_ADVISORY, False, f"check raised: {exc}")
+            )
+    return checks, list(ctx.get("repaired", []))
+
+
+# ---------------------------------------------------------------------------
+# the startup gate
+# ---------------------------------------------------------------------------
+def run_startup_gate(app, *, db_path: Path | None = None, log=None) -> GateReport:
+    """Verify the deployment *before* serving traffic.
+
+    Raises ``RuntimeError`` on an unoverridden FATAL failure. Under uvicorn that
+    surfaces as ``SystemExit(3)`` with the port never opened - a one-glance
+    symptom for the runbook.
+    """
+    started = time.time()
+    log = log or (lambda message: print(message, file=sys.stderr))
+
+    checks, repaired = run_checks(app, db_path=db_path)
+    for check in [item for item in checks if not item.ok and item.tier == TIER_REPAIRABLE]:
+        repair = REPAIRS.get(check.name)
+        if repair is None:
+            continue
+        applied = repair({"db_path": db_path, "app": app})
+        repaired.append({"check": check.name, "applied": applied})
+
+    if any(item.get("applied") for item in repaired):
+        checks, _ = run_checks(app, db_path=db_path)
+
+    report = GateReport(checks=checks, repaired=repaired, duration_ms=(time.time() - started) * 1000)
+
+    for check in report.failed:
+        log(f"[startup] {check.tier.upper()}: {check.name}: {check.detail}")
+
+    fatal = report.fatal_failures
+    if fatal:
+        overridable = [check for check in fatal if check.name not in NON_OVERRIDABLE]
+        blocked_irrespective = [check for check in fatal if check.name in NON_OVERRIDABLE]
+        if settings.startup_override_active and not blocked_irrespective:
+            report.override_used = True
+            log(
+                "[startup] OVERRIDE ACTIVE: serving despite "
+                f"{[check.name for check in overridable]} - reason: {settings.startup_override_reason}"
+            )
+            _record(
+                notifications.KIND_STARTUP_OVERRIDE,
+                notifications.SEVERITY_CRITICAL,
+                "Startup gate overridden",
+                f"The server started with failing checks {[check.name for check in overridable]}. "
+                f"Reason given: {settings.startup_override_reason}",
+                dedupe_key="startup_override",
+            )
+        else:
+            names = ", ".join(f"{check.name} ({check.detail})" for check in fatal)
+            raise RuntimeError(
+                "startup self-test failed, refusing to serve traffic: "
+                f"{names}. Fix the failure, or set STARTUP_OVERRIDE_REASON (with an optional "
+                "STARTUP_OVERRIDE_UNTIL) to start anyway; the override is audited and never "
+                "reports the deployment as healthy."
+            )
+
+    if report.advisory_failures:
+        degraded_names = [check.name for check in report.advisory_failures]
+        log(f"[startup] DEGRADED: {degraded_names}")
+        _record(
+            notifications.KIND_STARTUP_DEGRADED,
+            notifications.SEVERITY_WARNING,
+            "Server started degraded",
+            f"Advisory checks failed: {degraded_names}",
+            dedupe_key="startup_degraded:" + ",".join(sorted(degraded_names)),
+            payload={"checks": [check.as_dict() for check in report.advisory_failures]},
+        )
+
+    log(
+        f"[startup] self-test complete in {report.duration_ms:.0f}ms: "
+        f"{len(report.checks) - len(report.failed)}/{len(report.checks)} checks passed"
+        + (" (degraded)" if report.degraded else "")
+    )
+    return report
+
+
+def _record(kind: str, severity: str, title: str, body: str, *, dedupe_key: str, payload: dict | None = None) -> None:
+    try:
+        with database.db(write=True) as conn:
+            notifications.notify(
+                conn,
+                kind=kind,
+                severity=severity,
+                title=title,
+                body=body,
+                dedupe_key=dedupe_key,
+                payload=payload,
+            )
+    except sqlite3.Error:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# HTTP surfaces
+# ---------------------------------------------------------------------------
+def _code_fingerprint() -> str:
+    try:
+        from main import __file__ as main_file
+
+        return hashlib.sha256(Path(main_file).read_bytes()).hexdigest()[:8]
+    except Exception:  # pragma: no cover - defensive
+        return "unknown"
+
+
+def _migration_table(db_path: Path | None) -> list[dict]:
+    try:
+        conn = _open(db_path, read_only=True)
+        try:
+            applied = {
+                int(row[0]): {"applied_at": row[1]}
+                for row in conn.execute("SELECT version, applied_at FROM schema_migrations")
+            }
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        applied = {}
+    return [
+        {
+            "version": version,
+            "name": name,
+            "applied": version in applied,
+            "applied_at": applied.get(version, {}).get("applied_at"),
+        }
+        for version, name, _ in migrations.MIGRATIONS
+    ]
+
+
+def build_report(app, *, deep: bool = False, db_path: Path | None = None) -> GateReport:
+    checks, repaired = run_checks(app, db_path=db_path)
+    report = GateReport(checks=checks, repaired=repaired)
+    if deep:
+        report.checks.append(_deep_check(db_path))
+    return report
+
+
+def _deep_check(db_path: Path | None) -> Check:
+    try:
+        conn = _open(db_path, read_only=True)
+        try:
+            integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            counts = {}
+            for (table,) in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            ):
+                counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return Check("deep_integrity", TIER_ADVISORY, False, f"integrity check failed: {exc}")
+    ok = str(integrity).lower() == "ok"
+    return Check(
+        "deep_integrity",
+        TIER_ADVISORY,
+        ok,
+        f"integrity_check={integrity}",
+        {"integrity": integrity, "row_counts": counts},
+    )
+
+
+def _live_schema_version(db_path: Path | None) -> int:
+    try:
+        conn = _open(db_path, read_only=True)
+        try:
+            return migrations.current_version(conn)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return 0
+
+
+def _verdict(report: GateReport) -> dict:
+    """The part of a readiness run that is safe to hand to an anonymous caller."""
+    return {
+        "ok": not report.fatal_failures,
+        "degraded": report.degraded,
+        "checks": {check.name: check.public() for check in report.checks},
+        "failed_checks": [check.name for check in report.fatal_failures],
+        "degraded_checks": [check.name for check in report.advisory_failures],
+    }
+
+
+def _public_body(app, db_path: Path | None) -> dict:
+    """What ``GET /api/v1/readiness`` may return: the verdict and nothing else.
+
+    A probe that anyone can call must not be a map of the host. The app/schema
+    inventory, the fingerprints and every ``detail``/``value`` a check produced
+    (they name absolute paths) are served by ``/api/v1/admin/readiness``.
+    """
+    return _verdict(build_report(app, db_path=db_path))
+
+
+def _internal_body(report: GateReport, db_path: Path | None) -> dict:
+    """The verdict plus the internals, for the admin-only surface."""
+    body = _verdict(report)
+    body.update(
+        {
+            "hardened_build_live": not report.fatal_failures,
+            "app": {
+                "name": "site-attendance",
+                "version": settings.app_version,
+                "python": platform.python_version(),
+                "code_fingerprint": _code_fingerprint(),
+                "started_at": datetime.fromtimestamp(_STARTED_AT).strftime("%Y-%m-%d %H:%M:%S"),
+            },
+            "schema": {
+                "current": _live_schema_version(db_path),
+                "expected": migrations.SCHEMA_VERSION,
+            },
+            "migrations": _migration_table(db_path),
+            "secret_key_fingerprint": settings.secret_key_fingerprint,
+            "token_ttl_hours": settings.jwt_ttl_hours,
+        }
+    )
+    return body
+
+
+@router.get("/readiness")
+def readiness(response: Response, request: Request):
+    body = _public_body(request.app, None)
+    response.status_code = 200 if body["ok"] else 503
+    return body
+
+
+@router.get("/admin/readiness")
+def admin_readiness(
+    response: Response,
+    request: Request,
+    deep: int = 0,
+    current: CurrentUser = Depends(admin_only),
+):
+    report = build_report(request.app, deep=bool(deep))
+    body = _internal_body(report, None)
+    body["admin"] = {
+        "database_path": str(settings.database_path),
+        "backup_dir": str(settings.backup_dir),
+        "pid": os.getpid(),
+        "uptime_seconds": round(time.time() - _STARTED_AT, 1),
+        "allowed_origins": settings.allowed_origins,
+        "schema_guard_mode": settings.schema_guard_mode,
+        "startup_override_active": settings.startup_override_active,
+        # The full per-check detail/value/name, which the public route drops.
+        "checks": [check.as_dict() for check in report.checks],
+        "repaired": report.repaired,
+    }
+    response.status_code = 200 if body["ok"] else 503
+    return body

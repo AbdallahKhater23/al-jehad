@@ -1,9 +1,27 @@
 __pycache__/
 temp/
+backend/certs/
+# ONNX liveness model: a binary artifact that does not belong in git history.
+# Place it at backend/models/minifasnet.onnx (see backend/models/README.md).
+backend/models/*.onnx
+backend/models/*.onnx.*
 times.db
+# SQLite sidecar files created by WAL mode while the server runs
+times.db-wal
+times.db-shm
 .env
 worker_photos
 local_references
+# Selfies taken with a quick clock link. Biometric data, like the two above: never in git.
+quick_link_photos
 .vscode
 Dockerfile
 test_odoo.py
+backups/
+
+# The virtualenv is rebuilt per machine (see backend/requirements-optional.txt and the
+# note at the top of requirements-dev.txt); its 26k files are not the project.
+backend/venv/
+# Freebuff's own worktrees live here, and a git worktree inside a worktree is not a
+# thing to commit.
+.freebuff/
