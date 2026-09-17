@@ -170,6 +170,11 @@ const results = {};
     env.evaluate("document.getElementById('rulesRegularHours').value = '7.5'");
     env.evaluate("document.getElementById('rulesBreakMinutes').value = '45'");
     env.evaluate("document.getElementById('rulesBreakAfterHours').value = '5'");
+    // The company clock-in window travels with the rest of the rules: it is what every site
+    // without a window of its own is judged by, and this panel is the only place it is set.
+    env.evaluate("document.getElementById('rulesWindowStart').value = '22:00'");
+    env.evaluate("document.getElementById('rulesWindowEnd').value = '06:00'");
+    env.evaluate("document.getElementById('rulesTimezone').value = 'Africa/Cairo'");
     saveReply = Object.assign({}, RULES, {
         regular_hours: 7.5, break_minutes: 45, break_after_hours: 5
     });
@@ -320,6 +325,9 @@ def test_saving_the_rules_sends_them_and_repaints_from_the_answer(results):
         "break_minutes": 45,
         "break_after_hours": 5,
         "auto_close_at_regular": 1,
+        "clock_in_window_start": "22:00",
+        "clock_in_window_end": "06:00",
+        "site_timezone": "Africa/Cairo",
     }
     assert saved["authorized"] == "Bearer tok-5000"
     assert "saved" in saved["toast"].lower()

@@ -65,13 +65,14 @@ from typing import Any
 import numpy as np
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 import face_engine
 import liveness
 import notifications
 import shift_hours
 import shift_windows
+import textguard
 import uploads
 from config import PROJECT_ROOT, settings
 from database import db
@@ -335,8 +336,20 @@ class QuickLinkCreate(BaseModel):
     worker_id: str
     ttl_hours: int | None = None
     max_uses: int | None = None
+    #: For the administrator's own records ("the man on the third tower"). The link's note
+    #: is copied onto the punch the link produces and appears in the link's use list, so it
+    #: is prose rather than an identifier - and, being prose, it carries no markup.
     note: str | None = None
     base_url: str | None = None
+
+    @field_validator("note")
+    @classmethod
+    def _plain_note(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return textguard.prose(
+            value, field="Note", max_length=textguard.MAX_LABEL, allow_empty=True
+        )
 
 
 # ---------------------------------------------------------------------------

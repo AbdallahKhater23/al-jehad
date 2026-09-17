@@ -46,7 +46,6 @@ import numpy as np
 from deepface import DeepFace
 from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
@@ -79,6 +78,7 @@ import enrollment
 import face_engine
 import liveness
 import migrations
+import netguard
 import notes
 import notifications
 import offline_sync
@@ -90,6 +90,7 @@ import retention
 import schema_guard
 import security
 import telemetry
+import textguard
 import shift_hours
 import shift_windows
 import uploads
@@ -131,13 +132,17 @@ router = APIRouter()
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.allowed_origins,
-    allow_credentials=bool(settings.allowed_origins),
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
-)
+
+# The network layer: CORS by origin class, the admin address gate, and the security
+# headers. One middleware, because all three read the same request facts (method, path,
+# Origin, peer address) and parsing X-Forwarded-For three times is how it gets parsed
+# wrong once. Replaces ``CORSMiddleware``, whose single origin list served both the worker
+# app and the administrator console - see ``netguard`` for what that cost.
+#
+# Order matters: middleware added later wraps earlier ones. This one is added here, before
+# the routes, so it sits inside the frontend revalidation middleware (a refusal still gets
+# its Cache-Control) and outside the router (a refusal never reaches a handler).
+netguard.install(app)
 
 FRONTEND_DIR = str(PROJECT_ROOT / "frontend")
 LOCAL_REFS_DIR = str(PROJECT_ROOT / "local_references")
@@ -229,7 +234,12 @@ def get_shift_rules() -> dict:
                 value = row[key]
             except (IndexError, KeyError):
                 continue
-            if value is not None:
+            # A blank column is "nothing configured" and keeps the shipped value. These
+            # columns are NOT NULL with a default, so an administrator emptying the window
+            # boxes in the console stores ``''`` rather than NULL - and a ``''`` read back as a
+            # real value would resolve to 00:00-23:59 at every punch, i.e. a company window
+            # that makes nobody late. ``shift_windows._pick`` reads blank the same way.
+            if value is not None and str(value).strip() != "":
                 rules[key] = value
     return rules
 
@@ -354,12 +364,90 @@ class LoginRequest(BaseModel):
 
 
 class UserAddRequest(BaseModel):
+    """A new account, created by an administrator.
+
+    ``name`` is the field that matters here. It is stored, echoed into the audit entry, and
+    printed in every notification that mentions this person - so it is an *identifier* under
+    the ``textguard`` allowlist rather than free text: letters (English or Arabic), digits,
+    spaces and ``. , - _ ( ) /``. See that module for why an apostrophe is refused and why
+    the Arabic ranges are listed block by block instead of relying on ``\\w``.
+
+    ``password`` is deliberately untouched by any of this. It is hashed and never rendered,
+    and a validator that trimmed or restricted characters in it would quietly weaken every
+    credential in the system; ``security.validate_password_strength`` is the check for it, and
+    it answers a different question.
+    """
+
     user_id: str
     name: str
     email: str = ""
     phone: str = ""
     password: str
     role: str
+
+    @field_validator("name")
+    @classmethod
+    def _plain_name(cls, value: str) -> str:
+        return textguard.identifier(value, field="Name", max_length=textguard.MAX_NAME)
+
+    @field_validator("email")
+    @classmethod
+    def _plain_email(cls, value: str) -> str:
+        return textguard.contact(value, field="Email")
+
+    @field_validator("phone")
+    @classmethod
+    def _plain_phone(cls, value: str) -> str:
+        return textguard.contact(value, field="Phone")
+
+
+def _plain_hhmm(value: str | None, *, field: str) -> str | None:
+    """A strict 24-hour ``HH:MM``, or ``None`` for "not configured".
+
+    An empty string is read as "not configured" rather than as an error, because that is what
+    an HTML form sends for a time box nobody filled in - and rejecting it would make the
+    console's own forms stop saving. Every other shape is refused here, where an administrator
+    sees it, instead of being stored and then silently ignored at the gate: a start of
+    ``25:00`` stored in ``shift_rules`` used to degrade to ``00:00``-``23:59`` at every punch,
+    which is a window that makes nobody late (``shift_windows`` still falls back if one ever
+    gets in by another route).
+
+    Shared by the site form and the company-wide rules on purpose: those two are the same
+    question asked at two scopes, and a rule that lived in only one of them is how a site ends
+    up validated and the company default not.
+    """
+    if value is None:
+        return None
+    candidate = str(value).strip()
+    if not candidate:
+        return None
+    if not shift_windows.is_valid_hhmm(candidate):
+        raise ValueError(
+            f"{field} must be a 24-hour time in HH:MM form (for example 04:00, 22:00, "
+            f"00:00); '{value}' is not. Minutes are 00-59 and hours are 00-23."
+        )
+    return candidate
+
+
+def _plain_timezone(value: str | None) -> str | None:
+    """Refuse a timezone ``zoneinfo`` cannot resolve.
+
+    A typo like ``Africa/Cario`` or a POSIX-style ``EET-2`` would otherwise be stored and then
+    quietly fall back to the default at every punch - which moves a site's window by an hour or
+    two and presents as "the wrong people are late", not as a typo. Applies to the site's zone
+    and to the company default for the same reason.
+    """
+    if value is None:
+        return None
+    candidate = str(value).strip()
+    if not candidate:
+        return None
+    if not shift_windows.is_known_timezone(candidate):
+        raise ValueError(
+            f"'{value}' is not a timezone this server knows. Use an IANA name such as "
+            "Africa/Cairo or Asia/Riyadh."
+        )
+    return candidate
 
 
 class SiteModel(BaseModel):
@@ -372,66 +460,74 @@ class SiteModel(BaseModel):
     """
 
     site_name: str
+    #: A Google Maps URL or a ``lat,lon`` pair, parsed and discarded - never stored, never
+    #: rendered. That is why it is not put through the identifier allowlist above: a Maps URL
+    #: is full of ``: / ? = &``, and refusing those would refuse the way administrators
+    #: actually paste a site's coordinates.
     location_input: str
     radius: float
     clock_in_window_start: str | None = None
     clock_in_window_end: str | None = None
     site_timezone: str | None = None
 
+    @field_validator("site_name")
+    @classmethod
+    def _plain_site_name(cls, value: str) -> str:
+        """A site name is a key, a label in every report, and a notification field.
+
+        It is the primary key of ``construction_sites`` and it is written into
+        ``attendance_logs.site_name``, which means a name carrying markup is a stored payload
+        in the *attendance* table as well as in the site list - the one row an operator is
+        most likely to open in a spreadsheet.
+        """
+        return textguard.identifier(
+            value, field="Site name", max_length=textguard.MAX_SITE_NAME
+        )
+
     @field_validator("clock_in_window_start", "clock_in_window_end")
     @classmethod
     def _validate_window_time(cls, value: str | None) -> str | None:
-        """Refuse anything that is not a strict 24-hour ``HH:MM``.
-
-        An empty string is read as "not configured" rather than as an error, because that is
-        what an HTML form sends for a field nobody filled in - and rejecting it would make the
-        console's existing site form stop saving. Every other shape is refused here, where an
-        administrator sees it, instead of being stored and then silently ignored at the gate
-        (``shift_windows`` still falls back if one ever gets in by another route).
-        """
-        if value is None:
-            return None
-        candidate = value.strip()
-        if not candidate:
-            return None
-        if not shift_windows.is_valid_hhmm(candidate):
-            raise ValueError(
-                f"'{value}' is not a 24-hour time in HH:MM form (for example 04:00, 22:00, "
-                "00:00). Minutes are 00-59 and hours are 00-23."
-            )
-        return candidate
+        """The site's own hours, checked by the shared rule (see ``_plain_hhmm``)."""
+        return _plain_hhmm(value, field="Site clock-in window")
 
     @field_validator("site_timezone")
     @classmethod
     def _validate_timezone(cls, value: str | None) -> str | None:
-        """Refuse a timezone ``zoneinfo`` cannot resolve.
-
-        A typo like ``Africa/Cario`` or a POSIX-style ``EET-2`` would otherwise be stored and
-        then quietly fall back to the default at every punch - which moves a site's window by
-        an hour or two and presents as "the wrong people are late", not as a typo.
-        """
-        if value is None:
-            return None
-        candidate = value.strip()
-        if not candidate:
-            return None
-        if not shift_windows.is_known_timezone(candidate):
-            raise ValueError(
-                f"'{value}' is not a timezone this server knows. Use an IANA name such as "
-                "Africa/Cairo or Asia/Riyadh."
-            )
-        return candidate
+        """The site's own zone, checked by the shared rule (see ``_plain_timezone``)."""
+        return _plain_timezone(value)
 
 
 class ForceClockRequest(BaseModel):
     worker_id: str
+    #: Empty means "the site the administrator picked", so it is allowed to be absent; when
+    #: present it must be a name that could have come from the sites table.
     site_name: str = ""
+
+    @field_validator("site_name")
+    @classmethod
+    def _plain_site_name(cls, value: str) -> str:
+        return textguard.identifier(
+            value,
+            field="Site name",
+            max_length=textguard.MAX_SITE_NAME,
+            allow_empty=True,
+        )
 
 
 class ReviewApprovalRequest(BaseModel):
     log_id: int
     approved_hours: float | None = None
+    #: Why the administrator approved or refused an irregular shift. Free text, so it goes
+    #: through the prose profile: apostrophes and ampersands survive, markup does not. This
+    #: text ends up in the audit log and in the notification the worker may read.
     note: str | None = None
+
+    @field_validator("note")
+    @classmethod
+    def _plain_note(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return textguard.prose(value, field="Note", max_length=textguard.MAX_NOTE, allow_empty=True)
 
 
 class PasswordEditRequest(BaseModel):
@@ -466,6 +562,29 @@ class UserEditRequest(BaseModel):
     #: but a wrong record is still a wrong record.
     hourly_rate: float | None = None
 
+    @field_validator("name")
+    @classmethod
+    def _plain_name(cls, value: str) -> str:
+        """Shape only, deliberately: an *empty* name is refused by the endpoint below with
+        the 400 and the sentence the console already shows, and the roster's tests pin that
+        contract. This validator answers the other question - whether the text is a name at
+        all - and answering it here means a payload carrying markup never reaches the
+        database even if a future edit forgets to look.
+        """
+        return textguard.identifier(
+            value, field="Name", max_length=textguard.MAX_NAME, allow_empty=True
+        )
+
+    @field_validator("email")
+    @classmethod
+    def _plain_email(cls, value: str) -> str:
+        return textguard.contact(value, field="Email")
+
+    @field_validator("phone")
+    @classmethod
+    def _plain_phone(cls, value: str) -> str:
+        return textguard.contact(value, field="Phone")
+
 
 class UserDeleteRequest(BaseModel):
     user_id: str
@@ -482,6 +601,15 @@ class PasswordChangeRequest(BaseModel):
 
 
 class ShiftRulesUpdate(BaseModel):
+    """The company-wide rules - what a site inherits when it has no window of its own.
+
+    The window fields carry the same validators as a site's, because this is the same window
+    at a wider scope: without them an administrator could type ``25:00`` into the company
+    default and every punch would then be judged against ``00:00``-``23:59``, silently, with
+    ``late_flag`` never set again. The timezone is checked for the same reason - a typo there
+    moves every inheriting site's window by an hour or two.
+    """
+
     clock_in_window_start: str | None = None
     clock_in_window_end: str | None = None
     regular_hours: float | None = None
@@ -494,6 +622,18 @@ class ShiftRulesUpdate(BaseModel):
     #: 1 closes a shift when the paid hours reach ``regular_hours``, 0 leaves it open.
     auto_close_at_regular: int | None = None
 
+    @field_validator("clock_in_window_start", "clock_in_window_end")
+    @classmethod
+    def _validate_window_time(cls, value: str | None) -> str | None:
+        """The company window's hours, checked by the shared rule."""
+        return _plain_hhmm(value, field="Company clock-in window")
+
+    @field_validator("site_timezone")
+    @classmethod
+    def _validate_timezone(cls, value: str | None) -> str | None:
+        """The company timezone, checked by the shared rule."""
+        return _plain_timezone(value)
+
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -501,6 +641,13 @@ class ShiftRulesUpdate(BaseModel):
 #: The per-site clock-in window columns, in the order every write and read uses them.
 #: Named once because three call sites (insert, update, the audit payload) must agree.
 _SITE_WINDOW_FIELDS = ("clock_in_window_start", "clock_in_window_end", "site_timezone")
+
+#: The same three fields on the company-wide row, which is what a site inherits. The names are
+#: identical because they are the same window at a different scope - ``shift_windows`` reads a
+#: site's column and falls back to this one - and it is only the *storage* of an emptied field
+#: that differs: a site's columns are nullable (NULL = inherit) while ``shift_rules`` is NOT
+#: NULL, so there an empty box is stored as ``''``.
+_COMPANY_WINDOW_KEYS = _SITE_WINDOW_FIELDS
 
 
 def _site_window_columns(req: SiteModel) -> dict[str, Any]:
@@ -1589,6 +1736,16 @@ async def create_user(
             status_code=403, detail="Standard Admins cannot create admin or head admin accounts."
         )
     _validate_id_and_role(user_id, role)
+    # The same rules the JSON model applies, because this is the same door with a different
+    # content type. A multipart endpoint that skipped the text checks would be the way past
+    # them for anybody who read the code - and it is the endpoint the Credentials tab uses,
+    # so it is the one a real administrator's browser actually posts to.
+    try:
+        name = textguard.identifier(name, field="Name", max_length=textguard.MAX_NAME)
+        email = textguard.contact(email, field="Email")
+        phone = textguard.contact(phone, field="Phone")
+    except ValueError as exc:
+        raise textguard.http_error(exc) from None
     # The same rule the worker would be held to on a registration link. A console that
     # accepted "1234" here would make the link's policy pointless.
     validate_password_strength(password)
@@ -2159,7 +2316,16 @@ async def delete_site(
     ``site_name`` is declared as ``Form(...)`` on purpose: the shipped version
     declared it as a query parameter while the front-end posts multipart form
     data, so the Delete button answered 422 for everybody.
+
+    The name is validated like any other: it is an identifier for a row, and a delete that
+    accepts markup is a delete that writes markup into the audit entry describing it.
     """
+    try:
+        site_name = textguard.identifier(
+            site_name, field="Site name", max_length=textguard.MAX_SITE_NAME
+        )
+    except ValueError as exc:
+        raise textguard.http_error(exc) from None
     with db(write=True) as conn:
         existing = conn.execute(
             "SELECT lat, lon, radius FROM construction_sites WHERE site_name = ?", (site_name,)
@@ -2649,10 +2815,16 @@ async def read_shift_rules(current: CurrentUser = Depends(admin_only)):
 async def update_shift_rules(
     request: Request, payload: ShiftRulesUpdate, current: CurrentUser = Depends(admin_only)
 ):
-    changes = {key: value for key, value in payload.model_dump().items() if value is not None}
-    if not changes:
+    # ``model_fields_set``, not "every key the model has": a field the caller did not send must
+    # be left alone, and a field the caller *did* send as empty means "back to the shipped
+    # value". This table stores that as NULL (``get_shift_rules`` reads a NULL column as
+    # "nothing configured, use ``DEFAULT_SHIFT_RULES``"), and the previous version filtered
+    # None values out - so an administrator could move the company window to a night shift and
+    # then had no way to take it off again: an emptied box was indistinguishable from an
+    # untouched one. ``edit_site`` draws the same distinction for a site's own columns.
+    supplied = {key: getattr(payload, key) for key in payload.model_fields_set}
+    if not supplied:
         raise HTTPException(status_code=400, detail="No shift rule changes supplied.")
-
     allowed = {
         "clock_in_window_start",
         "clock_in_window_end",
@@ -2663,16 +2835,33 @@ async def update_shift_rules(
         "break_after_hours",
         "auto_close_at_regular",
     }
-    changes = {key: value for key, value in changes.items() if key in allowed}
+    # An emptied box on a window field means "back to the shipped value", and these three columns
+    # are ``NOT NULL`` - so it is stored as ``''``, which ``get_shift_rules`` and
+    # ``shift_windows._pick`` both read as "nothing configured". The previous version dropped
+    # every ``None``, which made an emptied box indistinguishable from an untouched field: an
+    # administrator could move the company window to a night shift and never take it off again.
+    # A null anywhere else means "not supplied" and is left out, rather than written into a
+    # column that cannot hold it.
+    changes: dict[str, Any] = {}
+    for key, value in supplied.items():
+        if key not in allowed:
+            continue
+        if value is None:
+            if key in _COMPANY_WINDOW_KEYS:
+                changes[key] = ""
+            continue
+        changes[key] = value
     # Refuse nonsense rather than storing it: a negative break or a paid day of zero
     # would silently pay every worker for nothing, and 0/1 is not a preference.
-    if "break_minutes" in changes and not (0 <= float(changes["break_minutes"]) <= 240):
+    if changes.get("break_minutes") is not None and not (0 <= float(changes["break_minutes"]) <= 240):
         raise HTTPException(status_code=400, detail="break_minutes must be between 0 and 240.")
-    if "break_after_hours" in changes and not (0 <= float(changes["break_after_hours"]) <= 24):
+    if changes.get("break_after_hours") is not None and not (
+        0 <= float(changes["break_after_hours"]) <= 24
+    ):
         raise HTTPException(status_code=400, detail="break_after_hours must be between 0 and 24.")
-    if "regular_hours" in changes and not (0 < float(changes["regular_hours"]) <= 24):
+    if changes.get("regular_hours") is not None and not (0 < float(changes["regular_hours"]) <= 24):
         raise HTTPException(status_code=400, detail="regular_hours must be between 0 and 24.")
-    if "auto_close_at_regular" in changes:
+    if changes.get("auto_close_at_regular") is not None:
         changes["auto_close_at_regular"] = 1 if int(changes["auto_close_at_regular"]) else 0
 
     with db(write=True) as conn:

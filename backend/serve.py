@@ -60,6 +60,27 @@ OPENSSL_CANDIDATES = (
 )
 
 
+def trusted_proxies_for_uvicorn() -> str:
+    """The ``TRUSTED_PROXIES`` setting in the form uvicorn's ``--forwarded-allow-ips`` wants.
+
+    Read from the same setting the application's own network gate uses (``netguard``), so
+    there is one list to get right rather than two that can disagree - a disagreement here is
+    invisible and expensive: uvicorn would not rewrite ``scope["client"]`` (so the audit log
+    and the per-IP rate limiter would see the proxy for every worker), while the gate would
+    refuse the administrator whose address it could no longer determine.
+
+    Falls back to loopback and says so, because this runs before the app's own configuration
+    validation: the server has to be able to start far enough to report a broken config.
+    """
+    try:
+        from config import build_settings
+
+        return ",".join(build_settings().trusted_proxies) or "127.0.0.1"
+    except Exception as exc:  # noqa: BLE001 - a broken config must not stop the boot message
+        print(f"  ! could not read TRUSTED_PROXIES ({exc}); trusting loopback only")
+        return "127.0.0.1"
+
+
 def find_openssl() -> str | None:
     found = shutil.which("openssl")
     if found:
@@ -250,16 +271,26 @@ def main() -> None:
 
     import uvicorn
 
+    # Behind a tunnel or a reverse proxy the real client address arrives in
+    # X-Forwarded-For, and uvicorn will only believe it from a peer on this list.
+    #
+    # This used to be hardcoded to loopback, which is right for the bundled TLS server
+    # and for a tunnel running on the same host - and wrong, silently, for a proxy on
+    # another machine: every worker behind it shared one slowapi bucket (a 15/minute
+    # limit for the whole site), and every audit row recorded the proxy's address as
+    # the actor's. It now reads the same ``TRUSTED_PROXIES`` setting the admin network
+    # gate uses (``netguard``), so there is one list to get right rather than two that
+    # can disagree.
+    forwarded_allow_ips = trusted_proxies_for_uvicorn()
+    print(f"  Trusted proxies for X-Forwarded-For: {forwarded_allow_ips}")
+
     uvicorn.run(
         APP_IMPORT,
         host=args.host,
         port=args.port,
         reload=args.reload,
-        # Behind a tunnel/reverse proxy the real worker IP arrives in
-        # X-Forwarded-For. slowapi rate-limits by client IP, so without this every
-        # worker behind the same tunnel would share one 15/minute bucket.
         proxy_headers=True,
-        forwarded_allow_ips="127.0.0.1",
+        forwarded_allow_ips=forwarded_allow_ips,
         **ssl_kwargs,
     )
 

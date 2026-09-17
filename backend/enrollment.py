@@ -51,12 +51,13 @@ from typing import Any
 
 import numpy as np
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 import biometrics
 import face_engine
 import liveness
 import notifications
+import textguard
 import uploads
 from config import PROJECT_ROOT, settings
 from database import db
@@ -362,16 +363,55 @@ class InviteCreate(BaseModel):
     worker_id: str
     ttl_hours: int | None = None
     max_uses: int | None = None
+    #: Free text for the administrator's own reference ("the man from the third tower"):
+    #: prose, so apostrophes survive and markup does not. It is shown in the invite list.
     note: str | None = None
     base_url: str | None = None
     #: ``enroll`` (default) registers a face for an account that exists; ``register``
     #: creates the account itself, in which case the name and role below are required
     #: and ``worker_id`` is the id being reserved for it.
     kind: str = KIND_ENROLL
+    #: The name written onto the account a ``register`` link creates. It is the *only*
+    #: name the visitor cannot choose - the public endpoint takes the id, the name and the
+    #: role from this row - which makes this the field that decides what a worker is called
+    #: on the roster, in the reports and in every notification about them. An identifier,
+    #: therefore, not prose.
     name: str | None = None
     role: str | None = None
     email: str | None = None
     phone: str | None = None
+
+    @field_validator("note")
+    @classmethod
+    def _plain_note(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return textguard.prose(
+            value, field="Note", max_length=textguard.MAX_LABEL, allow_empty=True
+        )
+
+    @field_validator("name")
+    @classmethod
+    def _plain_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return textguard.identifier(
+            value, field="Name", max_length=textguard.MAX_NAME, allow_empty=True
+        )
+
+    @field_validator("email")
+    @classmethod
+    def _plain_email(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return textguard.contact(value, field="Email")
+
+    @field_validator("phone")
+    @classmethod
+    def _plain_phone(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return textguard.contact(value, field="Phone")
 
 
 # ---------------------------------------------------------------------------
@@ -628,10 +668,19 @@ async def submit_registration(
     The order is deliberate. Everything that can fail and leave nothing behind happens
     first - the password policy, the photo policy, liveness, and the face embedding -
     and the account row, the reference and the consumed token are written only once all
-    of them have passed. A failure therefore costs the visitor a retry rather than
-    costing them the link, and it cannot leave a half-created account that can sign in
-    but cannot clock in.
+    of them have passed. A failure therefore    costs the visitor a retry rather than costing them the link, and it cannot leave a
+    half-created account that can sign in but cannot clock in.
+
+    ``email`` and ``phone`` are the only free text such a visitor can set, and both are
+    written onto a new ``users`` row. A name or a role cannot be smuggled in here: they come
+    from the invite the administrator wrote, which is where they are vetted.
     """
+    try:
+        email = textguard.contact(email, field="Email")
+        phone = textguard.contact(phone, field="Phone")
+    except ValueError as exc:
+        raise textguard.http_error(exc) from None
+
     now = datetime.now()
     with db() as conn:
         row = conn.execute("SELECT * FROM enrollment_invites WHERE token_hash = ?", (_hash_token(token),)).fetchone()
@@ -793,7 +842,16 @@ async def submit_enrollment(
 
     Public by necessity - the worker has no account credentials yet - so the token is
     the entire authorization: single-use, expiring, hashed at rest, and rate limited.
+
+    ``email`` and ``phone`` are the only free text a visitor can put on an existing
+    account here, so they are vetted like every other stored string rather than being
+    trusted because the endpoint is thin.
     """
+    try:
+        email = textguard.contact(email, field="Email")
+        phone = textguard.contact(phone, field="Phone")
+    except ValueError as exc:
+        raise textguard.http_error(exc) from None
     now = datetime.now()
     with db() as conn:
         row = conn.execute("SELECT * FROM enrollment_invites WHERE token_hash = ?", (_hash_token(token),)).fetchone()

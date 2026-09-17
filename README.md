@@ -105,17 +105,263 @@ laptop and the phone.
 
 ## Security notes (read before exposing this publicly)
 
-This backend was built for a trusted local network and has no API authentication:
-anyone with the URL can call `/api/v1/admin/logs`, `/api/v1/admin/users`,
-`/api/v1/admin/active_sessions` and can force workers in or out. The `Bearer`
-token the front-end sends is a placeholder that the server never checks. Before
-going live, either put the tunnel behind an identity-aware proxy or add real
-token/session auth to the admin routes.
+This section used to say the backend had **no API authentication** and fell back to
+**hardcoded Twilio credentials**. Both of those were true of the prototype and are no
+longer true of the application, so for the avoidance of doubt:
 
-Also: `main.py` currently falls back to **hardcoded Twilio credentials**
-(`TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN`) when the environment variables are
-missing. Move those to a `.env` file (the repo ignores `.env`) and rotate them,
-because a committed fallback secret is a leaked secret.
+* Every administrative route requires a session token (`Authorization: Bearer`), and the
+  token is checked for both validity and role - a worker's token is refused on
+  `/api/v1/admin/*` with 403, not 401, so the client does not sign them out over it.
+  Passwords are bcrypt hashes; there is no readable copy in the database.
+* `SECRET_KEY` is mandatory (the app refuses to start without one), the interactive API
+  documentation is off by default, outbound messaging is an internal notification table
+  rather than a Twilio call, and no code path falls back to a committed credential.
+* Every stored free-text field is validated at the boundary (`backend/textguard.py`) and
+  escaped again when the frontend renders it, and the document CSP refuses inline
+  `<script>` elements. Both halves, and the two allowances that remain, are in **What text
+  the server will store** and **Security headers** below.
+* Rate limits, the biometric retention sweeper, and the Prometheus endpoint's own
+  authentication are described in their own sections below.
+
+What remains true: this is a **LAN-first application**. Serve it on a site network, or put
+it behind a tunnel *and* the controls in the next section - the token gates the API, the
+network policy decides who may even attempt it.
+
+## Network hardening (CORS, admin IP allowlist, security headers)
+
+Three controls that were either missing or not separable, all in `backend/netguard.py` and
+all driven by environment settings. Nothing here is enabled by default in a way that can
+lock out an existing deployment: with no `ADMIN_IP_ALLOWLIST` and no CORS origins set, the
+application behaves as it did before (same-origin clients keep working).
+
+### 1. CORS with two origin classes
+
+`ALLOWED_ORIGINS` was one list for both audiences, so any origin allowed to fetch a punch
+was equally free to call `/api/v1/admin/users`. There are now two classes, because they are
+two trust levels:
+
+```bash
+# A phone/web app that has been handed a session. May read everything except /admin/*.
+CORS_WORKER_ORIGINS=https://app.example.com,https://*.workers.example.com
+# A managed console. May read the whole API, including /admin/*.
+CORS_ADMIN_ORIGINS=https://console.example.com
+# Optional: '*' is accepted for WORKER origins only (credentials are then dropped,
+# because a browser forbids the combination). An admin wildcard is refused at startup.
+```
+
+* Entries are exact origins, or one host wildcard (`https://*.example.com` matches the
+  subdomains and **not** the bare domain - list both if you want both). Scheme case and a
+  default port (`:443`, `:80`) are normalised, so `https://Console.Example.com:443/` matches
+  `https://console.example.com`.
+* A worker origin asking for an admin path gets **no CORS grant** - the request is still
+  served, but a browser cannot read the response. That is what CORS is: a browser-enforced
+  policy, not an authorization check, which is exactly why the admin API's real gate is the
+  session token plus the network allowlist below.
+* Preflights are answered by this middleware (the app has no `OPTIONS` handlers), so a
+  refused preflight is a readable `403 {"error_code": "cors_refused"}` naming the header or
+  the origin, rather than the browser's opaque network error. The headers this client
+  actually sends are allowed by default, including `ngrok-skip-browser-warning`.
+* `ALLOWED_ORIGINS` still works: it is merged in as a *worker* origin list, so a deployment
+  that had it set keeps the access it had and does not silently gain admin access.
+
+```bash
+# Knobs, all optional
+CORS_ALLOWED_METHODS=            # empty = GET, POST, OPTIONS
+CORS_ALLOWED_HEADERS=            # empty = the defaults listed above
+CORS_ALLOW_CREDENTIALS=1
+CORS_MAX_AGE_SECONDS=600
+```
+
+### 2. Admin IP allowlisting (with proxy validation)
+
+```bash
+# Addresses permitted to reach /admin/* and /api/v1/admin/*.
+# Empty = no gate (today's behaviour): the routes are still token-guarded, but any
+# address may attempt them.
+ADMIN_IP_ALLOWLIST=10.20.0.0/16,192.168.1.50,2001:db8::/32
+
+# Which peers may set X-Forwarded-For / X-Forwarded-Proto. Loopback by default, which
+# covers the bundled TLS server and a tunnel running on this host.
+TRUSTED_PROXIES=127.0.0.1/32,::1/128
+```
+
+The proxy rule is the part worth reading twice. `X-Forwarded-For` is a *request header*: any
+client can send it. It is believed **only** when the immediate peer is in `TRUSTED_PROXIES`,
+and the chain is then walked from the right, skipping trusted proxies, until an address that
+is not a proxy is found. Consequences, in order of how often they bite:
+
+* **A proxy on another host must be declared.** Otherwise the allowlist checks the proxy's
+  address instead of the administrator's. The app notices: it refuses the admin request with
+  `proxy_not_trusted`, counts it, **and** reports it in `GET /api/v1/readiness` as a failing
+  advisory check (`network_policy`) naming `TRUSTED_PROXIES`. `serve.py` now feeds this same
+  setting to uvicorn, so one list drives both the gate and the client address the audit log
+  and rate limiter see.
+* **Spoofing does not work.** A client that is not a trusted proxy sending
+  `X-Forwarded-For: <an allowed address>` is refused, never upgraded: the header is not an
+  address. That case has its own test.
+* **A misconfigured policy fails closed and loudly.** An entry that is not an address or
+  CIDR (`10.0.0.0/33`) makes the startup gate **fatal**: the process refuses to serve and
+  names the line, rather than running a gate that matches nothing and locking every
+  administrator out in silence. `TRUSTED_PROXIES=*` (a tunnel with no fixed egress) is
+  allowed but reported, because it means any peer may forge the header.
+* The gate applies to exactly the prefixes in `ADMIN_ALLOWLIST_PATHS` (`/admin`,
+  `/api/v1/admin` by default - add `/metrics` if your scraper should be gated too), never to
+  worker routes: a site's phones are on mobile networks and an allowlist that covered the
+  punch endpoint would stop the attendance the payroll is made of.
+* A refusal writes nothing: no session, no audit row, no notification. The response never
+  names the allowed networks - that would hand the allowlist over one guess at a time.
+
+```bash
+# Scrape this and alert on any increment: a step is either a misconfigured proxy or
+# somebody probing the admin surface.
+attendance_netguard_refusals_total{reason="ip_not_allowed"}
+attendance_netguard_refusals_total{reason="proxy_not_trusted"}
+```
+
+| symptom | cause |
+|---|---|
+| `403 {"error_code": "ip_not_allowed"}` | The client's address is outside `ADMIN_IP_ALLOWLIST`, or its address could not be determined. |
+| `403 {"error_code": "proxy_not_trusted"}` | `X-Forwarded-For` arrived from a peer that is not in `TRUSTED_PROXIES` (or the value was unparsable). Add the proxy, or stop sending the header. |
+| `403 {"error_code": "cors_refused"}` | A preflight from an origin no list names, or asking for a header the policy does not allow. |
+| Startup aborts with `network_policy` fatal | `ADMIN_IP_ALLOWLIST` / `TRUSTED_PROXIES` contains something that is not an address or CIDR. |
+| Readiness `network_policy` failing (advisory) | `X-Forwarded-For` has arrived from an undeclared peer: the gate is checking the proxy's address. |
+
+### 3. Security headers
+
+Sent on every response, including refusals and static assets:
+
+```
+X-Content-Type-Options: nosniff
+X-Frame-Options: DENY
+Referrer-Policy: strict-origin-when-cross-origin   (documents) / no-referrer (JSON)
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Resource-Policy: same-origin
+Permissions-Policy: camera=(self), geolocation=(self), microphone=(), display-capture=(), payment=(), usb=(), serial=()
+Content-Security-Policy: <one of two, see below>
+Strict-Transport-Security: max-age=15552000; includeSubDomains   (only over TLS)
+```
+
+* **The CSP splits by content type.** A JSON body has no business loading anything:
+  `default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'`.
+  An HTML document gets:
+
+  ```
+  default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none';
+  frame-src 'none'; form-action 'self';
+  script-src 'self' https://cdn.tailwindcss.com; script-src-attr 'unsafe-inline';
+  style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com;
+  img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' blob:;
+  connect-src 'self'; worker-src 'self' blob:; manifest-src 'self'
+  ```
+
+* **No inline `<script>` blocks.** The pages carried four of them (a boot diagnostics panel,
+  the Tailwind class-mode config, and one per standalone capture page). They are files now -
+  `frontend/boot.js`, `tailwind_boot.js`, `enroll.js`, `quick.js` - so `script-src` names no
+  `'unsafe-inline'` and a browser refuses an injected `<script>`. That is the one thing a
+  stored-XSS payload actually needs, and it is verified in a browser rather than asserted:
+  load the pre-change page under this policy and the console says *"Refused to execute inline
+  script"* twice, while the current page loads every script it needs. Moving the code into
+  files also exposed one piece of it that had been leaning on `eval`: the boot panel probed for
+  its globals with `new Function`, which this policy refuses, so the probe threw, the `catch`
+  read the throw as "not loaded", and the panel - only ever shown after a blank page - named
+  every script as missing. It names each global with `typeof` now, and
+  `tests/test_frontend_xss.py` refuses both the string-built call and `eval` coming back.
+* **Referrer policy splits too.** A document gets `strict-origin-when-cross-origin` (the
+  browser default, which still works when a page is opened across a tunnel); a JSON response
+  gets `no-referrer`, because a body that is never a navigation source does not need to send
+  one, and an error payload should not be quotable as a referrer.
+* **HSTS is sent only where TLS really is**: an `https` request, or `X-Forwarded-Proto:
+  https` *from a trusted proxy*. Sending it blind would pin the host for browsers while the
+  site server speaks plain HTTP, which is how a worker's phone stops reaching the punch
+  page. `HSTS_MAX_AGE_SECONDS=0` disables it.
+* **Honest limit, stated as two specific allowances.** `script-src` still names
+  `https://cdn.tailwindcss.com` (the frontend has no build step, so its utility CSS is
+  compiled in the browser; committing a Tailwind build removes the host) and
+  `script-src-attr 'unsafe-inline'` still permits **event-handler attributes**, because the
+  console builds its markup as strings and puts the handler in an `onclick=`. The second one
+  is the real remaining gap: an injected `<img onerror=...>` runs. Closing it is one
+  delegated `addEventListener` per container instead of a handler per button - 96 call sites
+  today, pinned by `tests/test_frontend_xss.py` so the count can only fall. `GET
+  /api/v1/readiness` reports `csp_html_inline_script_elements` (false),
+  `csp_html_inline_event_attributes` (true) and the script origins, so this is visible rather
+  than implied. A route that sets its own header keeps it (the middleware adds a baseline, it
+  does not overrule a handler).
+
+```bash
+SECURITY_HEADERS=1              # 0 sends none of the above (a proxy may set them)
+HSTS_MAX_AGE_SECONDS=15552000
+CSP_HTML=                       # empty = the built-in document policy
+CSP_API=                        # empty = the built-in JSON policy
+```
+
+### What this is not
+
+It is not an authorization layer (an allowed address still has to authenticate), not a WAF
+(it does not look at bodies or parameters), and not a substitute for TLS. `CORS` remains a
+browser-enforced policy; the controls that actually keep an attacker out of the payroll API
+are the session token, the allowlist, and TLS in front of both.
+
+## What text the server will store (stored XSS, and how it is prevented twice)
+
+Every string a client sends is stored and then rendered back out - into the roster, the notes
+inbox, the audit log, an administrator's notification, a CSV an operator opens in Excel. A
+worker named `<img src=x onerror=...>` is therefore not a worker with a funny name; it is code
+waiting for whoever reads a name next. There are two defences, and they are deliberately
+independent:
+
+**1. The value cannot be markup** (`backend/textguard.py`, called by every request model and by
+the multipart endpoints).
+
+| Profile | Used for | Rule |
+| --- | --- | --- |
+| identifier | worker names, site names, labels, categories | allowlist: Latin **and Arabic** letters (all blocks a keyboard produces), Western and Arabic-Indic digits, harakat, spaces, `. , - _ ( ) /` |
+| prose | note subjects and bodies, rejection reasons, link notes, invite notes | everything *except* the four active shapes: HTML tags (including the percent-encoded `<%2F`), HTML entities that decode into markup (`&lt;script&gt;`), `javascript:`/`vbscript:` and content-carrying `data:` URLs, and inline `on*=handler` text |
+| contact | email and phone | letters, digits, `@ . _ + ( ) , - /` |
+
+* **Arabic is a first-class case**, tested as one: `محمد كمال`, `مُحَمَّد` (with harakat) and
+  `٠١٢٣٤` (Arabic-Indic digits) all pass unchanged. The ranges are written out explicitly
+  rather than relying on `\w`, so "does an Arabic name pass?" is answered by reading a constant.
+* **Apostrophes are refused in identifiers, kept in prose.** `O'Brien` cannot be a stored
+  name - an apostrophe both breaks an unquoted SQL literal and escapes an HTML attribute. A
+  note keeps `it's the second time & nobody came`, because a note is a sentence and the
+  renderer escapes it. A deployment that needs the apostrophe widens
+  `IDENTIFIER_PUNCTUATION` in one place.
+* **Bidirectional overrides and control characters are stripped, not refused**: `U+202E`
+  reverses everything after it (a stored name can render as a *different* name) and a NUL makes
+  SQLite and Python disagree about the same string's length. `U+200C`/`U+200D` are explicitly
+  **kept** - they are Arabic and Persian orthography - and values are NFKC-folded so `Ａhmed`
+  and `Ahmed` are one name rather than two keys.
+* **Passwords are never touched by any of this.** They are hashed and never rendered;
+  restricting their characters would only weaken them. `LoginRequest` is left alone for the
+  same reason - it compares a credential, and refusing a character there locks a person out of
+  their own account.
+* **Refusals are 422 (JSON models) or 400 (multipart forms)**, and always name the character:
+  *"Name may contain letters (English or Arabic) ... It contains U+003C '<' (Less-Than Sign),
+  which is not one of them."* A 422 that still wrote the row would not be a defence, so the
+  suite checks the row count afterwards.
+
+**2. The renderer escapes everything it interpolates** (`frontend/*.js`: `escapeHtml` on every
+value that did not originate in the file). This is the half that covers rows written *before*
+the rule existed - and there are such rows, which is why both halves exist:
+
+* `tests/test_frontend_xss.py` renders hostile values (`<img onerror>`, `<script>`-named sites,
+  `svg/onload` statuses) through the app's own rendering functions in a Node VM and asserts the
+  DOM receives text, in both the phone-card and the desktop-table layouts - and it caught a real
+  gap while being written (`${err.message}` in a table, since fixed).
+* **What to do when you add a screen is written down**: `docs/FRONTEND_RENDERING.md` has the
+  audit (the eight interpolation classes that were unescaped, with the before/after for each),
+  the seven rules with examples, the list of sinks to grep for, and the cleanup still
+  outstanding. The short version is rule 1: escape every interpolation that is not a literal, a
+  number you computed, or a value you built in the same file.
+* `GET /api/v1/readiness` reports a **`stored_text`** check: values already in the database
+  that today's rules would refuse, per table and column. It is advisory and never repaired
+  automatically - rewriting a worker's name or a note somebody wrote is a decision for a
+  person. The read path keeps serving those rows, escaped.
+
+**What this is not.** It is not output encoding (nothing is stored as `&lt;`; that double-escapes
+the moment a correct renderer touches it), and it is not a substitute for the CSP above or for
+not putting a name into an SQL string. It is the boundary check that makes the *other* 20
+consumers of these rows safe without each of them having to remember.
 
 ## Configuration (required)
 
@@ -217,6 +463,17 @@ curl -X POST localhost:8000/api/v1/admin/sites/edit \
        "site_timezone":"Africa/Cairo"}'
 ```
 
+**From the console** (the way it is meant to be set): *Sites* → **Edit** on a site, or fill the
+window in on the *Add a site* form. Each card names the window **in force** and whether each half
+of it came from the site or from *Admin → Shift rules*, so "why was this arrival flagged?" is
+answered on the same screen as the site. Blank times mean "follow the company window", and *Use
+the company window* on an existing site empties them - which is what produces the explicit nulls
+that clear an override. The company window itself now sits on *Admin → Shift rules* next to the
+paid hours: it takes the same `HH:MM` and IANA-timezone checks as a site's, and emptying a box
+puts it back to the shipped `04:00`–`06:30`. Before this, neither window could be chosen in the
+console at all - the endpoint existed and nothing called it, which for the person at the gate is
+the same as the feature not existing.
+
 `21:30`–`05:30` is an overnight window: it runs past midnight, and **both** 23:15 and 04:30 are
 inside it. That is the case the old global rule could not express - a window whose start is
 after its end was never true, so every arrival at that site was flagged late, on-time ones
@@ -232,9 +489,15 @@ another machine (or another country) does not change who is late.
   arrives another way.
 * `site_timezone` must be an IANA name (`Africa/Cairo`, `Asia/Riyadh`); a typo is refused
   rather than silently falling back.
+* The company window on `POST /api/v1/admin/shift_rules` is checked by the **same** rules, at
+  the same endpoint the Shift rules panel posts to. An emptied box clears it back to the
+  shipped `04:00`–`06:30` - stored as `''`, because those columns are `NOT NULL`, and read as
+  "nothing configured" by both the rules loader and the resolver. A `25:00` typed here used to
+  be stored and then resolved to `00:00`–`23:59`, i.e. a company window that made nobody late.
 * Sending `null` (or `""`) for a field clears the override, so the site inherits again.
-  **Omitting** it from an edit leaves it alone - the console's site form predates this feature,
-  and a save from it must not erase a shift.
+  **Omitting** it from an edit leaves it alone: a form written before this feature existed, or an
+  integration that only moves a pin, must not erase a shift. The console's own editor sends all
+  three, because it *is* the window editor.
 * `GET /api/v1/admin/sites` returns both the configured columns and the resolved `window`,
   with a `source` per field saying whether it came from the site or the global rule.
 
@@ -721,6 +984,35 @@ as bcrypt hashes only. Anything else would put a readable password in exactly th
 and every backup of it that the hash-only rule exists to keep clean. An administrator's
 password is still a head-admin-only action, and the offer is hidden where the server
 would answer 403.
+
+## Tests
+
+```bash
+cd backend
+./venv/Scripts/python.exe -m pytest tests -q            # Windows (Git Bash)
+./venv/Scripts/python.exe -m pytest tests/test_site_shift_windows.py -q   # one suite
+```
+
+The suite **never touches your data.** At import it copies `times.db` into a temp directory,
+points the application at the copy, and refuses to run if the app resolves anywhere else
+(`harness.assert_database_isolation`). Before every test it restores that copy byte-for-byte,
+re-runs the migrations, and **empties every table that records what people did** - punches,
+sessions, notifications, the audit log, quick links, enrolled phones, notes, the offline queue.
+A shift somebody worked this morning, or a quick link the console issued ten minutes ago,
+cannot change a test's answer.
+
+The clone supplies the **schema and the configuration**; the tests supply their own traffic: a
+roster of four accounts, two sites, two completed shifts for the report suite, and the company
+shift rules at their shipped values. Two consequences worth knowing:
+
+* the live `times.db` has to *exist* - it is the only source of the schema (an empty file is
+  fine, a missing one is not);
+* a test that needs history seeds it. `tests/test_fixture_state.py` fails if the schema grows a
+table that is not classified as activity, shipped configuration or seeded, so this cannot rot
+silently - and it plants rows like real usage and proves a reset clears them.
+
+`audit_log` is append-only in the database itself, so the clear takes the trigger off, deletes
+and puts the same text back inside one transaction - the same rule the retention engine follows.
 
 ## Front-end layout modes
 

@@ -515,6 +515,220 @@ def _check_api_docs_disabled(ctx: dict) -> Check:
     )
 
 
+def _check_network_policy(ctx: dict) -> Check:
+    """Whether the network layer is doing what the deployment believes it is.
+
+    Two different verdicts live here, and they are deliberately not the same one:
+
+    * A policy that **will not build** (an allowlist entry that is not an address, an admin
+      CORS wildcard) is FATAL. The gate built from it matches nothing, i.e. it fails closed -
+      which is safe, and also means every administrator is locked out of the payroll console
+      by a typo. Better to refuse to start and say which line to fix, with the existing
+      startup override as the escape hatch.
+    * A policy that is **valid but weak** - no allowlist, ``TRUSTED_PROXIES`` trusting every
+      peer, ``*`` worker origins, ``unsafe-inline`` in the document CSP, or a forwarded
+      header that arrived from a peer nobody declared - is advisory. Each one is a decision an
+      operator may have made on purpose (a tunnel, a LAN deployment), so the job here is to
+      state it plainly rather than to overrule it.
+    """
+    import netguard
+
+    active = netguard.policy()
+    value = active.describe()
+
+    if active.problems:
+        return Check(
+            "network_policy",
+            TIER_FATAL,
+            False,
+            "network policy is invalid, so the admin gate refuses every client: "
+            + "; ".join(active.problems),
+            value,
+        )
+
+    misuse = netguard.forward_misuse()
+    if int(misuse.get("count") or 0) > 0:
+        return Check(
+            "network_policy",
+            TIER_ADVISORY,
+            False,
+            (
+                f"{int(misuse['count'])} request(s) arrived with X-Forwarded-For from an "
+                f"undeclared proxy (last peer: {misuse.get('last_peer')}); until TRUSTED_PROXIES "
+                "names that proxy, the admin allowlist is checking the proxy's address rather "
+                "than the administrator's"
+            ),
+            {**value, "forward_misuse": misuse},
+        )
+
+    detail = (
+        f"admin gate {'on for ' + ','.join(active.admin_paths) if active.admin_gate_enabled else 'off'}; "
+        f"{len(active.worker_origins)} worker origin(s), {len(active.admin_origins)} admin origin(s); "
+        f"security headers {'on' if active.security_headers else 'off'}"
+    )
+    if active.remarks:
+        detail += ". " + ". ".join(active.remarks)
+    return Check("network_policy", TIER_ADVISORY, True, detail, value)
+
+
+#: Every column in the database that holds text a person typed, with the rule it is now
+#: held to. Ordered so the tables an administrator reads first come first; the scan is
+#: bounded per table (``_TEXT_SCAN_LIMIT``) because this runs at every startup and inside
+#: the readiness endpoint, and a check that costs seconds is a check somebody disables.
+#: ``None`` as a limit means "whatever the module's own constant says".
+TEXT_SURFACES: tuple[tuple[str, str, tuple[tuple[str, str, int | None], ...]], ...] = (
+    (
+        "users",
+        "id",
+        (
+            ("name", "identifier", None),
+            ("email", "contact", None),
+            ("phone", "contact", None),
+        ),
+    ),
+    ("construction_sites", "site_name", (("site_name", "identifier", None),)),
+    (
+        "worker_notes",
+        "id",
+        (("subject", "prose", 0), ("body", "prose", 0)),  # 0 -> the notes settings
+    ),
+    (
+        "attendance_logs",
+        "id",
+        (
+            ("site_name", "identifier", None),
+            ("flag_reason", "prose", None),
+        ),
+    ),
+    (
+        "admin_notifications",
+        "id",
+        (("title", "prose", None), ("body", "prose", None)),
+    ),
+    (
+        "enrollment_invites",
+        "id",
+        (("name", "identifier", None), ("note", "prose", None)),
+    ),
+    ("quick_links", "id", (("note", "prose", None),)),
+)
+
+#: How many rows of one table this check will look at. The prefilter is a GLOB, so the query
+#: is a scan whatever it says; a table larger than this reports the bound rather than the
+#: whole truth, and says so.
+_TEXT_SCAN_LIMIT = 500
+
+
+def _check_stored_text_hygiene(ctx: dict) -> Check:
+    """Text already in the database that the validators would now refuse.
+
+    This is the honest half of what input validation can promise. From the moment
+    ``textguard`` is in the write path, a *new* name, site, note or reason cannot carry
+    markup - but a row written by an earlier version can, and it is exactly the row an
+    attacker would have planted on purpose. The read path escapes it (see
+    ``tests/test_frontend_xss.py``, which renders these values through the real frontend),
+    so this is not an open door; it is a list of things an operator may want to look at,
+    and the one place where "was this row always like that?" can be answered.
+
+    Advisory, and never repaired automatically: rewriting a worker's name or a note somebody
+    wrote is a decision for a person, not for a startup check.
+    """
+    import textguard
+    from config import settings
+
+    def _length(profile: str, column: str, limit: int | None) -> int:
+        if limit:
+            return limit
+        if profile == "contact":
+            return textguard.MAX_CONTACT
+        if column == "site_name":
+            return textguard.MAX_SITE_NAME
+        return textguard.MAX_LABEL
+
+    def _refusal(profile: str, column: str, value, length: int) -> str | None:
+        try:
+            if profile == "identifier":
+                textguard.identifier(value, field=column, max_length=length, allow_empty=True)
+            elif profile == "contact":
+                textguard.contact(value, field=column)
+            else:
+                textguard.prose(value, field=column, max_length=length, allow_empty=True)
+        except ValueError as exc:
+            return str(exc).split(".")[0]
+        return None
+
+    offenders: list[str] = []
+    scanned = 0
+    try:
+        conn = _open(ctx.get("db_path"), read_only=True)
+        try:
+            for table, id_column, columns in TEXT_SURFACES:
+                selected = [id_column, *(column for column, _, _ in columns)]
+                prefilter = " OR ".join(f"{column} GLOB '*[<>&]*'" for column, _, _ in columns)
+                try:
+                    rows = conn.execute(
+                        f"SELECT {', '.join(selected)} FROM {table} "
+                        f"WHERE {prefilter} LIMIT {_TEXT_SCAN_LIMIT}"
+                    ).fetchall()
+                except sqlite3.Error:
+                    # A table this check expects and the schema does not have yet is the
+                    # migration check's problem, not this one's.
+                    continue
+                scanned += len(rows)
+                for row in rows:
+                    # Positional, not by name: ``_open`` hands back plain tuples, and asking
+                    # a tuple for a column name is how this check would report itself as
+                    # broken instead of reporting the row it exists to find.
+                    fields = dict(zip(selected, row))
+                    for column, profile, limit in columns:
+                        value = fields[column]
+                        if value in (None, ""):
+                            continue
+                        if limit == 0:
+                            limit = (
+                                settings.notes_max_subject_chars
+                                if column == "subject"
+                                else settings.notes_max_body_chars
+                            )
+                        reason = _refusal(profile, column, value, _length(profile, column, limit))
+                        if reason is not None:
+                            offenders.append(
+                                f"{table}.{column} (row {fields[id_column]}): {reason}"
+                            )
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return Check("stored_text", TIER_ADVISORY, True, f"stored text not scanned: {exc}")
+
+    value = {
+        "rows_scanned": scanned,
+        "scan_limit_per_table": _TEXT_SCAN_LIMIT,
+        "offenders": offenders[:10],
+        "offender_count": len(offenders),
+    }
+    if not offenders:
+        return Check(
+            "stored_text",
+            TIER_ADVISORY,
+            True,
+            f"no stored text would be refused by the input rules ({scanned} row(s) with a "
+            "tag-like character in a scanned column)",
+            value,
+        )
+    return Check(
+        "stored_text",
+        TIER_ADVISORY,
+        False,
+        (
+            f"{len(offenders)} stored value(s) would not be accepted today: "
+            + "; ".join(offenders[:3])
+            + ". These are pre-validation rows - the read path escapes them, so they are not "
+            "executed, but they are worth a look before the next report quotes one"
+        ),
+        value,
+    )
+
+
 def _check_biometric_dirs(ctx: dict) -> Check:
     from main import LOCAL_REFS_DIR, WORKER_PHOTOS_DIR
 
@@ -897,6 +1111,8 @@ CHECKS = (
     _check_no_unprefixed_admin_routes,
     _check_static_mounts,
     _check_api_docs_disabled,
+    _check_network_policy,
+    _check_stored_text_hygiene,
     _check_biometric_dirs,
     _check_biometric_file_naming,
     _check_retention_sweep,

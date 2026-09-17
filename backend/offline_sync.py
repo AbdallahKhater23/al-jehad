@@ -83,12 +83,13 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 import migrations
 import notifications
 import shift_hours
 import shift_windows
+import textguard
 from config import settings
 from database import db
 from rate_limit import limiter
@@ -255,7 +256,18 @@ def effective_timestamp(anchor_server_time: str, monotonic_offset_s: float) -> d
 # ---------------------------------------------------------------------------
 class DeviceRef(BaseModel):
     device_id: str | None = None
+    #: Why the device is being registered, revoked or renamed, for the administrator's own
+    #: records. Free text, prose profile.
     note: str | None = None
+
+    @field_validator("note")
+    @classmethod
+    def _plain_note(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return textguard.prose(
+            value, field="Note", max_length=textguard.MAX_LABEL, allow_empty=True
+        )
 
 
 class OfflinePunch(BaseModel):
@@ -283,7 +295,18 @@ class SyncRequest(BaseModel):
 
 class ResolveRequest(BaseModel):
     decision: str = "approve"
+    #: The administrator's reason for approving or refusing a queued punch. This note is
+    #: written into ``attendance_logs.flag_reason`` (or the rejection row) and from there
+    #: into the punch-queue view and the offline report - the two places an operator reads
+    #: this text back.
     note: str | None = None
+
+    @field_validator("note")
+    @classmethod
+    def _plain_note(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return textguard.prose(value, field="Note", max_length=textguard.MAX_NOTE, allow_empty=True)
 
 
 # ---------------------------------------------------------------------------

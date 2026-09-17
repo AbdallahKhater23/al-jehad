@@ -410,6 +410,56 @@ const ADMIN_ICONS = {
     logout: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3"></path><path d="M10 8l-4 4 4 4"></path><path d="M6 12h9"></path></svg>'
 };
 
+// ---------------------------------------------------------------------
+//  The handset: what it is made of
+// ---------------------------------------------------------------------
+//  The same rule as the console, one screen closer to the thumb: **icons are
+//  inline SVG and never emoji.** The worker app used to be four emoji in a tab
+//  bar, a moon for the theme switch and a pin and a camera in the device panel.
+//  An emoji cannot take a token colour, so the active tab could not darken with
+//  the theme; it is drawn by the phone's own font, so the same app showed four
+//  different pictures on four different handsets; and a screen reader announces
+//  it as its Unicode name, which turned the nav into "spiral calendar, Clock".
+//
+//  * ``clockIn`` / ``clockOut`` are one picture mirrored - an arrow crossing a
+//    doorway, pointing in or out - so the two states are told apart by the
+//    direction of travel and not only by green-and-red, which is the pair a
+//    colour-blind worker on a bright screen is most likely to lose.
+const HAND_ICONS = {
+    clock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3.5 2"></path></svg>',
+    history: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="3" width="16" height="18" rx="2"></rect><path d="M8 8h8M8 12h8M8 16h5"></path></svg>',
+    notes: ADMIN_ICONS.notes,
+    profile: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="4"></circle><path d="M4.5 20.5a7.5 7.5 0 0 1 15 0"></path></svg>',
+    clockIn: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3"></path><path d="M4 12h9"></path><path d="m9.5 8.5 3.5 3.5-3.5 3.5"></path></svg>',
+    clockOut: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 4H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h3"></path><path d="M15 12H6"></path><path d="m10.5 8.5-3.5 3.5 3.5 3.5"></path></svg>',
+    pin: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 21s7-5.7 7-11a7 7 0 1 0-14 0c0 5.3 7 11 7 11Z"></path><circle cx="12" cy="10" r="2.5"></circle></svg>',
+    camera: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8h2.5L8 6h8l1.5 2H20a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1Z"></path><circle cx="12" cy="13" r="3"></circle></svg>',
+    alert: ADMIN_ICONS.alert,
+    info: ADMIN_ICONS.info,
+    back: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m14.5 6-6 6 6 6"></path></svg>',
+    cloudOff: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 18h9.5a4.5 4.5 0 0 0 .6-8.96A6 6 0 0 0 6.2 8.3"></path><path d="M4 20 20 4"></path></svg>'
+};
+
+//  A code the API sent, in the reader's language - shared by the console and the handset,
+//  because both show the same two enums and both got this wrong the same way.
+//
+//  ``I18n.__`` answers with the *key* when a translation is missing, and these builds lag
+//  the API: a note can be filed under a category, or move to a status, this frontend
+//  predates. The naive ``I18n.__(`noteCat_${category}`)`` then printed the key itself, so
+//  a card read ``noteCat_undefined`` (a field the server did not send) or
+//  ``noteStatus_archived`` (a status added server-side later). A code with no wording is
+//  shown opened up - ``tool_allowance`` reads "Tool allowance", which is the meaning
+//  somebody typed into the enum - and a code that is simply absent renders as nothing, so
+//  the caller can drop the chip rather than draw an empty one.
+function codeLabel(namespace, code) {
+    if (code === null || code === undefined || code === '') return '';
+    const key = `${namespace}_${code}`;
+    const label = I18n.__(key);
+    if (label !== key) return label;
+    const words = String(code).replace(/[_-]+/g, ' ').trim();
+    return words ? words.charAt(0).toUpperCase() + words.slice(1) : '';
+}
+
 //: The company this app belongs to, and its lockup, exactly as the artwork sets it.
 //: Deliberately *not* in i18n.js: a wordmark, a legal suffix and a founding year are
 //: proper nouns, and a translated wordmark is a different logo. The mark is a local
@@ -609,18 +659,29 @@ const UI = {
         else await this.renderWorkerDesktop();
     },
 
+    /**
+     * The strip that says who is holding the phone.
+     *
+     * The mark sits on the company's green - the same treatment the console's rail
+     * gives it - because this is the one place on the worker's screen that belongs to
+     * the company rather than to the job. The name is the administrator's spelling of
+     * it, so it goes through ``escapeHtml`` like every other value off the wire.
+     *
+     * The two controls are icon buttons carrying a ``aria-label``: the moon and the
+     * escape arrow that used to be the button's *content* are SVG now, so the label is
+     * the only thing a screen reader gets and it is a real word in all three languages.
+     */
     workerHeaderHtml() {
         return `
-            <div class="flex items-center justify-between gap-2 pb-3">
-                <div class="min-w-0">
-                    <p class="text-[11px] uppercase tracking-wide text-gray-500 dark:text-gray-400">${I18n.__('signedInAs')}</p>
-                    <p class="font-bold truncate">${State.user.name}</p>
-                </div>
-                <div class="flex items-center gap-2">
-                    ${this.langSelectHtml()}
-                    <button onclick="UI.toggleTheme()" class="icon-button" aria-label="${I18n.__('theme')}">🌙</button>
-                    <button onclick="UI.logout()" class="icon-button" aria-label="${I18n.__('logout')}">⎋</button>
-                </div>
+            <span class="hand-brand" aria-hidden="true"><img src="${BRAND.mark}" alt=""></span>
+            <div class="hand-who">
+                <p class="hand-who-name">${this.escapeHtml(State.user.name || '')}</p>
+                <p class="hand-who-role">${this.escapeHtml(I18n.__(State.user.role === 'moallem' ? 'roleMoallem' : 'roleWorker'))}</p>
+            </div>
+            <div class="hand-actions">
+                ${this.langSelectHtml()}
+                <button type="button" onclick="UI.toggleTheme()" class="icon-button" aria-label="${this.escapeHtml(I18n.__('theme'))}">${ADMIN_ICONS.theme}</button>
+                <button type="button" onclick="UI.logout()" class="icon-button" aria-label="${this.escapeHtml(I18n.__('logout'))}">${ADMIN_ICONS.logout}</button>
             </div>`;
     },
 
@@ -631,58 +692,81 @@ const UI = {
 
     workerTabBarHtml() {
         const tabs = [
-            { id: 'clock', icon: '🕒', label: I18n.__('clock') },
-            { id: 'history', icon: '🧾', label: I18n.__('history') },
-            { id: 'notes', icon: '📝', label: I18n.__('notes') },
-            { id: 'profile', icon: '👤', label: I18n.__('profile') }
+            { id: 'clock', icon: 'clock', label: I18n.__('clock') },
+            { id: 'history', icon: 'history', label: I18n.__('history') },
+            { id: 'notes', icon: 'notes', label: I18n.__('notes') },
+            { id: 'profile', icon: 'profile', label: I18n.__('profile') }
         ];
-        return `<nav class="tabbar">
+        // ``aria-current`` rather than a class is what marks the tab: it is the attribute
+        // a screen reader answers "where am I" with, and the styling hangs off it, so the
+        // two can never disagree. The handlers are one delegated listener (see
+        // ``bindWorkerTabs``) instead of an ``onclick`` per button - the document CSP still
+        // allows inline attributes, and every one removed is closer to removing it.
+        return `<nav class="hand-tabs" aria-label="${this.escapeHtml(I18n.__('handSections'))}">
             ${tabs.map(tab => `
-                <button class="${State.workerTab === tab.id ? 'is-active' : ''}" onclick="UI.setWorkerTab('${tab.id}')">
-                    <span class="tabbar-icon">${tab.icon}</span>
-                    <span>${tab.label}</span>
+                <button type="button" data-worker-tab="${tab.id}"
+                        ${State.workerTab === tab.id ? 'aria-current="page"' : ''}>
+                    ${HAND_ICONS[tab.icon]}
+                    <span>${this.escapeHtml(tab.label)}</span>
                 </button>`).join('')}
         </nav>`;
     },
 
-    /** Mobile: app shell with sticky header, single-column views and a bottom tab bar. */
+    /** One listener for the whole tab bar, so a tab needs no inline handler. */
+    bindWorkerTabs(root) {
+        const nav = (root || document).querySelector('.hand-tabs');
+        if (!nav) return;
+        nav.addEventListener('click', (event) => {
+            const button = event.target.closest('button[data-worker-tab]');
+            if (button) this.setWorkerTab(button.getAttribute('data-worker-tab'));
+        });
+    },
+
+    /**
+     * Mobile: the shell a worker holds at the gate.
+     *
+     * Sticky header, one column, and the four destinations in a fixed bottom bar -
+     * the shape the thumb already knows. What changed is what the bar is made of: the
+     * tabs now carry ``aria-current`` and one delegated listener rather than an
+     * ``onclick`` each, so switching tabs costs no inline script and the bar answers a
+     * screen reader's "where am I" instead of only styling the answer.
+     */
     async renderWorkerMobile() {
         const container = this.appContainer;
-        container.className = 'app-shell bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100';
+        container.className = 'hand-app';
         container.innerHTML = `
-            <header class="app-shell-header sticky top-0 z-30 bg-white/95 dark:bg-gray-800/95 backdrop-blur border-b border-gray-200 dark:border-gray-700">
-                ${this.workerHeaderHtml()}
+            <header class="hand-header">
+                <div class="hand-header-inner">${this.workerHeaderHtml()}</div>
             </header>
-            <main class="app-shell-main pt-4 lg:pb-8" id="workerMain"></main>
+            <main class="hand-main" id="workerMain"></main>
             ${this.workerTabBarHtml()}
         `;
+        this.bindWorkerTabs(container);
         await this.renderWorkerView(State.workerTab);
     },
 
-    /** Desktop: wide two-column dashboard, no bottom tab bar. */
+    /** Desktop: the same screen, wide - the shift on the left, the record on the right. */
     async renderWorkerDesktop() {
         const container = this.appContainer;
-        container.className = 'min-h-screen bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100';
+        container.className = 'hand-app';
         container.innerHTML = `
-            <div class="max-w-6xl mx-auto p-6 lg:p-8">
-                <header class="bg-white dark:bg-gray-800 px-6 py-4 rounded-2xl shadow-sm border border-gray-100 dark:border-gray-700 mb-6">
-                    ${this.workerHeaderHtml()}
-                </header>
-                <div class="grid grid-cols-1 lg:grid-cols-5 gap-6">
-                    <section class="lg:col-span-2 bg-white dark:bg-gray-800 p-6 rounded-2xl shadow-sm border border-gray-100 dark:border-gray-700">
-                        <div id="workerDashboard"></div>
-                    </section>
-                    <section class="lg:col-span-3 bg-white dark:bg-gray-800 p-6 rounded-2xl shadow-sm border border-gray-100 dark:border-gray-700">
-                        <h3 class="font-bold text-lg mb-4">${I18n.__('timesheetHistory')}</h3>
+            <header class="hand-header">
+                <div class="hand-header-inner">${this.workerHeaderHtml()}</div>
+            </header>
+            <div class="hand-desk">
+                <div class="hand-desk-col">
+                    <div class="hand-card"><div id="workerDashboard"></div></div>
+                    <div class="hand-card"><div id="devicePanel"></div></div>
+                </div>
+                <div class="hand-desk-col">
+                    <section class="hand-card">
+                        <div class="hand-section-head">
+                            <h3 class="hand-section-title">${this.escapeHtml(I18n.__('timesheetHistory'))}</h3>
+                        </div>
                         <div id="historyTable">${this.loadingHtml()}</div>
                     </section>
+                    <section class="hand-card"><div id="workerNotes"></div></section>
                 </div>
-                <section class="mt-6 bg-white dark:bg-gray-800 p-6 rounded-2xl shadow-sm border border-gray-100 dark:border-gray-700">
-                    <div id="workerNotes"></div>
-                </section>
-                <section class="mt-6 bg-white dark:bg-gray-800 p-6 rounded-2xl shadow-sm border border-gray-100 dark:border-gray-700">
-                    <div id="devicePanel"></div>
-                </section>
             </div>
         `;
         await WORKER_MODULES.renderClockPanel(document.getElementById('workerDashboard'));
@@ -694,9 +778,11 @@ const UI = {
     setWorkerTab(tab) {
         State.setWorkerTab(tab);
         if (Device.isMobile) {
-            document.querySelectorAll('.tabbar button').forEach((button, index) => {
-                button.classList.toggle('is-active', this.workerTabIds[index] === tab);
-            });
+            // The bar is repainted from the same source that drew it, so the aria-current
+            // and what is on screen cannot disagree after a tab switch.
+            const nav = document.querySelector('.hand-tabs');
+            if (nav) nav.outerHTML = this.workerTabBarHtml();
+            this.bindWorkerTabs(this.appContainer);
             this.renderWorkerView(tab);
         } else {
             this.renderWorkerPortal();
@@ -714,48 +800,83 @@ const UI = {
             main.innerHTML = `<div id="workerNotes"></div>`;
             await WORKER_MODULES.renderNotes(document.getElementById('workerNotes'));
         } else if (tab === 'profile') {
-            main.innerHTML = `<div id="workerProfile"></div><div id="devicePanel" class="mt-4"></div>`;
+            main.innerHTML = `<div id="workerProfile"></div><div id="devicePanel"></div>`;
             this.renderWorkerProfile(document.getElementById('workerProfile'));
             this.renderDevicePanel(document.getElementById('devicePanel'));
         } else {
-            main.innerHTML = `<div id="workerDashboard"></div><div id="devicePanel" class="mt-4"></div>`;
+            main.innerHTML = `<div id="workerDashboard"></div><div id="devicePanel"></div>`;
             await WORKER_MODULES.renderClockPanel(document.getElementById('workerDashboard'));
             this.renderDevicePanel(document.getElementById('devicePanel'));
         }
     },
 
+    /**
+     * What this phone knows about the account, and the one way out of it.
+     *
+     * Two cards rather than one long one, because the questions are different: the
+     * account (id, name, role) is set by an administrator and the worker can only read
+     * it, while the preferences below are the worker's own switches. Logging out keeps
+     * the danger treatment - and its own full-width button, because "log out" is the
+     * one thing on this screen that must never be tapped by accident in a pocket.
+     */
     renderWorkerProfile(container) {
+        const roleLabel = I18n.__(State.user.role === 'moallem' ? 'roleMoallem'
+            : (State.user.role === 'admin' ? 'admin' : 'roleWorker'));
         container.innerHTML = `
-            <div class="bg-white dark:bg-gray-800 rounded-2xl shadow-sm border border-gray-100 dark:border-gray-700 divide-y divide-gray-100 dark:divide-gray-700">
-                <div class="p-4 flex justify-between items-center">
-                    <span class="text-gray-500 dark:text-gray-400">${I18n.__('userId')}</span>
-                    <span class="font-bold">${State.user.id}</span>
+            <section class="hand-card">
+                <div class="hand-section-head">
+                    <h3 class="hand-section-title">${this.escapeHtml(I18n.__('handAccount'))}</h3>
                 </div>
-                <div class="p-4 flex justify-between items-center">
-                    <span class="text-gray-500 dark:text-gray-400">${I18n.__('name')}</span>
-                    <span class="font-bold">${State.user.name || '-'}</span>
+                <dl class="hand-dl">
+                    <div class="hand-dl-row">
+                        <dt>${this.escapeHtml(I18n.__('userId'))}</dt>
+                        <dd class="is-mono">${this.escapeHtml(State.user.id)}</dd>
+                    </div>
+                    <div class="hand-dl-row">
+                        <dt>${this.escapeHtml(I18n.__('name'))}</dt>
+                        <dd>${this.escapeHtml(State.user.name || '-')}</dd>
+                    </div>
+                    <div class="hand-dl-row">
+                        <dt>${this.escapeHtml(I18n.__('role'))}</dt>
+                        <dd>${this.escapeHtml(roleLabel)}</dd>
+                    </div>
+                </dl>
+            </section>
+            <section class="hand-card">
+                <div class="hand-section-head">
+                    <h3 class="hand-section-title">${this.escapeHtml(I18n.__('handPreferences'))}</h3>
                 </div>
-                <div class="p-4 flex justify-between items-center">
-                    <span class="text-gray-500 dark:text-gray-400">${I18n.__('role')}</span>
-                    <span class="font-bold">${State.user.role}</span>
-                </div>
-                <div class="p-4 flex justify-between items-center">
-                    <span class="text-gray-500 dark:text-gray-400">${I18n.__('lang')}</span>
-                    ${this.langSelectHtml()}
-                </div>
-                <div class="p-4 flex justify-between items-center">
-                    <span class="text-gray-500 dark:text-gray-400">${I18n.__('theme')}</span>
-                    <button onclick="UI.toggleTheme()" class="icon-button">🌙</button>
-                </div>
-                <div class="p-4">
-                    <button onclick="UI.logout()" class="w-full py-3 rounded-xl bg-red-50 dark:bg-red-900/30 text-red-600 dark:text-red-300 font-bold">${I18n.__('logout')}</button>
-                </div>
-            </div>`;
+                <dl class="hand-dl">
+                    <div class="hand-dl-row">
+                        <dt>${this.escapeHtml(I18n.__('lang'))}</dt>
+                        <dd>${this.langSelectHtml()}</dd>
+                    </div>
+                    <div class="hand-dl-row">
+                        <dt>${this.escapeHtml(I18n.__('theme'))}</dt>
+                        <dd><button type="button" onclick="UI.toggleTheme()" class="icon-button"
+                                    aria-label="${this.escapeHtml(I18n.__('theme'))}">${ADMIN_ICONS.theme}</button></dd>
+                    </div>
+                </dl>
+                <button type="button" onclick="UI.logout()"
+                        class="ui-btn ui-btn-danger hand-logout">${ADMIN_ICONS.logout}${this.escapeHtml(I18n.__('logout'))}</button>
+            </section>`;
     },
 
+    /**
+     * The wait, as a skeleton of the thing that is coming.
+     *
+     * A spinner in the middle of an empty page answers one question ("is it working?") when
+     * the two that matter are "is it working" and "where will the answer appear". Three
+     * bars of the shape the content will take, at the height it will take, answer both -
+     * and because the skeleton occupies the space the content will, nothing jumps when the
+     * request lands. The bars are decorative; the sentence is what a screen reader gets.
+     */
     loadingHtml(message) {
-        return `<div class="flex items-center gap-3 justify-center py-8 text-gray-500 dark:text-gray-400">
-            <span class="spinner"></span><span>${message || I18n.__('loading')}</span>
+        return `<div class="ui-skeleton" aria-busy="true">
+            <div class="ui-skeleton-row"><span class="ui-skeleton-bar" style="width:38%"></span></div>
+            <div class="ui-skeleton-row"><span class="ui-skeleton-bar" style="width:72%"></span></div>
+            <div class="ui-skeleton-row"><span class="ui-skeleton-bar" style="width:56%"></span></div>
+            <p class="sr-only">${this.escapeHtml(message || I18n.__('loading'))}</p>
         </div>`;
     },
 
@@ -774,25 +895,35 @@ const UI = {
         const camText = !Camera.isSupported ? I18n.__('cameraUnsupported')
             : (Location.isSecure ? I18n.__('cameraReady') : I18n.__('cameraInsecure'));
 
+        // A readiness figure the worker can act on: the dot and the border carry the state,
+        // the words carry it for anyone who cannot see either, and the two test buttons are
+        // the action the state implies - "GPS is not working" is not actionable, "test it" is.
+        const pill = (icon, klass, text) => `
+            <span class="ui-badge ${klass}">${HAND_ICONS[icon]}${this.escapeHtml(text)}</span>`;
+        const badgeClass = (state) => state === 'ready' ? 'is-ok' : (state === 'warn' ? 'is-warn' : 'is-danger');
         container.innerHTML = `
-            <div class="bg-white dark:bg-gray-800 rounded-2xl shadow-sm border border-gray-100 dark:border-gray-700 p-4">
-                <h3 class="font-bold mb-3">${I18n.__('deviceStatus')}</h3>
-                <div class="flex flex-wrap gap-2 mb-4">
-                    <span class="status-pill ${gpsClass}">📍 ${gpsText}</span>
-                    <span class="status-pill ${camClass}">📷 ${camText}</span>
-                </div>
-                <div class="flex flex-wrap gap-2">
-                    <button onclick="UI.testLocation()" class="px-4 py-2 rounded-xl bg-gray-100 dark:bg-gray-700 font-semibold">${I18n.__('checkLocation')}</button>
-                    <button onclick="UI.testCamera()" class="px-4 py-2 rounded-xl bg-gray-100 dark:bg-gray-700 font-semibold">${I18n.__('checkCamera')}</button>
-                </div>
-                ${!Location.isSecure ? `
-                    <div class="mt-4 p-3 rounded-xl bg-amber-50 dark:bg-amber-900/25 text-sm text-amber-800 dark:text-amber-200">
-                        <p class="font-semibold mb-1">${I18n.__('insecureTitle')}</p>
-                        <p>${I18n.__('insecureBody')}</p>
-                        <p class="mt-2 font-mono break-all">${Location.httpsLink}</p>
-                        <button onclick="UI.copyHttpsLink()" class="mt-2 px-3 py-2 rounded-lg bg-amber-500 text-white font-semibold">${I18n.__('copyLink')}</button>
-                    </div>` : ''}
-            </div>`;
+            <div class="hand-section-head">
+                <h3 class="hand-section-title">${this.escapeHtml(I18n.__('handThisPhone'))}</h3>
+                <p class="hand-section-note">${this.escapeHtml(I18n.__('deviceStatus'))}</p>
+            </div>
+            <div class="ui-row">
+                ${pill('pin', badgeClass(gpsClass), gpsText)}
+                ${pill('camera', badgeClass(camClass), camText)}
+            </div>
+            <div class="ui-row" style="margin-top:12px">
+                <button type="button" onclick="UI.testLocation()" class="ui-btn ui-btn-sm">${HAND_ICONS.pin}${this.escapeHtml(I18n.__('checkLocation'))}</button>
+                <button type="button" onclick="UI.testCamera()" class="ui-btn ui-btn-sm">${HAND_ICONS.camera}${this.escapeHtml(I18n.__('checkCamera'))}</button>
+            </div>
+            ${!Location.isSecure ? `
+                <div class="hand-alert" style="margin-top:12px">
+                    ${HAND_ICONS.alert}
+                    <div>
+                        <p><strong>${this.escapeHtml(I18n.__('insecureTitle'))}</strong></p>
+                        <p>${this.escapeHtml(I18n.__('insecureBody'))}</p>
+                        <p class="is-mono" style="word-break:break-all">${this.escapeHtml(Location.httpsLink)}</p>
+                        <button type="button" onclick="UI.copyHttpsLink()" class="ui-btn ui-btn-sm ui-btn-primary">${this.escapeHtml(I18n.__('copyLink'))}</button>
+                    </div>
+                </div>` : ''}`;
     },
 
     async testLocation() {
@@ -1525,7 +1656,10 @@ const UI = {
                     content.innerHTML = `<div class="text-center py-10 text-gray-500">${tab} ${I18n.__('comingSoon')}</div>`;
             }
         } catch (err) {
-            content.innerHTML = `<p class="text-red-500">${I18n.__('error')}: ${err.message}</p>`;
+            // The server's sentence is escaped like any other server text: it is written by
+            // whichever endpoint refused the request, and "it is our own message" stops
+            // being true the moment one of them interpolates something a client sent.
+            content.innerHTML = `<p class="text-red-500">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`;
         }
     },
 

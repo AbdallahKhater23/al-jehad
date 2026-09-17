@@ -915,6 +915,13 @@ const UI_MODULES = {
     // -----------------------------------------------------------------
     //  Sites - the places a clock-in is allowed from
     // -----------------------------------------------------------------
+    //: The name of the site whose editor is open, or ``null``. The card renders its facts or
+    //: its editor from this, so opening one is a repaint and not a second request.
+    _siteEdit: null,
+    //: The last list the API returned, for repaints that must not refetch (opening the editor).
+    _sites: null,
+    _sitesContent: null,
+
     //  A site is a point and a radius, and the tab showed one of them: a row reading
     //  "Radius: 65m" with a red Delete link, and an add form whose entire instruction
     //  was the placeholder "Lat,Lon". Neither survives contact with a real site - an
@@ -930,6 +937,25 @@ const UI_MODULES = {
         const coords = Number.isFinite(lat) && Number.isFinite(lon)
             ? `${lat.toFixed(5)}, ${lon.toFixed(5)}`
             : '\u2014';
+        const facts = this._siteEdit === name
+            ? this.sitesEditHtml(site)
+            : `
+                <div class="ui-facts" style="margin-top:14px">
+                    <div class="ui-fact">
+                        <span class="ops-stat-label">${this.escapeHtml(I18n.__('sitesRadius'))}</span>
+                        <span class="ui-fact-value">${this.escapeHtml(`${site.radius} m`)}</span>
+                    </div>
+                    <div class="ui-fact">
+                        <span class="ops-stat-label">${this.escapeHtml(I18n.__('sitesWindow'))}</span>
+                        <span class="ui-fact-value" data-site-window="${this.escapeHtml(name)}">${this.escapeHtml(this.windowLabel(site))}</span>
+                        <span class="ops-sub">${this.escapeHtml(this.windowOriginLabel(site, ['clock_in_window_start', 'clock_in_window_end']))}</span>
+                    </div>
+                    <div class="ui-fact">
+                        <span class="ops-stat-label">${this.escapeHtml(I18n.__('sitesWindowTimezone'))}</span>
+                        <span class="ui-fact-value">${this.escapeHtml(String((site.window || {}).site_timezone || ''))}</span>
+                        <span class="ops-sub">${this.escapeHtml(this.windowOriginLabel(site, ['site_timezone']))}</span>
+                    </div>
+                </div>`;
         return `
             <li class="ui-card" data-site="${this.escapeHtml(name)}">
                 <div class="ui-spread">
@@ -940,21 +966,117 @@ const UI_MODULES = {
                             <span class="ops-sub">${this.escapeHtml(coords)}</span>
                         </div>
                     </div>
-                    <button type="button" class="ui-btn ui-btn-danger ui-btn-sm" data-delete-site="${this.escapeHtml(name)}"
-                            onclick="UI_MODULES.deleteSite('${this.liveOpsInlineString(name)}')">${this.OPS_ICONS.trash}${this.escapeHtml(I18n.__('sitesDelete'))}</button>
-                </div>
-                <div class="ui-facts" style="margin-top:14px">
-                    <div class="ui-fact">
-                        <span class="ops-stat-label">${this.escapeHtml(I18n.__('sitesRadius'))}</span>
-                        <span class="ui-fact-value">${this.escapeHtml(`${site.radius} m`)}</span>
+                    <div class="ui-row">
+                        <button type="button" class="ui-btn ui-btn-sm" data-edit-site="${this.escapeHtml(name)}">${this.OPS_ICONS.clock}${this.escapeHtml(I18n.__('sitesEdit'))}</button>
+                        <button type="button" class="ui-btn ui-btn-danger ui-btn-sm" data-delete-site="${this.escapeHtml(name)}"
+                                onclick="UI_MODULES.deleteSite('${this.liveOpsInlineString(name)}')">${this.OPS_ICONS.trash}${this.escapeHtml(I18n.__('sitesDelete'))}</button>
                     </div>
                 </div>
+                ${facts}
             </li>`;
+    },
+
+    /**
+     * ``04:00-06:30``, with ``(overnight)`` spelled in the reader's language.
+     *
+     * Built here from the structured fields rather than using ``window.window`` from the API,
+     * which is an English sentence ("22:00-06:00 (overnight)") - fine for a log, wrong for a
+     * screen an Arabic-speaking administrator reads.
+     */
+    windowLabel(site) {
+        const info = (site && site.window) || {};
+        const start = String(info.clock_in_window_start || '');
+        const end = String(info.clock_in_window_end || '');
+        if (!start || !end) return '\u2014';
+        return `${start}-${end}` + (info.crosses_midnight ? ` (${I18n.__('sitesWindowOvernight')})` : '');
+    },
+
+    /**
+     * Where the hours (or the zone) in force came from: this site, or the company window.
+     *
+     * Per *field* on purpose. A site can set only its hours and keep the company timezone (or
+     * the other way round), so one "has this site configured a window?" answer would be a lie
+     * about one of the two rows on screen.
+     */
+    windowOriginLabel(site, keys) {
+        const source = ((site && site.window) || {}).source || {};
+        const fromSite = keys.some((key) => source[key] === 'site');
+        return fromSite ? I18n.__('sitesWindowFromSite') : I18n.__('sitesWindowFromCompany');
+    },
+
+    /**
+     * The window editor, opened in place of a site's facts.
+     *
+     * The time boxes load the site's *configured* columns, never the window that is in force -
+     * blank on the two sites out of three that have none of their own. Pre-filling them with the
+     * resolved company window would quietly convert an inheriting site into an overriding one:
+     * from that save on, moving the company hours would no longer move this site, and nobody
+     * would have asked for that.
+     */
+    sitesEditHtml(site) {
+        const raw = (key) => {
+            const value = site ? site[key] : null;
+            return value === null || value === undefined ? '' : String(value);
+        };
+        const lat = Number(site.lat);
+        const lon = Number(site.lon);
+        const coords = Number.isFinite(lat) && Number.isFinite(lon) ? `${lat},${lon}` : '';
+        const inherits = !raw('clock_in_window_start') && !raw('clock_in_window_end') && !raw('site_timezone');
+        return `
+            <form id="editSiteForm" class="ui-grid three" style="margin-top:14px">
+                <div class="ui-grid three" style="grid-column:1/-1;gap:12px">
+                    <div>
+                        <label class="ui-label" for="editSiteLocation">${this.escapeHtml(I18n.__('sitesLocation'))}</label>
+                        <input type="text" id="editSiteLocation" class="ui-field" inputmode="decimal" required
+                               value="${this.escapeHtml(coords)}">
+                    </div>
+                    <div>
+                        <label class="ui-label" for="editSiteRadius">${this.escapeHtml(I18n.__('sitesRadius'))}</label>
+                        <input type="number" id="editSiteRadius" class="ui-field" min="1" step="1" required
+                               value="${this.escapeHtml(String(site.radius))}">
+                    </div>
+                    <div>
+                        <label class="ui-label" for="editSiteTimezone">${this.escapeHtml(I18n.__('sitesWindowTimezone'))}</label>
+                        <input type="text" id="editSiteTimezone" class="ui-field" list="siteTimezoneOptions"
+                               placeholder="${this.escapeHtml(I18n.__('sitesWindowTimezonePlaceholder'))}"
+                               value="${this.escapeHtml(raw('site_timezone'))}">
+                    </div>
+                </div>
+                <div style="grid-column:1/-1">
+                    <p class="ui-section-note" id="editSiteWindowNotice">${this.escapeHtml(
+                        inherits
+                            ? I18n.__('sitesWindowNoticeCompany').replace('{window}', this.windowLabel(site))
+                            : I18n.__('sitesWindowNoticeSite').replace('{window}', this.windowLabel(site))
+                    )}</p>
+                </div>
+                <div>
+                    <label class="ui-label" for="editSiteWindowStart">${this.escapeHtml(I18n.__('sitesWindowStart'))}</label>
+                    <input type="time" id="editSiteWindowStart" class="ui-field" value="${this.escapeHtml(raw('clock_in_window_start'))}">
+                </div>
+                <div>
+                    <label class="ui-label" for="editSiteWindowEnd">${this.escapeHtml(I18n.__('sitesWindowEnd'))}</label>
+                    <input type="time" id="editSiteWindowEnd" class="ui-field" value="${this.escapeHtml(raw('clock_in_window_end'))}">
+                </div>
+                <div style="grid-column:1/-1" class="ui-row">
+                    <button type="submit" class="ui-btn ui-btn-primary">${this.OPS_ICONS.check}${this.escapeHtml(I18n.__('save'))}</button>
+                    <button type="button" class="ui-btn" data-company-window="1">${this.escapeHtml(I18n.__('sitesWindowUseCompany'))}</button>
+                    <button type="button" class="ui-btn ui-btn-quiet" data-cancel-site-edit="1">${this.escapeHtml(I18n.__('cancel'))}</button>
+                </div>
+            </form>`;
+    },
+
+    /** The zones an administrator is most likely to want, as suggestions - not a closed list. */
+    siteTimezoneOptionsHtml() {
+        return `<datalist id="siteTimezoneOptions">
+            ${['Africa/Cairo', 'Africa/Alexandria', 'Asia/Riyadh', 'Asia/Dubai', 'Asia/Kolkata', 'Europe/London', 'UTC']
+                .map((zone) => `<option value="${this.escapeHtml(zone)}"></option>`).join('')}
+        </datalist>`;
     },
 
     sitesAddHtml() {
         // The hint above the fields is the whole difference between a form an admin can
-        // fill in from a phone and one they have to guess at.
+        // fill in from a phone and one they have to guess at - including the window, which is
+        // the field that decides whether a worker arriving at 05:30 is on time or a review.
         return `
             <section class="ui-card is-flat" aria-labelledby="sitesAddTitle">
                 <h3 class="ui-section-title" id="sitesAddTitle">${this.escapeHtml(I18n.__('sitesAdd'))}</h3>
@@ -975,9 +1097,26 @@ const UI_MODULES = {
                         <input type="number" id="radius" class="ui-field" min="1" step="1" placeholder="100" required>
                     </div>
                     <div style="grid-column:1/-1">
+                        <p class="ui-section-note">${this.escapeHtml(I18n.__('sitesWindowHint'))}</p>
+                    </div>
+                    <div>
+                        <label class="ui-label" for="siteWindowStart">${this.escapeHtml(I18n.__('sitesWindowStart'))}</label>
+                        <input type="time" id="siteWindowStart" class="ui-field">
+                    </div>
+                    <div>
+                        <label class="ui-label" for="siteWindowEnd">${this.escapeHtml(I18n.__('sitesWindowEnd'))}</label>
+                        <input type="time" id="siteWindowEnd" class="ui-field">
+                    </div>
+                    <div>
+                        <label class="ui-label" for="siteWindowTimezone">${this.escapeHtml(I18n.__('sitesWindowTimezone'))}</label>
+                        <input type="text" id="siteWindowTimezone" class="ui-field" list="siteTimezoneOptions"
+                               placeholder="${this.escapeHtml(I18n.__('sitesWindowTimezonePlaceholder'))}">
+                    </div>
+                    <div style="grid-column:1/-1">
                         <button type="submit" class="ui-btn ui-btn-primary">${this.OPS_ICONS.plus}${this.escapeHtml(I18n.__('sitesAdd'))}</button>
                     </div>
                 </form>
+                ${this.siteTimezoneOptionsHtml()}
             </section>`;
     },
 
@@ -988,7 +1127,7 @@ const UI_MODULES = {
                     <p class="ui-empty-title">${this.escapeHtml(I18n.__('sitesEmpty'))}</p>
                     <p class="ui-empty-body">${this.escapeHtml(I18n.__('sitesEmptyHint'))}</p>
                </div>`
-            : `<ul class="ui-stack" style="list-style:none;margin:0;padding:0" data-sites-list="true">
+            : `<ul id="sitesList" class="ui-stack" style="list-style:none;margin:0;padding:0" data-sites-list="true">
                     ${sites.map((site) => this.sitesCardHtml(site)).join('')}
                </ul>`;
         return `
@@ -1012,9 +1151,66 @@ const UI_MODULES = {
             content.innerHTML = this.uiErrorHtml(err, "UI.renderAdminTab('Sites')");
             return;
         }
-        content.innerHTML = `<div class="ui-page" data-sites="true">${this.sitesHtml(Array.isArray(sites) ? sites : [])}</div>`;
+        this._sites = Array.isArray(sites) ? sites : [];
+        this._sitesContent = content;
+        this.paintSites(content);
+    },
+
+    /** Repaint from the list already in hand: opening the editor must not refetch the sites. */
+    paintSites(content) {
+        const target = content || this._sitesContent;
+        if (!target) return;
+        target.innerHTML = `<div class="ui-page" data-sites="true">${this.sitesHtml(this._sites || [])}</div>`;
         const form = document.getElementById('addSiteForm');
         if (form) form.onsubmit = (event) => this.addSite(event);
+        const edit = document.getElementById('editSiteForm');
+        if (edit) edit.onsubmit = (event) => this.saveSite(event);
+        // One listener for every card, bound as a property rather than written as an
+        // ``onclick=`` attribute in the markup: handler text built from data is the sink the
+        // document CSP keeps 'unsafe-inline' for (see docs/FRONTEND_RENDERING.md).
+        const list = document.getElementById('sitesList');
+        if (list) list.onclick = (event) => this.onSitesClick(event);
+    },
+
+    /**
+     * The Sites tab's buttons: edit, cancel, and "use the company window".
+     *
+     * Delegated from the list container, so no handler text is ever built out of a site name,
+     * and guarded on ``closest`` because the event this receives is the browser's to shape.
+     */
+    onSitesClick(event) {
+        const target = event && event.target;
+        if (!target || typeof target.closest !== 'function') return;
+        const edit = target.closest('[data-edit-site]');
+        if (edit) { this.openSiteEdit(edit.dataset.editSite); return; }
+        if (target.closest('[data-cancel-site-edit]')) { this.cancelSiteEdit(); return; }
+        if (target.closest('[data-company-window]')) this.useCompanyWindow();
+    },
+
+    openSiteEdit(name) {
+        this._siteEdit = String(name || '');
+        this.paintSites();
+    },
+
+    cancelSiteEdit() {
+        this._siteEdit = null;
+        this.paintSites();
+    },
+
+    /**
+     * Empty the three window boxes: the site goes back to the company window when saved.
+     *
+     * Emptied rather than filled with today's company values, because the save sends whatever is
+     * in the boxes - a prefilled copy would pin this site to the company hours *as they are now*,
+     * which is the opposite of what "use the company window" means.
+     */
+    useCompanyWindow() {
+        ['editSiteWindowStart', 'editSiteWindowEnd', 'editSiteTimezone'].forEach((id) => {
+            const field = document.getElementById(id);
+            if (field) field.value = '';
+        });
+        const notice = document.getElementById('editSiteWindowNotice');
+        if (notice) notice.textContent = I18n.__('sitesWindowWillInherit');
     },
 
     /** The add form's one action, in one place so its failure path is the same shape as every other form's. */
@@ -1022,14 +1218,20 @@ const UI_MODULES = {
         if (event && event.preventDefault) event.preventDefault();
         const value = (id) => {
             const element = document.getElementById(id);
-            return element && element.value !== undefined ? String(element.value) : '';
+            return element && element.value !== undefined ? String(element.value).trim() : '';
         };
         try {
             await API.request('/admin/sites/add', { method: 'POST', body: {
                 site_name: value('siteName'),
                 location_input: value('location'),
                 radius: parseFloat(value('radius')),
-                admin_id: State.user.id
+                admin_id: State.user.id,
+                // Blank means "inherit the company window", which is what an empty time box
+                // says - so it is sent as null rather than as "", and the site keeps
+                // following the company hours when those change.
+                clock_in_window_start: value('siteWindowStart') || null,
+                clock_in_window_end: value('siteWindowEnd') || null,
+                site_timezone: value('siteWindowTimezone') || null
             }});
         } catch (err) {
             // The reason has to reach the admin: "Site name already exists." and "Invalid
@@ -1040,6 +1242,42 @@ const UI_MODULES = {
         }
         Toast.success(I18n.__('sitesAdded'));
         UI.renderAdminTab('Sites');
+    },
+
+    /**
+     * Save the open editor: where the site is, and the window its arrivals are judged by.
+     *
+     * All three window fields are sent, and a blank box is sent as ``null`` - the API keeps
+     * "absent" (leave it alone) and "explicitly cleared" (put this site back on the company
+     * window) apart on purpose, and this form is the second of those. Omitting them because
+     * nothing looked changed would make "clear the window" unsaveable.
+     */
+    async saveSite(event) {
+        if (event && event.preventDefault) event.preventDefault();
+        const name = this._siteEdit;
+        if (!name) return;
+        const value = (id) => {
+            const element = document.getElementById(id);
+            return element && element.value !== undefined ? String(element.value).trim() : '';
+        };
+        try {
+            await API.request('/admin/sites/edit', { method: 'POST', body: {
+                site_name: name,
+                location_input: value('editSiteLocation'),
+                radius: parseFloat(value('editSiteRadius')),
+                admin_id: State.user.id,
+                clock_in_window_start: value('editSiteWindowStart') || null,
+                clock_in_window_end: value('editSiteWindowEnd') || null,
+                site_timezone: value('editSiteTimezone') || null
+            }});
+        } catch (err) {
+            Toast.error(err.message);
+            return null;
+        }
+        Toast.success(I18n.__('sitesSaved'));
+        this._siteEdit = null;
+        UI.renderAdminTab('Sites');
+        return true;
     },
 
     async deleteSite(name) {
@@ -1283,7 +1521,7 @@ const UI_MODULES = {
     newLinkHtml(res) {
         const field = 'p-2 rounded-lg border border-gray-200 dark:border-gray-600 dark:bg-gray-700 dark:text-white';
         const qr = res.qr_png_data_uri
-            ? `<img src="${res.qr_png_data_uri}" alt="${I18n.__('linksQr')}" class="mt-3 w-40 h-40 bg-white p-2 rounded-lg" />`
+            ? `<img src="${this.escapeHtml(res.qr_png_data_uri)}" alt="${I18n.__('linksQr')}" class="mt-3 w-40 h-40 bg-white p-2 rounded-lg" />`
             : '';
         return `
             <div class="mt-3 p-3 rounded-xl border border-green-300 dark:border-green-800" data-new-link="${this.escapeHtml(res.link_id)}">
@@ -1386,7 +1624,7 @@ const UI_MODULES = {
             used_up: 'text-amber-600 dark:text-amber-400',
             account_inactive: 'text-red-600 dark:text-red-400'
         };
-        return `<span class="${colours[state] || ''}">${I18n.__(`linksState_${state}`)}</span>`;
+        return `<span class="${colours[state] || ''}">${codeLabel('linksState', state)}</span>`;
     },
 
     linkUsesLabel(link) {
@@ -1846,7 +2084,16 @@ const UI_MODULES = {
         // that says so, so the missing buttons are explained rather than merely absent.
         const remove = isSelf ? '' : action('data-delete-user', id, I18n.__('credentialsDelete'),
             `UI_MODULES.deleteUser('${id}')`, 'ui-btn ui-btn-sm ui-btn-danger', this.OPS_ICONS.trash);
-        return `<span class="ui-row" style="flex-wrap:nowrap;justify-content:flex-end;gap:6px">${setPassword}${edit}${status}${remove}</span>`;
+        // ``nowrap`` belongs to the table, not to the actions: the roster is nine columns
+        // wide and four labelled buttons in the last one wrapped onto two lines, doubling
+        // every row's height. On the phone card there is no table to keep on one line, and
+        // holding the row to 426px inside a 320px screen made the *whole page* 472px wide -
+        // a horizontal scrollbar on the credentials screen and a tab bar that stopped short
+        // of the content. The card lets it wrap, which is what a card is for.
+        const rowStyle = compact
+            ? 'flex-wrap:nowrap;justify-content:flex-end;gap:6px'
+            : 'justify-content:flex-end;gap:6px';
+        return `<span class="ui-row" style="${rowStyle}">${setPassword}${edit}${status}${remove}</span>`;
     },
 
     /** The account being edited, looked up in the roster on screen. */
@@ -2861,6 +3108,27 @@ const UI_MODULES = {
                         <input type="checkbox" id="rulesAutoClose" ${autoClose ? 'checked' : ''}>
                         <span>${this.escapeHtml(I18n.__('shiftRulesAutoClose'))}</span>
                     </label>
+                    <!-- The window a site follows when it has none of its own. Same three
+                         fields as a site's, at the company scope, because "nobody here is
+                         late" is a decision about this window on every site that inherits
+                         it. Blank puts it back to the shipped 04:00-06:30. -->
+                    <div style="grid-column:1/-1">
+                        <p class="ui-section-note">${this.escapeHtml(I18n.__('shiftRulesWindowHint'))}</p>
+                    </div>
+                    <div>
+                        <label class="ui-label" for="rulesWindowStart">${this.escapeHtml(I18n.__('sitesWindowStart'))}</label>
+                        <input type="time" id="rulesWindowStart" class="ui-field" value="${this.escapeHtml(value('clock_in_window_start', ''))}">
+                    </div>
+                    <div>
+                        <label class="ui-label" for="rulesWindowEnd">${this.escapeHtml(I18n.__('sitesWindowEnd'))}</label>
+                        <input type="time" id="rulesWindowEnd" class="ui-field" value="${this.escapeHtml(value('clock_in_window_end', ''))}">
+                    </div>
+                    <div>
+                        <label class="ui-label" for="rulesTimezone">${this.escapeHtml(I18n.__('sitesWindowTimezone'))}</label>
+                        <input type="text" id="rulesTimezone" class="ui-field" list="siteTimezoneOptions"
+                               placeholder="${this.escapeHtml(I18n.__('sitesWindowTimezonePlaceholder'))}"
+                               value="${this.escapeHtml(value('site_timezone', ''))}">
+                    </div>
                     <!-- The text-xs class is kept alongside the component class on purpose:
                          the product suite reads this line by that class, and the Tailwind
                          CDN is not always reachable on site, so the token class is the one
@@ -2872,6 +3140,7 @@ const UI_MODULES = {
                         <button type="submit" class="ui-btn ui-btn-primary">${this.OPS_ICONS.sliders}${this.escapeHtml(I18n.__('save'))}</button>
                     </div>
                 </form>
+                ${this.siteTimezoneOptionsHtml()}
             </section>`;
     },
 
@@ -2908,11 +3177,27 @@ const UI_MODULES = {
                 ? 1 : loaded.auto_close_at_regular
         ) !== '0';
         const autoClose = box && typeof box.checked === 'boolean' ? box.checked : rememberedClose;
+        // Trimmed text rather than a number, and ``''`` is allowed through, which is the
+        // opposite of what ``number()`` does with an emptied numeric box. That asymmetry is
+        // deliberate: a blank paid-hours box is somebody who cleared it by accident, and
+        // saving 0 would pay nobody for anything - while a blank *time* box is the documented
+        // way to say "back to the shipped 04:00-06:30", so falling back there would make the
+        // company window impossible to take off again.
+        const text = (id) => {
+            const element = document.getElementById(id);
+            return element && element.value !== undefined && element.value !== null
+                ? String(element.value).trim() : '';
+        };
         const body = {
             regular_hours: number('rulesRegularHours', 'regular_hours', 8),
             break_minutes: number('rulesBreakMinutes', 'break_minutes', 30),
             break_after_hours: number('rulesBreakAfterHours', 'break_after_hours', 4),
-            auto_close_at_regular: autoClose ? 1 : 0
+            auto_close_at_regular: autoClose ? 1 : 0,
+            // What every site without a window of its own is judged by. Sent with the rest of
+            // the form because this panel is the only place it can be changed.
+            clock_in_window_start: text('rulesWindowStart'),
+            clock_in_window_end: text('rulesWindowEnd'),
+            site_timezone: text('rulesTimezone')
         };
         try {
             const answer = await API.request('/admin/shift_rules', { method: 'POST', body: body });
@@ -3793,8 +4078,8 @@ const UI_MODULES = {
     notesStatus() { return State.notesStatus || ''; },
     notesQuery() { return State.notesQuery || ''; },
 
-    noteStatusLabel(status) { return I18n.__(`noteStatus_${status}`); },
-    noteCategoryLabel(category) { return I18n.__(`noteCat_${category}`); },
+    noteStatusLabel(status) { return codeLabel('noteStatus', status); },
+    noteCategoryLabel(category) { return codeLabel('noteCat', category); },
 
     noteStatusClass(status) {
         if (status === 'resolved') return 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300';

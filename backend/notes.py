@@ -58,6 +58,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 import notifications
+import textguard
 from config import settings
 from database import db
 from rate_limit import limiter
@@ -181,14 +182,26 @@ def _audit(
 
 
 def _clean_text(value: str, *, field: str, limit: int) -> str:
-    text = str(value or "").strip()
-    if not text:
-        raise HTTPException(status_code=400, detail=f"{field} must not be empty.")
-    if len(text) > limit:
-        raise HTTPException(
-            status_code=400, detail=f"{field} must be at most {limit} characters."
-        )
-    return text
+    """Normalise and vet a note, a reply or a subject before it is written.
+
+    Every write path in this module funnels through here - the worker's note, the worker's
+    reply, the administrator's reply, the message attached to a status change - because a
+    note is the one field in this application whose entire purpose is free text written by
+    one person and read by another. That is also why it is the *prose* profile rather than
+    the identifier allowlist: markup, encoded markup and script URLs are refused, while
+    apostrophes, ampersands and semicolons are kept, since "it's the second time & nobody
+    came" is a sentence a worker writes and not an attack.
+
+    The escaping that makes those characters safe belongs to the renderer and is present
+    (``frontend/worker_modules.js`` and ``admin_modules.js`` pass every note field through
+    ``escapeHtml``). What happens here is the other half of that arrangement: a note that
+    reaches the database cannot *be* markup, so a reader that forgets to escape - the CSV
+    export, an operator's shell, a view nobody has written yet - is not a way in.
+    """
+    try:
+        return textguard.prose(value, field=field, max_length=limit)
+    except ValueError as exc:
+        raise textguard.http_error(exc) from None
 
 
 def _validate_category(category: str) -> str:

@@ -188,28 +188,30 @@ const WORKER_MODULES = {
             // same moment instead of a second apart on the same shift.
             const past = paid >= threshold * 3600;
             const dayReached = paidDay !== null && paid >= paidDay * 3600;
-            label.classList.toggle('text-red-600', past);
-            label.classList.toggle('dark:text-red-400', past);
-            label.classList.toggle('text-blue-600', !past);
-            label.classList.toggle('dark:text-blue-400', !past);
+            // One class rather than four palette utilities: the figure is the primary
+            // blue while the paid day is still running, and switches to the same warning
+            // colour as the note beneath it when it passes the line. The colour is never
+            // the only signal - the note that appears at the same moment carries the
+            // words, so a worker who cannot tell the two hues apart still sees the change.
+            label.classList.toggle('is-over', past);
 
             const noteEl = document.getElementById('shiftOvertimeNote');
             if (!noteEl) return;
             if (dayReached && autoCloses && !announcedDay) {
                 // The shift is at its paid limit: the server closes it at 8.5 h on site.
                 noteEl.innerHTML = `
-                    <p class="font-bold">${I18n.__('shiftEndsNow')}</p>
-                    <p class="mt-1 text-xs font-normal">${dayDone}</p>`;
+                    <p class="hand-note-title">${this.escapeHtml(I18n.__('shiftEndsNow'))}</p>
+                    <p class="hand-note-sub">${this.escapeHtml(dayDone)}</p>`;
                 announcedDay = true;
                 Toast.info(I18n.__('shiftEndsNow'));
             } else if (dayReached && autoCloses) {
                 noteEl.innerHTML = `
-                    <p class="font-bold">${I18n.__('shiftEndsNow')}</p>
-                    <p class="mt-1 text-xs font-normal">${dayDone}</p>`;
+                    <p class="hand-note-title">${this.escapeHtml(I18n.__('shiftEndsNow'))}</p>
+                    <p class="hand-note-sub">${this.escapeHtml(dayDone)}</p>`;
             } else if (past && !raised) {
                 noteEl.innerHTML = `
-                    <p class="font-bold">${note}</p>
-                    <p class="mt-1 text-xs font-normal">${openShiftHint}</p>`;
+                    <p class="hand-note-title">${this.escapeHtml(note)}</p>
+                    <p class="hand-note-sub">${this.escapeHtml(openShiftHint)}</p>`;
                 raised = true;
                 // The moment it tips over, while the worker is looking at the card.
                 Toast.info(note);
@@ -236,14 +238,13 @@ const WORKER_MODULES = {
         // Whatever the previous render started (tab switch now, stale fetch later)
         // must not keep ticking against a card that no longer exists.
         this.stopElapsedTimer();
-        container.innerHTML = `<div class="flex items-center gap-3 justify-center py-6 text-gray-500 dark:text-gray-400">
-            <span class="spinner"></span><span>${I18n.__('loading')}</span></div>`;
+        container.innerHTML = UI.loadingHtml();
 
         let status;
         try {
             status = await this.fetchStatus();
         } catch (err) {
-            container.innerHTML = `<p class="text-red-500">${I18n.__('error')}: ${err.message}</p>`;
+            container.innerHTML = `<p class="text-red-500">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`;
             return;
         }
 
@@ -256,53 +257,55 @@ const WORKER_MODULES = {
         const clockInTime = active && active.clock_in_time ? active.clock_in_time : null;
 
         container.innerHTML = `
-            <div class="text-center ${compact ? 'mb-5' : 'mb-6'}">
-                <p class="text-sm text-gray-500 dark:text-gray-400">${I18n.__('shiftStatus')}</p>
-                <p class="text-2xl font-extrabold mt-1 ${active ? 'text-green-600 dark:text-green-400' : 'text-gray-400'}">
-                    ${active ? I18n.__('onShift') : I18n.__('currentlyClockedOut')}
+            <div class="hand-hero ${active ? 'is-live' : ''}">
+                <p class="hand-hero-status">
+                    <span class="hand-dot ${active ? '' : 'is-off'}" aria-hidden="true"></span>${this.escapeHtml(I18n.__('shiftStatus'))}
                 </p>
+                <p class="hand-hero-word">${this.escapeHtml(active ? I18n.__('onShift') : I18n.__('currentlyClockedOut'))}</p>
                 ${active ? `
-                    ${active.clock_in_time ? `<p class="mt-2 text-sm text-gray-600 dark:text-gray-300">
-                        ${I18n.__('clockedInAt')} <strong>${active.clock_in_time}</strong>
-                    </p>` : ''}
-                    ${active.site_name ? `<p class="text-sm text-gray-600 dark:text-gray-300">${I18n.__('site')}: <strong>${active.site_name}</strong></p>` : ''}
-                    ${clockInTime ? `<p class="mt-1 text-sm font-semibold text-blue-600 dark:text-blue-400">
-                        ${I18n.__('elapsed')}: <span id="shiftElapsed" class="tabular-nums">0:00:00</span>
-                    </p>` : ''}
+                    <div class="hand-hero-meta">
+                        ${active.clock_in_time ? `<span>${this.escapeHtml(I18n.__('clockedInAt'))} <strong class="hand-mono">${this.escapeHtml(active.clock_in_time)}</strong></span>` : ''}
+                        ${active.site_name ? `<span>${this.escapeHtml(I18n.__('site'))}: <strong>${this.escapeHtml(active.site_name)}</strong></span>` : ''}
+                    </div>
+                    ${clockInTime ? `
+                        <span id="shiftElapsed" class="hand-timer">0:00:00</span>
+                        <span class="hand-timer-label">${this.escapeHtml(I18n.__('handTimeOnShift'))}</span>` : ''}
                     ${/* The two numbers a worker is paid by, said out loud: the paid day, the
                          unpaid break, and the shift length they add up to. Without them the
                          timer above reads as the thing that gets paid, and 8:30:00 on a
                          30-minute break day looks like an hour of missing money. */ ''}
-                    ${clockInTime ? `<p class="mt-1 text-xs text-gray-500 dark:text-gray-400" data-day-policy="${status.paidDayHours || 'default'}">
-                        ${I18n.__('shiftPaidDay')}: <b>${status.paidDayHours ? this.hoursLabel(status.paidDayHours) : '8'} h</b>
-                        · ${I18n.__('shiftUnpaidBreak')}: <b>${this.minutesLabel(status.breakMinutes)}</b>
+                    ${clockInTime ? `<p class="hand-policy" data-day-policy="${status.paidDayHours || 'default'}">
+                        ${this.escapeHtml(I18n.__('shiftPaidDay'))}: <b>${status.paidDayHours ? this.hoursLabel(status.paidDayHours) : '8'} h</b>
+                        · ${this.escapeHtml(I18n.__('shiftUnpaidBreak'))}: <b>${this.minutesLabel(status.breakMinutes)}</b>
                     </p>` : ''}
-                    ${clockInTime ? `<div id="shiftOvertimeNote" class="hidden mt-3 p-3 rounded-xl bg-amber-50 dark:bg-amber-900/25 border border-amber-300 dark:border-amber-700 text-sm text-left text-amber-800 dark:text-amber-200"></div>` : ''}
+                    ${clockInTime ? `<div id="shiftOvertimeNote" class="hand-note hidden"></div>` : ''}
                 ` : ''}
-                ${status.stale ? `<p class="mt-2 text-xs text-amber-600 dark:text-amber-400">${I18n.__('lastKnownStatus')}</p>` : ''}
+                ${status.stale ? `<p class="hand-hero-meta is-warn">${this.escapeHtml(I18n.__('lastKnownStatus'))}</p>` : ''}
             </div>
 
             ${status.flagged ? `
-                <p class="mb-4 p-3 rounded-xl bg-amber-50 dark:bg-amber-900/25 border border-amber-300 dark:border-amber-700 text-sm text-amber-800 dark:text-amber-200" data-flagged-for-review>
-                    ${I18n.__('flaggedForReview')}
-                </p>` : ''}
+                <div class="hand-alert" data-flagged-for-review>
+                    ${HAND_ICONS.alert}
+                    <p>${this.escapeHtml(I18n.__('flaggedForReview'))}</p>
+                </div>` : ''}
 
-            <button class="clock-button ${active ? 'out' : 'in'} ${compact ? 'compact' : ''}"
+            <button type="button" class="clock-button hand-clock ${active ? 'out' : 'in'} ${compact ? 'compact' : ''}"
                     onclick="WORKER_MODULES.handleClock('${action}')">
-                ${I18n.__(actionKey)}
+                ${action === 'Clock Out' ? HAND_ICONS.clockOut : HAND_ICONS.clockIn}
+                <span>${this.escapeHtml(I18n.__(actionKey))}</span>
             </button>
 
             ${this.offlinePanelHtml(status)}
 
-            <div class="grid grid-cols-2 gap-3 mt-4">
-                <div class="p-3 rounded-xl bg-gray-50 dark:bg-gray-700 text-center">
-                    <p class="text-xs text-gray-500 dark:text-gray-400">${I18n.__('hoursThisMonth')}</p>
-                    <p class="font-bold text-lg">${status.monthHours} h</p>
+            <div class="hand-facts">
+                <div class="hand-fact">
+                    <p class="hand-fact-label">${this.escapeHtml(I18n.__('hoursThisMonth'))}</p>
+                    <p class="hand-fact-value">${this.escapeHtml(status.monthHours)} h</p>
                 </div>
-                <div class="p-3 rounded-xl bg-gray-50 dark:bg-gray-700 text-center">
-                    <p class="text-xs text-gray-500 dark:text-gray-400">${I18n.__('location')}</p>
-                    <p class="font-bold text-sm ${Location.isSecure ? 'text-green-600 dark:text-green-400' : 'text-amber-600 dark:text-amber-400'}">
-                        ${Location.isSecure ? I18n.__('gpsReady') : I18n.__('gpsInsecure')}
+                <div class="hand-fact">
+                    <p class="hand-fact-label">${this.escapeHtml(I18n.__('location'))}</p>
+                    <p class="hand-fact-value ${Location.isSecure ? 'is-ok' : 'is-warn'}">
+                        ${this.escapeHtml(Location.isSecure ? I18n.__('handReady') : I18n.__('handNotReady'))}
                     </p>
                 </div>
             </div>
@@ -323,11 +326,22 @@ const WORKER_MODULES = {
         return this.renderClockPanel(container);
     },
 
-    /** Card list on mobile, table on desktop. */
+    /**
+     * The worker's own record: a timeline on a phone, a table on a desk.
+     *
+     * Two layouts from one data set, and the phone one is not a shrunk table. It is a
+     * rail with a stop per punch - a filled dot for a clock-in, a hollow one for a
+     * clock-out - because the question this screen answers is "what did my week look
+     * like", and a sequence of stops answers that at a glance in a way four aligned
+     * columns never did on a 360px screen.
+     *
+     * The site name is a value the worker never chose, so it is escaped like every other
+     * value off the wire, and it appears exactly once per row - a second copy anywhere in
+     * this markup would be a second chance to miss the escaping.
+     */
     async renderHistory(container) {
         if (!container) return;
-        container.innerHTML = `<div class="flex items-center gap-3 justify-center py-6 text-gray-500 dark:text-gray-400">
-            <span class="spinner"></span><span>${I18n.__('loading')}</span></div>`;
+        container.innerHTML = UI.loadingHtml();
 
         let workerLogs;
         try {
@@ -335,12 +349,17 @@ const WORKER_MODULES = {
             // filter here: /admin/logs answers 403 for a worker reading their own.
             workerLogs = (await API.request('/worker/me/logs?limit=20')).slice(0, 20);
         } catch (err) {
-            container.innerHTML = `<p class="text-red-500">${I18n.__('error')}: ${err.message}</p>`;
+            container.innerHTML = `<p class="ui-error">${this.escapeHtml(I18n.__('error'))}: ${this.escapeHtml(err.message)}</p>`;
             return;
         }
 
         if (workerLogs.length === 0) {
-            container.innerHTML = `<p class="text-center py-8 text-gray-500 dark:text-gray-400">${I18n.__('noHistory')}</p>`;
+            container.innerHTML = `
+                <div class="ui-empty" role="status">
+                    <span class="ui-empty-icon">${HAND_ICONS.history}</span>
+                    <p class="ui-empty-title">${this.escapeHtml(I18n.__('noHistory'))}</p>
+                    <p class="ui-empty-body">${this.escapeHtml(I18n.__('handNoHistoryHint'))}</p>
+                </div>`;
             return;
         }
 
@@ -348,40 +367,40 @@ const WORKER_MODULES = {
 
         if (Device.isMobile) {
             container.innerHTML = `
-                <div class="space-y-2">
+                <ul class="hand-rail">
                     ${workerLogs.map(log => `
-                        <div class="p-3 rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 flex justify-between gap-3">
-                            <div class="min-w-0">
-                                <p class="font-semibold ${log.action === 'Clock In' ? 'text-green-600 dark:text-green-400' : 'text-red-500'}">${actionLabel(log)}</p>
-                                <p class="text-xs text-gray-500 dark:text-gray-400">${log.timestamp}</p>
-                                <p class="text-xs text-gray-500 dark:text-gray-400">${log.site}</p>
+                        <li class="hand-stop ${log.action === 'Clock In' ? 'is-in' : 'is-out'}">
+                            <div class="hand-stop-what">
+                                <span class="hand-stop-action">${this.escapeHtml(actionLabel(log))}</span>
+                                <span class="hand-stop-when">${this.escapeHtml(log.timestamp)}</span>
+                                <span class="hand-stop-where">${this.escapeHtml(log.site)}</span>
                             </div>
-                            <div class="text-right flex-none">
-                                <p class="font-bold">${log.hours ? Number(log.hours).toFixed(2) + ' h' : '-'}</p>
-                                <p class="text-xs text-gray-500 dark:text-gray-400">${log.status || ''}</p>
+                            <div class="hand-stop-tally">
+                                <p class="hand-stop-hours">${log.hours ? Number(log.hours).toFixed(2) + ' h' : '-'}</p>
+                                <p class="hand-stop-status">${this.escapeHtml(log.status || '')}</p>
                             </div>
-                        </div>`).join('')}
-                </div>`;
+                        </li>`).join('')}
+                </ul>`;
             return;
         }
 
         container.innerHTML = `
-            <div class="overflow-x-auto">
-                <table class="w-full text-sm">
-                    <thead class="bg-gray-100 dark:bg-gray-700">
+            <div class="ui-table-wrap">
+                <table class="ui-table">
+                    <thead>
                         <tr>
-                            <th class="p-3 text-left">${I18n.__('action')}</th>
-                            <th class="p-3 text-left">${I18n.__('time')}</th>
-                            <th class="p-3 text-left">${I18n.__('site')}</th>
-                            <th class="p-3 text-right">${I18n.__('hours')}</th>
+                            <th scope="col">${this.escapeHtml(I18n.__('action'))}</th>
+                            <th scope="col">${this.escapeHtml(I18n.__('time'))}</th>
+                            <th scope="col">${this.escapeHtml(I18n.__('site'))}</th>
+                            <th scope="col" class="is-end">${this.escapeHtml(I18n.__('hours'))}</th>
                         </tr>
                     </thead>
-                    <tbody class="divide-y dark:divide-gray-600">
+                    <tbody>
                         ${workerLogs.map(log => `<tr>
-                            <td class="p-3 ${log.action === 'Clock In' ? 'text-green-600 dark:text-green-400' : 'text-red-500'} font-semibold">${actionLabel(log)}</td>
-                            <td class="p-3">${log.timestamp}</td>
-                            <td class="p-3">${log.site}</td>
-                            <td class="p-3 text-right">${log.hours ? Number(log.hours).toFixed(2) : '-'}</td>
+                            <td class="${log.action === 'Clock In' ? 'is-in' : 'is-out'}"><strong>${this.escapeHtml(actionLabel(log))}</strong></td>
+                            <td class="is-numeric">${this.escapeHtml(log.timestamp)}</td>
+                            <td>${this.escapeHtml(log.site)}</td>
+                            <td class="is-numeric is-end">${log.hours ? Number(log.hours).toFixed(2) : '-'}</td>
                         </tr>`).join('')}
                     </tbody>
                 </table>
@@ -398,21 +417,29 @@ const WORKER_MODULES = {
         if (typeof OFFLINE === 'undefined' || !OFFLINE.available()) return '';
         const blocks = [];
         if (status.queued > 0) {
+            // A queue is a count the worker is carrying, so it gets the one figure in the
+            // panel plus the two things they can do about it: wait, or send it now.
             blocks.push(`
-                <div class="mt-4 p-3 rounded-xl bg-amber-50 dark:bg-amber-900/25 text-sm text-amber-800 dark:text-amber-200">
-                    <p class="font-semibold">${I18n.__('queuedPunches')}: ${status.queued}</p>
-                    <p class="mt-1">${I18n.__('queuedPunchesHint')}</p>
-                    <button onclick="WORKER_MODULES.syncNow(this)" class="mt-2 px-3 py-2 rounded-lg bg-amber-500 text-white font-semibold">${I18n.__('syncNow')}</button>
+                <div class="hand-alert">
+                    ${HAND_ICONS.cloudOff}
+                    <div>
+                        <p><strong>${this.escapeHtml(I18n.__('queuedPunches'))}: ${Number(status.queued) || 0}</strong></p>
+                        <p>${this.escapeHtml(I18n.__('queuedPunchesHint'))}</p>
+                        <button type="button" onclick="WORKER_MODULES.syncNow(this)" class="ui-btn ui-btn-sm">${HAND_ICONS.clock}${this.escapeHtml(I18n.__('syncNow'))}</button>
+                    </div>
                 </div>`);
         }
         if (!OFFLINE.online()) {
-            blocks.push(`<p class="mt-3 text-xs text-gray-500 dark:text-gray-400">${I18n.__('offlineModeHint')}</p>`);
+            blocks.push(`<p class="hand-hero-meta">${this.escapeHtml(I18n.__('offlineModeHint'))}</p>`);
         }
         if (status.deviceState === 'key_lost' || status.deviceState === 'revoked') {
             blocks.push(`
-                <div class="mt-4 p-3 rounded-xl bg-red-50 dark:bg-red-900/25 text-sm text-red-700 dark:text-red-300">
-                    <p>${status.deviceState === 'revoked' ? I18n.__('deviceRevoked') : I18n.__('deviceKeyLost')}</p>
-                    ${status.deviceState === 'key_lost' ? `<button onclick="WORKER_MODULES.reRegisterDevice(this)" class="mt-2 px-3 py-2 rounded-lg bg-red-500 text-white font-semibold">${I18n.__('reRegisterDevice')}</button>` : ''}
+                <div class="hand-alert is-danger">
+                    ${HAND_ICONS.alert}
+                    <div>
+                        <p>${this.escapeHtml(status.deviceState === 'revoked' ? I18n.__('deviceRevoked') : I18n.__('deviceKeyLost'))}</p>
+                        ${status.deviceState === 'key_lost' ? `<button type="button" onclick="WORKER_MODULES.reRegisterDevice(this)" class="ui-btn ui-btn-sm ui-btn-danger">${this.escapeHtml(I18n.__('reRegisterDevice'))}</button>` : ''}
+                    </div>
                 </div>`);
         }
         return blocks.join('');
@@ -484,18 +511,27 @@ const WORKER_MODULES = {
             .replace(/[&<>"']/g, (char) => escapes[char]);
     },
 
-    noteCategoryLabel(category) { return I18n.__(`noteCat_${category}`); },
-    noteStatusLabel(status) { return I18n.__(`noteStatus_${status}`); },
+    // ``codeLabel`` is the shared one in frontendjavascript.js: an unknown code reads as
+    // words instead of as a key, and an absent one reads as nothing.
+    noteCategoryLabel(category) { return codeLabel('noteCat', category); },
+    noteStatusLabel(status) { return codeLabel('noteStatus', status); },
 
+    /** One state, one badge weight - the same four the console's tables use. */
     noteStatusClass(status) {
-        if (status === 'resolved') return 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300';
-        if (status === 'in_progress') return 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300';
-        if (status === 'closed') return 'bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-300';
-        return 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200';
+        if (status === 'resolved') return 'is-live';
+        if (status === 'in_progress') return 'is-ok';
+        if (status === 'closed') return 'is-quiet';
+        return 'is-warn';
     },
 
     noteStatusChip(status) {
-        return `<span class="px-2 py-0.5 rounded-full text-xs font-semibold ${this.noteStatusClass(status)}">${this.noteStatusLabel(status)}</span>`;
+        return `<span class="ui-badge ${this.noteStatusClass(status)}">${this.escapeHtml(this.noteStatusLabel(status))}</span>`;
+    },
+
+    /** No category, no chip - an empty badge is a rendering artefact, not a fact. */
+    noteCategoryChip(category) {
+        const label = this.noteCategoryLabel(category);
+        return label ? `<span class="ui-badge is-quiet">${this.escapeHtml(label)}</span>` : '';
     },
 
     async renderNotes(container) {
@@ -507,7 +543,7 @@ const WORKER_MODULES = {
         try {
             data = await API.request('/worker/notes');
         } catch (err) {
-            container.innerHTML = `<p class="text-red-500">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`;
+            container.innerHTML = `<p class="ui-error">${this.escapeHtml(I18n.__('error'))}: ${this.escapeHtml(err.message)}</p>`;
             return;
         }
         this._notes = data;
@@ -517,26 +553,26 @@ const WORKER_MODULES = {
     notesListHtml(data) {
         const notes = (data && data.notes) || [];
         const open = Number(data && data.open) || 0;
-        const button = 'px-4 py-2 rounded-xl font-semibold';
         return `
-            <div class="flex items-start justify-between gap-3 mb-3">
+            <div class="hand-section-head">
                 <div class="min-w-0">
-                    <h3 class="text-xl font-bold">${I18n.__('notesMine')}</h3>
-                    <p class="text-xs text-gray-500 dark:text-gray-400">${I18n.__('notesIntro')}</p>
+                    <h3 class="hand-section-title">${this.escapeHtml(I18n.__('notesMine'))}</h3>
+                    <p class="hand-section-note">${this.escapeHtml(I18n.__('notesIntro'))}</p>
                 </div>
                 <button type="button" data-new-note onclick="WORKER_MODULES.startNote()"
-                        class="flex-none ${button} bg-blue-600 text-white">${I18n.__('notesNew')}</button>
+                        class="ui-btn ui-btn-primary">${this.escapeHtml(I18n.__('notesNew'))}</button>
             </div>
             ${this._composingNote ? this.noteComposerHtml() : ''}
             ${open > 0 && !this._composingNote
-                ? `<p class="mb-3 text-xs text-amber-700 dark:text-amber-300">${I18n.__('notesOpenHint')}</p>`
+                ? `<p class="hand-note-line">${this.escapeHtml(I18n.__('notesOpenHint'))}</p>`
                 : ''}
             ${notes.length === 0
-                ? `<p class="py-6 text-center text-gray-500 dark:text-gray-400">
-                       <span class="block font-semibold">${I18n.__('notesEmpty')}</span>
-                       <span class="text-xs">${I18n.__('notesEmptyHint')}</span>
-                   </p>`
-                : `<div class="space-y-2">${notes.map((note) => this.noteCardHtml(note)).join('')}</div>`}`;
+                ? `<div class="ui-empty" role="status">
+                       <span class="ui-empty-icon">${HAND_ICONS.notes}</span>
+                       <p class="ui-empty-title">${this.escapeHtml(I18n.__('notesEmpty'))}</p>
+                       <p class="ui-empty-body">${this.escapeHtml(I18n.__('notesEmptyHint'))}</p>
+                   </div>`
+                : `<div class="hand-stack">${notes.map((note) => this.noteCardHtml(note)).join('')}</div>`}`;
     },
 
     noteCardHtml(note) {
@@ -544,55 +580,62 @@ const WORKER_MODULES = {
         const preview = note.last_message ? note.last_message.body : '';
         return `
             <button type="button" data-note="${note.id}" onclick="WORKER_MODULES.openNote(${note.id})"
-                    class="w-full text-left p-3 rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800">
-                <div class="flex items-start justify-between gap-2">
-                    <p class="font-semibold min-w-0 truncate">${this.escapeHtml(note.subject)}</p>
+                    class="hand-card is-note">
+                <div class="ui-spread">
+                    <p class="hand-note-subject">${this.escapeHtml(note.subject)}</p>
                     ${unread > 0
-                        ? `<span data-unread="${unread}" class="flex-none px-2 py-0.5 rounded-full text-xs font-bold bg-blue-600 text-white">${I18n.__('noteWaitingReply')}</span>`
+                        ? `<span data-unread="${unread}" class="ui-badge is-ok">${this.escapeHtml(I18n.__('noteWaitingReply'))}</span>`
                         : ''}
                 </div>
-                <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
-                    ${this.noteCategoryLabel(note.category)} · ${this.noteStatusChip(note.status)}
-                    ${note.priority === 'high' ? ` · <span data-urgent="1" class="font-semibold text-red-600 dark:text-red-400">${I18n.__('notePriorityHigh')}</span>` : ''}
+                <p class="hand-note-tags">
+                    ${this.noteCategoryChip(note.category)}
+                    ${this.noteStatusChip(note.status)}
+                    ${note.priority === 'high' ? `<span data-urgent="1" class="ui-badge is-danger">${this.escapeHtml(I18n.__('notePriorityHigh'))}</span>` : ''}
                 </p>
-                ${preview ? `<p class="mt-2 text-sm text-gray-600 dark:text-gray-300 truncate">${this.escapeHtml(preview)}</p>` : ''}
-                <p class="mt-1 text-xs text-gray-400">${I18n.__('noteLastActivity')}: ${this.escapeHtml(note.last_reply_at || note.created_at || '')}</p>
+                ${preview ? `<p class="hand-note-preview">${this.escapeHtml(preview)}</p>` : ''}
+                <p class="hand-note-stamp">${this.escapeHtml(I18n.__('noteLastActivity'))}: ${this.escapeHtml(note.last_reply_at || note.created_at || '')}</p>
             </button>`;
     },
 
-    /** The new-note form. Category first, because it decides who has to read it. */
+    /**
+     * The new-note form. Category first, because it decides who has to read it.
+     *
+     * Every field carries a real `<label>` rather than a placeholder: a placeholder is
+     * gone the moment somebody types, and this is a form filled in standing up, in the
+     * sun, with a reason to be quick. The ids and the two handlers are load-bearing -
+     * ``submitNote`` reads them back and the tests drive them by id - so only the shell
+     * around them changed.
+     */
     noteComposerHtml() {
-        const field = 'w-full mt-1 p-3 rounded-xl border border-gray-200 dark:border-gray-600 dark:bg-gray-700 dark:text-white';
-        const label = 'text-xs font-semibold text-gray-500 dark:text-gray-400';
         return `
-            <div class="mb-4 p-4 rounded-xl border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/20" data-note-composer>
-                <p class="font-semibold mb-3">${I18n.__('notesNew')}</p>
-                <label class="block mb-2">
-                    <span class="${label}">${I18n.__('noteCategory')}</span>
-                    <select id="noteCategory" class="${field}">
+            <div class="hand-composer" data-note-composer>
+                <p class="hand-section-title">${this.escapeHtml(I18n.__('notesNew'))}</p>
+                <label class="hand-field-group" style="margin-top:12px">
+                    <span class="hand-field-label">${this.escapeHtml(I18n.__('noteCategory'))}</span>
+                    <select id="noteCategory" class="ui-field">
                         ${this.NOTE_CATEGORIES.map((value) =>
-                            `<option value="${value}">${this.noteCategoryLabel(value)}</option>`).join('')}
+                            `<option value="${value}">${this.escapeHtml(this.noteCategoryLabel(value))}</option>`).join('')}
                     </select>
                 </label>
-                <label class="block mb-2">
-                    <span class="${label}">${I18n.__('noteSubject')}</span>
+                <label class="hand-field-group">
+                    <span class="hand-field-label">${this.escapeHtml(I18n.__('noteSubject'))}</span>
                     <input type="text" id="noteSubject" maxlength="120"
-                           placeholder="${I18n.__('noteSubjectPlaceholder')}" class="${field}">
+                           placeholder="${this.escapeHtml(I18n.__('noteSubjectPlaceholder'))}" class="ui-field">
                 </label>
-                <label class="block mb-3">
-                    <span class="${label}">${I18n.__('noteMessage')}</span>
+                <label class="hand-field-group">
+                    <span class="hand-field-label">${this.escapeHtml(I18n.__('noteMessage'))}</span>
                     <textarea id="noteBody" rows="4" maxlength="2000"
-                              placeholder="${I18n.__('noteMessagePlaceholder')}" class="${field}"></textarea>
+                              placeholder="${this.escapeHtml(I18n.__('noteMessagePlaceholder'))}" class="ui-field"></textarea>
                 </label>
-                <label class="flex items-center gap-2 mb-3 text-sm">
+                <label class="ui-check" style="margin-bottom:12px">
                     <input type="checkbox" id="noteUrgent">
-                    <span>${I18n.__('noteUrgent')}</span>
+                    <span>${this.escapeHtml(I18n.__('noteUrgent'))}</span>
                 </label>
-                <div class="flex flex-wrap gap-2">
+                <div class="ui-row">
                     <button type="button" data-send-note onclick="WORKER_MODULES.submitNote(this)"
-                            class="px-5 py-2 rounded-xl bg-blue-600 text-white font-semibold">${I18n.__('noteSend')}</button>
+                            class="ui-btn ui-btn-primary">${this.escapeHtml(I18n.__('noteSend'))}</button>
                     <button type="button" onclick="WORKER_MODULES.cancelNote()"
-                            class="px-4 py-2 rounded-xl font-semibold border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200">${I18n.__('noteCancel')}</button>
+                            class="ui-btn ui-btn-quiet">${this.escapeHtml(I18n.__('noteCancel'))}</button>
                 </div>
             </div>`;
     },
@@ -674,31 +717,35 @@ const WORKER_MODULES = {
         const messages = (note.messages || []).filter((message) => !message.internal);
         const hint = note.status === 'resolved' ? I18n.__('noteResolvedHint')
             : (note.status === 'closed' ? I18n.__('noteClosedHint') : '');
-        const field = 'w-full p-3 rounded-xl border border-gray-200 dark:border-gray-600 dark:bg-gray-700 dark:text-white';
         return `
             <button type="button" onclick="WORKER_MODULES.backToNotes()"
-                    class="mb-3 text-sm font-semibold text-blue-600 dark:text-blue-400" data-notes-back>
-                ← ${I18n.__('noteBack')}
+                    class="ui-btn ui-btn-quiet ui-btn-sm" data-notes-back>
+                ${HAND_ICONS.back}${this.escapeHtml(I18n.__('noteBack'))}
             </button>
-            <div class="mb-3">
-                <p class="font-bold text-lg">${this.escapeHtml(note.subject)}</p>
-                <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
-                    ${this.noteCategoryLabel(note.category)} · ${this.noteStatusChip(note.status)}
-                    · ${I18n.__('noteOpened')}: ${this.escapeHtml(note.created_at || '')}
-                </p>
+            <div class="hand-section-head" style="margin-top:12px">
+                <div class="min-w-0">
+                    <h3 class="hand-section-title">${this.escapeHtml(note.subject)}</h3>
+                    <p class="hand-section-note">
+                        ${this.escapeHtml(I18n.__('noteOpened'))}: ${this.escapeHtml(note.created_at || '')}
+                    </p>
+                </div>
+                <span class="ui-row" style="gap:6px">
+                    ${this.noteCategoryChip(note.category)}
+                    ${this.noteStatusChip(note.status)}
+                </span>
             </div>
-            ${hint ? `<p class="mb-3 p-3 rounded-xl text-xs bg-blue-50 dark:bg-blue-900/20 text-blue-800 dark:text-blue-200" data-thread-hint>${hint}</p>` : ''}
-            <div class="space-y-2 mb-4">
+            ${hint ? `<p class="hand-alert" data-thread-hint>${HAND_ICONS.info}<span>${this.escapeHtml(hint)}</span></p>` : ''}
+            <div class="hand-stack" style="margin:12px 0 16px">
                 ${messages.map((message) => this.noteMessageHtml(message)).join('')}
             </div>
-            <div class="p-3 rounded-xl border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800">
+            <div class="hand-card" style="background:var(--ops-surface-2);box-shadow:none">
                 <textarea id="noteReplyBody" rows="3" maxlength="2000"
-                          placeholder="${I18n.__('noteReplyPlaceholder')}" class="${field}"></textarea>
-                <div class="flex flex-wrap gap-2 mt-2">
+                          placeholder="${this.escapeHtml(I18n.__('noteReplyPlaceholder'))}" class="ui-field"></textarea>
+                <div class="ui-row" style="margin-top:8px">
                     <button type="button" data-send-reply onclick="WORKER_MODULES.sendNoteReply(${note.id}, this)"
-                            class="px-5 py-2 rounded-xl bg-blue-600 text-white font-semibold">${I18n.__('noteReply')}</button>
+                            class="ui-btn ui-btn-primary">${this.escapeHtml(I18n.__('noteReply'))}</button>
                     ${note.status === 'closed' ? '' : `<button type="button" data-close-note onclick="WORKER_MODULES.closeNote(${note.id})"
-                            class="px-4 py-2 rounded-xl font-semibold border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200">${I18n.__('noteClose')}</button>`}
+                            class="ui-btn ui-btn-quiet">${this.escapeHtml(I18n.__('noteClose'))}</button>`}
                 </div>
             </div>`;
     },
@@ -710,14 +757,11 @@ const WORKER_MODULES = {
     noteMessageHtml(message) {
         const mine = !message.from_admin;
         const who = mine ? I18n.__('noteFromYou') : I18n.__('noteFromAdmin');
-        const bubble = mine
-            ? 'bg-blue-600 text-white'
-            : 'bg-white dark:bg-gray-700 border border-gray-200 dark:border-gray-600';
         return `
-            <div class="flex ${mine ? 'justify-end' : 'justify-start'}" data-message="${message.id}">
-                <div class="max-w-[85%] p-3 rounded-xl ${bubble}">
-                    <p class="text-[11px] opacity-70 mb-1">${who} · ${this.escapeHtml(message.created_at || '')}</p>
-                    <p class="text-sm whitespace-pre-wrap break-words">${this.escapeHtml(message.body)}</p>
+            <div class="hand-bubble-row ${mine ? 'is-mine' : ''}" data-message="${message.id}">
+                <div class="hand-bubble ${mine ? 'is-mine' : ''}">
+                    <p class="hand-bubble-who">${this.escapeHtml(who)} · ${this.escapeHtml(message.created_at || '')}</p>
+                    <p class="hand-bubble-body">${this.escapeHtml(message.body)}</p>
                 </div>
             </div>`;
     },

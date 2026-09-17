@@ -106,7 +106,53 @@ class Settings(BaseModel):
     database_path: Path
     backup_dir: Path
     backup_max_age_hours: int = 24
+    #: The pre-hardening single origin list. It still works - ``netguard`` merges it into
+    #: ``cors_worker_origins`` - because a deployment that had it set was allowing exactly
+    #: the worker class, and renaming it out from under them would silently close their
+    #: console. New deployments should use the two lists below.
     allowed_origins: list[str] = []
+
+    # -- network hardening (see ``netguard``) -------------------------------
+    #  Who may call this API from a browser, and from where.
+    #
+    #  Two origin classes, because they are two trust levels: a *worker* origin is a phone
+    #  that has been handed a session; an *admin* origin is a managed console. An admin
+    #  origin may read the whole API, a worker origin may read everything except
+    #  ``/admin/*``. Both accept exact origins and one host wildcard
+    #  (``https://*.example.com`` - subdomains, not the bare domain: list both if both are
+    #  needed). ``*`` is accepted for worker origins only.
+    cors_worker_origins: list[str] = []
+    cors_admin_origins: list[str] = []
+    #: Empty means the middleware's default (GET, POST, OPTIONS / the headers this client
+    #: actually sends, including ``ngrok-skip-browser-warning``).
+    cors_allowed_methods: list[str] = []
+    cors_allowed_headers: list[str] = []
+    #: ``Access-Control-Allow-Credentials``. The app authenticates with a bearer token, so
+    #: this is only needed for a console that wants to send cookies; it is dropped
+    #: automatically when a worker origin list contains ``*`` (the browser forbids the pair).
+    cors_allow_credentials: bool = True
+    cors_max_age_seconds: int = 600
+    #: CIDRs or bare addresses permitted to reach administrator routes. **Empty means no
+    #: gate** - the routes are still token-guarded, but any address may attempt them.
+    admin_ip_allowlist: list[str] = []
+    admin_allowlist_paths: list[str] = ["/admin", "/api/v1/admin"]
+    #: Which peers may set ``X-Forwarded-For`` / ``X-Forwarded-Proto``. Loopback by default,
+    #: matching what ``serve.py`` hands uvicorn. A proxy on another host must be listed here,
+    #: or the real client address is unknown and the allowlist above checks the proxy instead.
+    trusted_proxies: list[str] = ["127.0.0.1/32", "::1/128"]
+    security_headers_enabled: bool = True
+    #: Sent only over TLS (or when a *trusted* proxy reports ``X-Forwarded-Proto: https``).
+    #: 0 disables the header entirely for a deployment that terminates TLS somewhere it
+    #: cannot see.
+    hsts_max_age_seconds: int = 15552000
+    #: Document / API policies. Unset uses ``netguard.CSP_HTML`` and ``netguard.CSP_API``.
+    #: The bundled policy already refuses inline ``<script>`` elements and names
+    #: ``cdn.tailwindcss.com`` because the frontend's utility CSS is compiled in the browser;
+    #: set ``CSP_HTML`` to drop that host once a Tailwind build is committed, and to add
+    #: hashes for any inline block a customised page reintroduces.
+    csp_api: str | None = None
+    csp_html: str | None = None
+
     enable_api_docs: bool = False
     face_model_preload: bool = True
     bootstrap_admin_password: str | None = None
@@ -309,6 +355,17 @@ class Settings(BaseModel):
             "jwt_ttl_hours": self.jwt_ttl_hours,
             "enable_api_docs": self.enable_api_docs,
             "allowed_origins": self.allowed_origins,
+            # Printed as the two lists an operator actually sets, plus the two that decide
+            # whether the admin gate and HSTS are doing anything at all.
+            "cors_worker_origins": self.cors_worker_origins,
+            "cors_admin_origins": self.cors_admin_origins,
+            "cors_allow_credentials": self.cors_allow_credentials,
+            "admin_ip_allowlist": self.admin_ip_allowlist,
+            "admin_allowlist_paths": self.admin_allowlist_paths,
+            "admin_gate_enabled": bool(self.admin_ip_allowlist),
+            "trusted_proxies": self.trusted_proxies,
+            "security_headers": self.security_headers_enabled,
+            "hsts_max_age_seconds": self.hsts_max_age_seconds,
             "schema_guard_mode": self.schema_guard_mode,
             "app_version": self.app_version,
             "liveness_mode": self.liveness_mode,
@@ -397,6 +454,19 @@ def build_settings(*, env_file: Path | None = None) -> Settings:
         backup_dir=backup_dir,
         backup_max_age_hours=_env_int("BACKUP_MAX_AGE_HOURS", 24),
         allowed_origins=_env_list("ALLOWED_ORIGINS"),
+        cors_worker_origins=_env_list("CORS_WORKER_ORIGINS"),
+        cors_admin_origins=_env_list("CORS_ADMIN_ORIGINS"),
+        cors_allowed_methods=[item.upper() for item in _env_list("CORS_ALLOWED_METHODS")],
+        cors_allowed_headers=_env_list("CORS_ALLOWED_HEADERS"),
+        cors_allow_credentials=_env_flag("CORS_ALLOW_CREDENTIALS", True),
+        cors_max_age_seconds=_env_int("CORS_MAX_AGE_SECONDS", 600),
+        admin_ip_allowlist=_env_list("ADMIN_IP_ALLOWLIST"),
+        admin_allowlist_paths=_env_list("ADMIN_ALLOWLIST_PATHS", ["/admin", "/api/v1/admin"]),
+        trusted_proxies=_env_list("TRUSTED_PROXIES", ["127.0.0.1/32", "::1/128"]),
+        security_headers_enabled=_env_flag("SECURITY_HEADERS", True),
+        hsts_max_age_seconds=_env_int("HSTS_MAX_AGE_SECONDS", 15552000),
+        csp_api=_env_str("CSP_API"),
+        csp_html=_env_str("CSP_HTML"),
         enable_api_docs=_env_flag("ENABLE_API_DOCS", False),
         face_model_preload=_env_flag("FACE_MODEL_PRELOAD", True),
         bootstrap_admin_password=_env_str("BOOTSTRAP_ADMIN_PASSWORD"),
@@ -479,7 +549,17 @@ def write_env_file(path: Path | None = None, *, overwrite: bool = False) -> Path
         "# Site Attendance configuration. NEVER commit this file.\n"
         f"SECRET_KEY={secrets.token_urlsafe(48)}\n"
         "DATABASE_PATH=\n"
+        "# Origins allowed to call this API from a browser. Two classes, because they are two\n"
+        "# trust levels: a worker origin may read everything except /admin/*, an admin origin\n"
+        "# may read all of it. Comma-separated; 'https://*.example.com' matches subdomains.\n"
         "ALLOWED_ORIGINS=\n"
+        "CORS_WORKER_ORIGINS=\n"
+        "CORS_ADMIN_ORIGINS=\n"
+        "# Addresses permitted to reach administrator routes (empty = no network gate):\n"
+        "ADMIN_IP_ALLOWLIST=\n"
+        "# Which peers may set X-Forwarded-For. Loopback by default; list a proxy on another\n"
+        "# host here, or the allowlist above ends up checking the proxy's address.\n"
+        "TRUSTED_PROXIES=127.0.0.1/32,::1/128\n"
         "ENABLE_API_DOCS=0\n"
         "JWT_TTL_HOURS=12\n"
         "SCHEMA_GUARD_MODE=enforce_repair\n"

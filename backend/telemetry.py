@@ -291,6 +291,17 @@ SQLITE_CONNECTIONS = _counter(
     ("access",),
 )
 
+# -- network policy (see ``netguard``) -------------------------------------
+NETGUARD_REFUSALS = _counter(
+    "attendance_netguard_refusals_total",
+    "Requests refused by the network policy, by reason: ip_not_allowed (the client is outside "
+    "ADMIN_IP_ALLOWLIST), proxy_not_trusted (X-Forwarded-For arrived from a peer that is not "
+    "a trusted proxy, so the real client address is unknown), origin_not_allowed (a CORS "
+    "preflight from an origin no policy names). Worth an alert: a step in this counter is "
+    "either a misconfigured proxy or somebody probing the admin surface.",
+    ("reason",),
+)
+
 # -- build information -----------------------------------------------------
 BUILD_INFO = _gauge(
     "attendance_build_info",
@@ -381,6 +392,10 @@ def observe_punch(*, action: str, status: str) -> None:
 
 def count_connection(*, read_only: bool) -> None:
     SQLITE_CONNECTIONS.labels(access="read_only" if read_only else "read_write").inc()
+
+
+def count_netguard_refusal(*, reason: str) -> None:
+    NETGUARD_REFUSALS.labels(reason=reason).inc()
 
 
 def count_statement(operation: str) -> None:

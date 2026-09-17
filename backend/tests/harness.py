@@ -30,6 +30,12 @@ SAFETY RULES THIS HARNESS ENFORCES
    test run.
 5. The temp database is restored from a pristine snapshot before every test, so
    the tests that mutate data stay order-independent.
+6. Every table that records *what people did* is then emptied in that copy (see
+   ``ACTIVITY_TABLES``). The snapshot is a database in daily use, so without this a
+   real punch, quick link or password reset from the same day sits inside a test's
+   fixture - and assertions like "exactly one late arrival" fail on somebody else's
+   traffic, which reads as a regression in the feature under test. The clone gives
+   the suite its schema and its configuration; the tests give it their data.
 """
 
 from __future__ import annotations
@@ -53,6 +59,7 @@ import uuid
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
+from typing import Final
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = BACKEND_DIR.parent
@@ -278,6 +285,47 @@ SEED_USERS: dict[str, tuple[str, str, str, str]] = {
     ADMIN: ("Seed Admin", "admin", "admin-pass-123", "seed1000@example.test"),
     HEAD_ADMIN: ("Seed Head Admin", "head_admin", "head-pass-123", "seed5000@example.test"),
 }
+#: Tables that hold **records of what people did**, as opposed to the configuration this suite
+#: seeds itself. Every one is emptied in the throwaway copy before each test.
+#:
+#: This is not tidiness. The copy is a photograph of a database that is **in use**, so this
+#: morning's real punch, a real quick link and a real late-arrival notification are all in it -
+#: and a test that asserts "exactly one late arrival", "this account has never had its password
+#: reset" or "the audit log names these two actions" then fails on somebody else's traffic. The
+#: failure looks like a regression in the feature under test, which is the expensive part: it
+#: sends you looking at code that is fine, and it trains people to ignore a red suite. Clearing
+#: the activity is what makes the copy a fixture.
+#:
+#: ``test_fixture_state.py`` fails if the schema grows a table that is in none of these lists,
+#: so this cannot silently fall behind the application.
+ACTIVITY_TABLES: Final = (
+    "attendance_logs",          # punches, approved hours: a real shift is a real row
+    "active_sessions",          # who is on site right now
+    "admin_notifications",      # the late arrivals, the reviews, the retention reports
+    "audit_log",                # every admin action, *and* the source of the roster's
+                                # ``password_changed_at`` and of the "was this audited" tests
+    "quick_links",              # a live punch link is a working credential
+    "quick_link_uses",
+    "worker_notes",             # notes are people talking to each other
+    "worker_note_messages",
+    "worker_devices",           # enrolled phones and their HMAC keys
+    "device_anchors",
+    "punch_queue",              # offline punches waiting to be replayed
+    "retention_runs",
+    "enrollment_invites",       # a live invite is a credential too
+    "enrollment_jobs",
+    "enrollment_job_items",
+)
+
+#: Tables left exactly as the live database has them: the schema ledger, and nothing else. The
+#: ledger is *kept* on purpose - it is what tells ``init_db`` which migrations this generation
+#: has already applied, and re-running them all is not the same thing as resuming.
+CONFIGURATION_TABLES: Final = ("schema_migrations",)
+
+#: Tables ``seed_database`` rewrites from scratch on every test, so their live contents never
+#: reach an assertion: the roster, the sites, and the shift rules a punch is judged by.
+SEEDED_TABLES: Final = ("users", "construction_sites", "shift_rules")
+
 #: The biometric id every seeded account is given, minted once for the session.
 #:
 #: The database is restored from a snapshot and reseeded before every test, and the reseed
@@ -384,6 +432,22 @@ SITES = {
     "Downtown Tower A": (30.05, 31.23, 65.0),
     "New Capital Zone B": (29.98, 31.75, 100.0),
 }
+#: A short, fixed attendance history: two completed shifts for the seeded worker, on two
+#: dates in March 2026 - inside the reports' widest period ("2026-01-01" to "2026-12-31") and
+#: outside "this month", so a report that defaults to the current month cannot pick them up by
+#: accident and a report that asks for the year always finds them.
+#:
+#: It exists because the report suite is *about* history: the timesheet, the CSV export and the
+#: attendance rate are assertions on rows nobody had ever seeded. Until this, the only rows they
+#: saw were the live deployment's, so "the report must not be empty" was really asserting that
+#: somebody had been clocking in at work this month - which is true some weeks and false others.
+#:
+#: Only :data:`WORKER` has history, and that is deliberate: ``test_auth_token_contract`` asserts
+#: the lead worker starts with *no* attendance rows, so adding any here would break a different
+#: invariant to fix this one.
+SEEDED_HISTORY_DAYS: Final = ("2026-03-02", "2026-03-09")
+SEEDED_HISTORY_HOURS: Final = 8.0
+
 #: Per-site clock-in windows, seeded only when a test asks for them (``SEED_SITE_WINDOWS``).
 #: Both seeded sites inherit the global rule by default, which is what keeps the shift-window
 #: tests that predate per-site windows measuring the global rule they were written against.
@@ -457,13 +521,100 @@ def seed_database(app_module) -> None:
             tuple(SEED_USERS),
         )
         conn.execute(
-            "INSERT INTO attendance_logs (id, worker_id, site_name, action, timestamp, hours, score, status) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (SEEDED_PENDING_LOG_ID, WORKER, "Downtown Tower A", "Clock In", now, 0.0, 0.5, "pending_review"),
+            "INSERT INTO attendance_logs (id, worker_id, site_name, action, timestamp, hours, score, status, status_code) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (SEEDED_PENDING_LOG_ID, WORKER, "Downtown Tower A", "Clock In", now, 0.0, 0.5, "pending_review", "pending_review"),
         )
+        # The completed shifts the reports read (see ``SEEDED_HISTORY_DAYS``): a clock-in and a
+        # clock-out per day, approved, with the paid hours recorded on the clock-out the way the
+        # punch path records them. The timesheet selects ``action = 'Clock Out'``, so a day with
+        # only a clock-in would be a shift the report never shows.
+        history = []
+        for day in SEEDED_HISTORY_DAYS:
+            history.append(
+                (WORKER, "Downtown Tower A", "Clock In", f"{day} 05:00:00", 0.0, 0.9, "Approved", "approved")
+            )
+            history.append(
+                (WORKER, "Downtown Tower A", "Clock Out", f"{day} 13:00:00", SEEDED_HISTORY_HOURS, 0.9,
+                 "Approved", "approved")
+            )
+        conn.executemany(
+            "INSERT INTO attendance_logs (worker_id, site_name, action, timestamp, hours, score, "
+            "status, status_code, source, approved_hours) VALUES (?,?,?,?,?,?,?,?,'online',?)",
+            [
+                (*row, SEEDED_HISTORY_HOURS if row[2] == "Clock Out" else None)
+                for row in history
+            ],
+        )
+        # The company rules are normalised as well, and for the same reason as the rows above:
+        # they are configuration a real administrator can now change from the console (Admin ->
+        # Shift rules, including the company clock-in window), so a test that asserts "an
+        # inheriting site is late at noon" has to be asserting the *shipped* window rather than
+        # whatever shift the company moved to this week. Only the documented keys are touched -
+        # a column this build does not know about is left where it is.
+        defaults = getattr(app_module, "DEFAULT_SHIFT_RULES", None) or {}
+        if defaults:
+            if conn.execute("SELECT id FROM shift_rules WHERE id = 1").fetchone() is None:
+                conn.execute(
+                    "INSERT INTO shift_rules (id, %s, updated_at) VALUES (1, %s, ?)"
+                    % (", ".join(defaults), ", ".join("?" * len(defaults))),
+                    (*defaults.values(), now),
+                )
+            else:
+                conn.execute(
+                    "UPDATE shift_rules SET %s, updated_at = ? WHERE id = 1"
+                    % ", ".join(f"{key} = ?" for key in defaults),
+                    (*defaults.values(), now),
+                )
         conn.commit()
     finally:
         conn.close()
+
+
+def clear_activity() -> None:
+    """Empty every activity table in the throwaway copy (see ``ACTIVITY_TABLES``).
+
+    Called on every reset, *after* ``init_db`` (so a table this build knows about exists even
+    when the snapshot predates it) and *before* ``seed_database`` (which writes the one seeded
+    session and the one ``pending_review`` record the tests address by id).
+
+    A table that is missing from the snapshot is skipped rather than fatal: the copy is whatever
+    generation the live database happened to be, and the suite's job is to run against the
+    application as it is, not to require the live file to be current.
+
+    ``audit_log`` cannot simply be deleted from: it is append-only and the *database* enforces
+    it (migration 1 installs a ``BEFORE DELETE`` trigger), so every delete aborts. That guard is
+    there for the right reason and this is not a reason to weaken it - retention's own rule
+    applies here too: read the trigger out of ``sqlite_master``, drop it, delete, and put the
+    same text back, all in one transaction, so a crash in the middle leaves the guard on.
+    """
+    import retention  # imported here so this module stays importable without the backend path
+
+    connection = sqlite3.connect(str(DB_PATH), timeout=30.0, isolation_level=None)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        guard = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+            (retention.AUDIT_DELETE_GUARD,),
+        ).fetchone()
+        guard_sql = str(guard[0]) if guard is not None and guard[0] else None
+        if guard_sql:
+            connection.execute(f"DROP TRIGGER IF EXISTS {retention.AUDIT_DELETE_GUARD}")
+        try:
+            for table in ACTIVITY_TABLES:
+                try:
+                    connection.execute(f"DELETE FROM {table}")
+                except sqlite3.OperationalError:
+                    continue
+        finally:
+            if guard_sql:
+                connection.execute(guard_sql)
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def _restore_pristine() -> None:
@@ -569,9 +720,15 @@ def reset_database(app_module) -> None:
     it has none of the columns the additive migrations introduce. Re-running
     ``init_db()`` here is what keeps every test running against the same schema the
     application ships, exactly as a real deployment would.
+
+    Between the two, every activity table is emptied (``clear_activity``): the snapshot is a
+    live database, and the person using this application writes rows into it all day. See
+    ``ACTIVITY_TABLES`` - the short version is that the clone gives the fixture its **shape and
+    its configuration**, and the tests give it their data.
     """
     _restore_pristine()
     app_module.init_db()
+    clear_activity()
     seed_database(app_module)
     reset_rate_limits(app_module)
     FAKE_FACE.FACE_MODE = "match"

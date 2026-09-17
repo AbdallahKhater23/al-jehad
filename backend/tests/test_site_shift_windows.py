@@ -671,6 +671,166 @@ def test_the_window_change_is_audited(client):
     assert "21:30" in entry[0] and "05:30" in entry[0]
 
 
+# ---------------------------------------------------------------------------
+# 6b. the company-wide window a site inherits from
+# ---------------------------------------------------------------------------
+#  Covered here as well as the per-site columns because it is the *same* window at a wider
+#  scope, entered from the same console, and it was the half that was neither validated nor
+#  clearable: ``POST /admin/shift_rules`` accepted ``25:00`` and then resolved it to
+#  00:00-23:59 at every punch, so a typo in the company default made nobody late anywhere that
+#  inherits it - silently, because a window nobody can miss is indistinguishable from an
+#  on-time workforce.
+
+
+def _company_window(client, **payload) -> dict:
+    """Save shift rules the way the console does, and answer with what the server kept."""
+    response = client.post("/api/v1/admin/shift_rules", headers=bearer(ADMIN), json=payload)
+    assert response.status_code == 200, response.text[:300]
+    return response.json()["rules"]
+
+
+def test_the_company_window_is_validated_where_an_administrator_enters_it(client):
+    for payload in (
+        {"clock_in_window_start": "25:00"},
+        {"clock_in_window_end": "06:60"},
+        {"clock_in_window_start": "4:00"},
+        {"clock_in_window_start": "four"},
+        {"site_timezone": "Africa/Cario"},
+        {"site_timezone": "EET-2"},
+    ):
+        response = client.post("/api/v1/admin/shift_rules", headers=bearer(ADMIN), json=payload)
+        # 422, like every other refusal in this file: it is the same Pydantic rule, and the
+        # message has to name the format an administrator should type instead.
+        assert response.status_code == 422, f"{payload} was accepted: {response.text[:200]}"
+        assert "HH:MM" in response.text or "timezone" in response.text, response.text[:200]
+
+    rules = client.get("/api/v1/admin/shift_rules", headers=bearer(ADMIN)).json()
+    assert rules["clock_in_window_start"] == "04:00", "a refused change must not have been written"
+    assert rules["clock_in_window_end"] == "06:30"
+    assert rules["site_timezone"] == "Africa/Cairo"
+
+
+def test_an_emptied_company_window_goes_back_to_the_shipped_default(client):
+    """An empty time box is "use the company default", which this table stores as NULL.
+
+    Sent as ``""`` - which is what an HTML time input submits once it is cleared - it is stored
+    as the empty string, because these columns are NOT NULL, and both ``get_shift_rules`` and
+    ``shift_windows._pick`` read blank as "nothing configured". The previous version filtered
+    ``None`` out of the update, so the window could be moved to a night shift and then never
+    taken off again. A blank read back as a *value* would be worse than that: it resolves to
+    00:00-23:59 through ``effective_window``, which is a company window nobody can miss.
+    """
+    assert _company_window(
+        client,
+        clock_in_window_start="22:00",
+        clock_in_window_end="06:00",
+        site_timezone="Asia/Riyadh",
+    )["clock_in_window_start"] == "22:00"
+
+    cleared = _company_window(
+        client, clock_in_window_start="", clock_in_window_end="", site_timezone=""
+    )
+    assert cleared["clock_in_window_start"] == "04:00"
+    assert cleared["clock_in_window_end"] == "06:30"
+    assert cleared["site_timezone"] == "Africa/Cairo"
+    assert db_scalar("SELECT clock_in_window_start FROM shift_rules WHERE id = 1") == ""
+
+
+def test_a_shift_rules_save_that_omits_the_window_leaves_it_alone(client):
+    """The panel posts four numbers; saving them must not clear a window it never mentioned."""
+    _company_window(client, clock_in_window_start="22:00", clock_in_window_end="06:00")
+    saved = _company_window(client, regular_hours=7.5)
+    assert saved["regular_hours"] == 7.5
+    assert saved["clock_in_window_start"] == "22:00", "an unmentioned field was cleared by a save"
+    assert saved["clock_in_window_end"] == "06:00"
+
+
+def test_the_company_window_is_what_an_inheriting_site_uses(client, app_module, frozen_clock):
+    """Set through the request the panel makes, so this covers the wiring and not the arithmetic."""
+    _company_window(client, clock_in_window_start="22:00", clock_in_window_end="06:00")
+    frozen_clock(at(23, 15))
+    before = _late_arrivals(MOALLEM)
+    response = clock_in(client, MOALLEM, headers=bearer(MOALLEM), coordinates=INSIDE_DOWNTOWN)
+
+    assert response.status_code == 200, response.text[:300]
+    assert db_scalar("SELECT late_flag FROM active_sessions WHERE worker_id = ?", (MOALLEM,)) is None
+    assert _late_arrivals(MOALLEM) == before, "an on-time arrival produced a late notification"
+
+
+def test_a_site_override_still_beats_a_changed_company_window(client, app_module, frozen_clock):
+    """Precedence the other way round: the company default moves, the site's own window holds.
+
+    The company window is set to 22:00-06:00, which contains 23:15 - so this punch is late only
+    because the *site* configured 05:00-07:30. Its twin (the site that configured nothing, at
+    the same hour, on time) is ``test_the_company_window_is_what_an_inheriting_site_uses``; the
+    two are separate tests because the second punch of one worker cannot be a second clock-in.
+    """
+    _company_window(client, clock_in_window_start="22:00", clock_in_window_end="06:00")
+    with with_site_windows(app_module, {ZONE_B: ("05:00", "07:30", None)}):
+        frozen_clock(at(23, 15))
+        late = clock_in(client, MOALLEM, headers=bearer(MOALLEM), coordinates=INSIDE_ZONE_B)
+
+        assert late.status_code == 200, late.text[:300]
+        flag = db_scalar("SELECT late_flag FROM active_sessions WHERE worker_id = ?", (MOALLEM,))
+        assert flag and "05:00" in flag and "07:30" in flag, flag
+
+
+# ---------------------------------------------------------------------------
+# 6c. the payloads the console sends
+# ---------------------------------------------------------------------------
+#  These are the request bodies ``frontend/admin_modules.js`` builds - the site form and the
+#  Shift rules panel - kept here as literals so a backend change that breaks the console fails
+#  in the suite rather than in an administrator's browser.
+
+
+def test_the_window_the_site_form_sends_is_accepted(client):
+    """What the Sites tab posts when an administrator picks a window for a site."""
+    response = client.post(
+        "/api/v1/admin/sites/edit",
+        headers=bearer(ADMIN),
+        json={
+            **_site_payload(ZONE_B),
+            "clock_in_window_start": "22:00",
+            "clock_in_window_end": "06:00",
+            "site_timezone": "Africa/Cairo",
+        },
+    )
+    assert response.status_code == 200, response.text[:300]
+    window_info = _site(client, ZONE_B)["window"]
+    assert window_info["window"] == "22:00-06:00 (overnight)"
+    assert window_info["crosses_midnight"] is True
+    assert window_info["site_specific"] is True
+    assert set(window_info["source"].values()) == {"site"}
+
+
+def test_the_form_that_clears_a_site_window_sends_null_and_is_accepted(client):
+    """"Use the company window" in the edit panel: three explicit nulls, nothing else."""
+    client.post(
+        "/api/v1/admin/sites/edit",
+        headers=bearer(ADMIN),
+        json={
+            **_site_payload(ZONE_B),
+            "clock_in_window_start": "22:00",
+            "clock_in_window_end": "06:00",
+            "site_timezone": "Africa/Cairo",
+        },
+    )
+    cleared = client.post(
+        "/api/v1/admin/sites/edit",
+        headers=bearer(ADMIN),
+        json={
+            **_site_payload(ZONE_B),
+            "clock_in_window_start": None,
+            "clock_in_window_end": None,
+            "site_timezone": None,
+        },
+    )
+    assert cleared.status_code == 200, cleared.text[:300]
+    window_info = _site(client, ZONE_B)["window"]
+    assert window_info["site_specific"] is False
+    assert set(window_info["source"].values()) == {"global"}, window_info["source"]
+
+
 def _site_payload(site_name: str, *, radius: float | None = None) -> dict:
     lat, lon, default_radius = {
         DOWNTOWN: (30.05, 31.23, 65.0),

@@ -749,6 +749,14 @@ def test_a_target_that_fails_after_dropping_the_guard_leaves_it_in_place(client,
     SAVEPOINT rollback has to undo the DDL as well as the delete.
     """
 
+    # A row for the hostile target to delete, and a count to compare against afterwards. This
+    # used to assert ``COUNT(*) > 0``, which passed for as long as the *live* database happened
+    # to contain audit rows - i.e. it was asserting that the deployment had been used, not that
+    # the rollback worked. The fixture no longer inherits that history, so the row is planted.
+    _seed_audit("user_edit", age_days=1)
+    before = db_scalar("SELECT COUNT(*) FROM audit_log")
+    assert before >= 1, "the planted audit row did not land"
+
     def hostile(conn, *, dry_run):
         conn.execute("DROP TRIGGER IF EXISTS audit_log_no_delete")
         conn.execute("DELETE FROM audit_log")
@@ -763,7 +771,7 @@ def test_a_target_that_fails_after_dropping_the_guard_leaves_it_in_place(client,
         connection.close()
 
     assert "RuntimeError" in outcome["error"]
-    assert db_scalar("SELECT COUNT(*) FROM audit_log") > 0, "the target's deletes survived its failure"
+    assert db_scalar("SELECT COUNT(*) FROM audit_log") == before, ("the target's deletes survived its failure")
     assert db_scalar("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'audit_log_no_delete'"), (
         "the append-only guard was left off"
     )

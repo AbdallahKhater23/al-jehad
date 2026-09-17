@@ -97,10 +97,15 @@ input, select, textarea, button {
 .tabbar button .tabbar-icon { font-size: 20px; line-height: 1; }
 .tabbar button.is-active { color: var(--accent); }
 
-/* Big thumb-friendly primary action */
+/* The one primary action, sized for a thumb rather than for a poster.
+   168px was right when this button *was* the card; now the shift card above it
+   carries the state, and a button that tall pushed the month's hours and the GPS
+   readiness - the two figures a worker checks before walking to the gate - below
+   the fold on a 640px-tall phone. 128px is still far past the 48px floor, still
+   landable without looking, and leaves the facts visible under it. */
 .clock-button {
     width: 100%;
-    min-height: 168px;
+    min-height: 128px;
     border: 0;
     border-radius: 1.75rem;
     font-size: 1.5rem;
@@ -112,7 +117,7 @@ input, select, textarea, button {
     box-shadow: 0 18px 30px -18px rgba(15, 23, 42, 0.55);
 }
 
-.clock-button.compact { min-height: 120px; font-size: 1.25rem; }
+.clock-button.compact { min-height: 104px; font-size: 1.25rem; }
 .clock-button:active { transform: scale(0.97); }
 .clock-button:disabled { opacity: 0.55; cursor: not-allowed; box-shadow: none; }
 .clock-button.in { background: linear-gradient(160deg, #16a34a, #15803d); }
@@ -432,7 +437,12 @@ input, select, textarea, button {
 .login-subtitle { margin: 0; font-size: 13px; line-height: 1.55; color: var(--ops-muted); max-width: 48ch; }
 .login-form { display: flex; flex-direction: column; gap: var(--ui-4); margin-top: var(--ui-1); }
 .login-field { display: flex; flex-direction: column; min-width: 0; }
-.login-submit { width: 100%; min-height: 48px; font-size: 15px; }
+/* The second class is load-bearing, not noise: ``.ui-btn`` is declared further down this
+   file and sets ``min-height: 42px`` and ``font-size: 14px``, so a bare ``.login-submit``
+   loses the cascade at equal specificity and both of these were dead - the button shipped
+   at the generic size while this rule said otherwise. Two classes beat one whatever the
+   order, so the intent holds even if ``.ui-btn`` moves again. */
+.login-form .login-submit { width: 100%; min-height: 46px; font-size: 15px; }
 
 .login-note {
     display: flex;
@@ -471,17 +481,54 @@ input, select, textarea, button {
     color: var(--ops-muted);
 }
 
-/* A phone gets the lockup as a header, not as half the screen: the mark, the
-   wordmark and the year, and the tagline stays behind - the worker standing at
-   the gate already knows what the company does. */
+/* A phone gets the lockup as a strip, not as half the screen: the mark, the wordmark
+   and the year side by side, and the tagline stays behind - the worker standing at the
+   gate already knows what the company does.
+
+   Stacked, this block cost 208px of the roughly 600px a phone browser hands back, and
+   the card came to 689px - so *Sign In* sat below the fold and the form had to be
+   scrolled before it could be submitted to a worker standing in the sun. Side by side
+   the same lockup is about a third of that, and the whole screen fits without the
+   primary action ever leaving the viewport. Nothing is dropped to get there: the mark,
+   the wordmark and the year are all still on screen. */
 @media (max-width: 899px) {
     .login-card { grid-template-columns: minmax(0, 1fr); }
-    .login-brand { padding: var(--ui-5) var(--ui-4); }
-    .login-mark { width: 58px; margin-bottom: 12px; }
-    .login-company { font-size: 24px; }
+    .login-brand {
+        flex-direction: row;
+        align-items: center;
+        justify-content: flex-start;
+        gap: var(--ui-3);
+        padding: 10px var(--ui-4);
+        text-align: start;
+    }
+    .login-lockup { align-items: flex-start; }
+    .login-mark { width: 38px; margin-bottom: 0; }
+    .login-company { font-size: 20px; }
+    .login-legal { margin-top: 4px; font-size: 9px; letter-spacing: 0.24em; }
+    .login-est { margin-top: 3px; width: min(100%, 176px); }
     .login-tagline { display: none; }
-    .login-est { margin-top: 10px; }
-    .login-form-panel { padding: var(--ui-5) var(--ui-4); }
+
+    .login-topbar { padding-top: calc(var(--safe-top) + var(--ui-3)); }
+
+    /* The last of the vertical budget, and the reason it is spent here: measured in a
+       320x640 frame, the shipped page came to 680px - *Sign In* 40px below the fold, and
+       the worker had to scroll a login form before they could submit it. Every number
+       below takes a few pixels from spacing, none from a control: the fields keep their
+       42px, the button keeps its 44px. 375px was 20px over and 414px already fit. */
+    .login-stage {
+        padding: var(--ui-2) calc(var(--safe-right) + var(--ui-3)) calc(var(--safe-bottom) + var(--ui-2)) calc(var(--safe-left) + var(--ui-3));
+    }
+    .login-form-panel { padding: var(--ui-3); gap: var(--ui-3); }
+    .login-title { font-size: 18px; }
+    .login-subtitle { font-size: 12px; line-height: 1.45; }
+    .login-form { gap: 8px; margin-top: 0; }
+    .login-form .ui-label { margin-bottom: 3px; }
+    .login-form .login-submit { min-height: 44px; }
+    .login-footer { padding-bottom: calc(var(--safe-bottom) + var(--ui-2)); }
+    /* The two controls above the form stay at 40px on a phone: cutting them to 36 bought
+       4px of height and cost the only touch targets on the screen that are not the
+       fields, which is the wrong four pixels to save. */
+    .login-topbar .icon-button { width: 40px; height: 40px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -571,6 +618,7 @@ input, select, textarea, button {
     --ops-calm: #475569;
     --ops-calm-wash: rgba(100, 116, 139, 0.14);
     --ops-live: #16a34a;
+    --ops-live-wash: rgba(22, 163, 74, 0.14);
     --ops-track: rgba(100, 116, 139, 0.22);
     --ops-shadow: 0 1px 2px rgba(15, 23, 42, 0.06), 0 8px 24px -20px rgba(15, 23, 42, 0.35);
     --ops-mono: ui-monospace, SFMono-Regular, 'SF Mono', 'Cascadia Mono', Menlo, Consolas, monospace;
@@ -594,6 +642,7 @@ html.dark,
     --ops-calm: #cbd5e1;
     --ops-calm-wash: rgba(148, 163, 184, 0.2);
     --ops-live: #22c55e;
+    --ops-live-wash: rgba(34, 197, 94, 0.2);
     --ops-track: rgba(148, 163, 184, 0.28);
     --ops-shadow: none;
 }
@@ -1269,6 +1318,8 @@ textarea.ui-field { min-height: 88px; resize: vertical; line-height: 1.5; }
 .ui-table tbody tr:hover td { background: var(--ops-surface-2); }
 .ui-table .is-numeric { font-family: var(--ops-mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .ui-table .is-end { text-align: end; }
+.ui-table .is-in strong { color: var(--ops-live); }
+.ui-table .is-out strong { color: var(--ops-danger-ink); }
 
 /* ---------- Badges ------------------------------------------------------- */
 
@@ -1286,6 +1337,7 @@ textarea.ui-field { min-height: 88px; resize: vertical; line-height: 1.5; }
 }
 .ui-badge svg { width: 12px; height: 12px; flex: none; }
 .ui-badge.is-ok { background: var(--ops-primary-wash); color: var(--ops-primary-ink); }
+.ui-badge.is-live { background: var(--ops-live-wash); color: var(--ops-live); }
 .ui-badge.is-warn { background: var(--ops-warn-wash); color: var(--ops-warn); }
 .ui-badge.is-danger { background: var(--ops-danger-wash); color: var(--ops-danger-ink); }
 .ui-badge.is-quiet { background: var(--ops-calm-wash); color: var(--ops-calm); }
@@ -1375,5 +1427,620 @@ textarea.ui-field { min-height: 88px; resize: vertical; line-height: 1.5; }
     /* Phone-width cards, not a squeezed table: the same information, in the
        order a thumb scrolls it. */
     .ui-facts { gap: var(--ui-3); }
+}
+
+/* ==========================================================================
+   The worker's handset
+   ==========================================================================
+   The screen a worker opens at the gate, on a phone, in gloves, in daylight.
+   It was the last screen still written in raw Tailwind utilities - `bg-white
+   dark:bg-gray-800 rounded-2xl` repeated at every call site, four emoji doing
+   the work of an icon set, and a bottom bar whose only 'you are here' signal
+   was a colour change on 11px text.
+
+   This is the same system as the console, one step closer to the thumb:
+
+   * **Tokens, not utilities.** Every value below comes from the `--ops-*` and
+     `--ui-*` layers above, so the dark theme stays a token swap and this
+     screen cannot drift away from the console it is fed by.
+   * **Icons are inline SVG.** No emoji anywhere in this shell: an emoji
+     cannot take a token colour, renders as a different picture on every
+     phone, and a screen reader reads it aloud as its Unicode name - which on
+     a tab bar means the nav announces itself as 'spiral calendar, Clock'.
+   * **The active tab is marked three ways** - a top rule, a wash and a weight
+     change - because a 12% wash on a phone in direct sunlight is invisible,
+     and because 'which tab am I on' must not depend on colour vision.
+   * **Nothing important sits under 48px, and nothing important is at the very
+     bottom of the viewport** without the safe-area inset added to it: this is
+     the screen used one-handed, held at the bottom, on a device whose own
+     software overlays a home indicator there.
+   ========================================================================== */
+
+:root {
+    --hand-gutter: 16px;
+    --hand-radius: 16px;
+    --hand-radius-lg: 22px;
+    --hand-tap: 48px;
+    --hand-max: 720px;
+}
+
+/* ---------- Shell ------------------------------------------------------- */
+
+.hand-app {
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+    min-height: 100dvh;
+    background: var(--ops-surface-2);
+    color: var(--ops-text);
+}
+
+.hand-header {
+    position: sticky;
+    top: 0;
+    z-index: 30;
+    background: color-mix(in srgb, var(--ops-surface) 92%, transparent);
+    -webkit-backdrop-filter: blur(10px);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--ops-border);
+    padding-top: var(--safe-top);
+    padding-left: calc(var(--hand-gutter) + var(--safe-left));
+    padding-right: calc(var(--hand-gutter) + var(--safe-right));
+}
+
+.hand-header-inner {
+    display: flex;
+    align-items: center;
+    gap: var(--ui-3);
+    max-width: var(--hand-max);
+    margin: 0 auto;
+    padding: var(--ui-3) 0;
+    min-width: 0;
+}
+
+/* The mark, on the company's green: the handset carries the identity the same
+   way the console rail does, and it is the only colour on this screen that
+   belongs to the company rather than to the job. */
+.hand-brand {
+    width: 40px;
+    height: 40px;
+    flex: none;
+    display: grid;
+    place-items: center;
+    border-radius: var(--ui-radius-sm);
+    background: var(--brand-green);
+}
+.hand-brand img { width: 20px; height: auto; display: block; }
+
+.hand-who { display: flex; flex-direction: column; min-width: 0; flex: 1 1 auto; }
+.hand-who-name {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 800;
+    letter-spacing: -0.01em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.hand-who-role {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    color: var(--ops-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.hand-actions { display: flex; align-items: center; gap: var(--ui-2); flex: none; }
+.hand-actions .icon-button { width: 40px; height: 40px; background: transparent; }
+.hand-actions .icon-button:hover { border-color: var(--ops-primary); }
+
+.hand-main {
+    flex: 1 1 auto;
+    width: 100%;
+    max-width: var(--hand-max);
+    margin: 0 auto;
+    padding: var(--ui-4) calc(var(--hand-gutter) + var(--safe-right)) calc(var(--tabbar-height) + var(--safe-bottom) + var(--ui-5)) calc(var(--hand-gutter) + var(--safe-left));
+    display: flex;
+    flex-direction: column;
+    gap: var(--ui-4);
+    min-width: 0;
+}
+
+/* ---------- The bottom bar, rebuilt ------------------------------------- */
+
+.hand-tabs {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 40;
+    display: grid;
+    grid-auto-flow: column;
+    grid-auto-columns: 1fr;
+    background: color-mix(in srgb, var(--ops-surface) 94%, transparent);
+    -webkit-backdrop-filter: blur(10px);
+    backdrop-filter: blur(10px);
+    border-top: 1px solid var(--ops-border);
+    padding-bottom: var(--safe-bottom);
+    padding-left: var(--safe-left);
+    padding-right: var(--safe-right);
+}
+
+.hand-tabs button {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    min-height: var(--tabbar-height);
+    padding: 8px 4px;
+    background: transparent;
+    border: 0;
+    color: var(--ops-muted);
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: color var(--ui-press) ease, background-color var(--ui-press) ease;
+}
+.hand-tabs button svg { width: 22px; height: 22px; flex: none; }
+.hand-tabs button:focus-visible { outline: 2px solid var(--ops-primary); outline-offset: -3px; }
+.hand-tabs button:hover { color: var(--ops-text); }
+
+.hand-tabs button[aria-current='page'] {
+    color: var(--ops-primary-ink);
+    font-weight: 800;
+    background: var(--ops-primary-wash);
+}
+.hand-tabs button[aria-current='page']::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    inset-inline-start: 22%;
+    width: 56%;
+    height: 3px;
+    border-radius: 0 0 999px 999px;
+    background: var(--ops-primary);
+}
+
+/* ---------- The shift, as the one card that matters --------------------- */
+
+.hand-hero {
+    position: relative;
+    overflow: hidden;
+    padding: var(--ui-5) var(--ui-4);
+    border: 1px solid var(--ops-border);
+    border-radius: var(--hand-radius-lg);
+    background: var(--ops-surface);
+    box-shadow: var(--ops-shadow);
+    text-align: center;
+}
+/* On shift, the card says so with a wash and a left edge rather than with a
+   whole dark panel: the phone is read in sunlight, and a saturated fill is the
+   one thing that becomes unreadable there. */
+.hand-hero.is-live {
+    border-inline-start: 3px solid var(--ops-live);
+    background:
+        radial-gradient(120% 80% at 50% 0%, rgba(22, 163, 74, 0.1), transparent 62%),
+        var(--ops-surface);
+}
+
+.hand-hero-status {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--ui-2);
+    margin: 0;
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ops-muted);
+}
+.hand-dot {
+    width: 9px;
+    height: 9px;
+    flex: none;
+    border-radius: 999px;
+    background: var(--ops-live);
+    box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.2);
+    animation: ops-breathe 2.4s ease-in-out infinite;
+}
+.hand-dot.is-off { background: var(--ops-track); box-shadow: none; animation: none; }
+
+.hand-hero-word {
+    margin: var(--ui-2) 0 0;
+    font-size: 24px;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+}
+.hand-hero.is-live .hand-hero-word { color: var(--ops-live); }
+
+.hand-timer {
+    display: block;
+    margin: var(--ui-3) 0 0;
+    font-family: var(--ops-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: clamp(38px, 13vw, 54px);
+    font-weight: 700;
+    line-height: 1;
+    letter-spacing: -0.02em;
+    color: var(--ops-primary-ink);
+}
+.hand-timer.is-over { color: var(--ops-warn); }
+.hand-timer-label {
+    display: block;
+    margin-top: 6px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ops-muted);
+}
+
+.hand-hero-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: var(--ui-3) 0 0;
+    font-size: 13px;
+    color: var(--ops-muted);
+}
+.hand-hero-meta strong { color: var(--ops-text); font-weight: 700; }
+.hand-hero-meta.is-warn { color: var(--ops-warn); }
+.hand-hero-meta .hand-mono { font-family: var(--ops-mono); font-variant-numeric: tabular-nums; }
+
+.hand-policy {
+    margin: var(--ui-3) 0 0;
+    padding-top: var(--ui-3);
+    border-top: 1px dashed var(--ops-border);
+    font-size: 12px;
+    color: var(--ops-muted);
+}
+.hand-policy b { color: var(--ops-text); }
+
+/* ---------- The one action --------------------------------------------- */
+
+/* The one primary action, right-sized.
+
+   ``.clock-button`` above still carries the handset's old geometry - it *was* the card,
+   so 168px made sense and 128px was this app's first pass at trimming it. Both are a
+   poster, not a button: at 128px the control took a fifth of a 640px phone screen and
+   read as a panel rather than as something to press, and the facts under it (the month's
+   hours, the GPS state) fell off the fold with it. 76px is still half again the 48px
+   floor, still landable without looking, and puts the shift, the action and both figures
+   on one screen. Overriding here rather than at ``.clock-button`` keeps the console's
+   copy of that rule alone. */
+.hand-clock {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--ui-3);
+    min-height: 76px;
+    border-radius: var(--hand-radius);
+    font-size: 1.375rem;
+}
+/* Two classes, so this beats ``.clock-button.compact`` on source order alone. */
+.hand-clock.compact { min-height: 64px; font-size: 1.25rem; }
+.hand-clock svg { width: 24px; height: 24px; flex: none; }
+
+/* ---------- Facts, cards, rows ----------------------------------------- */
+
+.hand-facts {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--ui-3);
+}
+.hand-fact {
+    padding: var(--ui-3);
+    border: 1px solid var(--ops-border);
+    border-radius: var(--hand-radius);
+    background: var(--ops-surface);
+    box-shadow: var(--ops-shadow);
+    min-width: 0;
+}
+.hand-fact-label {
+    margin: 0;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ops-muted);
+}
+.hand-fact-value {
+    margin: 4px 0 0;
+    font-family: var(--ops-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 20px;
+    font-weight: 700;
+    color: var(--ops-text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.hand-fact-value.is-ok { color: var(--ops-live); }
+.hand-fact-value.is-warn { color: var(--ops-warn); }
+
+.hand-card {
+    padding: var(--ui-4);
+    border: 1px solid var(--ops-border);
+    border-radius: var(--hand-radius);
+    background: var(--ops-surface);
+    box-shadow: var(--ops-shadow);
+    min-width: 0;
+}
+.hand-card.is-live { border-inline-start: 3px solid var(--ops-live); }
+
+.hand-section-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--ui-2);
+    margin-bottom: var(--ui-3);
+}
+/* A card that is also a button: the whole note is the target, so it is a real
+   `<button>` - keyboard-operable and announced as one - and the reset of the browser's
+   default button styling lives here rather than at the call site. */
+.hand-card.is-note {
+    display: block;
+    width: 100%;
+    text-align: start;
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
+    transition: border-color var(--ui-press) ease, background-color var(--ui-press) ease;
+}
+.hand-card.is-note:hover { border-color: var(--ops-muted); background: var(--ops-surface-2); }
+.hand-card.is-note:focus-visible { outline: 2px solid var(--ops-primary); outline-offset: 2px; }
+
+.hand-note-subject {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 700;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.hand-note-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 8px 0 0; }
+.hand-note-preview {
+    margin: 8px 0 0;
+    font-size: 13px;
+    color: var(--ops-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.hand-note-stamp { margin: 6px 0 0; font-size: 11px; color: var(--ops-muted); }
+
+.hand-section-title { margin: 0; font-size: 16px; font-weight: 800; letter-spacing: -0.01em; }
+.hand-section-note { margin: 2px 0 0; font-size: 12px; color: var(--ops-muted); max-width: 52ch; }
+
+.hand-note-line { margin: 0 0 var(--ui-3); font-size: 12px; font-weight: 600; color: var(--ops-warn); }
+
+.hand-alert {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--ui-2);
+    padding: var(--ui-3);
+    border: 1px solid var(--ops-warn);
+    border-radius: var(--hand-radius);
+    background: var(--ops-warn-wash);
+    color: var(--ops-warn);
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 1.5;
+    text-align: start;
+}
+.hand-alert.is-danger { border-color: var(--ops-danger); background: var(--ops-danger-wash); color: var(--ops-danger-ink); }
+
+/* The overtime note. ``hidden`` is toggled by the ticking timer, and the rule below is
+   written as ``.hand-note.hidden`` on purpose: the Tailwind Play CDN injects its
+   ``.hidden { display: none }`` into a <style> tag after this file, so a bare ``.hidden``
+   at equal specificity would be the one that lost - and a note about overtime would sit
+   on the card all day, wrong. Two classes beat one, whichever sheet lands last. */
+.hand-note {
+    margin-top: var(--ui-3);
+    padding: var(--ui-3);
+    border: 1px solid var(--ops-warn);
+    border-radius: var(--hand-radius);
+    background: var(--ops-warn-wash);
+    color: var(--ops-warn);
+    font-size: 13px;
+    text-align: start;
+}
+.hand-note.hidden, .hand-alert.hidden { display: none; }
+.hand-note-title { margin: 0; font-weight: 700; }
+.hand-note-sub { margin: 3px 0 0; font-size: 12px; font-weight: 500; }
+
+/* ---------- Stacks and bubbles ----------------------------------------- */
+
+.hand-stack { display: flex; flex-direction: column; gap: var(--ui-2); min-width: 0; }
+
+.hand-bubble-row { display: flex; }
+.hand-bubble-row.is-mine { justify-content: flex-end; }
+.hand-bubble {
+    max-width: 85%;
+    padding: var(--ui-3);
+    border-radius: var(--hand-radius);
+    border: 1px solid var(--ops-border);
+    background: var(--ops-surface-2);
+    color: var(--ops-text);
+}
+.hand-bubble.is-mine { background: var(--ops-primary); border-color: var(--ops-primary); color: #fff; }
+.hand-bubble-who { margin: 0 0 3px; font-size: 11px; font-weight: 700; opacity: 0.75; }
+.hand-bubble-body { margin: 0; font-size: 14px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.hand-composer {
+    padding: var(--ui-4);
+    border: 1px solid var(--ops-primary);
+    border-radius: var(--hand-radius);
+    background: var(--ops-primary-wash);
+}
+.hand-field-label {
+    display: block;
+    margin-bottom: 5px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ops-muted);
+}
+.hand-field-group { display: block; margin-bottom: var(--ui-3); }
+
+.hand-alert svg { width: 16px; height: 16px; flex: none; margin-top: 2px; }
+.hand-alert p { margin: 0; }
+.hand-alert button {
+    margin-top: var(--ui-2);
+    min-height: 40px;
+}
+
+/* ---------- History: a rail on a phone, a table on a desk -------------- */
+
+.hand-rail { position: relative; margin: 0; padding: 0 0 0 var(--ui-4); list-style: none; }
+[dir='rtl'] .hand-rail { padding: 0 var(--ui-4) 0 0; }
+.hand-rail::before {
+    content: '';
+    position: absolute;
+    top: 6px;
+    bottom: 6px;
+    inset-inline-start: 5px;
+    width: 2px;
+    background: var(--ops-border);
+}
+.hand-stop {
+    position: relative;
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--ui-3);
+    padding: var(--ui-3) 0;
+    min-width: 0;
+}
+.hand-stop + .hand-stop { border-top: 1px solid var(--ops-border); }
+.hand-stop::before {
+    content: '';
+    position: absolute;
+    inset-inline-start: calc(-1 * var(--ui-4) + 1px);
+    top: calc(var(--ui-3) + 5px);
+    width: 10px;
+    height: 10px;
+    border-radius: 999px;
+    background: var(--ops-surface);
+    border: 2px solid var(--ops-muted);
+}
+.hand-stop.is-in::before { border-color: var(--ops-live); background: var(--ops-live); }
+.hand-stop.is-out::before { border-color: var(--ops-danger); background: var(--ops-surface); }
+.hand-stop-what { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.hand-stop-action { font-size: 14px; font-weight: 700; }
+.hand-stop.is-in .hand-stop-action { color: var(--ops-live); }
+.hand-stop.is-out .hand-stop-action { color: var(--ops-danger-ink); }
+.hand-stop-when, .hand-stop-where {
+    font-size: 12px;
+    color: var(--ops-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.hand-stop-when { font-family: var(--ops-mono); font-variant-numeric: tabular-nums; }
+.hand-stop-tally { flex: none; text-align: end; }
+.hand-stop-hours {
+    margin: 0;
+    font-family: var(--ops-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 15px;
+    font-weight: 700;
+}
+.hand-stop-status { margin: 1px 0 0; font-size: 11px; color: var(--ops-muted); }
+
+/* ---------- Profile: a definition list, not a stack of boxes ----------- */
+
+.hand-dl { margin: 0; display: flex; flex-direction: column; }
+.hand-dl-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--ui-3);
+    padding: 10px 0;
+    min-height: var(--hand-tap);
+}
+.hand-dl-row + .hand-dl-row { border-top: 1px solid var(--ops-border); }
+.hand-dl dt { margin: 0; font-size: 13px; font-weight: 600; color: var(--ops-muted); }
+.hand-dl dd { margin: 0; font-size: 14px; font-weight: 700; color: var(--ops-text); text-align: end; min-width: 0; }
+.hand-dl dd.is-mono { font-family: var(--ops-mono); font-variant-numeric: tabular-nums; }
+
+.hand-logout {
+    width: 100%;
+    margin-top: var(--ui-3);
+    min-height: var(--hand-tap);
+}
+
+/* ---------- The desktop worker layout ---------------------------------- */
+
+.hand-desk {
+    flex: 1 1 auto;
+    width: 100%;
+    max-width: 1080px;
+    margin: 0 auto;
+    padding: var(--ui-5) var(--ui-4);
+    padding-left: calc(var(--ui-4) + var(--safe-left));
+    padding-right: calc(var(--ui-4) + var(--safe-right));
+    display: grid;
+    grid-template-columns: minmax(0, 400px) minmax(0, 1fr);
+    gap: var(--ui-5);
+    align-items: start;
+    min-width: 0;
+}
+.hand-desk-col { display: flex; flex-direction: column; gap: var(--ui-4); min-width: 0; }
+
+/* The desk layout's record table: four columns that mean something squeeze into
+   nothing when the window is narrow, so it keeps a floor and scrolls inside its own
+   card instead. A row that has to be read is better than a column that has to be
+   guessed, and the wrapper already carries ``overflow-x``. */
+.hand-desk table.ui-table { min-width: 460px; }
+
+@media (max-width: 899px) {
+    .hand-desk { grid-template-columns: minmax(0, 1fr); gap: var(--ui-4); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .hand-dot { animation: none; }
+    .hand-tabs button { transition: none; }
+}
+
+/* ---------- Phone ergonomics: nothing to tap under 40px ------------------ */
+/* 32px is a fine target under a mouse: it is the size that keeps a nine-column roster on
+   one line, and every rule below was written for exactly that. A thumb is not a mouse, and
+   the audit that found these found them everywhere - the site filters on Live Ops, the
+   period chips and "Copy link" on Shifts, the note filters, the device panel's two test
+   buttons. Raised together here rather than rule by rule, because the reason is the same
+   for all of them and a rule that grows one chip should grow its neighbours. Heights only:
+   width is what the dense rows are short of, and a chip that grows taller wraps. */
+@media (max-width: 899px) {
+    .ui-chip,
+    .ops-chip,
+    .ui-btn-sm,
+    .ui-btn.is-icon { min-height: 40px; }
+    .ui-btn.is-icon { min-width: 40px; }
+
+    /* The console builds a fair amount of markup out of Tailwind utilities rather than out
+       of a component class - the links screen's two selects and its Revoke/Taps buttons,
+       the notes row's Open button - so a component-level floor never reaches them. One rule
+       per element type inside the shell covers what a class list cannot, and it is the same
+       rule stated once: on a phone, no control is under 40px. Text boxes keep their own 42px
+       from ``.ui-field``; a checkbox is a box, not a target, and is left alone. */
+    .admin button,
+    .admin select,
+    .admin input[type='text'],
+    .admin input[type='password'],
+    .admin input[type='email'],
+    .admin input[type='tel'],
+    .hand-app select,
+    .hand-app input[type='text'],
+    .hand-app input[type='password'] { min-height: 40px; }
 }
 

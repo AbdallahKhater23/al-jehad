@@ -520,6 +520,33 @@ const results = {};
         composer_shown: env.evaluate("document.getElementById('workerNotes').innerHTML").indexOf('data-note-composer') >= 0
     };
 }
+
+// 13. a code this build has no wording for is opened up, not printed raw
+//
+// The API can hold a category or status this build predates - the same way the live one
+// held "answered" while the labels only named the four the console moves a note through.
+// ``I18n.__`` answers with the key in that case, so the naive label put
+// ``noteCat_undefined`` on the worker's card. A code is opened up into words instead, and
+// a field the server did not send renders no chip at all.
+{
+    const env = workerEnv();
+    const labels = (key) => env.evaluate(key);
+    results.code_labels = {
+        known_category: labels("WORKER_MODULES.noteCategoryLabel('password_reset')"),
+        known_status: labels("WORKER_MODULES.noteStatusLabel('in_progress')"),
+        unknown_category: labels("WORKER_MODULES.noteCategoryLabel('tool_allowance')"),
+        unknown_status: labels("WORKER_MODULES.noteStatusLabel('archived')"),
+        missing_category: labels("WORKER_MODULES.noteCategoryLabel(undefined)"),
+        null_status: labels("WORKER_MODULES.noteStatusLabel(null)"),
+        missing_chip: labels("WORKER_MODULES.noteCategoryChip(undefined)"),
+        unknown_chip: labels("WORKER_MODULES.noteCategoryChip('tool_allowance')")
+    };
+    // Arabic: the four the console ships are translated, an unknown code cannot be.
+    env.evaluate("I18n.setLang('ar')");
+    results.code_labels.arabic_known = labels("WORKER_MODULES.noteStatusLabel('resolved')");
+    results.code_labels.arabic_unknown = labels("WORKER_MODULES.noteCategoryLabel('tool_allowance')");
+    env.evaluate("I18n.setLang('en')");
+}
 """
 
 
@@ -669,6 +696,24 @@ def test_the_worker_opens_answers_and_closes_their_own_note(results):
     assert "/worker/notes/21/close" in urls
     reply = next(call for call in thread["calls"] if call["url"].endswith("/replies"))
     assert reply["body"] == {"body": "Still locked out."}
+
+
+def test_a_code_with_no_wording_in_this_build_is_opened_up_not_printed_raw(results):
+    labels = results["code_labels"]
+    assert labels["known_category"] == "Password", "a code the build knows keeps its wording"
+    assert labels["known_status"] == "Being handled"
+    assert labels["unknown_category"] == "Tool allowance", (
+        "a category the API can hold but this build predates reads as words, not as noteCat_..."
+    )
+    assert labels["unknown_status"] == "Archived"
+    assert labels["missing_category"] == "", "no category is not a category called undefined"
+    assert labels["null_status"] == ""
+    assert labels["missing_chip"] == "", "no category means no empty badge"
+    assert "tool_allowance" not in labels["unknown_chip"].replace("Tool allowance", "")
+    assert labels["arabic_known"] == "تم حلها", "the shipped statuses are still translated"
+    assert labels["arabic_unknown"] == "Tool allowance", (
+        "an unknown code has no Arabic, so it shows the words rather than a key"
+    )
 
 
 def test_the_workers_composer_refuses_an_empty_request(results):

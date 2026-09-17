@@ -420,6 +420,31 @@ const results = {};
         has_search_box: markup.indexOf('id="credentialsQuery"') >= 0
     };
 }
+
+// 10. the action row refuses to wrap in the table and wraps on the card
+//
+// Four labelled buttons are 426px wide together. In the nine-column roster that is the
+// reason for ``nowrap``: wrapping them doubled the height of every row. On the phone card
+// the same row on a 320px screen made the *whole document* 472px wide - a sideways-
+// scrolling credentials screen, with the fixed tab bar stopping short of the content.
+// That overflow is invisible to every assertion in this file, because the stub VM has no
+// layout engine and reports no geometry at all; what it can see is which of the two shapes
+// carries ``nowrap``, which is the decision the fix turned on.
+{
+    const env = credentialsEnv();
+    const rowStyle = (markup) => {
+        const match = /<span class="ui-row" style="([^"]*)"/.exec(markup);
+        return match ? match[1] : null;
+    };
+    env.evaluate("localStorage.setItem('layoutOverride', 'mobile')");
+    await env.evaluate("UI.renderAdminTab('Credentials')");
+    const phone = rowStyle(render(env));
+    env.evaluate("localStorage.setItem('layoutOverride', 'desktop')");
+    await env.evaluate("UI.renderAdminTab('Credentials')");
+    const table = rowStyle(render(env));
+    env.evaluate("localStorage.removeItem('layoutOverride')");
+    results.action_row = { phone: phone, table: table };
+}
 """
 
 
@@ -613,6 +638,16 @@ def test_the_phone_layout_shows_one_card_per_account(results):
     assert "Seed Worker" in mobile["first_card"]
     assert "Never set" not in mobile["first_card"], "the card belongs to the first account"
     assert mobile["has_search_box"] is True
+
+
+def test_the_action_row_wraps_on_the_card_and_not_in_the_table(results):
+    row = results["action_row"]
+    assert row["phone"] is not None, "the card has no action row to inspect"
+    assert "nowrap" not in row["phone"], (
+        "a 426px action row inside a 320px card makes the credentials page scroll sideways"
+    )
+    assert row["table"] is not None, "the table has no action row to inspect"
+    assert "nowrap" in row["table"], "the nine-column roster needs its four actions on one line"
 
 
 def test_a_dead_server_says_so_instead_of_showing_an_empty_roster(results):

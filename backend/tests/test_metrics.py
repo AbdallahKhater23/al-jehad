@@ -301,9 +301,12 @@ dashboard months later.
 
     # Failure-mode counters are the exception, and deliberately so: they exist to be *absent*
     # until something goes wrong, so a rule on them is a rule that fires on news rather than
-    # on traffic. Pinned here so nobody "completes" the set above by inventing a zero series.
+    # on traffic. What is pinned *here* is that they are documented, which is what makes the
+    # rule writable at all. That they carry no series until they have news is asserted in a
+    # fresh interpreter instead (see the subprocess test below): by the time this test runs,
+    # the refusals have been caused on purpose by the face-engine suite, so "no series" in
+    # *this* process would be a claim about the test session and not about the deployment.
     for family in ("attendance_face_model_failures_total", "attendance_face_engine_refusals_total"):
-        assert not samples(body, family), f"{family} published a series with nothing to report"
         assert f"# HELP {family}" in body, f"{family} is not documented in the payload"
 
 
@@ -379,7 +382,18 @@ def test_an_unknown_path_is_one_label_and_not_the_path(client):
 
 
 def test_the_label_sets_stay_small_after_a_full_exercise(client, app_module):
-    """A cap on cardinality is the difference between a metrics endpoint and a memory leak."""
+    """A cap on cardinality is the difference between a metrics endpoint and a memory leak.
+
+    Route, status, outcome and operation are vocabularies the application defines, so they are
+    capped absolutely: a series per requested path or per statement would blow past these
+    within one test's traffic. The face-engine ``job`` label is the one that is *not* capped
+    here, because its value is the ``__name__`` of whatever was submitted to the engine: the
+    application submits a fixed handful, but so does this suite, so an absolute number would
+    pin the test session rather than the endpoint. It is held to the property that matters
+    instead - the number of names does not grow with the number of requests, and no name can
+    be a request's own text.
+    """
+    before_jobs = label_values(scrape(client), "attendance_face_engine_job_seconds", "job")
     client.get("/api/v1/status")
     client.get("/api/v1/admin/users", headers=bearer(ADMIN))
     client.get("/api/v1/admin/sites", headers=bearer(ADMIN))
@@ -391,9 +405,16 @@ def test_the_label_sets_stay_small_after_a_full_exercise(client, app_module):
 
     assert len(label_values(body, "attendance_http_requests_total", "route")) <= 30
     assert len(label_values(body, "attendance_http_requests_total", "status")) <= 12
-    assert len(label_values(body, "attendance_face_engine_job_seconds", "job")) <= 12
     assert len(label_values(body, "attendance_verifications_total", "outcome")) <= 6
     assert len(label_values(body, "attendance_sqlite_statements_total", "operation")) <= 10
+
+    # Six requests, one punch: a code path that minted a label from anything the caller sent
+    # would add roughly that many names. The application's own fixed set adds a couple at most.
+    jobs = label_values(body, "attendance_face_engine_job_seconds", "job")
+    assert len(jobs - before_jobs) <= 6, sorted(jobs - before_jobs)
+    for name in jobs:
+        assert name and name.isidentifier() and len(name) <= 48, name
+        assert "not-a-real-token" not in name
 
 
 def test_sql_is_labelled_by_verb_and_never_by_statement(client, app_module):
@@ -768,6 +789,40 @@ def test_an_unhandled_exception_is_counted_as_a_500(client, app_module, monkeypa
 # ---------------------------------------------------------------------------
 # degrading without the library
 # ---------------------------------------------------------------------------
+def test_a_failure_counter_stays_silent_until_it_has_news():
+    """Nothing to report must mean no series - and only a fresh interpreter can say so.
+
+    A Prometheus client publishes *series*, so a counter with no children is a family with a
+    HELP line and no samples at all: absent from the payload, present in the documentation.
+    That is the shape an alerting rule wants ("fires on news, not on traffic"), and it is
+    invisible from inside this session, where the failure paths have been exercised on
+    purpose. So it is asserted where it is true: a clean interpreter that imports the module,
+    renders, and never causes a failure. A counter that "completes" its family with a zero
+    series fails here.
+    """
+    probe = (
+        "import telemetry\n"
+        "body = telemetry.render().decode()\n"
+        "families = ['attendance_face_model_failures_total', 'attendance_face_engine_refusals_total']\n"
+        "for family in families:\n"
+        "    assert '# HELP ' + family in body, 'undocumented: ' + family\n"
+        "    series = [\n"
+        "        line for line in body.splitlines()\n"
+        "        if line.startswith(family + '{') or line.startswith(family + ' ')\n"
+        "    ]\n"
+        "    assert not series, 'published with nothing to report: ' + repr(series)\n"
+        "print('SILENT_OK')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=str(BACKEND_DIR),
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert "SILENT_OK" in result.stdout, result.stderr[-500:]
+
+
 def test_every_helper_is_silent_when_the_library_is_missing():
     """Run in a clean interpreter with ``prometheus_client`` blocked at import."""
     probe = (
