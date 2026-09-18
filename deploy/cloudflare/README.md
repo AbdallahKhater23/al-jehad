@@ -19,6 +19,38 @@ So the Worker serves the frontend *and* forwards `/api`, `/static`, `/enroll` an
 backend. The browser only ever sees the Worker, so there is no CORS to configure and the
 document CSP's `connect-src 'self'` keeps holding.
 
+## First deploy, in order
+
+Backend first, then the Worker, and only then anything that depends on them. The order is not
+ceremony: the Worker's `API_ORIGIN` names the backend, so deploying the Worker first replaces a
+shell that at least loads with an app whose every call answers `api_unreachable`.
+
+1. **Commit and push the code the deployments build from** - `requirements.txt`, `railway.json`
+   and `.python-version` at the root, `deploy/cloudflare/` for the Worker. A push does not deploy
+   the Worker by itself: either `npx wrangler deploy` by hand (step 4) or Workers Builds wired to
+   the repo (bottom of this section).
+2. **Railway (browser login)** - connect the repository to the service (Source → connect,
+   Root Directory `/`), add a **Volume mounted at `/data`**, set `SECRET_KEY` and
+   `DATABASE_PATH=/data/times.db` (plus `BACKUP_DIR=/data/backups`), keep **one replica**, then
+   deploy and read **Deployments → View Logs** if it fails. Check
+   `https://<service>/api/v1/status` before going on.
+3. **`TRUSTED_PROXIES`, once you have a healthy deploy** - the edge is not loopback, so
+   `GET /api/v1/admin/readiness` reports `network_policy` with the peer address the app actually
+   sees (`forward_misuse.last_peer`); set `TRUSTED_PROXIES` to it (Railway's internal hop is in
+   `100.64.0.0/10`). Without it every worker shares one `15/minute` bucket and, with
+   `ADMIN_IP_ALLOWLIST` set, the admin gate refuses everybody with `proxy_not_trusted`.
+4. **Cloudflare (browser login)** - `npx --yes wrangler login`, then
+   `cd deploy/cloudflare && npx --yes wrangler deploy`.
+5. **Verify** - `python deploy/cloudflare/verify_live.py --worker <worker-url> --origin <backend-url>`
+   (four passes), then again with a worker's credentials, `--location`, `--selfie` and `--punch`
+   (seven, with the punch refused by the API's own checks, which is still a pass).
+
+**If you would rather a push did the whole thing:** Workers Builds is the switch - Workers &
+Pages → the Worker → Settings → Builds → connect the repository, root directory
+`deploy/cloudflare`, deploy command `npx wrangler deploy`. Railway's equivalent is connecting the
+repository under Settings → Source. With both connected, `git push` rebuilds both; without them,
+a push rebuilds nothing.
+
 ## 1. Get the backend answering
 
 Deploy it (root README, *Running the backend on Railway*), then check the address the Worker
@@ -73,6 +105,28 @@ binding, and the four path prefixes from `wrangler.toml`). `backend/tests/test_c
 fails if the code's list and `wrangler.toml`'s list stop agreeing, so change both together.
 
 ## 3. Check it
+
+```bash
+# the whole path in one run: backend, the Worker, the shell, and the punch screen's own calls
+python deploy/cloudflare/verify_live.py \
+    --worker https://al-jehad1.abdallahtamet281.workers.dev \
+    --origin https://al-jehad-production.up.railway.app
+
+# ... and with a worker's credentials, the two calls the punch screen makes, through the Worker
+python deploy/cloudflare/verify_live.py --worker <worker-url> --location 30.05,31.23 \
+    --user-id <id> --email <worker> --password <pw> --selfie <a.jpg> --punch
+```
+
+`verify_live.py` checks each piece in the order that makes the first failure the one worth
+reading, and names the answer instead of leaving a status code to interpret: a 404 from the
+asset layer (no proxy), `worker_misconfigured`, `api_unreachable`, a JSON 502 carrying
+`x-railway-fallback` (the host has no healthy service), or Cloudflare's own `error code: 1010`
+(your *client* was banned by its bot rules - the deployment may be fine). The punch is expected
+to be *refused* most of the time - a geofence, an unenrolled account, a punch outside the
+site's window - and a refusal is a pass: what it proves is that the API judged the request,
+rather than an asset host answering it. `--password` can come from `$PUNCH_PASSWORD` instead.
+
+The same path by hand, if you want one curl:
 
 ```bash
 curl -s https://al-jehad1.abdallahtamet281.workers.dev/api/v1/status   # JSON, not an HTML 404
