@@ -159,7 +159,13 @@ DEFAULT_SHIFT_RULES: dict[str, Any] = {
     "clock_in_window_end": "06:30",
     "regular_hours": 8.0,
     "overtime_notify_hours": 8.1,
-    "site_timezone": "KUWAIT",
+    # A zone the runtime can actually resolve. This used to say "KUWAIT", which is not an
+    # IANA key: ``ZoneInfo`` raises for it, so ``shift_windows.resolve_timezone`` fell back to
+    # ``DEFAULT_TIMEZONE`` (Africa/Cairo, below in ``shift_windows``) on every punch while the
+    # console displayed the word KUWAIT as if it were the site's clock. The two agreed by
+    # accident and only because the fallback happened to be the zone we meant - a silent
+    # substitution is indistinguishable from a real setting until someone edits the other one.
+    "site_timezone": "Africa/Cairo",
     # The unpaid break and the end of the paid day. A full day is 8 h paid plus a
     # 30-minute unpaid break (8.5 h on site); ``shift_hours.py`` is the only module that
     # turns those numbers into money, and every path that closes a shift asks it.
@@ -2901,7 +2907,11 @@ async def update_shift_rules(
         if value is None:
             if key in _COMPANY_WINDOW_KEYS:
                 changes[key] = ""
-
+            # ``continue`` matters: without it the line below wrote the ``None`` back over the
+            # ``''`` - straight into a ``NOT NULL`` column, so clearing the company clock-in
+            # window answered 500 and saved nothing. It also kept a ``None`` for every other
+            # field in play, which is what "not supplied" has to mean.
+            continue
         changes[key] = value
     # Refuse nonsense rather than storing it: a negative break or a paid day of zero
     # would silently pay every worker for nothing, and 0/1 is not a preference.

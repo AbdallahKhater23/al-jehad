@@ -1,6 +1,9 @@
 __pycache__/
 temp/
 backend/certs/
+# Wrangler's local build state, written by ``wrangler dev`` / ``wrangler deploy`` from
+# deploy/cloudflare/. Machine-specific and regenerated on every run, like a venv.
+.wrangler/
 # ONNX liveness model: a binary artifact that does not belong in git history.
 # Place it at backend/models/minifasnet.onnx (see backend/models/README.md).
 backend/models/*.onnx

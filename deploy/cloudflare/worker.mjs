@@ -16,7 +16,8 @@
  *   1. **serves the frontend** from the ``ASSETS`` binding (``../frontend``, deployed with
  *      the Worker), and
  *   2. **proxies the paths the backend owns** - ``/api``, ``/static``, ``/enroll``, ``/q`` -
- *      to the Cloudflare Tunnel in front of the backend.
+ *      to the backend's own public address: the Railway service it is deployed as, or a
+ *      tunnel, for as long as the backend is running on somebody's machine.
  *
  * EVERYTHING ELSE IS A FRONTEND ASSET, WHICH IS THE SECURITY HALF. The proxy list is an
  * allow-list, not a deny-list: a path nobody listed is served from the asset bundle (a 404
@@ -41,11 +42,11 @@
 //: that must keep working for somebody with no account and no session.
 const BACKEND_PREFIXES = ['/api', '/static', '/enroll', '/q'];
 
-//: Tunnels that answer an unrecognised client with an HTML interstitial. Cloudflare Tunnel -
-//: the deployment this Worker is written for - does not, so nothing needs skipping for it.
-//: ngrok's free tier does, and the frontend already sends this header when it talks to one of
-//: those directly; the Worker is now that client, so it sends it too. Mirrors
-//: ``TUNNEL_HOST_SUFFIXES`` in ``frontend/frontendjavascript.js``.
+//: Hosts that answer an unrecognised client with an HTML interstitial. A real host (Railway,
+//: or a Cloudflare Tunnel) does not, so nothing needs skipping for it. ngrok's free tier does,
+//: and the frontend already sends this header when it talks to one of those directly; the
+//: Worker is now that client, so it sends it too. Mirrors ``TUNNEL_HOST_SUFFIXES`` in
+//: ``frontend/frontendjavascript.js``.
 const TUNNEL_HOST_SUFFIXES = ['ngrok-free.dev', 'ngrok-free.app', 'ngrok.app', 'ngrok.io', 'ngrok.dev'];
 
 //: Methods with no body, so a body is never attached to them.
@@ -144,13 +145,14 @@ async function proxyToApi(request, env, url) {
     try {
         response = await fetch(target.toString(), init);
     } catch (err) {
-        // The tunnel is down or the address is wrong - which is a fact about the deployment,
+        // The backend is down or the address is wrong - which is a fact about the deployment,
         // and is worth saying rather than reporting as an auth error on every screen.
         return problem(
             502,
             'api_unreachable',
             `The API at ${origin} could not be reached from this Worker ` +
-                `(${(err && err.message) || err}). Check that the tunnel is running.`
+                `(${(err && err.message) || err}). Check that the backend is up - that is the ` +
+                'Railway service, or a tunnel if the backend is running on your machine.'
         );
     }
     if (BODYLESS_STATUSES.has(response.status)) {

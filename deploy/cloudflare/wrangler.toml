@@ -2,7 +2,7 @@
 #
 # ``wrangler deploy`` from this directory uploads ``../../frontend`` as static assets and the
 # Worker beside them, and publishes them at ``<name>.<account>.workers.dev``. See README.md in
-# this folder for the tunnel the backend sits behind, the dashboard-only route, and what to set
+# this folder for the address the backend answers on, the dashboard-only route, and what to set
 # before the first request.
 name = "al-jehad1"
 main = "worker.mjs"
@@ -21,12 +21,14 @@ binding = "ASSETS"
 run_worker_first = ["/api/*", "/static/*", "/enroll/*", "/q/*"]
 
 [vars]
-# The public https address of the backend's tunnel, without a trailing slash. Run the backend
-# with ``python backend/serve.py --tunnel`` and ``cloudflared tunnel --url http://localhost:8000``
-# (see README.md), then put that address here - a named tunnel's own hostname if the account
-# has a domain, because a quick tunnel's trycloudflare.com address changes on every restart
-# and this line is what would have to change with it.
+# The backend's public https address, without a trailing slash.
+#
+# This is the Railway service, which is what makes the app a deployment rather than a laptop
+# with a tunnel: the address does not change, so this line is written once. Point it at a tunnel
+# (``python backend/serve.py --tunnel`` + ``cloudflared tunnel --url http://localhost:8000``)
+# only while the host is down - a quick tunnel's trycloudflare.com address changes on every
+# restart, and changing it means editing this file and redeploying the Worker.
 #
 # It has no default on purpose: with it empty every API call answers a 500 that names this
 # variable, instead of the 404 that looks like the backend is broken.
-API_ORIGIN = "https://REPLACE-WITH-YOUR-TUNNEL.trycloudflare.com"
+API_ORIGIN = "https://al-jehad-production.up.railway.app"
