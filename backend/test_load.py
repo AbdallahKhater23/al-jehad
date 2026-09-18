@@ -4,7 +4,11 @@ import time
 
 import requests
 
+<<<<<<< HEAD:backend/test_load.py
 url = "https://sixth-subpanel-resample.ngrok-free.dev/"
+=======
+test_image_path = "./worker_photos/1.jpg" 
+>>>>>>> 33d9383 (Optimize backend performance and speed up face verification):test_load.py
 
 #: The reference selfies in ``worker_photos/`` are named after each account's immutable
 #: biometric id, not after the account id, so this takes whichever one is there instead of
@@ -24,10 +28,15 @@ total_time = 0.0
 for i in range(1, 51):
     action = "Clock In" if i % 2 != 0 else "Clock Out"
     
+    # Added the password field required by the updated verification route
     data_payload = {
         "worker_id": "1",
+<<<<<<< HEAD:backend/test_load.py
         'email_or_phone' : 'test@example.com',
         "password": "testpassword", 
+=======
+        "password": "123",
+>>>>>>> 33d9383 (Optimize backend performance and speed up face verification):test_load.py
         "action": action,
         "latitude": "30.050010", 
         "longitude": "31.230010"
