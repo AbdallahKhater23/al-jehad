@@ -15,7 +15,7 @@ import numpy as np
 from passlib.context import CryptContext
 
 # 1. OPTIMIZED: Reduced bcrypt rounds to 10 for much faster verification speed
-pwd_context = CryptContext(schemes=["bcrypt"], bcrypt__rounds=10, deprecated="auto")
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # 2. OPTIMIZED: RAM Cache to entirely eliminate SQLite overhead on user lookups
 USER_CACHE = {}
@@ -106,7 +106,7 @@ def compare_faces_sync(reference_json_path: str, live_image_data) -> dict:
             img_path=live_image_data, 
             model_name="VGG-Face",
             enforce_detection=True,
-            detector_backend="opencv" 
+            detector_backend="mtcnn" 
         )
         
         if len(live_embedding_objs) > 1:
