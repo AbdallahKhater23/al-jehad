@@ -222,7 +222,17 @@ def default_port() -> int:
     return port
 
 
-def main() -> None:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse the command line, and apply the one rule that couples two of the flags.
+
+    Split out from :func:`main` so the flags a host is configured with can be checked without
+    starting a server: ``railway.json`` names this command line, and a typo in it used to be
+    discoverable only by watching a deploy fail.
+
+    ``--tunnel`` is a promise that something in front of us terminates TLS, so it implies plain
+    HTTP on this side. Serving the self-signed certificate to a proxy that already did the
+    handshake is what makes GPS and the camera fail on a phone while the laptop looks fine.
+    """
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--host", default="0.0.0.0", help="bind address (default: 0.0.0.0)")
     parser.add_argument(
@@ -236,12 +246,17 @@ def main() -> None:
         "--tunnel", action="store_true",
         help="plain HTTP for a tunnel that provides the HTTPS (ngrok, cloudflared, ...)"
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.tunnel:
         # The tunnel terminates TLS and forwards plain HTTP to us, so the browser
         # still gets a real trusted certificate. That is enough for GPS + camera,
         # and it avoids the self-signed warning entirely.
         args.http = True
+    return args
+
+
+def main() -> None:
+    args = parse_args()
 
     if _port_already_in_use(args.port):
         print(
