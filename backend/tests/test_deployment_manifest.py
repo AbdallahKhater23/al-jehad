@@ -1,0 +1,197 @@
+"""The files a host builds from: the runtime manifest, the start command, and the port.
+
+WHY THIS EXISTS
+---------------
+The repository had no runtime requirements file, and its own note in
+``backend/requirements-dev.txt`` said so and called it a deployment risk. It was one: a host
+that builds from this repository (Railway, Render, Fly) has nothing to install, so the
+application either never starts or starts with whatever the builder guessed - and the symptom
+is a 502 from the edge with no error anywhere the application can show you. That is what
+``al-jehad-production.up.railway.app`` answered before these files existed.
+
+Three things have to stay true together, and each one is silent when it breaks:
+
+* **the manifest pins the runtime and nothing more.** A missing pin is an application that
+  installs something other than what was tested; a test-only package in it is build time and
+  disk on a host we pay for. Both directions are asserted, and so is the shape (``name==version``
+  - a floating requirement is not a manifest);
+* **the healthcheck path is a real route that answers 200 without a session.** Railway asks that
+  path before it hands over traffic: a wrong one marks a perfectly healthy deploy unhealthy, and
+  an authenticated one does the same, since the platform is not a user;
+* **the start command binds the port the host gives it.** ``PORT`` is how Railway, Render, Fly
+  and Heroku say which port to listen on, and ignoring it produces the same 502 with the
+  application running and healthy at a port nobody forwards to.
+
+The last check is the one that keeps ``.python-version`` honest: the manifest is a freeze of a
+*particular* interpreter, and the pair has to move together.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import re
+import sys
+
+import pytest
+
+from harness import PROJECT_ROOT
+
+REQUIREMENTS = PROJECT_ROOT / "requirements.txt"
+RAILWAY = PROJECT_ROOT / "railway.json"
+PYTHON_VERSION = PROJECT_ROOT / ".python-version"
+SERVE = PROJECT_ROOT / "backend" / "serve.py"
+
+#: Imported by the application or by ``serve.py`` at runtime. Each one is a feature that
+#: disappears - or a start that fails - if the host does not install it.
+RUNTIME_PINS = (
+    "fastapi",
+    "uvicorn",
+    "deepface",
+    "tensorflow",
+    "numpy",
+    "scipy",
+    "pydantic",
+    "starlette",
+    "slowapi",
+    "PyJWT",
+    "passlib",
+    "python-multipart",
+    "python-dotenv",
+    "pillow",
+    "requests",
+)
+
+#: Pinned by ``backend/requirements-dev.txt`` for the suite and the operator scripts. The venv
+#: they were frozen from is the *test* environment, so they all appear in a naive ``pip freeze``
+#: - and none of them belongs in what a host installs.
+TEST_ONLY = ("pytest", "pluggy", "iniconfig", "httpx2", "httpcore2", "pyee", "playwright")
+
+PIN = re.compile(r"^([A-Za-z0-9_.\-]+)==([^\s=<>!~]+)$")
+
+
+def _manifest() -> dict[str, str]:
+    """``{name.lower(): version}`` for the runtime manifest, comments dropped."""
+    pins: dict[str, str] = {}
+    for line in REQUIREMENTS.read_text(encoding="utf-8").splitlines():
+        entry = line.strip()
+        if not entry or entry.startswith("#"):
+            continue
+        match = PIN.match(entry)
+        assert match, f"{entry!r} is not a pinned requirement (name==version)"
+        pins[match.group(1).lower()] = match.group(2)
+    return pins
+
+
+@pytest.fixture(scope="module")
+def serve_module():
+    """``backend/serve.py`` loaded by path, without running ``main()``."""
+    spec = importlib.util.spec_from_file_location("serve_under_test", SERVE)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_runtime_manifest_exists_at_the_root_and_is_fully_pinned():
+    """The file a builder looks for, in the place it looks."""
+    assert REQUIREMENTS.exists(), "a host building from this repo installs nothing without it"
+    pins = _manifest()
+    assert len(pins) > 40, f"the manifest looks truncated: {len(pins)} pins"
+
+
+@pytest.mark.parametrize("name", RUNTIME_PINS)
+def test_every_runtime_import_is_pinned(name):
+    assert name.lower() in _manifest(), (
+        f"{name} is imported at runtime and is not in requirements.txt: a host that builds "
+        "from this repository would start without it"
+    )
+
+
+@pytest.mark.parametrize("name", TEST_ONLY)
+def test_no_test_only_package_is_installed_on_a_host(name):
+    """They are pinned in ``backend/requirements-dev.txt``, which is where they belong."""
+    assert name.lower() not in _manifest(), (
+        f"{name} is a test/tooling dependency and is installed on every deploy"
+    )
+
+
+def test_the_optional_extras_stay_optional():
+    """onnxruntime, qrcode and openpyxl degrade gracefully, so they are not hard requirements."""
+    pins = _manifest()
+    for name in ("onnxruntime", "qrcode", "openpyxl"):
+        assert name not in pins, (
+            f"{name} is an optional extra (see backend/requirements-optional.txt): pinning it "
+            "turns a feature that degrades into a start that fails"
+        )
+
+
+def test_the_python_version_matches_the_interpreter_the_manifest_was_frozen_from():
+    """A freeze is known-good on one interpreter; the pair has to move together."""
+    pinned = PYTHON_VERSION.read_text(encoding="utf-8").strip()
+    assert re.fullmatch(r"\d+\.\d+", pinned), pinned
+    live = f"{sys.version_info.major}.{sys.version_info.minor}"
+    assert pinned == live, (
+        f"the manifest was frozen on Python {pinned} and this interpreter is {live}: "
+        "regenerate requirements.txt and update .python-version together"
+    )
+
+
+def test_the_railway_config_has_the_pieces_a_deploy_needs():
+    config = json.loads(RAILWAY.read_text(encoding="utf-8"))
+    assert config["build"]["builder"] == "NIXPACKS"
+    start = config["deploy"]["startCommand"]
+    assert "backend/serve.py" in start, start
+    assert "--tunnel" in start, (
+        "the host terminates TLS: serving a self-signed certificate behind it is what makes "
+        "GPS and the camera fail on a phone"
+    )
+    assert config["deploy"]["healthcheckTimeout"] >= 120, (
+        "the first start runs migrations and imports TensorFlow; a short timeout marks a "
+        "healthy deploy unhealthy"
+    )
+
+
+def test_the_healthcheck_path_is_a_route_that_answers_without_a_session(client):
+    """Railway is not a user: a path that needs a token marks every deploy unhealthy."""
+    path = json.loads(RAILWAY.read_text(encoding="utf-8"))["deploy"]["healthcheckPath"]
+    response = client.get(path)
+    assert response.status_code == 200, f"{path} answered {response.status_code}"
+    assert response.json().get("status"), response.text[:200]
+
+
+# ---------------------------------------------------------------------------
+# the port the host gives us
+# ---------------------------------------------------------------------------
+def test_the_port_flag_defaults_to_the_host_s_port_and_stays_8000_locally(serve_module, monkeypatch):
+    """One command on the laptop and on the host, with the port written down once."""
+    monkeypatch.delenv("PORT", raising=False)
+    assert serve_module.default_port() == 8000
+
+    monkeypatch.setenv("PORT", "7431")
+    assert serve_module.default_port() == 7431
+
+
+@pytest.mark.parametrize("value", ["", "   ", "abc", "0", "99999", "-5", "8080.5"])
+def test_a_port_that_is_not_a_port_falls_back_instead_of_crashing(serve_module, monkeypatch, value):
+    """A typo in a dashboard variable must not look like an application that crashes on start."""
+    monkeypatch.setenv("PORT", value)
+    assert serve_module.default_port() == 8000
+
+
+def test_the_start_command_is_accepted_and_means_plain_http(serve_module, monkeypatch):
+    """Run the real parser over the configured command line, not a paraphrase of it.
+
+    A bad flag here is a deploy that fails at start, and ``--tunnel`` is the flag that matters:
+    it must turn the bundled certificate *off*, because a proxy has already done the handshake.
+    """
+    command = json.loads(RAILWAY.read_text(encoding="utf-8"))["deploy"]["startCommand"]
+    argv = command.split()
+    assert argv[0].startswith("python"), command
+
+    monkeypatch.setenv("PORT", "7431")
+    args = serve_module.parse_args(argv[1:])  # ["backend/serve.py", "--tunnel"]
+    assert args.tunnel is True
+    assert args.http is True, "the host terminates TLS; serving our certificate behind it breaks GPS"
+    assert args.port == 7431, "the host's PORT is what the edge forwards to"
+    assert args.reload is False, "reloading in production restarts the app under load"
