@@ -179,6 +179,40 @@ def test_a_port_that_is_not_a_port_falls_back_instead_of_crashing(serve_module, 
     assert serve_module.default_port() == 8000
 
 
+def test_the_startup_banner_names_the_database_the_app_actually_opens(serve_module, monkeypatch, tmp_path):
+    """``DATABASE_PATH`` is the volume, and the banner is how an operator knows where the data is.
+
+    It used to print the checkout's ``times.db`` no matter what, so a correctly configured
+    deploy on a mounted volume still reported a path inside the container - the one line that
+    would be read while deciding whether the next deploy is about to take the punches with it.
+    """
+    monkeypatch.delenv("DATABASE_PATH", raising=False)
+    assert serve_module.resolved_database() == PROJECT_ROOT / "times.db"
+
+    volume = tmp_path / "data" / "times.db"
+    monkeypatch.setenv("DATABASE_PATH", str(volume))
+    assert serve_module.resolved_database() == volume
+
+    monkeypatch.setenv("DATABASE_PATH", "vol/times.db")  # relative, like a sloppy dashboard entry
+    assert serve_module.resolved_database() == PROJECT_ROOT / "vol" / "times.db"
+
+
+def test_a_volume_that_is_not_mounted_is_named_in_the_startup_message(serve_module, tmp_path):
+    """SQLite will not create the directory, and its own error names neither setting nor cause.
+
+    The directory is deliberately not created for the operator: a missing volume that is
+    papered over looks exactly like a mounted one until the redeploy that takes every punch
+    with it. What the server owes them instead is one line saying which path is missing.
+    """
+    mounted = tmp_path / "data"
+    mounted.mkdir()
+    assert serve_module.volume_warning(mounted / "times.db") is None
+
+    message = serve_module.volume_warning(tmp_path / "not-mounted" / "times.db")
+    assert message and "not-mounted" in message
+    assert "DATABASE_PATH" in message, "the line has to name the setting that is wrong"
+
+
 def test_the_start_command_is_accepted_and_means_plain_http(serve_module, monkeypatch):
     """Run the real parser over the configured command line, not a paraphrase of it.
 
@@ -190,7 +224,7 @@ def test_the_start_command_is_accepted_and_means_plain_http(serve_module, monkey
     assert argv[0].startswith("python"), command
 
     monkeypatch.setenv("PORT", "7431")
-    args = serve_module.parse_args(argv[1:])  # ["backend/serve.py", "--tunnel"]
+    args = serve_module.parse_args(argv[2:])  # the flags, i.e. ["--tunnel"]
     assert args.tunnel is True
     assert args.http is True, "the host terminates TLS; serving our certificate behind it breaks GPS"
     assert args.port == 7431, "the host's PORT is what the edge forwards to"

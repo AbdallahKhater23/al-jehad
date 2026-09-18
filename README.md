@@ -58,21 +58,89 @@ After that the origin counts as secure and GPS, camera and "Add to Home Screen"
 all work. Workers can also self-check from **Profile → Device status** (Test
 location / Test camera).
 
-## Going live over a tunnel (Cloudflare Tunnel / ngrok)
+## Going live
 
-A tunnel is the best option for real workers: it gives a **proper trusted HTTPS
-certificate**, so there is no "not private" warning, and GPS + camera work on every
-device with no per-device setup.
+The app calls its own page origin for everything (`page origin + /api/v1`, see
+`API.resolveBaseURL`), so publishing it is two pieces that keep it one origin:
+
+| Piece | Where it runs |
+| --- | --- |
+| **The backend** | A host - the Railway service below - at an https address that does not change. |
+| **The frontend** | Cloudflare, as a Worker that serves the shell and proxies the API paths to that address. |
+
+Both give a **proper trusted HTTPS certificate**, so there is no "not private" warning and GPS +
+camera work on every device with no per-device setup. Running both on this machine behind a
+tunnel is the fallback at the end of this section, and it works - it is just the version that
+stops when the machine sleeps.
+
+### The frontend on Cloudflare Workers
+
+`deploy/cloudflare/` is a Worker that serves the frontend as static assets and proxies
+`/api`, `/static`, `/enroll` and `/q` to the backend address in its `API_ORIGIN`. The proxy is
+not optional: the app is single-origin by construction, so a shell hosted on Cloudflare with no
+proxy calls `<your-worker>/api/v1/...` and gets a 404 from the asset host (which is exactly what
+`al-jehad1.abdallahtamet281.workers.dev` did before the Worker existed). That folder holds the
+Worker, the `wrangler.toml`, the check to run before the first deploy, and the two things to
+watch after it.
+
+### The backend on a host (Railway, or any host that injects a port)
+
+The backend runs on a host rather than this laptop, which is what makes the address the Worker
+points at stop changing - and what stops the app depending on a machine being awake.
+`railway.json`, `.python-version` and `requirements.txt` at the root are the whole config: build
+with Nixpacks, start with `python backend/serve.py --tunnel`, and check `GET /api/v1/status`
+before releasing traffic.
 
 ```bash
-python backend/serve.py --tunnel          # terminal 1: plain HTTP on :8000 for the tunnel
-cloudflared tunnel --url http://localhost:8000   # terminal 2: the public HTTPS address
+railway up                     # or connect the repo in the dashboard
+railway volume add --mount-path /data
 ```
 
-`--tunnel` means "the tunnel provides the HTTPS, so do not make a self-signed
-certificate". Then open the printed `https://<words>.trycloudflare.com` address on the
-laptop and the phone. `ngrok http 8000` works the same way if that is what you have.
+Set these as **service variables** (not in a committed file):
 
+| Variable | Why |
+| --- | --- |
+| `SECRET_KEY` | **Required.** 32+ random chars (`python -m config --write-env`). Without it `build_settings()` raises and the app never imports - which on a host looks like a 502 from the edge, not like a configuration error. |
+| `DATABASE_PATH=/data/times.db` | Points the database at the mounted volume. Set `BACKUP_DIR=/data/backups` too. |
+| `TRUSTED_PROXIES` | The host's edge is not loopback, so until this lists it every worker is bucketed under one address: they hit `429`s together and the audit log records the proxy as the actor. `serve.py` prints the list it is using at startup; `GET /api/v1/readiness` reports `proxy_not_trusted`. |
+| `ENABLE_API_DOCS=0` | The default. Leave it unless you are debugging. |
+
+Three things that are easy to get wrong and silent when you do:
+
+- **A volume is not optional.** SQLite lives in a file; without one, every deploy and every
+  restart replaces the container's filesystem and the punches are gone. Run **one replica**:
+  SQLite is single-writer, and two instances on one file corrupts it.
+- **Memory.** The image imports TensorFlow and DeepFace, so the container wants roughly 1.5-2 GB
+  and a slow first start while the models load. `healthcheckTimeout` is 300s in `railway.json`
+  for that reason - a shorter one marks a healthy deploy unhealthy.
+- **Onnxruntime is not installed** (it is an optional extra), so liveness is advisory: when the
+  model is absent the API reports it and face *matching* still runs. Do not read the readiness
+  warnings as a broken deploy.
+
+Verify the host's own address before pointing anything at it - this deployment's is
+`https://al-jehad-production.up.railway.app`, so
+`https://al-jehad-production.up.railway.app/api/v1/status` must answer `{"status": ...}`. If it answers **502 "Application failed to respond"**, the edge is up
+and nothing healthy is behind it - read the deploy log, not the app log; the usual causes are a
+missing `SECRET_KEY` (see above), a builder with no `requirements.txt` (which is why the file is
+now committed), or an app bound to a port nobody forwards to (`PORT` is read by `serve.py`).
+
+### Fallback: a tunnel from this machine (cloudflared / ngrok)
+
+For when the host is down and the app is needed now. The same Worker is pointed at this address
+instead of the host's:
+
+```bash
+python backend/serve.py --tunnel                  # terminal 1: plain HTTP on :8000 for the tunnel
+cloudflared tunnel --url http://localhost:8000     # terminal 2: the public HTTPS address
+```
+
+`--tunnel` means "the tunnel provides the HTTPS, so do not make a self-signed certificate". Put
+the printed `https://<words>.trycloudflare.com` address in the Worker's `API_ORIGIN` and redeploy
+it; `ngrok http 8000` works the same way if that is what you have.
+
+- **The address changes on every restart.** That is the whole reason this is the fallback: the
+  Worker *holds* the address, so a new one means editing the config and redeploying, and the app
+  answers `api_unreachable` until you do.
 - **No front-end configuration needed.** The page and the API share one origin, so
   the app calls `https://<your-tunnel>/api/v1/...` automatically. (That also means
   no mixed-content blocking: the old hardcoded `http://<host>:8000` API URL would
@@ -80,24 +148,10 @@ laptop and the phone. `ngrok http 8000` works the same way if that is what you h
 - **First visit per browser, on ngrok only:** ngrok's free tier shows a "You are
   about to visit …" warning page. Click **Visit Site** once; after that the app
   loads normally. Cloudflare Tunnel shows no such page.
-- **Rate limiting stays per worker.** `serve.py` enables proxy headers, so the
-  `15/minute` limit on clock-in applies to each worker's real IP. Without that,
-  every worker behind the tunnel would share one bucket and hit 429s together.
-- Keep the tunnel URL private. It has no authentication in front of it.
-- **The tunnel address is not a frontend.** Anybody opening it gets the app, which
-  is fine, but a quick tunnel (`trycloudflare.com`) gets a *new* address every time
-  it restarts - so it is not a link to give workers. For that, put the shell on
-  Cloudflare and the tunnel behind the API.
-
-### Serving the frontend from Cloudflare Workers
-
-`deploy/cloudflare/` is a Worker that serves the frontend as static assets and proxies
-`/api`, `/static`, `/enroll` and `/q` to the tunnel, so the one address workers get is stable
-while the backend stays behind a tunnel on this machine. The proxy is not optional: the app is
-single-origin by construction, so a shell hosted on Cloudflare with no proxy calls
-`<your-worker>/api/v1/...` and gets a 404 from the asset host (which is exactly what
-`al-jehad1.abdallahtamet281.workers.dev` did before the Worker existed). That folder holds the
-Worker, the `wrangler.toml`, and the two things to watch after the first deploy.
+- **Rate limiting stays per worker**, and here it needs no setting: `serve.py` enables proxy
+  headers and cloudflared connects from `127.0.0.1`, which `TRUSTED_PROXIES` trusts by default.
+  On a host the edge is not loopback, so that variable has to be set by hand - see above.
+- Keep the address private. It has no authentication in front of it.
 
 ## Troubleshooting
 
@@ -1005,6 +1059,12 @@ password is still a head-admin-only action, and the offer is hidden where the se
 would answer 403.
 
 ## Tests
+
+`backend/tests/test_deployment_manifest.py` keeps the deployment files honest: runtime imports
+stay pinned in `requirements.txt` (and test-only packages stay out of it), the healthcheck path is
+a real route that answers 200 without a session, the start command in `railway.json` still parses
+and still means plain HTTP behind the host's TLS, and a `PORT` that is not a port number falls
+back to 8000 instead of failing the start.
 
 ```bash
 cd backend

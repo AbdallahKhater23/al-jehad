@@ -51,7 +51,7 @@ PROJECT_ROOT = BACKEND_DIR.parent
 # be started from the same place as the server it replaces - otherwise you silently
 # get a different, empty database. Run from the project root and import `backend.main`.
 APP_IMPORT = "backend.main:app"
-DATABASE_FILE = PROJECT_ROOT / "times.db"
+DEFAULT_DATABASE_FILE = PROJECT_ROOT / "times.db"
 CERT_DIR = BACKEND_DIR / "certs"
 CERT_FILE = CERT_DIR / "dev-cert.pem"
 KEY_FILE = CERT_DIR / "dev-key.pem"
@@ -68,6 +68,45 @@ OPENSSL_CANDIDATES = (
     "/usr/local/bin/openssl",
     "/opt/homebrew/bin/openssl",
 )
+
+
+def resolved_database() -> Path:
+    """The SQLite file the application will actually open, for the startup banner.
+
+    ``DATABASE_PATH`` is how a host points the app at a mounted volume, and ``config.py``
+    resolves it (``~`` expanded, a relative path taken from the working directory, which this
+    script has already set to the project root) before anything else reads the database. The
+    banner used to name the checkout's ``times.db`` unconditionally, so a deploy that was
+    correctly writing to ``/data/times.db`` still printed a path next to the code - and that
+    one line is how an operator answers "where is the data", usually while deciding whether a
+    redeploy is about to delete it.
+    """
+    raw = (os.environ.get("DATABASE_PATH") or "").strip()
+    path = Path(raw).expanduser() if raw else DEFAULT_DATABASE_FILE
+    return path if path.is_absolute() else (PROJECT_ROOT / path)
+
+
+def volume_warning(database: Path) -> str | None:
+    """What to say when the directory ``DATABASE_PATH`` points into does not exist.
+
+    SQLite will not create the directory, so the application dies in startup with
+    ``unable to open database file`` - a message that names neither the setting nor the most
+    likely cause. On a host the cause is almost always the same: the volume is not mounted at
+    the path the variable names, so the file would land on the container's own filesystem and
+    disappear with the next deploy.
+
+    The directory is deliberately **not** created here. A missing volume that is papered over
+    this way is indistinguishable from a mounted one until the redeploy that takes every punch
+    with it, and losing a payroll record silently is worse than a server that refuses to start.
+    """
+    folder = database.parent
+    if folder.exists():
+        return None
+    return (
+        f"the directory {folder} does not exist, so the database cannot be created there.\n"
+        "     On a host this usually means the volume is not mounted at that path: "
+        "DATABASE_PATH must point inside the mount (e.g. /data/times.db)."
+    )
 
 
 def trusted_proxies_for_uvicorn() -> str:
@@ -315,7 +354,11 @@ def main() -> None:
     print("\n" + "=" * 68)
     print("  Site Attendance server is starting")
     print("=" * 68)
-    print(f"  Database: {DATABASE_FILE}")
+    database_file = resolved_database()
+    print(f"  Database: {database_file}")
+    warning = volume_warning(database_file)
+    if warning:
+        print(f"  !! {warning}")
     print(f"  Working dir: {PROJECT_ROOT}")
     print(f"  Laptop:  {scheme}://localhost:{args.port}")
     for ip in ips:
@@ -324,9 +367,12 @@ def main() -> None:
     print("-" * 68)
     if args.tunnel:
         print(f"  Tunnel mode: point your tunnel at http://localhost:{args.port}")
+        print(f"      cloudflared tunnel --url http://localhost:{args.port}")
         print(f"      ngrok http {args.port}")
         print("  Then open the tunnel's https://... address on every device.")
-        print("  First visit per browser: click 'Visit Site' on the ngrok warning page.")
+        print("  On a host (Railway, Render, ...) this flag is how the edge terminates TLS:")
+        print("  nothing is listening on a public interface here, only on the port above.")
+        print("  First visit per browser, ngrok only: click 'Visit Site' on the warning page.")
         print("  The tunnel supplies the trusted HTTPS, so GPS and the camera work")
         print("  with no certificate warning.")
     elif args.http:

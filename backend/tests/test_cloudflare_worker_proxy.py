@@ -10,8 +10,8 @@ outage. The app is single-origin by construction - ``API.resolveBaseURL`` answer
 this Worker existed (checked with a request, not assumed: the shell answered 200, ``/api/v1/
 status`` answered 404).
 
-So the Worker serves the frontend and forwards the paths the backend owns to the tunnel. What
-is asserted here is the part that would be a security bug if it were wrong:
+So the Worker serves the frontend and forwards the paths the backend owns to the backend's own
+address. What is asserted here is the part that would be a security bug if it were wrong:
 
 * **the proxy list is an allow-list.** ``/api/v1/status`` is forwarded; ``/apiary`` is not. A
   path nobody listed is served from the asset bundle, never forwarded with the caller's
@@ -20,9 +20,9 @@ is asserted here is the part that would be a security bug if it were wrong:
 * **the request survives the hop** - method, path, query, body and ``Authorization`` - and the
   response comes back untouched, refusals included. A proxy that turned a 403 into a 200 would
   be a second implementation of the API's contract;
-* **the two headers that exist for a reason** are set: the tunnel's interstitial skip (an ngrok
-  host would otherwise answer a fetch with its warning page) and the client's address, which is
-  what keeps a per-worker rate limit from becoming one shared bucket;
+* **the two headers that exist for a reason** are set: the interstitial skip for a host that
+  shows a warning page (ngrok's free tier would otherwise answer a fetch with HTML) and the
+  client's address, which is what keeps a per-worker rate limit from becoming one shared bucket;
 * **a misconfigured deployment says so.** No ``API_ORIGIN`` answers a 500 naming the variable,
   not the 404 that reads like a backend fault - the failure this suite was written from.
 
@@ -58,9 +58,10 @@ WORKER = DEPLOY_DIR / "worker.mjs"
 WRANGLER = DEPLOY_DIR / "wrangler.toml"
 
 TUNNEL = "https://tunnel.example.ngrok-free.dev"
-#: A Cloudflare Tunnel, which is what this deployment actually runs behind. Named here as the
-#: representative of "a tunnel that needs no interstitial header skipped".
-CLOUDFLARED = "https://attendance.trycloudflare.com"
+#: The backend's own address in the deployment this Worker is written for - the Railway
+#: service, at a hostname that does not change. Named as the representative of "a host that
+#: needs no interstitial header skipped".
+HOST = "https://al-jehad-production.up.railway.app"
 
 
 @pytest.fixture(scope="module")
@@ -76,7 +77,7 @@ const { isBackendPath } = await import(pathToFileURL(process.argv[2]).href);
 // The two addresses come from the Python half, so both halves are asserting against one
 // literal rather than two that agreed when they were written.
 const TUNNEL = '__TUNNEL__';
-const CLOUDFLARED = '__CLOUDFLARED__';
+const HOST = '__HOST__';
 
 /** What the Worker's outbound call looked like, so the hop can be asserted. */
 let calls = [];
@@ -208,11 +209,10 @@ const results = {};
     results.redirect = await call(incoming('/q/token'), env());
 }
 
-// 7. a Cloudflare Tunnel address - the deployment this Worker is written for - needs no
-// interstitial header at all
+// 7. a real host - the deployment this Worker is written for - needs no interstitial header
 {
-    await call(incoming('/api/v1/status'), env({ API_ORIGIN: CLOUDFLARED }));
-    results.cloudflared = {
+    await call(incoming('/api/v1/status'), env({ API_ORIGIN: HOST }));
+    results.host = {
         url: calls[0].url,
         skip_interstitial: calls[0].init.headers.get('ngrok-skip-browser-warning')
     };
@@ -231,7 +231,7 @@ const results = {};
     results.trailing_slash = calls[0].url;
 }
 
-// 9. the tunnel being down is reported as the tunnel being down
+// 9. a backend that is down is reported as a backend that is down
 {
     globalThis.fetch = async () => { throw new Error('connect ECONNREFUSED'); };
     results.unreachable = await call(incoming('/api/v1/status'), env());
@@ -249,7 +249,7 @@ process.stdout.write(JSON.stringify(results));
     with tempfile.TemporaryDirectory(prefix="worker_vm_") as folder:
         harness = Path(folder) / "harness.mjs"
         harness.write_text(
-            script.replace("__TUNNEL__", TUNNEL).replace("__CLOUDFLARED__", CLOUDFLARED),
+            script.replace("__TUNNEL__", TUNNEL).replace("__HOST__", HOST),
             encoding="utf-8",
         )
         completed = subprocess.run(
@@ -260,7 +260,7 @@ process.stdout.write(JSON.stringify(results));
     return json.loads(completed.stdout)
 
 
-def test_a_backend_path_is_forwarded_to_the_tunnel_with_the_hop_s_headers(results):
+def test_a_backend_path_is_forwarded_to_the_backend_with_the_hop_s_headers(results):
     api = results["api"]
     assert api["calls"] == 1
     assert api["url"] == f"{TUNNEL}/api/v1/status"
@@ -336,14 +336,15 @@ def test_a_refusal_from_the_api_comes_back_exactly_as_it_was_sent(results):
     assert results["redirect"]["headers"]["location"] == "https://example.test/next"
 
 
-def test_a_cloudflare_tunnel_gets_no_interstitial_header(results):
-    """Cloudflare Tunnel shows no warning page, so the hop carries no ngrok header.
+def test_a_host_that_shows_no_warning_page_gets_no_interstitial_header(results):
+    """A real host (Railway, or a Cloudflare Tunnel) shows no warning page, so nothing is sent.
 
     It is one header, but it is the difference between a JSON API call and an HTML page
-    parsed as JSON - so the two tunnel kinds are asserted separately rather than assumed.
+    parsed as JSON - so the hosts that need it and the hosts that do not are asserted
+    separately rather than assumed.
     """
-    assert results["cloudflared"]["url"] == f"{CLOUDFLARED}/api/v1/status"
-    assert results["cloudflared"]["skip_interstitial"] is None
+    assert results["host"]["url"] == f"{HOST}/api/v1/status"
+    assert results["host"]["skip_interstitial"] is None
 
 
 def test_a_misconfigured_worker_names_the_variable_instead_of_404_ing(results):
@@ -373,7 +374,7 @@ def test_a_trailing_slash_in_the_origin_does_not_double_up_the_path(results):
     assert results["trailing_slash"] == f"{TUNNEL}/api/v1/status"
 
 
-def test_an_unreachable_tunnel_is_reported_as_an_unreachable_tunnel(results):
+def test_an_unreachable_backend_is_reported_as_an_unreachable_backend(results):
     assert results["unreachable"]["status"] == 502
     assert "api_unreachable" in results["unreachable"]["body"]
 
@@ -393,6 +394,30 @@ def test_an_unreachable_tunnel_is_reported_as_an_unreachable_tunnel(results):
 )
 def test_the_worker_s_own_router_agrees(results, path, expected):
     assert results["is_backend_path"][path] is expected
+
+
+def test_the_committed_api_origin_is_a_real_address_not_a_placeholder():
+    """The variable the deployment lives or dies by, checked before a deploy instead of after.
+
+    ``API_ORIGIN`` is the one setting whose wrong value is invisible until a worker is standing
+    at a site: an empty or placeholder one answers a 500 on every call, and a *stale* one (the
+    quick tunnel from last week, whose hostname is now dead) answers ``api_unreachable``. Both
+    look like a backend outage from the phone. The committed value is the deployed backend -
+    the Railway service - so this asserts that it is an https address and not one of the
+    placeholders this file has used.
+    """
+    config = WRANGLER.read_text(encoding="utf-8")
+    match = re.search(r'^API_ORIGIN\s*=\s*"([^"]*)"', config, re.M)
+    assert match, "wrangler.toml no longer declares API_ORIGIN"
+    origin = match.group(1).strip()
+
+    assert origin.startswith("https://"), f"API_ORIGIN must be https, not {origin!r}"
+    assert origin.rstrip("/") == origin, "a trailing slash becomes //api/v1 and 404s"
+    for placeholder in ("REPLACE", "YOUR-", "example.", "localhost", "trycloudflare"):
+        assert placeholder.lower() not in origin.lower(), (
+            f"API_ORIGIN is still a placeholder ({origin!r}): a quick-tunnel address also "
+            "rotates on every restart, so it is not an address to commit"
+        )
 
 
 def test_the_two_copies_of_the_proxy_list_agree():
