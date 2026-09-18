@@ -84,6 +84,15 @@ laptop and the phone.
   every worker behind the tunnel would share one bucket and hit 429s together.
 - Keep the tunnel URL private. It has no authentication in front of it.
 
+### Putting Cloudflare in front of the tunnel
+
+A tunnel address is fine to hand around but it is not a frontend: it serves the API, and it
+changes every time ngrok restarts. Serving the frontend from Cloudflare Workers instead needs
+one thing the Worker must do for you - forward `/api`, `/static`, `/enroll` and `/q` to the
+tunnel - because the app is single-origin by construction and will otherwise call
+`<your-worker>/api/v1/...` and get a 404 from the asset host. `deploy/cloudflare/` has the
+Worker, the `wrangler.toml`, and the two things to watch after the first deploy.
+
 ## Troubleshooting
 
 - **Still "GPS blocked" on a phone** — check the badge in Profile → Device status.
@@ -97,6 +106,10 @@ laptop and the phone.
   `04:00`–`06:30` at a site that starts at 21:30 is the usual mistake.
 - **Nothing is styled / blank white page** — Tailwind is loaded from a CDN, so the
   device needs internet on the first load.
+- **The app loads but signs in nowhere ("Cannot reach the server")** — the page is being
+  served from a host that is not serving `/api/v1`. The app calls the page's own origin on
+  purpose, so the fix is a proxy in front of the backend, not a frontend setting: see
+  `deploy/cloudflare/README.md`.
 - **Photos or faces are still on disk past their retention period** — run
   `cd backend && python -m retention` for the report (it deletes nothing), then
   `--apply`. A file that cannot be removed is listed by name in the report and in the

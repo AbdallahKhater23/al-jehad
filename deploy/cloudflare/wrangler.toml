@@ -1,0 +1,29 @@
+# The Worker that serves the frontend and proxies the backend.
+#
+# ``wrangler deploy`` from this directory uploads ``../../frontend`` as static assets and the
+# Worker beside them. See README.md in this folder for the dashboard-only route and for what
+# to set before the first request.
+name = "al-jehad1"
+main = "worker.mjs"
+compatibility_date = "2026-09-01"
+
+# The frontend, served from Cloudflare's edge. ``binding`` is the name the Worker reads as
+# ``env.ASSETS``.
+[assets]
+directory = "../../frontend"
+binding = "ASSETS"
+
+# Belt and braces, and the reason it is explicit: the Worker routes the backend paths by
+# itself (an allow-list inside worker.mjs), and this stops the asset layer from ever
+# answering one of them with a file or a 404 first. A path list that is wrong in one place
+# would otherwise be silently wrong in the other.
+run_worker_first = ["/api/*", "/static/*", "/enroll/*", "/q/*"]
+
+[vars]
+# The public https address in front of the backend - an ngrok or Cloudflare Tunnel host,
+# without a trailing slash. Run the backend with ``python backend/serve.py --tunnel`` and put
+# that tunnel's address here.
+#
+# It has no default on purpose: with it empty every API call answers a 500 that names this
+# variable, instead of the 404 that looks like the backend is broken.
+API_ORIGIN = "https://REPLACE-WITH-YOUR-TUNNEL.ngrok-free.dev"

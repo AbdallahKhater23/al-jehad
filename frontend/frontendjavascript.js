@@ -1098,6 +1098,7 @@ const UI = {
                 <div>
                     <p class="font-bold text-lg">${I18n.__(actionKey)}</p>
                     <p class="text-xs opacity-70" id="cameraCoords">📍 ${coords}</p>
+                    <p class="camera-window" id="cameraWindow" data-verdict="" hidden></p>
                 </div>
                 <button onclick="UI.closeCamera()" class="icon-button" style="background:rgba(255,255,255,.12);border-color:rgba(255,255,255,.25);color:#fff">✕</button>
             </div>
@@ -1115,6 +1116,9 @@ const UI = {
         document.body.appendChild(overlay);
         this._cameraOpen = true;
         document.body.style.overflow = 'hidden';
+        // Started before the stream is awaited, so the line is usually there by the time the
+        // worker has their face in the frame. It never blocks the camera: see ``loadSiteWindow``.
+        this.loadSiteWindow(coords, action).catch(() => {});
 
         try {
             const stream = await Camera.start();
@@ -1240,6 +1244,80 @@ const UI = {
             Toast.error(queueError.message || I18n.__('offlineQueueFailed'));
             return false;
         }
+    },
+
+    /**
+     * The clock-in window where this phone is standing, on the punch card itself.
+     *
+     * The window a punch is judged by belongs to the site the geofence puts the phone inside,
+     * and until now the only place that judgement appeared was an administrator's notification
+     * ("arrival outside the clock-in window") - a sentence about the worker that the worker
+     * never read. This asks the server the same question the punch will ask a moment later, so
+     * "am I early, on time or late" is answered while there is still time to do something
+     * about it, instead of afterwards.
+     *
+     * Clock-in only. A clock-out is not judged by this window - the hours are - so printing
+     * "late" over somebody who is *leaving* would be a lie told by the screen.
+     *
+     * It is advice, never a gate. A failed request (no signal, an older server, a session that
+     * expired while the card was open) leaves the line hidden and the shutter exactly as usable
+     * as it was; the punch is still judged on the server, from a fresh fix, at the shutter. The
+     * line is read from the fix the card opened with and is therefore a moment stale - what it
+     * says is the site's window, not a second-by-second race with the record.
+     */
+    async loadSiteWindow(coords, action) {
+        if (action !== 'Clock In') return;
+        let info;
+        try {
+            info = await API.request(
+                `/worker/me/site-window?location_input=${encodeURIComponent(coords)}`
+            );
+        } catch (err) {
+            return;
+        }
+        // Re-read the element: the worker may have closed the card, or taken the photo, while
+        // this request was in flight, and painting into a removed card is painting into nothing.
+        const line = document.getElementById('cameraWindow');
+        if (!line) return;
+        if (info && info.on_site) {
+            line.textContent = this.siteWindowLine(info);
+            line.dataset.verdict = String(info.verdict || '');
+        } else {
+            // Not inside any geofence: the punch will be refused, so the useful thing to say is
+            // where to stand, not a window for a site this worker is not standing on.
+            line.textContent = I18n.__('punchWindowOffSite');
+            line.dataset.verdict = 'off_site';
+        }
+        line.hidden = false;
+    },
+
+    /**
+     * One line: the site, the window in force there, and where now falls in it.
+     *
+     * Composed here rather than on the server because this card exists in three languages, and
+     * the server sends the arithmetic (verdict and minutes) rather than a sentence. The site
+     * name and the window label are values off the wire, so they arrive as text, not as markup.
+     */
+    siteWindowLine(info) {
+        const where = I18n.__('punchWindowSite')
+            .replace('{site}', String(info.site_name || ''))
+            .replace('{window}', String((info.window || {}).window || ''))
+            .trim();
+        return `${where} · ${this.siteWindowVerdict(info)}`;
+    },
+
+    siteWindowVerdict(info) {
+        const minutes = this.windowMinutes(info.minutes_off);
+        if (info.verdict === 'early') return I18n.__('punchWindowEarly').replace('{minutes}', minutes);
+        if (info.verdict === 'late') return I18n.__('punchWindowLate').replace('{minutes}', minutes);
+        return I18n.__('punchWindowOnTime');
+    },
+
+    /** "25m" / "1h 5m" - how far outside the window this arrival is. */
+    windowMinutes(value) {
+        const minutes = Math.max(0, Math.round(Number(value) || 0));
+        const hours = Math.floor(minutes / 60);
+        return hours > 0 ? `${hours}h ${minutes % 60}m` : `${minutes}m`;
     },
 
     closeCamera() {

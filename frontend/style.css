@@ -220,6 +220,24 @@ input, select, textarea, button {
 .camera-framing[data-framing="warn"] { background: rgba(217, 119, 6, 0.92); }
 .camera-framing[data-framing="bad"] { background: rgba(185, 28, 28, 0.92); }
 
+/* The clock-in window for the site the phone is standing on, on the punch card.
+   It sits under the coordinates in the card's header, over the live video, so it is read the
+   way the rest of that line is - before the shutter, not in a notification afterwards. The
+   verdict carries a colour, and the words carry the same verdict, because colour alone is the
+   one signal a worker in direct sun cannot rely on. */
+.camera-window {
+    margin: 6px 0 0;
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1.4;
+    color: #fff;
+}
+.camera-window[hidden] { display: none; }
+.camera-window[data-verdict="on_time"] { color: #86efac; }
+.camera-window[data-verdict="early"] { color: #fde68a; }
+.camera-window[data-verdict="late"],
+.camera-window[data-verdict="off_site"] { color: #fca5a5; }
+
 .shutter-button {
     width: 76px;
     height: 76px;

@@ -44,7 +44,7 @@ from typing import Any, Mapping
 
 import numpy as np
 from deepface import DeepFace
-from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -159,7 +159,7 @@ DEFAULT_SHIFT_RULES: dict[str, Any] = {
     "clock_in_window_end": "06:30",
     "regular_hours": 8.0,
     "overtime_notify_hours": 8.1,
-    "site_timezone": "Africa/Cairo",
+    "site_timezone": "KUWAIT",
     # The unpaid break and the end of the paid day. A full day is 8 h paid plus a
     # 30-minute unpaid break (8.5 h on site); ``shift_hours.py`` is the only module that
     # turns those numbers into money, and every path that closes a shift asks it.
@@ -734,6 +734,21 @@ def validate_plausible_coordinates(lat: float, lon: float) -> None:
         )
 
 
+def site_at(conn: sqlite3.Connection, lat: float, lon: float) -> sqlite3.Row | None:
+    """The site whose geofence contains this fix, or ``None`` - the whole rule, once.
+
+    First match wins, in the order the table returns the sites, and that is deliberate: an
+    overlapping pair of geofences has to resolve to *one* site or the punch, the window it is
+    judged by and the site named on the record could each pick a different one. Two callers
+    ask this question - the punch handler and the worker's own "what window applies where I am
+    standing" look-up - and a second copy of this loop is how they would come to disagree.
+    """
+    for site in conn.execute("SELECT * FROM construction_sites").fetchall():
+        if get_distance_meters(site["lat"], site["lon"], lat, lon) <= site["radius"]:
+            return site
+    return None
+
+
 #: What a worker is told when the *photo* is the problem, keyed by the reason
 #: ``compare_faces_sync`` reports. Those strings are written for an operator reading a
 #: log - and one of them (``Internal processing error: <exception>``) used to be echoed
@@ -1117,6 +1132,49 @@ async def get_my_stats(current: CurrentUser = Depends(any_authenticated)):
     return await get_worker_stats(current.id, current)
 
 
+@router.get("/worker/me/site-window")
+async def get_my_site_window(
+    location_input: str = Query(..., max_length=300),
+    current: CurrentUser = Depends(any_authenticated),
+):
+    """The clock-in window where this phone is standing, and whether now is inside it.
+
+    The punch card said nothing about the window until *after* the shutter: the verdict was
+    written into an administrator's notification ("arrival outside the clock-in window"), which
+    is a sentence about the worker that the worker never read. This answers the same question
+    one tap earlier - the same geofence test, the same per-site window, the same predicate - so
+    somebody standing at a gate knows whether they are early, on time or late while there is
+    still time to do something about it (wait, walk in, or tell a supervisor).
+
+    Read-only, self-scoped and deliberately unable to refuse anything: whatever this returns,
+    the punch is still judged by ``/attendance/verify``. A worker whose phone cannot reach this
+    endpoint loses a line of text, not their hours.
+    """
+    lat, lon = parse_location_input(location_input)
+    validate_plausible_coordinates(lat, lon)
+
+    rules = get_shift_rules()
+    with db() as conn:
+        # Read in the same request as the window resolution below, so the site named here and
+        # the hours reported cannot come from two different versions of the row.
+        site_row = site_at(conn, lat, lon)
+
+    window = shift_windows.effective_window(site_row, rules)
+    arrival = window.arrival(datetime.now())
+    return {
+        # ``on_site`` is the honest answer to "is this even a place a punch can be taken from":
+        # with no geofence match the punch is refused, and a window shown for a site the worker
+        # is not standing on would explain a decision that is not the one about to be made.
+        "on_site": site_row is not None,
+        "site_name": window.site_name,
+        "window": window.as_dict(),
+        # The subject is the token, exactly as in the two self-scoped reads above; nothing here
+        # is about another worker, so there is no id to tamper with.
+        "worker_id": current.id,
+        **arrival.as_dict(),
+    }
+
+
 @router.get("/worker/me/logs")
 async def get_my_logs(limit: int = 50, current: CurrentUser = Depends(any_authenticated)):
     """Your own recent attendance rows.
@@ -1210,15 +1268,9 @@ async def verify_worker(
         # *this* site's shift, and re-reading the row later would be a second query that could
         # disagree with the geofence that just matched (an administrator editing the site
         # between the two). One read, one answer to "which site is this, and what are its hours".
-        sites = conn.execute("SELECT * FROM construction_sites").fetchall()
+        detected_site_row = site_at(conn, lat, lon)
 
-    detected_site = None
-    detected_site_row = None
-    for site in sites:
-        if get_distance_meters(site["lat"], site["lon"], lat, lon) <= site["radius"]:
-            detected_site = site["site_name"]
-            detected_site_row = site
-            break
+    detected_site = detected_site_row["site_name"] if detected_site_row is not None else None
 
     if not detected_site:
         raise HTTPException(
@@ -2849,7 +2901,7 @@ async def update_shift_rules(
         if value is None:
             if key in _COMPANY_WINDOW_KEYS:
                 changes[key] = ""
-            continue
+
         changes[key] = value
     # Refuse nonsense rather than storing it: a negative break or a paid day of zero
     # would silently pay every worker for nothing, and 0/1 is not a preference.
@@ -3081,6 +3133,7 @@ async def quick_link_page(token: str):  # noqa: ARG001 - the token is read by th
     if not os.path.exists(page):  # pragma: no cover - packaging accident
         return {"error": f"quick.html not found in {FRONTEND_DIR}"}
     return FileResponse(page)
+    
 
 
 @asynccontextmanager

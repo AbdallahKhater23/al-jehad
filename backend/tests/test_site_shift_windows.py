@@ -44,6 +44,7 @@ from harness import (
     INSIDE_DOWNTOWN,
     INSIDE_ZONE_B,
     MOALLEM,
+    OUTSIDE_ALL_SITES,
     ZONE_B,
     bearer,
     clock_in,
@@ -1131,3 +1132,200 @@ def test_the_old_helper_still_answers_the_way_its_callers_expect(app_module, fro
     assert app_module._within_clock_in_window(window(*NIGHT_SHIFT)) is True
     # An explicit moment wins over the clock.
     assert app_module._within_clock_in_window(GLOBAL, at(5, 0)) is True
+
+
+# ---------------------------------------------------------------------------
+# 10. what the worker is told before they tap
+# ---------------------------------------------------------------------------
+#  The window used to reach exactly two audiences: the punch handler, and - as a late-arrival
+#  notification - an administrator. The person it is actually about, standing at the gate, was
+#  told nothing until after the shutter. ``Window.arrival`` is that judgement published one tap
+#  earlier, and ``GET /worker/me/site-window`` is where the phone asks for it.
+#
+#  What is asserted here is that it is the *same* judgement: the near edge of a wrapping window,
+#  the site's clock rather than the server's, the site's hours rather than the company's, and
+#  "inside" wherever the punch path would flag nothing. A card that said "on time" while the
+#  record was flagged late would be worse than no card at all.
+
+
+@pytest.mark.parametrize(
+    "start,end,moment,verdict,minutes",
+    [
+        # A day window: before it opens, inside it, after it closes.
+        ("04:00", "06:30", "03:30", "early", 30),
+        ("04:00", "06:30", "04:00", "on_time", 0),
+        ("04:00", "06:30", "06:30", "on_time", 0),
+        ("04:00", "06:30", "06:31", "late", 1),
+        ("04:00", "06:30", "12:00", "late", 330),
+        # An overnight window, either side of midnight.
+        ("21:30", "05:30", "21:00", "early", 30),
+        ("21:30", "05:30", "23:15", "on_time", 0),
+        ("21:30", "05:30", "05:30", "on_time", 0),
+        ("21:30", "05:30", "06:00", "late", 30),
+        # ... and the middle of the day between two night shifts, where the honest answer is
+        # the nearer edge: 12:00 is 6.5 h after the close and 9.5 h before the open, so the
+        # shift it belongs to is the one that just ended.
+        ("21:30", "05:30", "12:00", "late", 390),
+        ("21:30", "05:30", "15:00", "early", 390),
+        # A one-minute window, which is what ``start == end`` means.
+        ("06:00", "06:00", "05:59", "early", 1),
+        ("06:00", "06:00", "06:01", "late", 1),
+    ],
+)
+def test_the_verdict_names_the_side_of_the_window_an_arrival_is_on(start, end, moment, verdict, minutes):
+    hours, minute = (int(part) for part in moment.split(":"))
+    arrival = window(start, end).arrival(at(hours, minute))
+    assert arrival.verdict == verdict
+    assert arrival.minutes_off == minutes
+    assert arrival.local_time == moment
+
+
+def test_on_time_means_exactly_what_the_punch_path_calls_on_time():
+    """The card and the record are two renderings of one predicate, not two predicates.
+
+    ``contains`` is what decides the late flag; if ``classify`` ever grew a second opinion -
+    a different boundary, an exclusive end - the worker would be told one thing and the
+    administrator's queue would say another.
+    """
+    for start, end in ((240, 390), (1320, 330), (360, 360), (0, 1439)):
+        for moment in range(0, shift_windows.MINUTES_PER_DAY, 3):
+            verdict, minutes = shift_windows.classify(start, end, moment)
+            inside = shift_windows.contains(start, end, moment)
+            assert (verdict == shift_windows.VERDICT_ON_TIME) is inside, (start, end, moment)
+            assert (minutes == 0) is inside, (start, end, moment)
+            assert verdict in {
+                shift_windows.VERDICT_ON_TIME,
+                shift_windows.VERDICT_EARLY,
+                shift_windows.VERDICT_LATE,
+            }
+
+
+def test_a_verdict_is_read_on_the_sites_clock_not_the_servers():
+    """The same instant is on time at one site and early at the other, by their zones alone.
+
+    19:00 UTC is 00:30 in Kolkata - inside a 23:30-01:30 window - and 22:00 in Cairo, an hour
+    and a half before that same window opens.
+    """
+    instant = at(19, 0, zone="UTC")
+    kolkata = window("23:30", "01:30", "Asia/Kolkata")
+    cairo = window("23:30", "01:30", "Africa/Cairo")
+    assert kolkata.arrival(instant).verdict == shift_windows.VERDICT_ON_TIME
+    assert kolkata.arrival(instant).local_time == "00:30"
+    assert cairo.arrival(instant).verdict == shift_windows.VERDICT_EARLY
+    assert cairo.arrival(instant).minutes_off == 90
+    assert cairo.arrival(instant).local_time == "22:00"
+
+
+def test_a_timestamp_that_cannot_be_converted_is_reported_as_on_time():
+    """A device clock reading year 9999 is a bad timestamp, and the punch path says the same."""
+    arrival = window(*DAY_SHIFT).arrival(datetime.max)
+    assert arrival.verdict == shift_windows.VERDICT_ON_TIME
+    assert arrival.local_time is None
+
+
+# ---------------------------------------------------------------------------
+# 10b. the endpoint the punch card calls
+# ---------------------------------------------------------------------------
+WINDOW_PATH = "/api/v1/worker/me/site-window"
+
+
+def _site_window(client, coordinates: str, headers) -> dict:
+    """What the phone's card would be given, through the request it actually makes."""
+    response = client.get(f"{WINDOW_PATH}?location_input={coordinates}", headers=headers)
+    assert response.status_code == 200, response.text[:300]
+    return response.json()
+
+
+def test_the_worker_is_told_the_window_where_they_are_standing(client, app_module, frozen_clock):
+    """The whole feature, end to end: the site, its hours, and where now falls in them."""
+    with with_site_windows(app_module, {DOWNTOWN: ("05:00", "07:30", None)}):
+        frozen_clock(at(5, 45))
+        answer = _site_window(client, INSIDE_DOWNTOWN, bearer(MOALLEM))
+
+    assert answer["on_site"] is True
+    assert answer["site_name"] == DOWNTOWN
+    assert answer["window"]["clock_in_window_start"] == "05:00"
+    assert answer["window"]["clock_in_window_end"] == "07:30"
+    assert answer["window"]["window"] == "05:00-07:30"
+    assert answer["verdict"] == "on_time"
+    assert answer["minutes_off"] == 0
+    assert answer["site_time"] == "05:45", "the site's own clock is what the verdict is read on"
+
+
+@pytest.mark.parametrize(
+    "moment,verdict,minutes",
+    [("13:00", "early", 30), ("13:30", "on_time", 0), ("14:00", "on_time", 0), ("14:01", "late", 1)],
+)
+def test_the_card_knows_early_from_late_at_the_site_the_worker_is_on(
+    client, app_module, frozen_clock, moment, verdict, minutes
+):
+    """Four arrivals, one site, one window: the three words the worker needs.
+
+    ``14:00`` is the closing minute and is on time - the window is inclusive at both ends, so
+    the minute an administrator typed is a minute that exists (see the module docstring).
+    """
+    with with_site_windows(app_module, {DOWNTOWN: ("13:30", "14:00", None)}):
+        frozen_clock(at(*map(int, moment.split(":"))))
+        answer = _site_window(client, INSIDE_DOWNTOWN, bearer(MOALLEM))
+
+    assert answer["verdict"] == verdict
+    assert answer["minutes_off"] == minutes
+
+
+def test_the_site_next_door_gives_the_other_answer_at_the_same_instant(client, app_module, frozen_clock):
+    """Resolved per site, like the punch: same instant, same endpoint, opposite verdicts."""
+    with with_site_windows(app_module, {ZONE_B: ("21:30", "05:30", None)}):
+        frozen_clock(at(23, 15))
+        night = _site_window(client, INSIDE_ZONE_B, bearer(MOALLEM))
+        day = _site_window(client, INSIDE_DOWNTOWN, bearer(MOALLEM))
+
+    assert night["site_name"] == ZONE_B and night["verdict"] == "on_time"
+    assert day["site_name"] == DOWNTOWN and day["verdict"] == "early"
+    assert day["window"]["window"] == "04:00-06:30", "the company window, which this site inherits"
+    assert day["window"]["source"]["clock_in_window_start"] == "global"
+
+
+def test_a_worker_outside_every_geofence_is_told_so_rather_than_shown_a_window(
+    client, app_module, frozen_clock
+):
+    """No geofence match means the punch is refused, so the honest line is where to stand.
+
+    The company window still comes back - it is the window that *would* apply - but ``on_site``
+    is what the card keys on, so nothing promises a punch that will not be recorded.
+    """
+    frozen_clock(at(5, 0))
+    answer = _site_window(client, OUTSIDE_ALL_SITES, bearer(MOALLEM))
+    assert answer["on_site"] is False
+    assert answer["site_name"] is None
+    assert answer["window"]["site_specific"] is False
+
+
+def test_the_window_look_up_needs_a_session(client):
+    """It is self-scoped like its neighbours: no token, no answer, and nothing to guess."""
+    assert client.get(f"{WINDOW_PATH}?location_input={INSIDE_DOWNTOWN}").status_code == 401
+
+
+def test_a_fix_that_is_not_a_place_is_refused(client, app_module):
+    """A mock-location reading is invalid input, exactly as it is at the punch."""
+    for bad in ("", "0,0", "not-a-place", "91,0"):
+        response = client.get(f"{WINDOW_PATH}?location_input={bad}", headers=bearer(MOALLEM))
+        assert response.status_code == 400, f"{bad!r}: {response.text[:200]}"
+
+
+def test_the_look_up_cannot_refuse_a_punch(client, app_module, frozen_clock):
+    """It is advice. Whatever it answers, the punch that follows is judged on its own.
+
+    The two must still agree in what they call on time - that is the point of the card - but a
+    worker whose phone asked the question at 13:29 and tapped at 13:31 gets the record, not the
+    card's opinion of the past.
+    """
+    with with_site_windows(app_module, {DOWNTOWN: ("13:30", "14:00", None)}):
+        frozen_clock(at(13, 29))
+        early = _site_window(client, INSIDE_DOWNTOWN, bearer(MOALLEM))
+        assert early["verdict"] == "early"
+
+        # A minute later the same worker taps the shutter, and the punch path agrees.
+        frozen_clock(at(13, 31))
+        response = clock_in(client, MOALLEM, headers=bearer(MOALLEM), coordinates=INSIDE_DOWNTOWN)
+        assert response.status_code == 200, response.text[:300]
+        assert db_scalar("SELECT late_flag FROM active_sessions WHERE worker_id = ?", (MOALLEM,)) is None
