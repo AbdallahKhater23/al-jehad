@@ -34,6 +34,15 @@ THE THREE THINGS THAT ARE EASY TO GET WRONG
    typed into a minute that does not exist, which is exactly the kind of off-by-one that shows
    up as one worker flagged every single day.
 
+THE SAME ANSWER, ONE SCREEN EARLIER
+------------------------------------
+The window is also shown to the worker *before* the punch (``Window.arrival``), because the
+verdict used to be delivered only to an administrator, as a notification about an arrival that
+had already happened. "You are late" after the shutter is a statement about the past; the same
+arithmetic a tap earlier is something a person can still act on. It is one more caller of
+:func:`contains`, not a second rule - two implementations of this predicate is how a card ends
+up saying "on time" while the record is flagged late.
+
 AN UNPARSEABLE WINDOW IS NOT A LATE ARRIVAL
 -------------------------------------------
 Every function here is deliberately total: a missing, malformed or unknown-zone value falls
@@ -154,6 +163,76 @@ def contains(start_minutes: int, end_minutes: int, moment_minutes: int) -> bool:
     return moment_minutes >= start_minutes or moment_minutes <= end_minutes
 
 
+#: Where an arrival falls relative to a window. Published to the worker's punch card and
+#: computed from the same predicate the punch itself is judged by, so the two cannot disagree
+#: about the one question a person standing at a gate is asking.
+VERDICT_ON_TIME = "on_time"
+VERDICT_EARLY = "early"
+VERDICT_LATE = "late"
+
+
+def classify(start_minutes: int, end_minutes: int, moment_minutes: int) -> tuple[str, int]:
+    """``(verdict, minutes_off)`` for an arrival outside or inside a window.
+
+    ``minutes_off`` is how early or how late, in minutes, and is 0 exactly when the arrival is
+    inside the window - the two travel together, so a caller can never print "late" without a
+    number, or a number without a direction.
+
+    Inside the window the answer is "on time". Outside it, the window is *closed* from ``end``
+    until ``start``, and that gap is the only thing left to describe: the arrival is "late" when
+    it is nearer the close (the shift that has just gone) and "early" when it is nearer the
+    open (the shift that is coming). At 12:00 on a 22:00-06:00 site, six hours after it closed
+    and ten before it opens again, the honest answer is late; at 21:00, an hour before it opens,
+    it is early.
+
+    That is one rule for both shapes of window, and deliberately so. The old ``start <= now <=
+    end`` bug came from treating a wrapping window as a special case, and a *second* branch here
+    - "before the start is early, after the end is late" for a day window - would make 23:00 on
+    a 04:00-06:30 site read as "late by 16 h 30 m" instead of "early, opens in 5 h". Both are
+    true statements about the clock; only one is worth reading on the way into a shift.
+
+    ``start == end`` is a one-minute window (see :func:`contains`): before that minute is
+    early, after it is late, and the whole rest of the day is one or the other.
+
+    ``minutes_off`` is never 0 outside the window: an arrival exactly on an edge is *inside*
+    (both ends are inclusive), so the distances below are at least a minute.
+    """
+    if contains(start_minutes, end_minutes, moment_minutes):
+        return VERDICT_ON_TIME, 0
+    since_close = (moment_minutes - end_minutes) % MINUTES_PER_DAY
+    until_open = (start_minutes - moment_minutes) % MINUTES_PER_DAY
+    if since_close <= until_open:
+        return VERDICT_LATE, since_close
+    return VERDICT_EARLY, until_open
+
+
+@dataclass(frozen=True)
+class Arrival:
+    """Where one instant falls relative to one window, as a punch card can print it.
+
+    A third field rather than a sentence: the frontend speaks three languages and composes the
+    wording itself, so the server's job is the arithmetic and the site's local clock - never
+    the phrasing.
+    """
+
+    verdict: str
+    minutes_off: int
+    #: ``HH:MM`` on the *site's* clock at the moment asked about, or ``None`` for a timestamp
+    #: that could not be converted at all (see :meth:`Window.arrival`).
+    local_time: str | None = None
+
+    @property
+    def is_on_time(self) -> bool:
+        return self.verdict == VERDICT_ON_TIME
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "verdict": self.verdict,
+            "minutes_off": self.minutes_off,
+            "site_time": self.local_time,
+        }
+
+
 @dataclass(frozen=True)
 class Window:
     """An effective clock-in window: the hours, the zone, and where each part came from."""
@@ -213,6 +292,24 @@ class Window:
             # policy for those (``offline_sync`` compares against a clock-skew allowance).
             return True
         return contains(self.start_minutes, self.end_minutes, local.hour * 60 + local.minute)
+
+    def arrival(self, moment: datetime) -> Arrival:
+        """Where ``moment`` falls in this window, on the site's clock.
+
+        The counterpart of :meth:`contains_moment`, and deliberately built on the same two
+        inputs: a window that says "inside" here and "flagged" there is the bug this module
+        already exists to prevent, one screen earlier.
+
+        An unconvertible timestamp is on time, exactly as ``contains_moment`` treats it - it is
+        a bad device clock, not a late worker, and the punch path has its own policy for those.
+        """
+        try:
+            local = self.local(moment)
+        except (OverflowError, OSError, ValueError):
+            return Arrival(VERDICT_ON_TIME, 0, None)
+        minutes = local.hour * 60 + local.minute
+        verdict, minutes_off = classify(self.start_minutes, self.end_minutes, minutes)
+        return Arrival(verdict, minutes_off, format_hhmm(minutes))
 
     def label(self) -> str:
         """``06:00-08:00``, or ``22:00-06:00 (overnight)``, for messages a person reads."""
