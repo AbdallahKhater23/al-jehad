@@ -58,7 +58,9 @@ WORKER = DEPLOY_DIR / "worker.mjs"
 WRANGLER = DEPLOY_DIR / "wrangler.toml"
 
 TUNNEL = "https://tunnel.example.ngrok-free.dev"
-CLOUDFLARED = "https://attendance.example.com"
+#: A Cloudflare Tunnel, which is what this deployment actually runs behind. Named here as the
+#: representative of "a tunnel that needs no interstitial header skipped".
+CLOUDFLARED = "https://attendance.trycloudflare.com"
 
 
 @pytest.fixture(scope="module")
@@ -206,9 +208,10 @@ const results = {};
     results.redirect = await call(incoming('/q/token'), env());
 }
 
-// 7. a Cloudflare Tunnel address needs no interstitial header
+// 7. a Cloudflare Tunnel address - the deployment this Worker is written for - needs no
+// interstitial header at all
 {
-    await call(incoming('/api/v1/status'), env({ API_ORIGIN: 'https://attendance.example.com' }));
+    await call(incoming('/api/v1/status'), env({ API_ORIGIN: CLOUDFLARED }));
     results.cloudflared = {
         url: calls[0].url,
         skip_interstitial: calls[0].init.headers.get('ngrok-skip-browser-warning')
@@ -333,7 +336,12 @@ def test_a_refusal_from_the_api_comes_back_exactly_as_it_was_sent(results):
     assert results["redirect"]["headers"]["location"] == "https://example.test/next"
 
 
-def test_a_tunnel_that_needs_no_interstitial_header_does_not_get_one(results):
+def test_a_cloudflare_tunnel_gets_no_interstitial_header(results):
+    """Cloudflare Tunnel shows no warning page, so the hop carries no ngrok header.
+
+    It is one header, but it is the difference between a JSON API call and an HTML page
+    parsed as JSON - so the two tunnel kinds are asserted separately rather than assumed.
+    """
     assert results["cloudflared"]["url"] == f"{CLOUDFLARED}/api/v1/status"
     assert results["cloudflared"]["skip_interstitial"] is None
 
