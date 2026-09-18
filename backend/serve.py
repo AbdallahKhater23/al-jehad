@@ -19,10 +19,20 @@ Usage
     python serve.py --http          # plain HTTP, localhost only (no GPS/camera off-device)
     python serve.py --gen-cert-only  # (re)create the certificate and exit
     python serve.py --port 8443
+    python serve.py --tunnel        # plain HTTP for a tunnel/proxy that provides the HTTPS
 
 The certificate is self-signed and stored in ``backend/certs/`` (git-ignored).
 Each device has to accept the "not private" warning once; after tapping
 "Advanced -> Proceed" the page counts as a secure context and GPS/camera work.
+
+On a host that publishes the app for you (Railway, Render, Fly, Heroku - the ones
+that inject ``PORT``) there is no certificate to make and no port to guess:
+
+    python serve.py --tunnel
+
+``--tunnel`` because the host terminates TLS, exactly like a tunnel does, and the
+port comes from ``PORT`` when it is set - so one command works on the laptop and on
+the host, with no port written down in two places.
 """
 
 from __future__ import annotations
@@ -187,10 +197,38 @@ def ensure_certificate(ips: list[str], force: bool = False) -> tuple[Path, Path]
     return CERT_FILE, KEY_FILE
 
 
+def default_port() -> int:
+    """The port to bind: ``PORT`` when the host injects one, else 8000.
+
+    Railway, Render, Fly and Heroku publish whatever the process listens on, and they say
+    which port that is in ``PORT``. Ignoring it is the classic "502 Application failed to
+    respond": the app is running and healthy on 8000, at a port the edge never forwards to.
+
+    A value that is not a port number is reported and ignored rather than fatal, for the same
+    reason the punch path never raises over configuration: a typo in a dashboard's variable
+    should not look like an application that crashes on start.
+    """
+    raw = os.environ.get("PORT", "").strip()
+    if not raw:
+        return 8000
+    try:
+        port = int(raw)
+    except ValueError:
+        print(f"[serve] PORT={raw!r} is not a port number; using 8000", file=sys.stderr)
+        return 8000
+    if not 1 <= port <= 65535:
+        print(f"[serve] PORT={port} is out of range; using 8000", file=sys.stderr)
+        return 8000
+    return port
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--host", default="0.0.0.0", help="bind address (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=8000, help="port (default: 8000)")
+    parser.add_argument(
+        "--port", type=int, default=default_port(),
+        help="port (default: $PORT on a host that injects one, else 8000)",
+    )
     parser.add_argument("--http", action="store_true", help="serve plain HTTP instead of HTTPS")
     parser.add_argument("--reload", action="store_true", help="auto-reload on code changes")
     parser.add_argument("--gen-cert-only", action="store_true", help="create the certificate then exit")
@@ -233,10 +271,25 @@ def main() -> None:
     # searchable too. Inserting the root alone produced
     # "ModuleNotFoundError: No module named 'enrollment'" when the server was started
     # from anywhere other than ``backend/``.
+    #
+    # ``backend/`` goes in *last*, which puts it first - the order here used to be the
+    # other way round, and since these are inserted at position 0 the root ended up ahead
+    # of ``backend/``. Nothing collides except the one name that does: a checkout with a
+    # ``main.py`` at the root as well (the pre-``backend/`` prototype that the rollback
+    # branch keeps there) then answers ``import main`` with that file, and
+    # ``biometrics.directories()`` fails at startup with "module 'main' has no attribute
+    # LOCAL_REFS_DIR" - every module the app imports resolves to the *other* main. The
+    # intended module is the one that also has ``database``, ``enrollment`` and
+    # ``security`` beside it, so the backend directory wins.
     os.chdir(PROJECT_ROOT)
-    for candidate in (BACKEND_DIR, PROJECT_ROOT):
-        if str(candidate) not in sys.path:
-            sys.path.insert(0, str(candidate))
+    # Removed and re-inserted rather than inserted-if-absent: running this script already put
+    # ``backend/`` in ``sys.path`` (Python prepends the script's own directory), and that entry
+    # is not always textually equal to ``BACKEND_DIR`` the way ``Path.resolve()`` writes it - so
+    # the old check could skip the one directory that had to move, leaving the root in front.
+    for candidate in (PROJECT_ROOT, BACKEND_DIR):
+        while str(candidate) in sys.path:
+            sys.path.remove(str(candidate))
+        sys.path.insert(0, str(candidate))
 
     scheme = "http" if args.http else "https"
     ssl_kwargs = {}

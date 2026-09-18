@@ -16,7 +16,7 @@
  *   1. **serves the frontend** from the ``ASSETS`` binding (``../frontend``, deployed with
  *      the Worker), and
  *   2. **proxies the paths the backend owns** - ``/api``, ``/static``, ``/enroll``, ``/q`` -
- *      to the tunnel in front of the backend.
+ *      to the Cloudflare Tunnel in front of the backend.
  *
  * EVERYTHING ELSE IS A FRONTEND ASSET, WHICH IS THE SECURITY HALF. The proxy list is an
  * allow-list, not a deny-list: a path nobody listed is served from the asset bundle (a 404
@@ -41,10 +41,11 @@
 //: that must keep working for somebody with no account and no session.
 const BACKEND_PREFIXES = ['/api', '/static', '/enroll', '/q'];
 
-//: Tunnels that answer an unrecognised client with an HTML interstitial. The frontend sends
-//: ``ngrok-skip-browser-warning`` itself when it talks to one of these directly; the Worker is
-//: now that client, so it has to send it too. Mirrors ``TUNNEL_HOST_SUFFIXES`` in
-//: ``frontend/frontendjavascript.js``.
+//: Tunnels that answer an unrecognised client with an HTML interstitial. Cloudflare Tunnel -
+//: the deployment this Worker is written for - does not, so nothing needs skipping for it.
+//: ngrok's free tier does, and the frontend already sends this header when it talks to one of
+//: those directly; the Worker is now that client, so it sends it too. Mirrors
+//: ``TUNNEL_HOST_SUFFIXES`` in ``frontend/frontendjavascript.js``.
 const TUNNEL_HOST_SUFFIXES = ['ngrok-free.dev', 'ngrok-free.app', 'ngrok.app', 'ngrok.io', 'ngrok.dev'];
 
 //: Methods with no body, so a body is never attached to them.

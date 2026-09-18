@@ -1,8 +1,9 @@
 # The Worker that serves the frontend and proxies the backend.
 #
 # ``wrangler deploy`` from this directory uploads ``../../frontend`` as static assets and the
-# Worker beside them. See README.md in this folder for the dashboard-only route and for what
-# to set before the first request.
+# Worker beside them, and publishes them at ``<name>.<account>.workers.dev``. See README.md in
+# this folder for the tunnel the backend sits behind, the dashboard-only route, and what to set
+# before the first request.
 name = "al-jehad1"
 main = "worker.mjs"
 compatibility_date = "2026-09-01"
@@ -20,10 +21,12 @@ binding = "ASSETS"
 run_worker_first = ["/api/*", "/static/*", "/enroll/*", "/q/*"]
 
 [vars]
-# The public https address in front of the backend - an ngrok or Cloudflare Tunnel host,
-# without a trailing slash. Run the backend with ``python backend/serve.py --tunnel`` and put
-# that tunnel's address here.
+# The public https address of the backend's tunnel, without a trailing slash. Run the backend
+# with ``python backend/serve.py --tunnel`` and ``cloudflared tunnel --url http://localhost:8000``
+# (see README.md), then put that address here - a named tunnel's own hostname if the account
+# has a domain, because a quick tunnel's trycloudflare.com address changes on every restart
+# and this line is what would have to change with it.
 #
 # It has no default on purpose: with it empty every API call answers a 500 that names this
 # variable, instead of the 404 that looks like the backend is broken.
-API_ORIGIN = "https://REPLACE-WITH-YOUR-TUNNEL.ngrok-free.dev"
+API_ORIGIN = "https://REPLACE-WITH-YOUR-TUNNEL.trycloudflare.com"

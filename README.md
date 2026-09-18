@@ -58,39 +58,45 @@ After that the origin counts as secure and GPS, camera and "Add to Home Screen"
 all work. Workers can also self-check from **Profile → Device status** (Test
 location / Test camera).
 
-## Going live over a tunnel (ngrok / Cloudflare)
+## Going live over a tunnel (Cloudflare Tunnel / ngrok)
 
 A tunnel is the best option for real workers: it gives a **proper trusted HTTPS
 certificate**, so there is no "not private" warning, and GPS + camera work on every
 device with no per-device setup.
 
 ```bash
-python backend/serve.py --tunnel     # terminal 1: plain HTTP on :8000 for the tunnel
-ngrok http 8000                      # terminal 2: the public HTTPS address
+python backend/serve.py --tunnel          # terminal 1: plain HTTP on :8000 for the tunnel
+cloudflared tunnel --url http://localhost:8000   # terminal 2: the public HTTPS address
 ```
 
 `--tunnel` means "the tunnel provides the HTTPS, so do not make a self-signed
-certificate". Then open the `https://<something>.ngrok-free.dev` address on the
-laptop and the phone.
+certificate". Then open the printed `https://<words>.trycloudflare.com` address on the
+laptop and the phone. `ngrok http 8000` works the same way if that is what you have.
 
-- **First visit per browser:** ngrok shows a "You are about to visit …" warning
-  page. Click **Visit Site** once; after that the app loads normally.
 - **No front-end configuration needed.** The page and the API share one origin, so
   the app calls `https://<your-tunnel>/api/v1/...` automatically. (That also means
   no mixed-content blocking: the old hardcoded `http://<host>:8000` API URL would
   have been refused on an HTTPS page.)
+- **First visit per browser, on ngrok only:** ngrok's free tier shows a "You are
+  about to visit …" warning page. Click **Visit Site** once; after that the app
+  loads normally. Cloudflare Tunnel shows no such page.
 - **Rate limiting stays per worker.** `serve.py` enables proxy headers, so the
   `15/minute` limit on clock-in applies to each worker's real IP. Without that,
   every worker behind the tunnel would share one bucket and hit 429s together.
 - Keep the tunnel URL private. It has no authentication in front of it.
+- **The tunnel address is not a frontend.** Anybody opening it gets the app, which
+  is fine, but a quick tunnel (`trycloudflare.com`) gets a *new* address every time
+  it restarts - so it is not a link to give workers. For that, put the shell on
+  Cloudflare and the tunnel behind the API.
 
-### Putting Cloudflare in front of the tunnel
+### Serving the frontend from Cloudflare Workers
 
-A tunnel address is fine to hand around but it is not a frontend: it serves the API, and it
-changes every time ngrok restarts. Serving the frontend from Cloudflare Workers instead needs
-one thing the Worker must do for you - forward `/api`, `/static`, `/enroll` and `/q` to the
-tunnel - because the app is single-origin by construction and will otherwise call
-`<your-worker>/api/v1/...` and get a 404 from the asset host. `deploy/cloudflare/` has the
+`deploy/cloudflare/` is a Worker that serves the frontend as static assets and proxies
+`/api`, `/static`, `/enroll` and `/q` to the tunnel, so the one address workers get is stable
+while the backend stays behind a tunnel on this machine. The proxy is not optional: the app is
+single-origin by construction, so a shell hosted on Cloudflare with no proxy calls
+`<your-worker>/api/v1/...` and gets a 404 from the asset host (which is exactly what
+`al-jehad1.abdallahtamet281.workers.dev` did before the Worker existed). That folder holds the
 Worker, the `wrangler.toml`, and the two things to watch after the first deploy.
 
 ## Troubleshooting
