@@ -80,8 +80,9 @@ stops when the machine sleeps.
 not optional: the app is single-origin by construction, so a shell hosted on Cloudflare with no
 proxy calls `<your-worker>/api/v1/...` and gets a 404 from the asset host (which is exactly what
 `al-jehad1.abdallahtamet281.workers.dev` did before the Worker existed). That folder holds the
-Worker, the `wrangler.toml`, the check to run before the first deploy, and the two things to
-watch after it.
+Worker, the `wrangler.toml`, `verify_live.py` (the one command that checks the whole path,
+including the punch screen's own calls through the public URL), and the two things to watch
+after the first deploy.
 
 ### The backend on a host (Railway, or any host that injects a port)
 
@@ -1059,6 +1060,12 @@ password is still a head-admin-only action, and the offer is hidden where the se
 would answer 403.
 
 ## Tests
+
+`backend/tests/test_verify_live_script.py` covers `deploy/cloudflare/verify_live.py` without any
+network: whose answer a response is (the API's JSON refusal, the Worker's `error_code`, or an
+asset host's HTML), that Cloudflare's own 403 `error code: 1010` is never reported as a broken
+deployment, that the host's `x-railway-fallback` 502 is named as the host's problem, and that the
+hand-built multipart punch body is a form the API can parse.
 
 `backend/tests/test_deployment_manifest.py` keeps the deployment files honest: runtime imports
 stay pinned in `requirements.txt` (and test-only packages stay out of it), the healthcheck path is
