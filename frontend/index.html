@@ -30,8 +30,14 @@
     -->
     <script src="boot.js"></script>
 
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="tailwind_boot.js"></script>
+    <!--
+      One stylesheet, on this origin. It used to be three lines: the Tailwind CDN (which
+      compiled the utility classes in the browser, on every load, on the connection this
+      app is least able to assume), a script that apologised when that download failed,
+      and style.css. The utilities are components in style.css now, so a phone with no
+      internet gets the app it gets with one, and the policy no longer has to name a
+      third-party script origin. netguard.py's CSP is the other half of that.
+    -->
     <link rel="stylesheet" href="style.css">
     <noscript>
         <p style="font-family:system-ui,sans-serif;padding:20px">
@@ -44,10 +50,24 @@
     <div id="modalRoot"></div>
     <div id="toastRoot" class="toast-root" aria-live="polite"></div>
 
+    <!--
+      Four files, and only the four every session uses. Two more arrive later, on the
+      session that actually needs them, so a worker's phone does not download them:
+
+        admin_modules.js   255 KB, the console's eight screens. A worker can never reach
+                           one - UI.renderApp sends a worker to the handset - so UI
+                           injects this the first time an administrator signs in.
+        i18n.ar.js         40 KB, and i18n.hi.js at 53 KB, the two translations a reader
+                           who kept English will never read. I18n.load fetches the one
+                           a reader asks for.
+
+      Both are injected as a plain classic script tag pointing at the file, so the globals
+      they declare (UI_MODULES, TRANSLATIONS) are the same bindings the eager tags created.
+      backend/tests/test_frontend_payload.py is what keeps them out of this list.
+    -->
     <script src="i18n.js"></script>
     <script src="frontendjavascript.js"></script>
     <script src="offline_queue.js"></script>
     <script src="worker_modules.js"></script>
-    <script src="admin_modules.js"></script>
 </body>
 </html>

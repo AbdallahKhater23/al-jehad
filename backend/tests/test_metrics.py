@@ -403,7 +403,13 @@ def test_the_label_sets_stay_small_after_a_full_exercise(client, app_module):
     clock_in(client, MOALLEM, headers=bearer(MOALLEM))
     body = scrape(client)
 
-    assert len(label_values(body, "attendance_http_requests_total", "route")) <= 30
+    # The route vocabulary is defined in code, one label per *route template*, so this is a
+    # tight pin on purpose: it catches a route whose template embeds a caller's value, and a
+    # deliberate feature adds exactly one. Last raised from 30 by
+    # ``/admin/enroll/needs_reenrollment`` (the re-enrollment worklist); the property under
+    # test is that nothing here grows with the *number of requests*, which is what the
+    # assertions below this one use their own counts for.
+    assert len(label_values(body, "attendance_http_requests_total", "route")) <= 31
     assert len(label_values(body, "attendance_http_requests_total", "status")) <= 12
     assert len(label_values(body, "attendance_verifications_total", "outcome")) <= 6
     assert len(label_values(body, "attendance_sqlite_statements_total", "operation")) <= 10

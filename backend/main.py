@@ -46,7 +46,7 @@ import numpy as np
 from deepface import DeepFace
 from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
 from scipy.spatial.distance import cosine
@@ -108,6 +108,29 @@ from security import (
     validate_password_strength,
     verify_password,
 )
+
+
+# ---------------------------------------------------------------------------
+# Responses that are already JSON
+# ---------------------------------------------------------------------------
+def _json(payload) -> JSONResponse:
+    """Hand back a payload that is already JSON, without FastAPI walking it first.
+
+    FastAPI runs every non-``Response`` return value through ``jsonable_encoder``, which
+    walks the structure one value at a time - an ``isinstance``/``dataclass`` test per leaf.
+    On these row payloads that walk changes no byte: every value is a dict, a list, a
+    string, a number or ``None``, straight out of SQLite. It is also, measured on this
+    machine, one of the largest costs of the list endpoints - ~6.6 ms for the 129 KB
+    ``/admin/pending_reviews`` body and ~2.5 ms for ``/admin/logs`` - for work that produces
+    an identical response.
+
+    Safe exactly while those payloads stay JSON-native, which is what
+    ``tests/test_json_payloads_skip_the_encoder.py`` asserts (``jsonable_encoder(payload) ==
+    payload``, and ``json.dumps`` succeeding). A ``datetime`` or a ``Decimal`` reaching a row
+    must fail there and be fixed at the source rather than becoming a 500 here. Same
+    reasoning, and the same shape, as ``reports._encoded``.
+    """
+    return JSONResponse(content=payload)
 
 # ---------------------------------------------------------------------------
 # Application, limiter, static paths
@@ -762,6 +785,12 @@ def site_at(conn: sqlite3.Connection, lat: float, lon: float) -> sqlite3.Row | N
 #: little of our internals. These say what to do instead, and the code beside each one is
 #: what the client, the logs and the triage views key on, so the wording can change
 #: without anything downstream changing with it.
+#: The error ``compare_faces_sync`` reports when the *stored template* is the problem.
+#: Its own string rather than a generic failure because the two have different owners: a
+#: stale template needs an administrator to take a photograph, and a server fault needs
+#: somebody to read a log. Keys the mapping below, so it is a constant and not a literal.
+FACE_REFERENCE_STALE = "Reference face template predates the current face pipeline."
+
 FACE_FRAME_REFUSALS: dict[str, tuple[str, str]] = {
     "No face detected.": (
         "face_not_found",
@@ -776,6 +805,12 @@ FACE_FRAME_REFUSALS: dict[str, tuple[str, str]] = {
         "reference_missing",
         "Your face is not registered yet, so this punch cannot be matched. Ask your "
         "administrator to enroll you.",
+    ),
+    FACE_REFERENCE_STALE: (
+        "reference_stale",
+        "Your face records were taken before a change to the face check, so this photo "
+        "cannot be compared with them. Ask your administrator to enroll you again - it "
+        "takes one photo.",
     ),
 }
 
@@ -794,10 +829,30 @@ def _frame_refusal(error: str) -> tuple[str, str]:
 
 
 def compare_faces_sync(reference_json_path: str, live_image_data) -> dict:
+    # The template is read *before* the model runs, on purpose: an unusable template is a
+    # fact about the file, and spending a VGG-Face embedding to discover it would put a
+    # 200 ms model call in front of a refusal that has nothing to do with the photo. It
+    # also keeps the failure where an operator can find it - see ``biometrics``.
     try:
-        with open(reference_json_path, "r") as handle:
-            reference_embedding = json.load(handle)
+        reference = biometrics.read_reference(reference_json_path)
+    except FileNotFoundError:
+        return {"verified": False, "distance": 99.9, "error": "Reference embedding not found."}
+    except Exception:
+        # Unreadable is answered as stale rather than as a server fault: the fix is the
+        # same photograph, and two names for one fix is how a worker gets sent round a
+        # loop. The detailed reason is in ``biometrics.stale_references`` for an admin.
+        return {"verified": False, "distance": 99.9, "error": FACE_REFERENCE_STALE}
 
+    reason = biometrics.stale_reason(reference)
+    if reason is not None:
+        log.warning(
+            "refusing to score a stale face template (%s): %s",
+            reason,
+            os.path.basename(reference_json_path),
+        )
+        return {"verified": False, "distance": 99.9, "error": FACE_REFERENCE_STALE}
+
+    try:
         # ``represent_direct``, not a submission: the endpoint submits *this whole
         # function* to the face engine, so the model call here is the body of an engine
         # job. A job that submitted to its own pool would wait for the worker running it
@@ -809,11 +864,23 @@ def compare_faces_sync(reference_json_path: str, live_image_data) -> dict:
             return {"verified": False, "distance": 99.9, "error": "Multiple faces detected."}
 
         live_embedding = live_embedding_objs[0]["embedding"]
+        if len(reference.embedding) != len(live_embedding):
+            # A template of a different size cannot be compared at all: ``cosine`` would
+            # raise on the shape mismatch and answer with "Internal processing error" - a
+            # 500 that tells a worker nothing and blames us for what is a template change.
+            log.warning(
+                "face template %s has %s dimensions, the live embedding has %s",
+                os.path.basename(reference_json_path),
+                len(reference.embedding),
+                len(live_embedding),
+            )
+            return {"verified": False, "distance": 99.9, "error": FACE_REFERENCE_STALE}
+
         # The comparison itself, timed apart from the embedding that fed it: one is a numpy dot
         # product over 4096 floats and the other is half a second of TensorFlow, and reporting
         # them as one number would hide whichever one changed.
         started = time.perf_counter()
-        distance = cosine(reference_embedding, live_embedding)
+        distance = cosine(reference.embedding, live_embedding)
         telemetry.observe_cosine(time.perf_counter() - started)
 
         # The score on the way past, because it is the only early warning that the model, the
@@ -2262,7 +2329,7 @@ async def list_audit_log(
             ).fetchall()
         else:
             rows = conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-    return [dict(row) for row in rows]
+    return _json([dict(row) for row in rows])
 
 
 # ---------------------------------------------------------------------------
@@ -2512,7 +2579,7 @@ async def list_pending_reviews(current: CurrentUser = Depends(admin_only)):
             """,
             (STATUS_PENDING_REVIEW,),
         ).fetchall()
-    return [dict(row) for row in rows]
+    return _json([dict(row) for row in rows])
 
 
 @router.post("/admin/approve_review")
@@ -2738,7 +2805,7 @@ async def get_logs(limit: int = 500, worker_id: str | None = None, current: Curr
                 "ORDER BY l.timestamp DESC LIMIT ?",
                 (limit,),
             ).fetchall()
-    return [
+    return _json([
         {
             "id": row["id"],
             "worker_id": row["worker_id"],
@@ -2757,7 +2824,7 @@ async def get_logs(limit: int = 500, worker_id: str | None = None, current: Curr
             "flag_reason": row["flag_reason"],
         }
         for row in rows
-    ]
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -2776,7 +2843,7 @@ async def list_notifications(
         else:
             rows = conn.execute("SELECT * FROM admin_notifications ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         unread = notifications.unread_count(conn)
-    return {"unread": unread, "notifications": [dict(row) for row in rows]}
+    return _json({"unread": unread, "notifications": [dict(row) for row in rows]})
 
 
 @router.post("/admin/notifications/{notification_id}/read")
@@ -2797,6 +2864,29 @@ async def mark_notification_read(notification_id: int, current: CurrentUser = De
 # ---------------------------------------------------------------------------
 # admin: enrollment and shift rules
 # ---------------------------------------------------------------------------
+@router.get("/admin/enroll/needs_reenrollment")
+async def list_stale_templates(current: CurrentUser = Depends(admin_only)):
+    """Who has to be photographed again, and why.
+
+    The replacement of the face detector changed the crop an embedding is computed from,
+    so a template made before it no longer describes the picture a punch produces. Scoring
+    one anyway is the worst outcome available - a meaningless number that can read as a
+    *mismatch*, which accuses a worker of being somebody else - so ``compare_faces_sync``
+    refuses instead and points here.
+
+    Deliberately not a field on ``/admin/users``: that payload is a fixed contract every
+    row of the roster carries, and this is a short list an administrator acts on once
+    after an upgrade. The repair is the enrollment flow that already exists -
+    ``/admin/enroll`` with a fresh photo, or an enrollment link for a worker who is not at
+    the desk - so this endpoint reports rather than repairs.
+
+    ``expected_dimensions`` is left to the caller's own model by way of the live
+    embedding's shape check at punch time; here a template is stale when it records no
+    pipeline (every file written before the change) or records a different one.
+    """
+    return _json(biometrics.stale_references())
+
+
 @router.post("/admin/enroll")
 async def enroll_worker(
     request: Request,

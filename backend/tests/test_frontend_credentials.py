@@ -121,7 +121,8 @@ function textOf(cell) {
 }
 
 // Every account row, read the way the admin sees it: cells in order, plus the two state
-// attributes the module publishes (so an assertion never depends on Tailwind classes).
+// attributes the module publishes, so an assertion never depends on a class name - that is
+// a decision for the stylesheet, and the phone card and the desktop row share the hooks.
 function rowsOf(markup) {
     const rows = markup.match(/<tr data-user="[^"]*"[\s\S]*?<\/tr>/g) || [];
     return rows.map((row) => ({
@@ -135,7 +136,7 @@ function rowsOf(markup) {
 }
 
 function cardsOf(markup) {
-    const cards = markup.match(/<div class="p-4 rounded-xl border[^"]*" data-user="[^"]*"[\s\S]*?<\/div>\s*<\/div>/g) || [];
+    const cards = markup.match(/<div class="[^"]*" data-user="[^"]*"[\s\S]*?<\/div>\s*<\/div>/g) || [];
     return cards.map((card) => ({
         id: (/data-user="([^"]*)"/.exec(card) || [])[1],
         text: textOf(card)

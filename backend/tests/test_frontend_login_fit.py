@@ -92,6 +92,29 @@ def _length(declarations: str, prop: str) -> int:
     return int(match.group(1))
 
 
+def _hex(value: str) -> tuple[int, int, int]:
+    digits = value.strip().lstrip("#")
+    if len(digits) == 3:
+        digits = "".join(char * 2 for char in digits)
+    return tuple(int(digits[index:index + 2], 16) for index in (0, 2, 4))  # type: ignore[return-value]
+
+
+def _channel_lightness(channel: int) -> float:
+    """WCAG's transfer function: one 0-255 channel to a 0-1 linear one."""
+    ratio = channel / 255
+    return ratio / 12.92 if ratio <= 0.04045 else ((ratio + 0.055) / 1.055) ** 2.4
+
+
+def _contrast(foreground: str, background: str) -> float:
+    """The WCAG contrast ratio between two hex colours, lighter over darker."""
+    def luminance(colour: str) -> float:
+        red, green, blue = (_channel_lightness(channel) for channel in _hex(colour))
+        return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+    lighter, darker = sorted((luminance(foreground), luminance(background)), reverse=True)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
 def test_the_phone_login_is_a_strip_so_the_form_fits_without_scrolling():
     phone = _media_block(PHONE_QUERY, ".login-card")
     brand = _rule(phone, ".login-brand")
@@ -137,9 +160,8 @@ def test_no_phone_control_is_under_the_touch_floor():
     for selector in (".ui-chip", ".ops-chip", ".ui-btn-sm", ".ui-btn.is-icon"):
         assert selector in block, f"{selector} kept its 32px height on a phone"
         assert _length(_rule(block, selector), "min-height") >= 40
-    # The console builds several controls out of Tailwind utilities rather than a
-    # component class - the links screen's selects and its Revoke/Taps buttons, the notes
-    # row's Open button - so a class-level floor never reaches them.
+    # Not every control carries a component class - a bare <select> in a form, a table's
+    # own <button> - so the floor is also set on the elements themselves.
     for selector in (".admin button", ".admin select"):
         assert selector in block, f"{selector} has no phone floor"
         assert _length(_rule(block, selector), "min-height") >= 40
@@ -155,3 +177,34 @@ def test_the_clock_button_is_a_thumb_and_not_a_poster():
     compact = _rule(STYLE, ".hand-clock.compact")
     assert compact, "the desktop variant is now sized by .clock-button again"
     assert _length(compact, "min-height") <= 80
+
+
+def test_the_solid_action_fills_carry_white_text_in_both_themes():
+    """A fill is a contrast promise, and the promise is white text on it.
+
+    The clock button used to be a two-stop gradient with a hardcoded red in it, so
+    nothing in the stylesheet could be asked whether the label on it was readable. It is
+    a token now, and the reason the token exists is that the *status* hues cannot do this
+    job: white 16px on ``--ops-live`` (#16a34a) is 3.3:1, under the 4.5:1 a label that
+    size needs. Anything that repaints one of these four to a lighter red or green for a
+    theme puts an unreadable label on the one control this app is used for, silently -
+    which is exactly what a test is for.
+    """
+    for role in ("--ops-action-in", "--ops-action-in-press",
+                 "--ops-action-out", "--ops-action-out-press"):
+        values = re.findall(rf"{role}:\s*(#[0-9a-fA-F]{{3,8}})", STYLE)
+        assert len(values) >= 2, f"{role} is not declared for both themes: {values}"
+        for value in values:
+            ratio = _contrast("#ffffff", value)
+            assert ratio >= 4.5, (
+                f"white on {role} {value} is {ratio:.2f}:1 - the label on the clock button "
+                "is now unreadable, in one theme, without anything else changing"
+            )
+
+    # The pairing the ratios above are measured against, so this cannot pass by the
+    # button quietly dropping its white label for a dark one.
+    button = _rule(STYLE, ".clock-button")
+    assert button, "the shared primary action lost its rule"
+    assert "color: #fff" in button, (
+        "the four fills are measured against white; a dark label changes what must hold"
+    )

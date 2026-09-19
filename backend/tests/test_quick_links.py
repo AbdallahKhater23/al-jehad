@@ -24,6 +24,7 @@ quietly remove:
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta
 
 import pytest
@@ -175,6 +176,104 @@ def test_only_an_administrator_may_issue_a_link(client):
             endpoint="/admin/quick_links",
             detail="a clock link is a punch without a password",
         )
+
+
+#: The two pages a link opens, and the script each one is made of. Both are served one
+#: segment deep (``/q/<token>``, ``/enroll/<token>``) and both load their script with a
+#: ``src`` that has to be read against that URL rather than against the file on disk.
+LINK_PAGES = (("quick.html", "quick.js"), ("enroll.html", "enroll.js"))
+
+
+def test_the_page_a_link_opens_reaches_a_script_the_browser_will_run(client):
+    """The link worked; the page it opened did not, and nothing said so.
+
+    ``quick.html`` and ``enroll.html`` are served at ``/q/<token>`` and ``/enroll/<token>``
+    - one segment deep, where that segment is a token and not a directory. A bare
+    ``src="quick.js"`` therefore resolves to ``/q/quick.js``, which the *token route* matches
+    and answers with the page itself, as ``text/html``. Browsers refuse to execute a script
+    whose response is HTML (strict MIME checking, and Chrome says so in the console), so
+    neither file ever ran: the page kept the two placeholders it ships with - "Checking this
+    link…" and "Checking your location…" - and it looked like a hung connection rather than
+    a broken asset. The same trap caught the enrollment page, which nobody reported.
+
+    Measured rather than asserted from the markup: the second half fetches the URL the
+    browser will build from that ``src`` and insists it comes back as JavaScript, not as the
+    page again. A page that reaches for its script in the wrong direction fails here instead
+    of on a worker's phone at a gate; a "tidy-up" back to the bare file name fails here too.
+    """
+    for page, script in LINK_PAGES:
+        body = (harness.PROJECT_ROOT / "frontend" / page).read_text(encoding="utf-8")
+        sources = re.findall(r'<script[^>]*\bsrc="([^"]+)"', body)
+        assert sources, f"{page} loads no script at all"
+        # Every script on the page, not just the first: the shared capture module was added
+        # to both pages, and a trap that only watches the page's own file would let the new
+        # one be named the wrong way.
+        assert sources[-1] == f"../{script}", (
+            f'{page} asks for its own flow as "{sources[-1]}". It is served at '
+            f'/<prefix>/<token>, so anything but "../{script}" resolves into the token '
+            "segment and comes back as this page"
+        )
+        assert "../capture.js" in sources, (
+            f"{page} does not load the shared capture module. The camera, the photo policy "
+            "and the location fix are one file for both link pages; a page that grows its "
+            "own copy again is the drift this refactor removed"
+        )
+
+        for src in sources:
+            name = src.rsplit("/", 1)[-1]
+            assert src == f"../{name}", (
+                f'{page} asks for "{src}". Both link pages are served at /<prefix>/<token> '
+                f"- one segment deep, and that segment is a token - so the script has to "
+                f'be asked for one level up, as "../{name}"'
+            )
+            # What the browser will request, and what it has to be given back.
+            served = client.get(f"/{name}")
+            assert served.status_code == 200, f"/{name} is not served: {served.status_code}"
+            content_type = served.headers.get("content-type", "")
+            assert "javascript" in content_type, (
+                f"/{name} answered as {content_type!r}; a script served as anything else is "
+                "a script the browser refuses to execute"
+            )
+            assert "<!DOCTYPE html>" not in served.text[:200], (
+                f"/{name} answered with the page rather than the script"
+            )
+
+
+def test_both_link_pages_carry_every_element_the_shared_module_reaches_for():
+    """One capture module, two pages, and it reaches into their markup by id.
+
+    This is the failure that costs the most and shows the least: a page missing an element
+    the module binds to throws while wiring its buttons, so the *whole* page stops - the
+    link is never fetched, the state never painted, and it sits on "Checking this link…"
+    looking like a slow connection. The enrollment page lost its file input exactly this
+    way, when the shared translation pass replaced the text of the label the input was
+    nested in.
+
+    The id list is read off the module's own source rather than written out here, so an id
+    added for one page cannot be forgotten on the other.
+    """
+    module = (harness.PROJECT_ROOT / "frontend" / "capture.js").read_text(encoding="utf-8")
+    ids = sorted(set(re.findall(r'getElementById\(\"([\w-]+)\"\)', module)))
+    # The location line is addressed through an option on ``locate``, so it is named here.
+    ids = sorted(set(ids) | {"location-line"})
+    assert len(ids) >= 6, f"capture.js addresses only {ids}"
+
+    #: The one id only the punch page has, and deliberately: enrollment is not
+    #: geo-verified, so there is no line to write a fix into and the module checks for the
+    #: element instead of assuming it. Every other id is required on both pages.
+    PUNCH_ONLY = {"location-line"}
+
+    for page, _ in LINK_PAGES:
+        body = (harness.PROJECT_ROOT / "frontend" / page).read_text(encoding="utf-8")
+        required = ids if page.startswith("quick") else [n for n in ids if n not in PUNCH_ONLY]
+        missing = [name for name in required if f'id="{name}"' not in body]
+        assert missing == [], (
+            f"{page} is missing {missing}: capture.js addresses it by id, so the page would "
+            "stop at its first binding instead of rendering"
+        )
+        # ``hidden`` is how the module shows and hides the camera, the preview and the
+        # fallback label. It is each page's own stylesheet, so each page has to define it.
+        assert ".hidden" in body, f"{page} uses the module's show/hide contract but never styles it"
 
 
 def test_issue_returns_a_usable_link_once(client):

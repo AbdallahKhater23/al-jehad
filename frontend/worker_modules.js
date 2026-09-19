@@ -200,17 +200,17 @@ const WORKER_MODULES = {
             if (dayReached && autoCloses && !announcedDay) {
                 // The shift is at its paid limit: the server closes it at 8.5 h on site.
                 noteEl.innerHTML = `
-                    <p class="hand-note-title">${this.escapeHtml(I18n.__('shiftEndsNow'))}</p>
+                    <p class="hand-note-title">${HAND_ICONS.alert}<span>${this.escapeHtml(I18n.__('shiftEndsNow'))}</span></p>
                     <p class="hand-note-sub">${this.escapeHtml(dayDone)}</p>`;
                 announcedDay = true;
                 Toast.info(I18n.__('shiftEndsNow'));
             } else if (dayReached && autoCloses) {
                 noteEl.innerHTML = `
-                    <p class="hand-note-title">${this.escapeHtml(I18n.__('shiftEndsNow'))}</p>
+                    <p class="hand-note-title">${HAND_ICONS.alert}<span>${this.escapeHtml(I18n.__('shiftEndsNow'))}</span></p>
                     <p class="hand-note-sub">${this.escapeHtml(dayDone)}</p>`;
             } else if (past && !raised) {
                 noteEl.innerHTML = `
-                    <p class="hand-note-title">${this.escapeHtml(note)}</p>
+                    <p class="hand-note-title">${HAND_ICONS.alert}<span>${this.escapeHtml(note)}</span></p>
                     <p class="hand-note-sub">${this.escapeHtml(openShiftHint)}</p>`;
                 raised = true;
                 // The moment it tips over, while the worker is looking at the card.
@@ -244,7 +244,7 @@ const WORKER_MODULES = {
         try {
             status = await this.fetchStatus();
         } catch (err) {
-            container.innerHTML = `<p class="text-red-500">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`;
+            container.innerHTML = `<p class="ui-note is-body is-danger">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`;
             return;
         }
 
@@ -258,26 +258,42 @@ const WORKER_MODULES = {
 
         container.innerHTML = `
             <div class="hand-hero ${active ? 'is-live' : ''}">
-                <p class="hand-hero-status">
-                    <span class="hand-dot ${active ? '' : 'is-off'}" aria-hidden="true"></span>${this.escapeHtml(I18n.__('shiftStatus'))}
-                </p>
+                <div class="hand-hero-top">
+                    <p class="hand-hero-status">
+                        <span class="hand-dot ${active ? '' : 'is-off'}" aria-hidden="true"></span>${this.escapeHtml(I18n.__('shiftStatus'))}
+                    </p>
+                    ${/* The site, in the corner: the one fact on this card the worker did not
+                         choose and cannot change, so it is a chip rather than a second
+                         headline. */ ''}
+                    ${active && active.site_name
+                        ? `<p class="hand-hero-site">${this.escapeHtml(I18n.__('site'))}<strong>${this.escapeHtml(active.site_name)}</strong></p>`
+                        : ''}
+                </div>
                 <p class="hand-hero-word">${this.escapeHtml(active ? I18n.__('onShift') : I18n.__('currentlyClockedOut'))}</p>
                 ${active ? `
-                    <div class="hand-hero-meta">
-                        ${active.clock_in_time ? `<span>${this.escapeHtml(I18n.__('clockedInAt'))} <strong class="hand-mono">${this.escapeHtml(active.clock_in_time)}</strong></span>` : ''}
-                        ${active.site_name ? `<span>${this.escapeHtml(I18n.__('site'))}: <strong>${this.escapeHtml(active.site_name)}</strong></span>` : ''}
-                    </div>
                     ${clockInTime ? `
                         <span id="shiftElapsed" class="hand-timer">0:00:00</span>
                         <span class="hand-timer-label">${this.escapeHtml(I18n.__('handTimeOnShift'))}</span>` : ''}
                     ${/* The two numbers a worker is paid by, said out loud: the paid day, the
                          unpaid break, and the shift length they add up to. Without them the
                          timer above reads as the thing that gets paid, and 8:30:00 on a
-                         30-minute break day looks like an hour of missing money. */ ''}
-                    ${clockInTime ? `<p class="hand-policy" data-day-policy="${status.paidDayHours || 'default'}">
-                        ${this.escapeHtml(I18n.__('shiftPaidDay'))}: <b>${status.paidDayHours ? this.hoursLabel(status.paidDayHours) : '8'} h</b>
-                        · ${this.escapeHtml(I18n.__('shiftUnpaidBreak'))}: <b>${this.minutesLabel(status.breakMinutes)}</b>
-                    </p>` : ''}
+                         30-minute break day looks like an hour of missing money - and the
+                         clock-in the server actually recorded, so the timer can be checked
+                         against something a worker can point at. */ ''}
+                    ${clockInTime ? `<div class="hand-policy" data-day-policy="${status.paidDayHours || 'default'}">
+                        <span class="hand-policy-cell">
+                            <span class="hand-policy-label">${this.escapeHtml(I18n.__('clockedInAt'))}</span>
+                            <span class="hand-policy-value is-mono">${this.escapeHtml(active.clock_in_time)}</span>
+                        </span>
+                        <span class="hand-policy-cell">
+                            <span class="hand-policy-label">${this.escapeHtml(I18n.__('shiftPaidDay'))}</span>
+                            <span class="hand-policy-value"><b>${status.paidDayHours ? this.hoursLabel(status.paidDayHours) : '8'} h</b></span>
+                        </span>
+                        <span class="hand-policy-cell">
+                            <span class="hand-policy-label">${this.escapeHtml(I18n.__('shiftUnpaidBreak'))}</span>
+                            <span class="hand-policy-value"><b>${this.minutesLabel(status.breakMinutes)}</b></span>
+                        </span>
+                    </div>` : ''}
                     ${clockInTime ? `<div id="shiftOvertimeNote" class="hand-note hidden"></div>` : ''}
                 ` : ''}
                 ${status.stale ? `<p class="hand-hero-meta is-warn">${this.escapeHtml(I18n.__('lastKnownStatus'))}</p>` : ''}
@@ -300,7 +316,7 @@ const WORKER_MODULES = {
             <div class="hand-facts">
                 <div class="hand-fact">
                     <p class="hand-fact-label">${this.escapeHtml(I18n.__('hoursThisMonth'))}</p>
-                    <p class="hand-fact-value">${this.escapeHtml(status.monthHours)} h</p>
+                    <p class="hand-fact-value is-mono">${this.escapeHtml(status.monthHours)} h</p>
                 </div>
                 <div class="hand-fact">
                     <p class="hand-fact-label">${this.escapeHtml(I18n.__('location'))}</p>
@@ -555,7 +571,7 @@ const WORKER_MODULES = {
         const open = Number(data && data.open) || 0;
         return `
             <div class="hand-section-head">
-                <div class="min-w-0">
+                <div class="ui-stack is-tight">
                     <h3 class="hand-section-title">${this.escapeHtml(I18n.__('notesMine'))}</h3>
                     <p class="hand-section-note">${this.escapeHtml(I18n.__('notesIntro'))}</p>
                 </div>
@@ -701,7 +717,7 @@ const WORKER_MODULES = {
         try {
             note = await API.request(`/worker/notes/${noteId}`);
         } catch (err) {
-            this._notesHost.innerHTML = `<p class="text-red-500">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`;
+            this._notesHost.innerHTML = `<p class="ui-note is-body is-danger">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`;
             return;
         }
         this._noteThread = note;
@@ -723,7 +739,7 @@ const WORKER_MODULES = {
                 ${HAND_ICONS.back}${this.escapeHtml(I18n.__('noteBack'))}
             </button>
             <div class="hand-section-head" style="margin-top:12px">
-                <div class="min-w-0">
+                <div class="ui-stack is-tight">
                     <h3 class="hand-section-title">${this.escapeHtml(note.subject)}</h3>
                     <p class="hand-section-note">
                         ${this.escapeHtml(I18n.__('noteOpened'))}: ${this.escapeHtml(note.created_at || '')}

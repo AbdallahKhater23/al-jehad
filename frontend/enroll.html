@@ -13,7 +13,8 @@
     font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     display: flex; flex-direction: column;
   }
-  header { padding: 18px 16px 10px; }
+  header { padding: 18px 16px 10px; display: flex; gap: 12px; align-items: flex-start; }
+  header .head { flex: 1; min-width: 0; }
   h1 { font-size: 1.15rem; margin: 0 0 4px; }
   .sub { color: #94a3b8; font-size: .85rem; margin: 0; }
   main { flex: 1; padding: 12px 16px 28px; display: flex; flex-direction: column; gap: 14px; }
@@ -27,6 +28,14 @@
   }
   button.secondary { background: #334155; color: #e2e8f0; }
   button[disabled] { opacity: .5; cursor: not-allowed; }
+  /* The language picker, as on the punch page: sized like a control, not like the one
+     thing the page is for. */
+  .langs { display: flex; gap: 4px; flex: 0 0 auto; }
+  .langs button {
+    flex: 0 0 auto; min-height: 30px; min-width: 32px; padding: 0 7px; border-radius: 999px;
+    background: #334155; color: #cbd5e1; font-size: .75rem; font-weight: 700; line-height: 1;
+  }
+  .langs button[aria-pressed="true"] { background: #38bdf8; color: #0b1220; }
   input[type=file] { display: none; }
   input.field {
     flex: 1 1 140px; min-height: 48px; border-radius: 12px; border: 1px solid #334155;
@@ -43,19 +52,33 @@
   .msg.err { display: block; background: #3b0d0d; color: #fca5a5; border: 1px solid #7f1d1d; }
   .pill { display: inline-block; padding: 3px 9px; border-radius: 999px; background: #0b1220; color: #7dd3fc; font-size: .75rem; }
   .hidden { display: none !important; }
+  /* The vendor credit, as on every other page this app serves. */
+  .credit { margin: 0; padding: 0 16px 18px; text-align: center; font-size: .78rem; color: #64748b; }
 </style>
 </head>
 <body>
+<!--
+  English in the file, re-read into the reader's language by ``capture.js`` off the
+  ``data-t`` keys - the same contract as the punch page, and for the same reason: a script
+  that does not arrive leaves English, not key names.
+-->
 <header>
-  <h1 id="title">Register your face</h1>
-  <p class="sub" id="who">Checking your link…</p>
+  <div class="head">
+    <h1 id="title" data-t="enroll.title">Register your face</h1>
+    <p class="sub" id="who" data-t="enroll.sub">Checking your link…</p>
+  </div>
+  <nav class="langs" id="langs" data-t-aria="language">
+    <button type="button" data-lang="en">EN</button>
+    <button type="button" data-lang="ar">ع</button>
+    <button type="button" data-lang="hi">हि</button>
+  </nav>
 </header>
 
 <main>
   <div id="message" class="msg"></div>
 
   <div class="card" id="step-intro">
-    <p class="note">
+    <p class="note" data-t="enroll.intro">
       Stand in good light, hold the phone at eye level, and look straight at the camera.
       Remove hats or sunglasses. This photo is compared with the selfie you take when you
       clock in, so take it where you normally clock in.
@@ -64,15 +87,20 @@
 
   <div class="card">
     <video id="video" playsinline autoplay muted class="hidden"></video>
-    <img id="preview" class="preview hidden" alt="Your photo preview" />
+    <img id="preview" class="preview hidden" data-t-alt="camera.preview.photo" alt="Your photo preview" />
     <canvas id="canvas" class="hidden"></canvas>
     <div class="row" style="margin-top:12px">
-      <button id="btn-start">Open camera</button>
-      <button id="btn-shoot" class="secondary hidden">Take photo</button>
-      <button id="btn-retake" class="secondary hidden">Retake</button>
+      <button id="btn-start" data-t="camera.open">Open camera</button>
+      <button id="btn-shoot" class="secondary hidden" data-t="camera.shoot.photo">Take photo</button>
+      <button id="btn-retake" class="secondary hidden" data-t="camera.retake">Retake</button>
     </div>
+    <!--
+      The sentence is in a span of its own - see the same note on the punch page: a
+      translation replaces an element's text, and doing that to the label would delete the
+      file input this page needs when the camera is refused.
+    -->
     <label class="file" id="fallback-label">
-      Camera not available? Tap here to use the phone's gallery instead
+      <span data-t="enroll.fallback">Camera not available? Tap here to use the phone's gallery instead</span>
       <input id="file" type="file" accept="image/jpeg,image/png,image/webp" />
     </label>
     <p class="note" id="photo-policy"></p>
@@ -88,23 +116,34 @@
   <div class="card hidden" id="password-card">
     <p class="note" id="password-hint" style="margin-top:0"></p>
     <div class="row" style="margin-top:10px">
-      <input id="password" class="field" type="password" placeholder="Choose a password"
-             autocomplete="new-password" />
-      <input id="password2" class="field" type="password" placeholder="Type it again"
-             autocomplete="new-password" />
+      <input id="password" class="field" type="password" data-t-ph="enroll.password.placeholder"
+             placeholder="Choose a password" autocomplete="new-password" />
+      <input id="password2" class="field" type="password" data-t-ph="enroll.password2.placeholder"
+             placeholder="Type it again" autocomplete="new-password" />
     </div>
   </div>
 
   <div class="card">
     <div class="row">
-      <input id="phone" class="field" type="tel" placeholder="Phone (optional)" inputmode="tel" />
-      <input id="email" class="field" type="email" placeholder="Email (optional)" />
+      <input id="phone" class="field" type="tel" data-t-ph="enroll.phone.placeholder"
+             placeholder="Phone (optional)" inputmode="tel" />
+      <input id="email" class="field" type="email" data-t-ph="enroll.email.placeholder"
+             placeholder="Email (optional)" />
     </div>
-    <button id="btn-submit" style="margin-top:12px;width:100%" disabled>Submit my photo</button>
+    <button id="btn-submit" style="margin-top:12px;width:100%" data-t="enroll.submit" disabled>Submit my photo</button>
     <p class="note" id="status-line"></p>
   </div>
 </main>
 
-<script src="enroll.js"></script>
+<footer class="credit" id="credit">Powered by دوامك اسهل</footer>
+
+<!--
+  Two scripts. This page is served at ``/enroll/<token>``, so a relative src asks the token
+  route for... this page. See the longer note in quick.html - the same trap, the same
+  one-level-up answer, and the same two files: the shared capture module, then this page's
+  own flow.
+-->
+<script src="../capture.js"></script>
+<script src="../enroll.js"></script>
 </body>
 </html>

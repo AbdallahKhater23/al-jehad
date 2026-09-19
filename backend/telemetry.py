@@ -446,10 +446,18 @@ def sql_operation(statement: str) -> str:
     only the verb crosses this boundary. ``other`` is the honest answer for anything
     unrecognised.
     """
-    try:
-        head = _LEADING_COMMENTS.sub("", str(statement or ""), count=1).lstrip()
-    except Exception:  # pragma: no cover - defensive
-        return "other"
+    text = str(statement or "")
+    # Fast path: a statement almost always starts with its verb, and a leading comment must
+    # start with '-' or '/', so ``lstrip`` alone answers it and the regex - which exists only
+    # for comments - is skipped. This is on the hot path: it runs once per SQL statement the
+    # application executes, i.e. several times per request, from ``database``'s instrumented
+    # connection. The two paths agree whenever the first non-space character is a letter.
+    head = text.lstrip()
+    if not (head and head[0].isalpha()):
+        try:
+            head = _LEADING_COMMENTS.sub("", text, count=1).lstrip()
+        except Exception:  # pragma: no cover - defensive
+            return "other"
     lowered = head[:32].lower()
     for prefix, label in _SQL_VERBS:
         if lowered.startswith(prefix):

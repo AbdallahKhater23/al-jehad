@@ -219,17 +219,27 @@ function inputValue(html, id) {
     return match ? match[1] : null;
 }
 
-// The header, as the reader sees it: the labels, in the order they are painted.
+// The shifts table alone, so a second table in the tab cannot be read as this one.
+function shiftsTable(html) {
+    const start = html.indexOf('data-shifts-table="true"');
+    if (start < 0) return '';
+    return html.slice(start, html.indexOf('</table>', start));
+}
+
+// The header, as the reader sees it: the labels, in the order they are painted. Read off
+// the table's own ``th``/``td`` rather than off a padding class: the cells carry no class
+// of their own now, and their padding comes from ``.ui-table`` - a class the suite would
+// be pinning a framework's name for rather than the cell it is about.
 function headerLabels(html) {
-    return (html.match(/<th class="p-2">[\s\S]*?<\/th>/g) || [])
+    return (shiftsTable(html).match(/<th[^>]*>[\s\S]*?<\/th>/g) || [])
         .map((cell) => cell.replace(/<[^>]*>/g, '').trim());
 }
 
 // Every row's cells, as text, in the order they are painted: what a reader would read
 // off the table, line by line.
 function allRows(html) {
-    return (html.match(/<tr data-shift="[^"]*"[\s\S]*?<\/tr>/g) || [])
-        .map((row) => (row.match(/<td class="p-2">[\s\S]*?<\/td>/g) || [])
+    return (shiftsTable(html).match(/<tr data-shift="[^"]*"[\s\S]*?<\/tr>/g) || [])
+        .map((row) => (row.match(/<td[^>]*>[\s\S]*?<\/td>/g) || [])
             .map((cell) => cell.replace(/<[^>]*>/g, '').trim()));
 }
 
@@ -693,7 +703,7 @@ const results = {};
         await env.evaluate("UI.renderAdminTab('Shifts')");
         const html = env.evaluate("document.getElementById('adminContent').innerHTML");
         results.mobile = Object.assign(cardValues(html), {
-            labels: (html.match(/<dt class="text-xs font-semibold text-gray-500 dark:text-gray-400">[\s\S]*?<\/dt>/g) || [])
+            labels: (html.match(/<dt[^>]*\bdata-shift-label\b[^>]*>[\s\S]*?<\/dt>/g) || [])
                 .map((cell) => cell.replace(/<[^>]*>/g, '').trim())
         });
     }

@@ -146,10 +146,10 @@ class Settings(BaseModel):
     #: cannot see.
     hsts_max_age_seconds: int = 15552000
     #: Document / API policies. Unset uses ``netguard.CSP_HTML`` and ``netguard.CSP_API``.
-    #: The bundled policy already refuses inline ``<script>`` elements and names
-    #: ``cdn.tailwindcss.com`` because the frontend's utility CSS is compiled in the browser;
-    #: set ``CSP_HTML`` to drop that host once a Tailwind build is committed, and to add
-    #: hashes for any inline block a customised page reintroduces.
+    #: The bundled policy already refuses inline ``<script>`` elements and names no
+    #: third-party origin: the frontend's styles are component classes in ``style.css``, not
+    #: utilities compiled in the browser. Set ``CSP_HTML`` to add the sources a customised
+    #: page needs, and hashes for any inline block it reintroduces.
     csp_api: str | None = None
     csp_html: str | None = None
 
@@ -180,6 +180,15 @@ class Settings(BaseModel):
     #: In ``enforce`` mode, is a missing runtime/model fatal (fail closed, the safe
     #: default) or a warning that lets the punch through?
     liveness_allow_unavailable: bool = False
+
+    # -- face detection (YuNet ONNX, see ``face_detector``) -----------------
+    #  Detection was ~70% of a verification: measured 308 ms with MTCNN against 10 ms with
+    #  YuNet at the application's own 640x640 working size. The model is 232 KB and ships
+    #  in-tree; the override and the pin exist for the same reason the liveness ones do -
+    #  an operator who keeps the artifact elsewhere, or wants the server to refuse an
+    #  unexpected one. Absent, verification falls back to the previous detector.
+    face_detector_model_path: Path = Path("backend/models/face_detection_yunet_2023mar.onnx")
+    face_detector_model_sha256: str | None = None
 
     # -- face verification capacity (see ``face_engine``) -------------------
     #  Every punch and every enrollment is a VGG-Face embedding plus an MTCNN detection,
@@ -481,6 +490,11 @@ def build_settings(*, env_file: Path | None = None) -> Settings:
         liveness_mode=liveness_mode,
         liveness_model_path=_env_path("LIVENESS_MODEL_PATH", PROJECT_ROOT / "backend/models/minifasnet.onnx"),
         liveness_model_sha256=_env_str("LIVENESS_MODEL_SHA256"),
+        face_detector_model_path=_env_path(
+            "FACE_DETECTOR_MODEL_PATH",
+            PROJECT_ROOT / "backend/models/face_detection_yunet_2023mar.onnx",
+        ),
+        face_detector_model_sha256=_env_str("FACE_DETECTOR_MODEL_SHA256"),
         liveness_input_size=_env_int("LIVENESS_INPUT_SIZE", 80),
         liveness_accept_threshold=_env_float("LIVENESS_ACCEPT_THRESHOLD", 0.70),
         liveness_reject_threshold=_env_float("LIVENESS_REJECT_THRESHOLD", 0.55),

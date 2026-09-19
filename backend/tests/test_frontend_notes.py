@@ -309,11 +309,14 @@ const results = {};
     await env.evaluate("UI.renderAdminTab('Notes')");
     await env.evaluate("UI_MODULES.openNote(11)");
     const markup = render(env);
-    const messages = (markup.match(/<div class="flex (?:justify-start|justify-end)" data-message="\d+" data-internal="[01]"/g) || [])
+    // A message is identified by the two data attributes, and "which side is it on" by the
+    // bubble's own variant class - the same class the stylesheet uses to put it there, so a
+    // message that stopped being the admin's would fail here as well as on screen.
+    const messages = (markup.match(/<div class="hand-bubble-row[^"]*" data-message="\d+" data-internal="[01]"/g) || [])
         .map((tag) => ({
             id: (/data-message="(\d+)"/.exec(tag) || [])[1],
             internal: /data-internal="1"/.test(tag),
-            mine: tag.indexOf('justify-end') >= 0
+            mine: tag.indexOf('is-mine') >= 0
         }));
     results.thread = {
         messages: messages,

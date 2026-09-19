@@ -40,15 +40,18 @@ FRONTEND = PROJECT_ROOT / "frontend"
 
 pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
-# Runs the same files index.html loads, in one shared scope (as separate tags
-# would), against a stubbed DOM and a recording fetch.
+# The files a worker's phone ends up with, in one shared scope (as separate tags
+# would), against a stubbed DOM and a recording fetch. Deliberately no
+# admin_modules.js: this suite is where the worker path is proven to run without it,
+# now that index.html no longer ships it and UI fetches it only for an administrator.
 HARNESS = r"""
 const vm = require('vm');
 const fs = require('fs');
 const path = require('path');
 
 const frontend = process.argv[2];
-const scripts = ['i18n.js', 'frontendjavascript.js', 'worker_modules.js'];
+const scripts = ['i18n.js', 'i18n.ar.js', 'i18n.hi.js', 'frontendjavascript.js',
+                 'worker_modules.js'];
 
 // A clock the tests can move by hand. The card's timer has to be *live*: the only
 // way to observe a shift tipping past the threshold while the worker watches is to

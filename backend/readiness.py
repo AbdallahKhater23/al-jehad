@@ -1003,6 +1003,50 @@ def _check_face_engine(ctx: dict) -> Check:
     return Check("face_engine", TIER_ADVISORY, not snapshot.get("busy"), detail, snapshot)
 
 
+def _check_face_detector(ctx: dict) -> Check:
+    """Which face detector is live, and how many templates it has invalidated.
+
+    Advisory, and it never stops the server - a checkout without the model runs on the
+    previous detector, which is correct, just thirty times slower on the detection half of
+    every punch. That is worth one line an operator can see.
+
+    The second half is the migration: replacing the detector changed the crop an embedding
+    is computed from, so every template written before it has to be re-enrolled. The count
+    is the size of that worklist, and the fix is a photograph rather than a config change -
+    so it is reported here and acted on through ``/admin/enroll`` (see
+    ``biometrics.stale_references``).
+    """
+    try:
+        import face_detector
+
+        described = face_detector.describe()
+    except Exception as exc:  # noqa: BLE001 - a report must never fail on one check
+        return Check("face_detector", TIER_ADVISORY, True, f"could not be checked: {exc}")
+
+    detail = (
+        f"{described['detector']} ({described['pipeline']}) is the face detector"
+        if described["available"]
+        else f"YuNet is unavailable ({described.get('error') or 'no reason given'}) and "
+        "verification is running on the previous detector"
+    )
+    ok = bool(described["available"])
+
+    try:
+        import biometrics
+
+        worklist = biometrics.stale_references()
+    except Exception as exc:  # noqa: BLE001
+        return Check("face_detector", TIER_ADVISORY, ok, f"{detail}; templates could not be checked: {exc}")
+
+    stale = int(worklist.get("count") or 0)
+    if stale:
+        detail += (
+            f"; {stale} of {worklist.get('enrolled_checked', 0)} enrolled templates were made "
+            "by the previous pipeline and need re-enrollment (/api/v1/admin/enroll/needs_reenrollment)"
+        )
+    return Check("face_detector", TIER_ADVISORY, ok, detail, worklist)
+
+
 def _check_clock_sanity(ctx: dict) -> Check:
     try:
         conn = _open(ctx.get("db_path"), read_only=True)
@@ -1119,6 +1163,7 @@ CHECKS = (
     _check_retention_residue,
     _check_metrics,
     _check_face_engine,
+    _check_face_detector,
     _check_liveness,
     _check_clock_sanity,
     _check_database_path,
