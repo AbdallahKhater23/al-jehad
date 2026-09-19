@@ -299,7 +299,7 @@ def test_the_extracted_scripts_are_valid_javascript():
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is not installed")
-    for name in ("boot.js", "tailwind_boot.js", "enroll.js", "quick.js"):
+    for name in ("boot.js", "enroll.js", "quick.js", "capture.js"):
         path: Path = FRONTEND / name
         assert path.exists(), f"{name} is referenced by a page but missing"
         completed = subprocess.run(

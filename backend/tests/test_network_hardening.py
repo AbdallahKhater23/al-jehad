@@ -473,9 +473,13 @@ def test_a_document_response_carries_the_document_policy(client, monkeypatch):
     assert "frame-ancestors 'none'" in policy
     assert "object-src 'none'" in policy
     assert "frame-src 'none'" in policy
-    # Named rather than wildcarded: the one remote script the frontend genuinely loads is
-    # the Tailwind Play CDN, and it is named in ``script-src`` alone.
-    assert "https://cdn.tailwindcss.com" in policy
+    # No third-party origin at all, in either directive. The utility classes the frontend
+    # used to have compiled in the browser by the Tailwind Play CDN are components in
+    # ``frontend/style.css``; a policy that names that host again means the compiler is
+    # back, and a phone at a gate is downloading a 120 KB script to style five classes.
+    assert "cdn.tailwindcss.com" not in policy
+    assert "script-src 'self';" in policy
+    assert "style-src 'self' 'unsafe-inline';" in policy
     assert "img-src 'self' data: blob:" in policy
 
 

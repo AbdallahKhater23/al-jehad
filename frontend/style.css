@@ -23,8 +23,149 @@ html.dark {
     color-scheme: dark;
 }
 
+/* ---------- The base layer -------------------------------------------------
+   Tailwind's CDN was doing three jobs, and only one of them was styling: it compiled
+   utilities in the browser, it set the theme's dark mode, and it shipped a *reset* - the
+   preflight. The utilities are gone from the markup (every call site now names a
+   component in this file). The reset cannot be: the app was written on top of it, so
+   removing the script without it would not restyle the app, it would un-style it.
+
+   These are the parts of preflight this app actually stands on, spelled out:
+
+   * ``box-sizing: border-box`` everywhere. Every card, field and button in the app is a
+     percentage width or a fixed height *plus* padding; without this the console is a
+     page of horizontally scrolling boxes.
+   * margins off the block elements. The markup is full of headings and paragraphs whose
+     spacing comes from the component they are in, not from the element.
+   * headings inherit their size and weight. ``.ui-title``, ``.ui-card-title`` and the
+     handset's own classes set both deliberately; an ``h3`` that keeps the browser's
+     1.17em bold would fight them.
+   * form controls: inherit the page's font, no UA padding, no UA button chrome.
+   * media on its own line, never wider than its box.
+
+   The one thing it does *not* reproduce is the webfont: Tailwind's default family was
+   already overridden on ``body``, and this app never downloaded it. */
+
+html {
+    /* No text inflation when a phone is turned on its side: iOS grows the type in a
+       rotated viewport unless told not to, which reflows every table in the console. */
+    -webkit-text-size-adjust: 100%;
+}
+
+*,
+*::before,
+*::after {
+    box-sizing: border-box;
+}
+
+h1, h2, h3, h4, h5, h6, p, figure, blockquote, dl, dd, pre {
+    margin: 0;
+}
+
+h1, h2, h3, h4, h5, h6 {
+    font-size: inherit;
+    font-weight: inherit;
+}
+
+ol, ul {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+img, svg, video, canvas, audio, iframe, embed, object {
+    display: block;
+    vertical-align: middle;
+}
+
+img, video {
+    max-width: 100%;
+    height: auto;
+}
+
+table {
+    border-collapse: collapse;
+    border-spacing: 0;
+}
+
+hr {
+    height: 0;
+    border: 0;
+    border-top-width: 1px;
+    color: inherit;
+}
+
+a {
+    color: inherit;
+    text-decoration: inherit;
+}
+
+b, strong {
+    font-weight: bolder;
+}
+
+button, input, optgroup, select, textarea {
+    margin: 0;
+    padding: 0;
+    font-weight: inherit;
+    line-height: inherit;
+    color: inherit;
+}
+
+button, select {
+    text-transform: none;
+}
+
+button, [type='button'], [type='reset'], [type='submit'] {
+    -webkit-appearance: button;
+    background-color: transparent;
+    background-image: none;
+    cursor: pointer;
+}
+
+/* A search field is a field. Without this the browser draws its own rounded control and
+   a native clear button on top of the one the console already has. */
+[type='search'] {
+    -webkit-appearance: textfield;
+    outline-offset: -2px;
+}
+
+::-webkit-search-decoration {
+    -webkit-appearance: none;
+}
+
+::-webkit-file-upload-button {
+    -webkit-appearance: button;
+    font: inherit;
+}
+
+textarea {
+    resize: vertical;
+}
+
+/* The app's own switch, not a style: the camera overlay, the photo previews and the
+   overtime note are all in the DOM with this class on them from the first paint, and the
+   code takes it off when the thing they announce is ready. ``sr-only`` is the other half
+   of the idea - text a screen reader reads and the eye does not. */
+.hidden {
+    display: none !important;
+}
+
+.sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border-width: 0;
+}
+
 body {
     background-color: var(--bg-color);
+    line-height: 1.5; /* preflight's, and every screen was measured against it */
     color: var(--text-color);
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     transition: var(--transition);
@@ -97,31 +238,50 @@ input, select, textarea, button {
 .tabbar button .tabbar-icon { font-size: 20px; line-height: 1; }
 .tabbar button.is-active { color: var(--accent); }
 
-/* The one primary action, sized for a thumb rather than for a poster.
-   168px was right when this button *was* the card; now the shift card above it
-   carries the state, and a button that tall pushed the month's hours and the GPS
-   readiness - the two figures a worker checks before walking to the gate - below
-   the fold on a 640px-tall phone. 128px is still far past the 48px floor, still
-   landable without looking, and leaves the facts visible under it. */
+/* The one primary action on the handset - and, after three passes at it, a button.
+
+   It has been 168px (when it *was* the card), 128px, 104px and 76px tall, always with
+   a two-stop gradient and a 1.5rem label. All four are a poster: a control that takes
+   a fifth of the screen reads as a panel, so a worker tap-hunts for the part of it
+   that is pressable, the gradient makes the *colour* the loudest thing on a screen
+   whose subject is the shift, and the height pushed the month's hours and the GPS
+   state off a 640px handset. 52px is a thumb-sized target with room for a 16px label
+   and a 18px icon, and one flat fill the surface behind it cannot wash out.
+
+   The fills are their own tokens (``--ops-action-*``) rather than the status hues:
+   a status colour only has to be legible *as* a colour, while this one has to carry
+   white 16px text at 4.5:1 in both themes. */
 .clock-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--ui-2);
     width: 100%;
-    min-height: 128px;
-    border: 0;
-    border-radius: 1.75rem;
-    font-size: 1.5rem;
-    font-weight: 800;
-    letter-spacing: 0.02em;
+    min-height: 52px;
+    padding: 6px var(--ui-4);
+    border: 1px solid transparent;
+    border-radius: var(--ui-radius-sm);
+    font-size: 16px;
+    font-weight: 700;
+    line-height: 1.1;
+    letter-spacing: 0;
     color: #fff;
     cursor: pointer;
-    transition: transform 0.12s ease, filter 0.2s ease, opacity 0.2s ease;
-    box-shadow: 0 18px 30px -18px rgba(15, 23, 42, 0.55);
+    transition: background-color var(--ui-press) ease, border-color var(--ui-press) ease, transform var(--ui-press) ease;
 }
+.clock-button svg { width: 18px; height: 18px; flex: none; }
 
-.clock-button.compact { min-height: 104px; font-size: 1.25rem; }
-.clock-button:active { transform: scale(0.97); }
-.clock-button:disabled { opacity: 0.55; cursor: not-allowed; box-shadow: none; }
-.clock-button.in { background: linear-gradient(160deg, #16a34a, #15803d); }
-.clock-button.out { background: linear-gradient(160deg, #dc2626, #b91c1c); }
+.clock-button.compact { min-height: 48px; font-size: 15px; }
+/* A press that moves the button, not the page: ``scale`` on a full-width control
+   nudges every neighbour with it, which is what made the old one feel like jelly. */
+.clock-button:hover:not(:disabled) { filter: brightness(1.06); }
+.clock-button:active:not(:disabled) { transform: translateY(1px); }
+.clock-button:disabled { opacity: 0.55; cursor: not-allowed; }
+.clock-button:focus-visible { outline: 2px solid var(--ops-primary); outline-offset: 2px; }
+.clock-button.in { background: var(--ops-action-in); }
+.clock-button.in:hover:not(:disabled) { background: var(--ops-action-in-press); filter: none; }
+.clock-button.out { background: var(--ops-action-out); }
+.clock-button.out:hover:not(:disabled) { background: var(--ops-action-out-press); filter: none; }
 
 /* Horizontal, swipeable admin tab strip on small screens */
 .tab-strip {
@@ -247,6 +407,35 @@ input, select, textarea, button {
     cursor: pointer;
 }
 .shutter-button:active { transform: scale(0.94); }
+/* The overlay's own two rows. They were Tailwind flex strings on three divs; the overlay
+   is black in both themes, so nothing here reads a token - the white is the point. */
+.camera-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--ui-3);
+    padding: var(--ui-4);
+    color: #fff;
+}
+.camera-head p { margin: 0; }
+.camera-action { font-size: 18px; font-weight: 700; }
+.camera-coords { font-size: 12px; opacity: 0.7; }
+.camera-controls-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--ui-4);
+}
+.camera-hint {
+    margin: var(--ui-3) 0 0;
+    text-align: center;
+    font-size: 12px;
+    opacity: 0.7;
+    color: #fff;
+}
+/* The gutter the shutter keeps on either side, so it is centred whether or not a second
+   control is on the row. */
+.camera-spacer { width: 76px; }
 
 /* ---------- Feedback ---------- */
 .toast-root {
@@ -499,6 +688,37 @@ input, select, textarea, button {
     color: var(--ops-muted);
 }
 
+/*
+   The vendor's credit, at the foot of every page (UI.creditHtml).
+
+   One line, muted, and the *same size on every surface*: it is a signature, not a
+   heading, and a signature that grows on the console would compete with the company
+   lockup that the page is actually about.
+
+   ``letter-spacing: normal`` is load-bearing where it sits inside the login footer: that
+   block tracks its text at .08em, which is a Latin device - Arabic is cursive, so tracking
+   pulls the joins apart - and the wordmark is set in Arabic in all three languages.
+*/
+.app-credit {
+    margin: 0;
+    letter-spacing: normal;
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--ops-muted);
+    text-align: center;
+}
+.login-footer .app-credit { margin-top: 6px; }
+
+/* The handset reserves the fixed tab strip's height at the foot of its own page, because
+   the strip covers whatever is under it - the credit included. */
+.hand-credit {
+    margin-top: auto;
+    padding: 0 calc(var(--hand-gutter) + var(--safe-right)) calc(var(--tabbar-height) + var(--safe-bottom) + var(--ui-4)) calc(var(--hand-gutter) + var(--safe-left));
+}
+.hand-credit.is-desk { padding-bottom: calc(var(--safe-bottom) + var(--ui-5)); }
+
+.admin-credit { margin-top: var(--ui-5); }
+
 /* A phone gets the lockup as a strip, not as half the screen: the mark, the wordmark
    and the year side by side, and the tagline stays behind - the worker standing at the
    gate already knows what the company does.
@@ -637,6 +857,19 @@ input, select, textarea, button {
     --ops-calm-wash: rgba(100, 116, 139, 0.14);
     --ops-live: #16a34a;
     --ops-live-wash: rgba(22, 163, 74, 0.14);
+    /* The handset's two solid action fills, and the one word drawn in the live hue.
+
+       These are deliberately *not* the status colours above. A status hue only has to
+       be legible as a colour, next to a word that says the same thing; a fill has to
+       carry white 16px text at 4.5:1, which ``--ops-live`` (#16a34a) manages only
+       3.3:1 of. So the clock-in green is a step deeper than the live green, and the
+       clock-out red is the danger red with a pressed step under it. ``--ops-live-ink``
+       is the exception that is text rather than a fill, so it moves with the surface. */
+    --ops-action-in: #15803d;
+    --ops-action-in-press: #166534;
+    --ops-action-out: #dc2626;
+    --ops-action-out-press: #b91c1c;
+    --ops-live-ink: #15803d;
     --ops-track: rgba(100, 116, 139, 0.22);
     --ops-shadow: 0 1px 2px rgba(15, 23, 42, 0.06), 0 8px 24px -20px rgba(15, 23, 42, 0.35);
     --ops-mono: ui-monospace, SFMono-Regular, 'SF Mono', 'Cascadia Mono', Menlo, Consolas, monospace;
@@ -661,6 +894,15 @@ html.dark,
     --ops-calm-wash: rgba(148, 163, 184, 0.2);
     --ops-live: #22c55e;
     --ops-live-wash: rgba(34, 197, 94, 0.2);
+    /* The action fills are held identical to light on purpose: what sits behind those
+       white labels is the button, not the theme. ``--ops-live-ink`` is not a fill - it
+       is a word on a themed card - so it follows the surface, where #22c55e on the dark
+       card at 6.4:1 gives way to a lighter green at 8.4:1. */
+    --ops-action-in: #15803d;
+    --ops-action-in-press: #166534;
+    --ops-action-out: #dc2626;
+    --ops-action-out-press: #b91c1c;
+    --ops-live-ink: #4ade80;
     --ops-track: rgba(148, 163, 184, 0.28);
     --ops-shadow: none;
 }
@@ -706,6 +948,7 @@ html.dark,
 .ops-btn-primary:hover:not(:disabled) { background: var(--ops-primary-ink); border-color: var(--ops-primary-ink); }
 .ops-btn-danger { border-color: var(--ops-danger); color: var(--ops-danger-ink); background: var(--ops-surface); }
 .ops-btn-danger:hover:not(:disabled) { background: var(--ops-danger-wash); border-color: var(--ops-danger); }
+.ops-btn.is-block { width: 100%; }
 
 /* --- the four figures an operator reads at a glance --------------------- */
 .ops-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(148px, 1fr)); gap: 10px; }
@@ -726,6 +969,9 @@ html.dark,
 .ops-stat-hint { font-size: 12px; color: var(--ops-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ops-stat.is-warn .ops-stat-value { color: var(--ops-warn); }
 .ops-stat.is-danger .ops-stat-value { color: var(--ops-danger-ink); }
+/* A figure that is deliberately not part of the one beside it: the break taken out of the
+   paid hours. Readable, and quieter than the number it is subtracted from. */
+.ops-stat.is-quiet .ops-stat-value { color: var(--ops-muted); }
 
 /* --- toolbar: search, site chips, sort ---------------------------------- */
 .ops-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
@@ -1164,6 +1410,16 @@ html.dark,
 }
 .admin-tabs button:focus-visible { outline: 2px solid var(--ops-primary); outline-offset: 2px; }
 
+/*
+   The console's module could not be fetched (UI.renderConsoleFailure).
+
+   One card, centred, near the top rather than in the middle: it is read once and then
+   either dismissed or acted on, and the two buttons are the whole of the action. Capped
+   at 460px so it does not stretch into a single lonely line on a 1280px desktop.
+*/
+.console-failure { max-width: 460px; margin: 12vh auto 0; }
+.console-failure .ui-card-title { display: block; margin: 0; }
+
 /* ---------- Surfaces ----------------------------------------------------- */
 
 .ui-surface {
@@ -1180,6 +1436,81 @@ html.dark,
 .ui-title { margin: 0; font-size: 18px; font-weight: 800; letter-spacing: -0.01em; color: var(--ops-text); }
 .ui-hint { margin: 4px 0 0; font-size: 13px; line-height: 1.5; color: var(--ops-muted); max-width: 74ch; }
 
+/* A note: the console's smallest prose, and the thing that was forty utility strings.
+   Every one of them read `text-xs text-gray-500 dark:text-gray-400`, which is how the
+   same kind of sentence ended up 11 different combinations and how the dark theme ended
+   up with a second copy of every colour. The tones are roles now. */
+.ui-note {
+    display: block;
+    margin: 4px 0 0;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--ops-muted);
+}
+.ui-note.is-body { font-size: 14px; }
+.ui-note.is-strong { font-weight: 700; }
+.ui-note.is-warn { color: var(--ops-warn); }
+.ui-note.is-danger { color: var(--ops-danger-ink); }
+.ui-note.is-ok { color: var(--ops-live-ink); }
+/* A state read off a record and shown in a cell: "Active", "Revoked", "Expired". Text
+   rather than a badge, because a column of them is read down rather than tapped, and
+   tones rather than the sixteen colour utilities that used to spell each one out twice
+   (once for light, once for dark). */
+.ui-state { font-weight: 600; }
+.ui-state.is-ok { color: var(--ops-live-ink); }
+.ui-state.is-warn { color: var(--ops-warn); }
+.ui-state.is-danger { color: var(--ops-danger-ink); }
+.ui-state.is-quiet { color: var(--ops-muted); }
+.ui-note.is-faint { opacity: 0.75; }
+.ui-note.is-center { text-align: center; }
+.ui-note.is-mono { font-family: var(--ops-mono); overflow-wrap: anywhere; }
+.ui-note.is-block { margin: 0; }
+/* A fact read out of a form and shown back: "Role: admin". A wash, not a field - it is
+   not there to be typed into. */
+.ui-note.is-panel {
+    margin: 0;
+    padding: var(--ui-2) var(--ui-3);
+    border-radius: var(--ui-radius-sm);
+    background: var(--ops-surface-2);
+    font-size: 14px;
+    color: var(--ops-text);
+}
+.ui-note.is-label {
+    margin: 0 0 5px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+}
+/* The same roles, for a place that has its own size already: a table cell whose value is
+   a name, a count that is high, an em dash. A note would have shrunk them to 12px. */
+.ui-strong { font-weight: 700; }
+.ui-tone-muted { color: var(--ops-muted); }
+.ui-tone-faint { color: var(--ops-muted); opacity: 0.8; }
+.ui-tone-warn { color: var(--ops-warn); }
+.ui-tone-danger { color: var(--ops-danger-ink); }
+.ui-tone-ok { color: var(--ops-live-ink); }
+/* A callout: a sentence the reader must not scroll past, in a wash rather than a card.
+   It was four hand-picked pastel boxes, each with its own dark-mode hexes. */
+.ui-alert {
+    padding: var(--ui-3) var(--ui-4);
+    border: 1px solid var(--ops-border);
+    border-radius: var(--ui-radius);
+    background: var(--ops-surface-2);
+    color: var(--ops-text);
+    font-size: 13px;
+    line-height: 1.5;
+}
+.ui-alert > :first-child { margin-top: 0; }
+.ui-alert > :last-child { margin-bottom: 0; }
+.ui-alert.is-warn { border-color: var(--ops-warn); background: var(--ops-warn-wash); }
+.ui-alert.is-ok { border-color: var(--ops-live); background: var(--ops-live-wash); }
+.ui-alert.is-info { border-color: var(--ops-primary); background: var(--ops-primary-wash); }
+.ui-alert.is-danger { border-color: var(--ops-danger); background: var(--ops-danger-wash); }
+.ui-alert.is-stacked {
+    display: flex;
+    flex-direction: column;
+    gap: var(--ui-2);
+}
+
 .ui-section { display: flex; flex-direction: column; gap: var(--ui-3); min-width: 0; }
 .ui-section-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: var(--ui-2); }
 .ui-section-title { margin: 0; font-size: 15px; font-weight: 700; color: var(--ops-text); }
@@ -1194,6 +1525,16 @@ html.dark,
     min-width: 0;
 }
 .ui-card.is-flat { background: var(--ops-surface-2); box-shadow: none; }
+.ui-card.is-tight { padding: var(--ui-3); }
+/* A card whose children are a title, a note and a form. The gaps come from the card, so
+   no child carries a margin of its own - which is what the utility version did, one
+   `mb-3` at a time. */
+.ui-card.is-stacked {
+    display: flex;
+    flex-direction: column;
+    gap: var(--ui-3);
+}
+.ui-card.is-stacked > * { margin-top: 0; margin-bottom: 0; }
 .ui-card.is-accent { border-inline-start: 3px solid var(--ops-primary); }
 .ui-card.is-warn { border-inline-start: 3px solid var(--ops-warn); }
 .ui-card.is-danger { border-inline-start: 3px solid var(--ops-danger); }
@@ -1202,11 +1543,30 @@ html.dark,
 
 .ui-stack { display: flex; flex-direction: column; gap: var(--ui-3); min-width: 0; }
 .ui-stack.is-tight { gap: var(--ui-2); }
+.ui-stack.is-flush { gap: var(--ui-1); }
 .ui-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--ui-2); }
+.ui-row.is-loose { gap: var(--ui-3); }
+.ui-row.is-top { align-items: flex-start; }
+.ui-row.is-bottom { align-items: flex-end; }
+.ui-row.is-tight { gap: var(--ui-1); }
+/* Two controls that share a line when there is width for it and stack when there is not:
+   the phone in daylight and the desktop in the office get the same markup. */
+.ui-pair {
+    display: flex;
+    flex-direction: column;
+    gap: var(--ui-2);
+}
+@media (min-width: 640px) {
+    .ui-pair { flex-direction: row; align-items: center; }
+    .ui-pair.is-bottom { align-items: flex-end; }
+}
 .ui-spread { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--ui-2); }
 .ui-grid { display: grid; gap: var(--ui-3); }
 .ui-grid.two { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
 .ui-grid.three { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+.ui-grid.four { grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
+/* A form field that is a whole row of the grid - the submit button, a full-width note. */
+.ui-span-all { grid-column: 1 / -1; }
 .ui-push { margin-inline-start: auto; }
 
 .ui-divider { height: 1px; background: var(--ops-border); border: 0; margin: 0; }
@@ -1282,6 +1642,25 @@ textarea.ui-field { min-height: 88px; resize: vertical; line-height: 1.5; }
 .ui-btn-quiet { border-color: transparent; background: transparent; color: var(--ops-muted); }
 .ui-btn-quiet:hover:not(:disabled) { background: var(--ops-calm-wash); border-color: transparent; color: var(--ops-text); }
 .ui-btn-sm { min-height: 32px; padding: 4px var(--ui-3); font-size: 13px; }
+.ui-btn.is-block { width: 100%; }
+.ui-btn.is-grow { flex: 1 1 0; min-width: 0; }
+/* An action the design wants read as a word, not a control: "back to the inbox" above a
+   thread. It keeps the button's hit area and focus ring and drops everything else. */
+.ui-btn.is-link {
+    min-height: 0;
+    padding: 0;
+    border-color: transparent;
+    background: transparent;
+    color: var(--ops-primary-ink);
+}
+.ui-btn.is-link:hover:not(:disabled) { background: transparent; border-color: transparent; text-decoration: underline; }
+/* Amber is the console's "this changes somebody's access" tone: setting a password on
+   another account, making a clock-in link. White on the light orange is 1.8:1, so the
+   dark theme takes the ink instead of assuming a light background. */
+.ui-btn-warn { background: var(--ops-warn); border-color: var(--ops-warn); color: #fff; }
+.ui-btn-warn:hover:not(:disabled) { background: var(--ops-warn); border-color: var(--ops-text); color: #fff; }
+html.dark .ui-btn-warn { color: #0f172a; }
+html.dark .ui-btn-warn:hover:not(:disabled) { color: #0f172a; }
 /* An icon carries no words, so the button does not need room for them - and a row of
    four of these is what keeps a nine-column roster on one line per account. */
 .ui-btn.is-icon { padding: 0; min-width: 32px; }
@@ -1336,6 +1715,36 @@ textarea.ui-field { min-height: 88px; resize: vertical; line-height: 1.5; }
 .ui-table tbody tr:hover td { background: var(--ops-surface-2); }
 .ui-table .is-numeric { font-family: var(--ops-mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .ui-table .is-end { text-align: end; }
+/* The one table whose header is a filled row rather than a rule. */
+.ui-table-head { background: var(--ops-surface-2); }
+/* A cell holding a paragraph: wide enough to read the first line, fixed so the column
+   does not re-measure itself on every row. */
+.ui-table .is-clip { max-width: 22rem; }
+/* A photo in a list: a link's snapshot, a face on an account. Its own size, and never
+   taller than the fold. */
+.ui-photo {
+    margin-top: var(--ui-2);
+    border-radius: var(--ui-radius-sm);
+    max-height: 288px;
+}
+/* A cell whose value is a paragraph becomes a cell that ends in an ellipsis: the notes
+   list is read by scanning, and a subject wrapped onto four lines is a row nobody can
+   compare with the one above it. */
+.ui-truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.ui-nowrap { white-space: nowrap; }
+.ui-mono { font-family: var(--ops-mono); font-variant-numeric: tabular-nums; }
+.ui-break { overflow-wrap: anywhere; }
+.ui-dim { opacity: 0.6; }
+.is-end { text-align: end; }
+/* A QR code is a picture of a URL: it needs to be a fixed square on white, at a size a
+   phone can read across a desk, in both themes. */
+.ui-qr {
+    width: 160px;
+    height: 160px;
+    padding: var(--ui-2);
+    border-radius: var(--ui-radius-sm);
+    background: #fff;
+}
 .ui-table .is-in strong { color: var(--ops-live); }
 .ui-table .is-out strong { color: var(--ops-danger-ink); }
 
@@ -1359,6 +1768,19 @@ textarea.ui-field { min-height: 88px; resize: vertical; line-height: 1.5; }
 .ui-badge.is-warn { background: var(--ops-warn-wash); color: var(--ops-warn); }
 .ui-badge.is-danger { background: var(--ops-danger-wash); color: var(--ops-danger-ink); }
 .ui-badge.is-quiet { background: var(--ops-calm-wash); color: var(--ops-calm); }
+.ui-badge.is-info { background: var(--ops-primary-wash); color: var(--ops-primary-ink); }
+.ui-badge.is-solid { background: var(--ops-primary); color: #fff; }
+.ui-badge.is-push { margin-inline-start: var(--ui-2); }
+.ui-badge.is-lead { margin-inline-end: var(--ui-2); }
+/* Siblings on one line that a stack cannot space: a badge and the button beside it in a
+   table cell, the internal tag after a timestamp. */
+.ui-spaced-start { margin-inline-start: var(--ui-2); }
+.ui-spaced-end { margin-inline-end: var(--ui-2); }
+/* A title or a button that sits in a plain block rather than a stack, and so carries its
+   own spacing - the two help modals, which are each one string of markup. */
+.ui-title.is-spaced { margin-bottom: var(--ui-3); }
+.ui-btn.is-spaced-top { margin-top: var(--ui-4); }
+.ui-divider.is-spaced { margin: var(--ui-4) 0; }
 
 /* ---------- Facts: a label over a figure, the console's smallest unit ---- */
 
@@ -1477,7 +1899,6 @@ textarea.ui-field { min-height: 88px; resize: vertical; line-height: 1.5; }
 :root {
     --hand-gutter: 16px;
     --hand-radius: 16px;
-    --hand-radius-lg: 22px;
     --hand-tap: 48px;
     --hand-max: 720px;
 }
@@ -1626,15 +2047,23 @@ textarea.ui-field { min-height: 88px; resize: vertical; line-height: 1.5; }
 
 /* ---------- The shift, as the one card that matters --------------------- */
 
+/* The card is a *reading order* - what this is, which state it is in, how long it has
+   been running, and the three numbers it is paid by - one band each, left aligned.
+
+   It used to be centred, which on a 342px content width stacked five different ragged
+   centres down one column and left the policy line reading as a sixth caption to the
+   timer above it. Left-aligned, the eye walks one edge: label, state, figure, figures.
+   The panel is 32px of padding rather than 24 top / 16 sides, because on a phone the
+   card is the whole screen and the extra inset is what makes it read as a card. */
 .hand-hero {
     position: relative;
     overflow: hidden;
-    padding: var(--ui-5) var(--ui-4);
+    padding: var(--ui-4);
     border: 1px solid var(--ops-border);
-    border-radius: var(--hand-radius-lg);
+    border-radius: var(--hand-radius);
     background: var(--ops-surface);
     box-shadow: var(--ops-shadow);
-    text-align: center;
+    text-align: start;
 }
 /* On shift, the card says so with a wash and a left edge rather than with a
    whole dark panel: the phone is read in sunlight, and a saturated fill is the
@@ -1642,24 +2071,54 @@ textarea.ui-field { min-height: 88px; resize: vertical; line-height: 1.5; }
 .hand-hero.is-live {
     border-inline-start: 3px solid var(--ops-live);
     background:
-        radial-gradient(120% 80% at 50% 0%, rgba(22, 163, 74, 0.1), transparent 62%),
+        radial-gradient(120% 70% at 0% 0%, rgba(22, 163, 74, 0.09), transparent 58%),
         var(--ops-surface);
 }
 
+/* Status on the left, the site on the right: the two facts that frame everything
+   below, on one line instead of two centred ones. */
+.hand-hero-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--ui-2);
+    min-width: 0;
+}
 .hand-hero-status {
     display: inline-flex;
     align-items: center;
-    gap: var(--ui-2);
+    gap: 7px;
     margin: 0;
-    font-size: 13px;
+    font-size: 11px;
     font-weight: 700;
-    letter-spacing: 0.06em;
+    letter-spacing: 0.08em;
     text-transform: uppercase;
     color: var(--ops-muted);
 }
+/* The site is the one fact here the worker did not choose and cannot change, so it is
+   a quiet chip in the corner rather than a second headline. It truncates instead of
+   wrapping: a 40-character site name must not push the timer off the first screen. */
+.hand-hero-site {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+    margin: 0;
+    padding: 3px 9px;
+    border: 1px solid var(--ops-border);
+    border-radius: 999px;
+    background: var(--ops-surface-2);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--ops-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.hand-hero-site strong { color: var(--ops-text); font-weight: 700; }
 .hand-dot {
-    width: 9px;
-    height: 9px;
+    width: 8px;
+    height: 8px;
     flex: none;
     border-radius: 999px;
     background: var(--ops-live);
@@ -1668,29 +2127,34 @@ textarea.ui-field { min-height: 88px; resize: vertical; line-height: 1.5; }
 }
 .hand-dot.is-off { background: var(--ops-track); box-shadow: none; animation: none; }
 
+/* The state as a sentence at 20px, not a 24px shout: the biggest thing on this card is
+   the clock, and a headline that competes with it makes two heroes and no hierarchy. */
 .hand-hero-word {
-    margin: var(--ui-2) 0 0;
-    font-size: 24px;
+    margin: 10px 0 0;
+    font-size: 20px;
     font-weight: 800;
-    letter-spacing: -0.02em;
+    line-height: 1.25;
+    letter-spacing: -0.015em;
 }
-.hand-hero.is-live .hand-hero-word { color: var(--ops-live); }
+.hand-hero.is-live .hand-hero-word { color: var(--ops-live-ink); }
 
+/* The figure the whole screen is about. 40px is read at arm's length and still fits a
+   360px handset beside its own label; 54px was a scoreboard, and it wrapped. */
 .hand-timer {
     display: block;
-    margin: var(--ui-3) 0 0;
+    margin: 10px 0 0;
     font-family: var(--ops-mono);
     font-variant-numeric: tabular-nums;
-    font-size: clamp(38px, 13vw, 54px);
+    font-size: clamp(32px, 10vw, 40px);
     font-weight: 700;
-    line-height: 1;
+    line-height: 1.05;
     letter-spacing: -0.02em;
     color: var(--ops-primary-ink);
 }
 .hand-timer.is-over { color: var(--ops-warn); }
 .hand-timer-label {
     display: block;
-    margin-top: 6px;
+    margin-top: 4px;
     font-size: 11px;
     font-weight: 700;
     letter-spacing: 0.08em;
@@ -1708,56 +2172,79 @@ textarea.ui-field { min-height: 88px; resize: vertical; line-height: 1.5; }
 }
 .hand-hero-meta strong { color: var(--ops-text); font-weight: 700; }
 .hand-hero-meta.is-warn { color: var(--ops-warn); }
-.hand-hero-meta .hand-mono { font-family: var(--ops-mono); font-variant-numeric: tabular-nums; }
 
+/* The clock-in time, the paid day and the unpaid break: three facts with a label each,
+   because without them the timer above reads as the thing that gets paid and 8:30 on a
+   30-minute-break day looks like an hour of missing money. A grid of one column per
+   fact - floored at 96px, so a 320px handset gets two rows rather than three crushed
+   ones - and a hairline above it, so it is a footer and not a fourth caption. */
 .hand-policy {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+    gap: var(--ui-2) var(--ui-3);
     margin: var(--ui-3) 0 0;
     padding-top: var(--ui-3);
-    border-top: 1px dashed var(--ops-border);
-    font-size: 12px;
+    border-top: 1px solid var(--ops-border);
+}
+.hand-policy-cell { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.hand-policy-label {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
     color: var(--ops-muted);
 }
-.hand-policy b { color: var(--ops-text); }
+.hand-policy-value {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ops-text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+/* The one value that is a full timestamp: a serial number would be truncated to
+   "2026-09-18 1..." in a 106px column, and a truncated time is not a fact. It breaks
+   at its own space instead - date over time - which is how a worker reads it anyway. */
+.hand-policy-value.is-mono {
+    font-family: var(--ops-mono);
+    font-variant-numeric: tabular-nums;
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+.hand-policy b { color: var(--ops-text); font-weight: 700; }
 
 /* ---------- The one action --------------------------------------------- */
 
-/* The one primary action, right-sized.
-
-   ``.clock-button`` above still carries the handset's old geometry - it *was* the card,
-   so 168px made sense and 128px was this app's first pass at trimming it. Both are a
-   poster, not a button: at 128px the control took a fifth of a 640px phone screen and
-   read as a panel rather than as something to press, and the facts under it (the month's
-   hours, the GPS state) fell off the fold with it. 76px is still half again the 48px
-   floor, still landable without looking, and puts the shift, the action and both figures
-   on one screen. Overriding here rather than at ``.clock-button`` keeps the console's
-   copy of that rule alone. */
+/* The handset's copy of the same button. The shared base above is already the right
+   size, so all this adds is the phone's roomier radius and the extra weight a 17px
+   label needs beside an 18px icon; ``.compact`` is the desktop column, where the button
+   is one of four things on screen and can give back the last 4px. */
 .hand-clock {
     position: relative;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: var(--ui-3);
-    min-height: 76px;
+    min-height: 52px;
     border-radius: var(--hand-radius);
-    font-size: 1.375rem;
+    font-size: 17px;
 }
 /* Two classes, so this beats ``.clock-button.compact`` on source order alone. */
-.hand-clock.compact { min-height: 64px; font-size: 1.25rem; }
-.hand-clock svg { width: 24px; height: 24px; flex: none; }
+.hand-clock.compact { min-height: 48px; font-size: 15px; }
+.hand-clock svg { width: 18px; height: 18px; flex: none; }
 
 /* ---------- Facts, cards, rows ----------------------------------------- */
 
+/* Two tiles, not two panels: they carry the month's paid hours and whether the phone
+   can record a punch at all, so they are read in one glance under the button. The
+   hairline card (no shadow) is what keeps them from competing with the shift card
+   above, which is the only thing on this screen allowed to look raised. */
 .hand-facts {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: var(--ui-3);
+    gap: var(--ui-2);
 }
 .hand-fact {
-    padding: var(--ui-3);
+    padding: 10px var(--ui-3);
     border: 1px solid var(--ops-border);
-    border-radius: var(--hand-radius);
+    border-radius: var(--ui-radius-sm);
     background: var(--ops-surface);
-    box-shadow: var(--ops-shadow);
     min-width: 0;
 }
 .hand-fact-label {
@@ -1767,19 +2254,25 @@ textarea.ui-field { min-height: 88px; resize: vertical; line-height: 1.5; }
     letter-spacing: 0.06em;
     text-transform: uppercase;
     color: var(--ops-muted);
+    /* "Hours this month" is the longest label either language has and it does not fit
+       a 320px handset's tile on one line; balanced wrapping breaks it between words
+       rather than leaving "Hours this mo..." as the tile's only readable text. */
+    text-wrap: balance;
+    line-height: 1.25;
 }
 .hand-fact-value {
-    margin: 4px 0 0;
-    font-family: var(--ops-mono);
-    font-variant-numeric: tabular-nums;
-    font-size: 20px;
+    margin: 2px 0 0;
+    font-size: 17px;
     font-weight: 700;
     color: var(--ops-text);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
 }
-.hand-fact-value.is-ok { color: var(--ops-live); }
+/* Only the figures are monospaced: "Ready" is a word, and a word set in a terminal
+   face is the shape people read as a serial number. */
+.hand-fact-value.is-mono { font-family: var(--ops-mono); font-variant-numeric: tabular-nums; }
+.hand-fact-value.is-ok { color: var(--ops-live-ink); }
 .hand-fact-value.is-warn { color: var(--ops-warn); }
 
 .hand-card {
@@ -1791,6 +2284,12 @@ textarea.ui-field { min-height: 88px; resize: vertical; line-height: 1.5; }
     min-width: 0;
 }
 .hand-card.is-live { border-inline-start: 3px solid var(--ops-live); }
+/* A panel that draws its own card must not be wrapped in a second one. The desktop
+   layout used to put the shift panel - which has its own border, radius and shadow -
+   inside a ``.hand-card``, and the border inside a border is the box-in-a-box that made
+   a laid-out screen read as unstyled HTML. ``is-bare`` is the wrapper saying "I am only
+   here to hold the panel". */
+.hand-card.is-bare { padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
 
 .hand-section-head {
     display: flex;
@@ -1840,39 +2339,58 @@ textarea.ui-field { min-height: 88px; resize: vertical; line-height: 1.5; }
 
 .hand-note-line { margin: 0 0 var(--ui-3); font-size: 12px; font-weight: 600; color: var(--ops-warn); }
 
+/* A callout, not a billboard. Outlined on all four sides at full warning saturation,
+   this was the loudest object on the screen - louder than the shift it describes and
+   louder than the action under it - so the state moves to one edge and a wash and the
+   outline goes. The icon and the sentence still carry the meaning for anyone who cannot
+   see the colour, which is what the box never did on its own. */
 .hand-alert {
     display: flex;
     align-items: flex-start;
-    gap: var(--ui-2);
-    padding: var(--ui-3);
-    border: 1px solid var(--ops-warn);
-    border-radius: var(--hand-radius);
+    gap: 10px;
+    padding: 10px var(--ui-3);
+    border: 0;
+    border-inline-start: 3px solid var(--ops-warn);
+    border-radius: var(--ui-radius-sm);
     background: var(--ops-warn-wash);
     color: var(--ops-warn);
     font-size: 13px;
     font-weight: 600;
-    line-height: 1.5;
+    line-height: 1.45;
     text-align: start;
 }
-.hand-alert.is-danger { border-color: var(--ops-danger); background: var(--ops-danger-wash); color: var(--ops-danger-ink); }
+.hand-alert.is-danger {
+    border-inline-start-color: var(--ops-danger);
+    background: var(--ops-danger-wash);
+    color: var(--ops-danger-ink);
+}
 
 /* The overtime note. ``hidden`` is toggled by the ticking timer, and the rule below is
    written as ``.hand-note.hidden`` on purpose: the Tailwind Play CDN injects its
    ``.hidden { display: none }`` into a <style> tag after this file, so a bare ``.hidden``
    at equal specificity would be the one that lost - and a note about overtime would sit
    on the card all day, wrong. Two classes beat one, whichever sheet lands last. */
+/* The overtime note, inside the shift card and the same shape as the callout above it:
+   one edge, one wash, words. Its title is bold and its second line is a size down, so a
+   worker skimming for "is this still running" reads the title and stops. */
 .hand-note {
     margin-top: var(--ui-3);
-    padding: var(--ui-3);
-    border: 1px solid var(--ops-warn);
-    border-radius: var(--hand-radius);
+    padding: 10px var(--ui-3);
+    border: 0;
+    border-inline-start: 3px solid var(--ops-warn);
+    border-radius: var(--ui-radius-sm);
     background: var(--ops-warn-wash);
     color: var(--ops-warn);
     font-size: 13px;
+    line-height: 1.45;
     text-align: start;
 }
 .hand-note.hidden, .hand-alert.hidden { display: none; }
-.hand-note-title { margin: 0; font-weight: 700; }
+/* The title carries the alert icon now instead of the ⚠️ that used to be inside the
+   sentence: every other icon on this screen is an inline SVG, and a glyph that the
+   phone's own font draws is a different picture on every handset. */
+.hand-note-title { display: flex; align-items: flex-start; gap: 8px; margin: 0; font-weight: 700; }
+.hand-note-title svg { width: 16px; height: 16px; flex: none; margin-top: 1px; }
 .hand-note-sub { margin: 3px 0 0; font-size: 12px; font-weight: 500; }
 
 /* ---------- Stacks and bubbles ----------------------------------------- */
@@ -1921,15 +2439,22 @@ textarea.ui-field { min-height: 88px; resize: vertical; line-height: 1.5; }
 
 .hand-rail { position: relative; margin: 0; padding: 0 0 0 var(--ui-4); list-style: none; }
 [dir='rtl'] .hand-rail { padding: 0 var(--ui-4) 0 0; }
-.hand-rail::before {
+/* The rail is drawn stop by stop rather than as one line down the list. A single line
+   has to guess where the first and last dots are, and it guessed 11px long at the top
+   and 70px long at the bottom - a hairline hanging in space above the newest punch and
+   below the oldest, which is what a timeline looks like when nobody looked at it. Each
+   stop now carries its own segment, from just under its dot to the centre of the next
+   one, and the last stop carries none. */
+.hand-stop::after {
     content: '';
     position: absolute;
-    top: 6px;
-    bottom: 6px;
-    inset-inline-start: 5px;
+    inset-inline-start: calc(-1 * var(--ui-4) + 5px);
+    top: calc(var(--ui-3) + 15px);
+    bottom: -22px;
     width: 2px;
     background: var(--ops-border);
 }
+.hand-stop:last-child::after { content: none; }
 .hand-stop {
     position: relative;
     display: flex;
@@ -2020,6 +2545,14 @@ textarea.ui-field { min-height: 88px; resize: vertical; line-height: 1.5; }
    card instead. A row that has to be read is better than a column that has to be
    guessed, and the wrapper already carries ``overflow-x``. */
 .hand-desk table.ui-table { min-width: 460px; }
+
+/* The rail the header draws and the shell under it have to be the same width. They were
+   not: the header stopped at the handset's 720px column while the desk grid ran to
+   1080px, so on a desktop the brand sat centred over a left-aligned page - the first
+   thing an operator sees is a layout that cannot decide what it is. */
+@media (min-width: 900px) {
+    .hand-header-inner { max-width: calc(1080px - 2 * var(--ui-4)); }
+}
 
 @media (max-width: 899px) {
     .hand-desk { grid-template-columns: minmax(0, 1fr); gap: var(--ui-4); }

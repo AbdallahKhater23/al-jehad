@@ -1,228 +1,207 @@
-
+/**
+ * The page an enrollment link opens.
+ *
+ * The camera, the photo policy and every sentence about a photo are ``capture.js``, shared
+ * with the punch page; what is left here is this page's own flow: which link this is
+ * (enroll or register), the password the registration link owns, and the upload.
+ */
 (function () {
-  "use strict";
-  var API = "/api/v1";
-  var token = decodeURIComponent(location.pathname.split("/").filter(Boolean).pop() || "");
-  var stream = null, blob = null;
+    "use strict";
 
-  // The server's answer replaces this, so the page never has to be told twice what the
-  // limit is. The defaults are the same numbers, so a link whose response has not
-  // arrived yet still refuses a 40 MB video rather than uploading it.
-  var policy = { max_bytes: 5 * 1024 * 1024, accepted: ["image/jpeg", "image/png", "image/webp"] };
-  var minPasswordLength = 8;
-  var isRegister = false;
+    var API = "/api/v1";
+    var token = decodeURIComponent(location.pathname.split("/").filter(Boolean).pop() || "");
+    var minPasswordLength = 8;
+    var isRegister = false;
+    var workerId = "";
+    //: The server's answer, kept for the lines that are a sentence about it - the link's
+    //: own header. Every other line on this page is read off state that does not change.
+    var invite = null;
+    //: False until the server has said the link is usable - see the same guard on the punch
+    //: page: an unusable link must not be re-armed by a photo arriving.
+    var usable = false;
+    var camera = null;
 
-  var $ = function (id) { return document.getElementById(id); };
+    var $ = function (id) { return document.getElementById(id); };
 
-  function say(text, kind) {
-    var box = $("message");
-    box.className = "msg " + (kind || "");
-    box.textContent = text;
-  }
-
-  function mb(bytes) {
-    return (Number(bytes || 0) / (1024 * 1024)).toFixed(1);
-  }
-
-  /**
-   * Why this file cannot be used, or null when it can.
-   *
-   * The real check is the server's, from the bytes, because the file name and the
-   * browser's idea of the type are both supplied by whoever sends the request - this
-   * only saves somebody a 6 MB upload over a phone tether.
-   */
-  function checkPhoto(file) {
-    if (!file) return "Take or choose a photo first.";
-    var size = Number(file.size || 0);
-    if (size <= 0) return "That file is empty. Choose a photo from the gallery.";
-    if (size > Number(policy.max_bytes || 0)) {
-      return "That photo is " + mb(size) + " MB and the limit is " +
-             mb(policy.max_bytes) + " MB. Retake it at a lower resolution.";
+    function say(text, kind) {
+        var box = $("message");
+        box.className = "msg " + (kind || "");
+        box.textContent = text;
     }
-    var type = String(file.type || "").toLowerCase();
-    if (policy.accepted.indexOf(type) < 0) {
-      var name = String(file.name || "").toLowerCase();
-      if (!(type === "" && /\.(jpe?g|png|webp)$/.test(name))) {
-        return "That file is not a photo. Only " + policy.accepted.join(", ") +
-               " are accepted - no documents, PDFs or videos.";
-      }
+
+    /** The server's refusal, in the server's words, which are not translated here. */
+    function detailOf(body, fallbackKey) {
+        var detail = body && body.detail;
+        var text = (detail && detail.message) || detail || Capture.t(fallbackKey);
+        var code = detail && detail.error_code ? " (" + detail.error_code + ")" : "";
+        return text + code;
     }
-    return null;
-  }
 
-  function showPhotoProblem(problem) {
-    var box = $("photo-problem");
-    box.className = problem ? "note warn" : "note warn hidden";
-    box.textContent = problem || "";
-  }
+    /**
+     * Who the link is for, and when it stops working.
+     *
+     * Assembled from the server's answer rather than left to the ``data-t`` pass: the
+     * translation replaces an element's text, so a language switch would otherwise leave
+     * this line reading "Checking your link…" over a link that had already been checked.
+     * The name and the id are the server's, and are escaped.
+     */
+    function describeWho() {
+        if (!invite) return;
+        var verb = Capture.t(isRegister ? "enroll.verb.register" : "enroll.verb.enroll");
+        $("who").innerHTML = verb + " <strong>" + Capture.esc(invite.worker_name) + "</strong> (id " +
+            Capture.esc(invite.worker_id) + ") · <span class='pill'>" +
+            Capture.esc(Capture.t("quick.expires", { date: invite.expires_at })) + "</span>";
+    }
 
-  function applyPolicy() {
-    var list = policy.accepted.map(function (type) { return type.replace("image/", "").toUpperCase(); });
-    $("photo-policy").textContent =
-      "Photos only: " + list.join(", ") + ", up to " + mb(policy.max_bytes) + " MB.";
-    $("file").setAttribute("accept", policy.accepted.join(","));
-  }
-
-  function loadInvite() {
-    fetch(API + "/enroll/" + encodeURIComponent(token))
-      .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
-      .then(function (res) {
-        if (!res.ok) {
-          say((res.body && (res.body.detail && res.body.detail.message || res.body.detail)) || "This link is not valid.", "err");
-          $("btn-start").disabled = true; $("btn-submit").disabled = true; $("fallback-label").classList.add("hidden");
-          return;
+    function describeInvite() {
+        if (!isRegister) {
+            $("title").textContent = Capture.t("enroll.title");
+            $("step-intro").classList.remove("hidden");
+            $("password-card").classList.add("hidden");
+            $("btn-submit").textContent = Capture.t("enroll.submit");
         }
-        if (res.body.photo_policy) policy = res.body.photo_policy;
-        if (res.body.min_password_length) minPasswordLength = Number(res.body.min_password_length);
-        applyPolicy();
+    }
 
-        isRegister = res.body.kind === "register";
-        var verb = isRegister ? "Creating an account for" : "Enrolling";
-        $("who").innerHTML = verb + " <strong>" + res.body.worker_name + "</strong> (id " +
-          res.body.worker_id + ") · <span class='pill'>expires " + res.body.expires_at + "</span>";
+    function loadInvite() {
+        fetch(API + "/enroll/" + encodeURIComponent(token))
+            .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
+            .then(function (res) {
+                if (!res.ok) {
+                    say(detailOf(res.body, "link.invalid"), "err");
+                    $("btn-start").disabled = true;
+                    $("btn-submit").disabled = true;
+                    $("fallback-label").classList.add("hidden");
+                    return;
+                }
+                usable = true;
+                if (res.body.photo_policy) Capture.setPolicy(res.body.photo_policy);
+                if (res.body.min_password_length) minPasswordLength = Number(res.body.min_password_length);
+                Capture.applyPolicy();
+
+                isRegister = res.body.kind === "register";
+                workerId = res.body.worker_id;
+                invite = res.body;
+                describeWho();
+
+                if (isRegister) {
+                    // The password is the visitor's own choice and nobody can reset it for
+                    // them, so the rule is stated before they type rather than after they
+                    // submit.
+                    $("title").textContent = Capture.t("enroll.registerTitle");
+                    $("step-intro").classList.add("hidden");
+                    $("password-card").classList.remove("hidden");
+                    $("password-hint").textContent = Capture.t("enroll.password.hint", {
+                        n: minPasswordLength, id: res.body.worker_id
+                    });
+                    $("btn-submit").textContent = Capture.t("enroll.create");
+                } else {
+                    describeInvite();
+                }
+
+                if (!res.body.usable) {
+                    say(Capture.t("enroll.unusable", { status: res.body.status }), "err");
+                    $("btn-start").disabled = true;
+                    $("btn-submit").disabled = true;
+                    $("password-card").classList.add("hidden");
+                }
+            })
+            .catch(function () { say(Capture.t("offline"), "err"); });
+    }
+
+    function submit() {
+        var problem = camera.problem();
+        if (problem) {
+            camera.showProblem(problem);
+            say(problem, "err");
+            return;
+        }
+        var form = new FormData();
+        form.append("photo", camera.photo(), "photo.jpg");
+        form.append("phone", $("phone").value || "");
+        form.append("email", $("email").value || "");
+        var url = API + "/enroll/" + encodeURIComponent(token);
 
         if (isRegister) {
-          // The password is the visitor's own choice and nobody can reset it for them,
-          // so the rule is stated before they type rather than after they submit.
-          $("title").textContent = "Create your account";
-          $("password-card").classList.remove("hidden");
-          $("password-hint").textContent =
-            "Choose a password of at least " + minPasswordLength + " characters. You will sign in " +
-            "with your ID (" + res.body.worker_id + ") and this password, so keep it safe.";
-          $("btn-submit").textContent = "Create my account";
+            var password = $("password").value || "";
+            var again = $("password2").value || "";
+            if (password.length < minPasswordLength) {
+                say(Capture.t("enroll.passwordShort", { n: minPasswordLength }), "err");
+                return;
+            }
+            if (password !== again) {
+                say(Capture.t("enroll.passwordMismatch"), "err");
+                return;
+            }
+            form.append("password", password);
+            url += "/register";
         }
 
-        if (!res.body.usable) {
-          say("This link is " + res.body.status + ". Ask your administrator for a new one.", "err");
-          $("btn-start").disabled = true;
-          $("btn-submit").disabled = true;
-          $("password-card").classList.add("hidden");
-        }
-      })
-      .catch(function () { say("Could not reach the server. Check your connection.", "err"); });
-  }
-
-  function startCamera() {
-    navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: { ideal: 720 } }, audio: false })
-      .then(function (s) {
-        stream = s;
-        $("video").srcObject = s;
-        $("video").classList.remove("hidden");
-        $("preview").classList.add("hidden");
-        $("btn-shoot").classList.remove("hidden");
-        $("btn-retake").classList.add("hidden");
-        $("btn-start").classList.add("hidden");
-        $("fallback-label").classList.add("hidden");
-      })
-      .catch(function () {
-        say("Camera blocked. Use the button below to open your phone's gallery.", "err");
-      });
-  }
-
-  function choose(file) {
-    var problem = checkPhoto(file);
-    showPhotoProblem(problem);
-    if (problem) {
-      blob = null;
-      $("btn-submit").disabled = true;
-      return;
-    }
-    blob = file;
-    $("preview").src = URL.createObjectURL(file);
-    $("preview").classList.remove("hidden");
-    $("video").classList.add("hidden");
-    $("btn-submit").disabled = false;
-  }
-
-  function shoot() {
-    var video = $("video"), canvas = $("canvas");
-    canvas.width = video.videoWidth || 720;
-    canvas.height = video.videoHeight || 960;
-    canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
-    canvas.toBlob(function (b) {
-      choose(b);
-      $("btn-shoot").classList.add("hidden");
-      $("btn-retake").classList.remove("hidden");
-      stopCamera();
-    }, "image/jpeg", 0.92);
-  }
-
-  function stopCamera() {
-    if (stream) { stream.getTracks().forEach(function (t) { t.stop(); }); stream = null; }
-  }
-
-  function retake() {
-    blob = null; $("btn-submit").disabled = true;
-    showPhotoProblem("");
-    $("btn-shoot").classList.remove("hidden");
-    $("btn-retake").classList.add("hidden");
-    startCamera();
-  }
-
-  function submit() {
-    var problem = checkPhoto(blob);
-    if (problem) {
-      showPhotoProblem(problem);
-      say(problem, "err");
-      return;
-    }
-    var form = new FormData();
-    form.append("photo", blob, "photo.jpg");
-    form.append("phone", $("phone").value || "");
-    form.append("email", $("email").value || "");
-    var url = API + "/enroll/" + encodeURIComponent(token);
-
-    if (isRegister) {
-      var password = $("password").value || "";
-      var again = $("password2").value || "";
-      if (password.length < minPasswordLength) {
-        say("Your password needs at least " + minPasswordLength + " characters.", "err");
-        return;
-      }
-      if (password !== again) {
-        say("The two passwords are not the same.", "err");
-        return;
-      }
-      form.append("password", password);
-      url += "/register";
+        $("btn-submit").disabled = true;
+        $("status-line").textContent = Capture.t("enroll.uploading");
+        fetch(url, { method: "POST", body: form })
+            .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
+            .then(function (res) {
+                if (res.ok) {
+                    if (isRegister) {
+                        say(Capture.t("enroll.done.register"), "ok");
+                        $("password-card").classList.add("hidden");
+                    } else {
+                        say(Capture.t("enroll.done.enroll"), "ok");
+                    }
+                    var live = res.body.liveness || {};
+                    $("status-line").textContent = Capture.t("enroll.liveness", { verdict: live.verdict || "n/a" });
+                    $("btn-retake").classList.add("hidden");
+                    return;
+                }
+                say(detailOf(res.body, "enroll.failed"), "err");
+                $("btn-submit").disabled = false;
+                $("status-line").textContent = "";
+            })
+            .catch(function () {
+                say(Capture.t("enroll.uploadFailed"), "err");
+                $("btn-submit").disabled = false;
+            });
     }
 
-    $("btn-submit").disabled = true;
-    $("status-line").textContent = "Uploading…";
-    fetch(url, { method: "POST", body: form })
-      .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
-      .then(function (res) {
-        if (res.ok) {
-          if (isRegister) {
-            say("Done. Your account is ready - sign in with your ID and the password you chose.", "ok");
-            $("password-card").classList.add("hidden");
-          } else {
-            say("Done. Your reference photo has been registered.", "ok");
-          }
-          var live = res.body.liveness || {};
-          $("status-line").textContent = "Liveness: " + (live.verdict || "n/a");
-          $("btn-retake").classList.add("hidden");
-        } else {
-          var detail = res.body && res.body.detail;
-          var code = detail && detail.error_code ? " (" + detail.error_code + ")" : "";
-          var text = (detail && detail.message) || detail || "Enrollment failed.";
-          say(text + code, "err");
-          $("btn-submit").disabled = false;
-          $("status-line").textContent = "";
-        }
-      })
-      .catch(function () { say("Upload failed. Check your connection and try again.", "err"); $("btn-submit").disabled = false; });
-  }
+    function boot() {
+        Capture.applyDirection();
+        Capture.translate(document);
+        document.title = Capture.t("enroll.headTitle");
+        $("credit").textContent = Capture.credit();
+        Capture.wireLanguagePicker(function () {
+            document.title = Capture.t("enroll.headTitle");
+            $("credit").textContent = Capture.credit();
+            Capture.applyPolicy();
+            describeWho();
+            // The intro, the title and the submit button are read off the same state the
+            // first paint read them off - the link's kind, which does not change.
+            if (isRegister) {
+                $("title").textContent = Capture.t("enroll.registerTitle");
+                $("password-hint").textContent = Capture.t("enroll.password.hint", {
+                    n: minPasswordLength, id: workerId
+                });
+                $("btn-submit").textContent = Capture.t("enroll.create");
+            } else {
+                describeInvite();
+            }
+        });
 
-  $("btn-start").addEventListener("click", startCamera);
-  $("btn-shoot").addEventListener("click", shoot);
-  $("btn-retake").addEventListener("click", retake);
-  $("btn-submit").addEventListener("click", submit);
-  $("file").addEventListener("change", function (event) {
-    var file = event.target.files && event.target.files[0];
-    if (file) choose(file);
-  });
+        camera = Capture.createCamera({
+            primary: "btn-submit",
+            family: "photo",
+            allow: function () { return usable; },
+            onBlocked: function () { say(Capture.t("camera.blocked.enroll"), "err"); }
+        });
 
-  applyPolicy();
-  loadInvite();
+        $("btn-start").addEventListener("click", function () { camera.start(); });
+        $("btn-shoot").addEventListener("click", function () { camera.shoot(); });
+        $("btn-retake").addEventListener("click", function () { camera.retake(); });
+        $("btn-submit").addEventListener("click", submit);
+        $("file").addEventListener("change", function (event) { camera.chooseFromInput(event.target); });
+
+        Capture.applyPolicy();
+        loadInvite();
+    }
+
+    boot();
 })();

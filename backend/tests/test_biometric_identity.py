@@ -444,3 +444,236 @@ def test_readiness_reports_whether_any_face_is_still_named_after_an_account(clie
         assert check.value["references"] >= 1
     finally:
         planted.unlink()
+
+
+# ---------------------------------------------------------------------------
+# the detector changed, so the crop changed
+# ---------------------------------------------------------------------------
+# The detector was replaced (MTCNN -> YuNet, see ``face_detector``), and a template is an
+# embedding of the *crop* that detector chose - measured IoU 0.814 between the two boxes, so
+# about 19% different. Scoring an old template against a new punch is therefore not a weak
+# match, it is not a comparison at all: the number means nothing, and it can land in the
+# *mismatch* band, which accuses a worker of being somebody else.
+#
+# So a template records what made it and a mismatch is refused. The one thing that must not
+# happen is a refusal with no way out, which is what the re-enrollment path is for.
+STALE_WORKER = "416"
+CURRENT_WORKER = "417"
+
+
+def _plant_stale_template(user_id: str, *, pipeline=None, dimensions=None) -> Path:
+    """Write a template in the shape an upgraded site already has on disk.
+
+    ``pipeline=None`` writes the bare JSON list every existing template is: a vector and no
+    record of what produced it, which is exactly the case that needs re-enrolling. Passing a
+    pipeline writes the newer record instead, which is how the dimension guard is reached
+    without the provenance check answering first.
+    """
+    vector = harness._reference_embedding()
+    if dimensions is not None:
+        vector = vector[:dimensions]
+    if pipeline is None:
+        text = json.dumps(vector)
+    else:
+        text = json.dumps(
+            {
+                "model": "VGG-Face",
+                "pipeline": pipeline,
+                "dimensions": len(vector),
+                "embedding": vector,
+            }
+        )
+    target = harness.reference_path(user_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+    return target
+
+
+def test_a_template_from_the_old_pipeline_is_refused_not_scored(client):
+    """The refusal names the fix, and it is *not* "Internal processing error".
+
+    A meaningless distance is the worst available answer here: it can read as a mismatch, and
+    then the record says a worker's face did not match when the truth is that the two were
+    never comparable.
+    """
+    assert create_account(client, STALE_WORKER).status_code == 200
+    planted = _plant_stale_template(STALE_WORKER)
+    try:
+        response = harness.clock_in(client, STALE_WORKER, headers=bearer(STALE_WORKER))
+
+        assert response.status_code == 400, response.text[:300]
+        detail = response.json()["detail"]
+        assert detail["error_code"] == "reference_stale", detail
+        assert "administrator" in detail["message"].lower(), detail
+        assert "enroll" in detail["message"].lower(), detail
+        assert "internal" not in detail["message"].lower(), (
+            "a template change is not a server fault and must not be reported as one"
+        )
+        assert db_scalar("SELECT COUNT(*) FROM attendance_logs WHERE worker_id = ?", (STALE_WORKER,)) == 0
+    finally:
+        planted.unlink(missing_ok=True)
+
+
+def test_a_template_of_the_wrong_size_is_refused_rather_than_500(client):
+    """A shape mismatch inside ``cosine`` answers 500 and says nothing.
+
+    The *pipeline* matches here on purpose, so this reaches the dimension guard rather than
+    the provenance one - which is the case a model swap leaves behind, half-written: a 512-float
+    ArcFace template beside a 4096-float VGG-Face one. The live embedding the stub reports is
+    the seeded worker's full-width vector, so the two really are different sizes and the
+    comparison really would raise.
+
+    Same refusal as a stale template, because it is the same fix: a photograph. What must not
+    happen is ``Internal processing error: shapes not aligned`` - a 500 that blames the server
+    for a template change and tells the worker nothing.
+    """
+    import face_detector
+
+    assert create_account(client, STALE_WORKER).status_code == 200
+    planted = _plant_stale_template(STALE_WORKER, pipeline=face_detector.PIPELINE, dimensions=512)
+    try:
+        health = biometrics.reference_health(STALE_WORKER, expected_dimensions=4096)
+        assert health == (False, biometrics.STALE_UNREADABLE), health
+
+        response = harness.clock_in(client, STALE_WORKER, headers=bearer(STALE_WORKER))
+
+        assert response.status_code == 400, response.text[:300]
+        assert response.json()["detail"]["error_code"] == "reference_stale"
+    finally:
+        planted.unlink(missing_ok=True)
+
+
+def test_re_enrolling_clears_the_refusal(client):
+    """The way out. A refusal with no path forward is a dead end for a whole workforce."""
+    assert create_account(client, STALE_WORKER).status_code == 200
+    planted = _plant_stale_template(STALE_WORKER)
+    try:
+        assert harness.clock_in(client, STALE_WORKER, headers=bearer(STALE_WORKER)).status_code == 400
+
+        again = harness.enroll(client, STALE_WORKER, headers=bearer(ADMIN))
+        assert again.status_code == 200, again.text[:300]
+
+        punch = harness.clock_in(client, STALE_WORKER, headers=bearer(STALE_WORKER))
+        assert punch.status_code == 200, (
+            "re-enrollment is the repair, so it has to actually repair: " + punch.text[:200]
+        )
+        assert json.loads(harness.reference_path(STALE_WORKER).read_text(encoding="utf-8"))["pipeline"]
+    finally:
+        planted.unlink(missing_ok=True)
+
+
+def test_a_template_the_application_wrote_is_current(client):
+    """The other half: the check must not call everything stale.
+
+    A guard that refuses every punch is indistinguishable from a broken deployment, and it
+    would pass a test that only looked at the stale case.
+    """
+    assert create_account(client, CURRENT_WORKER, image=jpeg_bytes()).status_code == 200
+
+    health = biometrics.reference_health(CURRENT_WORKER)
+    assert health == (True, None), health
+    punch = harness.clock_in(client, CURRENT_WORKER, headers=bearer(CURRENT_WORKER))
+    assert punch.status_code == 200, punch.text[:300]
+
+
+def test_the_admin_worklist_names_who_needs_a_new_photo(client):
+    """The re-enrollment *path*: who to photograph, and why - without reading a filesystem."""
+    assert create_account(client, STALE_WORKER).status_code == 200
+    assert create_account(client, CURRENT_WORKER, image=jpeg_bytes()).status_code == 200
+    planted = _plant_stale_template(STALE_WORKER)
+    try:
+        response = client.get("/api/v1/admin/enroll/needs_reenrollment", headers=bearer(ADMIN))
+        assert response.status_code == 200, response.text[:300]
+        body = response.json()
+
+        listed = {row["id"]: row for row in body["stale"]}
+        assert STALE_WORKER in listed, body
+        assert listed[STALE_WORKER]["reason"] == biometrics.STALE_NO_PROVENANCE
+        assert listed[STALE_WORKER]["name"], "an administrator acts on a name, not an id"
+        assert CURRENT_WORKER not in listed, "a current template is not work"
+        assert body["count"] == len(body["stale"])
+        assert body["pipeline"] == biometrics.current_pipeline()
+    finally:
+        planted.unlink(missing_ok=True)
+
+
+def test_the_worklist_is_an_admin_surface(client):
+    """It names workers and their face files, so it is not a worker's to read."""
+    response = client.get("/api/v1/admin/enroll/needs_reenrollment", headers=bearer(WORKER))
+    harness.assert_denied(response, endpoint="needs_reenrollment", detail="the roster of faces")
+
+
+def test_read_reference_accepts_both_shapes(tmp_path):
+    """One parser for two on-disk formats, because an upgraded site holds both at once."""
+    vector = [0.5, -0.25, 0.125]
+
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text(json.dumps(vector), encoding="utf-8")
+    parsed = biometrics.read_reference(str(legacy))
+    assert parsed.embedding == vector
+    assert parsed.pipeline is None, "a bare list is a template from before provenance"
+    assert len(parsed) == 3
+
+    current = tmp_path / "current.json"
+    current.write_text(
+        json.dumps({"pipeline": "x", "model": "VGG-Face", "embedding": vector}), encoding="utf-8"
+    )
+    parsed = biometrics.read_reference(str(current))
+    assert parsed.embedding == vector and parsed.pipeline == "x" and parsed.model == "VGG-Face"
+
+    for content in ("{\"not\": \"a template\"}", "\"a string\"", "42"):
+        broken = tmp_path / "broken.json"
+        broken.write_text(content, encoding="utf-8")
+        with pytest.raises(ValueError):
+            biometrics.read_reference(str(broken))
+
+
+def test_the_stale_reason_separates_the_three_cases(tmp_path):
+    """Three different causes, because an administrator has to know which one they are in."""
+    current = biometrics.current_pipeline()
+    live = biometrics.Reference(embedding=[0.1, 0.2], pipeline=current)
+    assert biometrics.stale_reason(live) is None
+
+    assert biometrics.stale_reason(biometrics.Reference(embedding=[0.1], pipeline=None)) == (
+        biometrics.STALE_NO_PROVENANCE
+    )
+    assert biometrics.stale_reason(biometrics.Reference(embedding=[0.1], pipeline="mtcnn")) == (
+        biometrics.STALE_OTHER_PIPELINE
+    )
+    assert biometrics.stale_reason(live, expected_dimensions=512) == biometrics.STALE_UNREADABLE
+    assert biometrics.stale_reason(live, expected_dimensions=2) is None
+
+    # Every reason has something to say to the person who has to clear it.
+    assert set(biometrics.STALE_EXPLANATIONS) == {
+        biometrics.STALE_UNREADABLE,
+        biometrics.STALE_NO_PROVENANCE,
+        biometrics.STALE_OTHER_PIPELINE,
+    }
+
+
+def test_readiness_reports_the_detector_and_the_re_enrollment_worklist(client):
+    """An operator has to be able to see both halves without opening a directory."""
+    import readiness
+
+    assert create_account(client, STALE_WORKER).status_code == 200
+    planted = _plant_stale_template(STALE_WORKER)
+    try:
+        check = readiness._check_face_detector({})
+        assert check.name == "face_detector"
+        assert check.tier == readiness.TIER_ADVISORY, "a missing model is not a reason to refuse to boot"
+        assert "face detector" in check.detail
+        assert "re-enrollment" in check.detail, check.detail
+        assert check.value["count"] >= 1
+    finally:
+        planted.unlink(missing_ok=True)
+
+
+def test_the_readiness_check_names_the_detector_that_is_live(client):
+    """The fallback is reported, not hidden: it is thirty times slower per punch."""
+    import face_detector
+    import readiness
+
+    check = readiness._check_face_detector({})
+    assert check.value["detector"] == face_detector.DETECTOR_NAME
+    assert check.ok is True, "the harness stubs the detector as present"
+    assert face_detector.PIPELINE in check.detail

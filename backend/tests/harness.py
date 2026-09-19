@@ -216,9 +216,14 @@ class FakeDeepFace:
         # With a fallback to the seeded vector, because deleting an account's template is
         # itself something the suite tests: a stub that could only answer by reading a file
         # under test would fail the test it is there to serve.
+        import biometrics
+
         try:
-            reference = json.loads(reference_path(WORKER).read_text())
-        except OSError:
+            # Read through the application's own parser, in the shape the application writes
+            # (a vector *and* what produced it). A stub that assumed a bare list would break
+            # the moment the record grew, and the failure would look like a broken model.
+            reference = biometrics.read_reference(str(reference_path(WORKER))).embedding
+        except (OSError, ValueError, TypeError):
             reference = _reference_embedding()
         if self.FACE_MODE == "mismatch":
             vector = [-value for value in reference]
@@ -233,6 +238,63 @@ FAKE_FACE = FakeDeepFace()
 _fake_deepface = types.ModuleType("deepface")
 _fake_deepface.DeepFace = FAKE_FACE
 sys.modules["deepface"] = _fake_deepface
+
+
+# ---------------------------------------------------------------------------
+# 2b. Deterministic face detector stub (no ONNX, no OpenCV model)
+# ---------------------------------------------------------------------------
+# ``face_engine`` detects through ``face_detector`` (YuNet) whenever its model is on disk -
+# and the model is committed beside the code, so without this stub every punch test would
+# run a real ONNX detector over a synthetic JPEG, find nothing, and be answered with "no face
+# detected". The seam is ``detect_and_align``: the single function the engine calls, and the
+# one whose *answer* the application actually reads (how many faces are in the frame, at what
+# confidence, and which crop is handed to the model). Stubbing it rather than the detector as
+# a whole keeps the YuNet routing itself under test - the per-face embedding, the face-count
+# guard, the crop - and fakes only the pixels.
+import face_detector as _face_detector  # noqa: E402 - after the stubs it replaces
+
+
+def _stub_available() -> tuple[bool, str]:
+    """The model is present, so ``face_engine`` takes the detector path.
+
+    Declared true rather than false on purpose: the fallback path is the old code, and a
+    suite that never exercises the new one cannot notice it breaking. The detector's own
+    loading, alignment and geometry are covered directly in ``test_face_detector.py``.
+    """
+    return True, ""
+
+
+def _stub_detect_and_align(image):
+    """The detector's answer, in the shape ``extract_faces`` and ``represent`` read.
+
+    One entry per ``FACE_COUNT``, each carrying ``confidence`` (the key ``extract_faces``
+    uses) and the same frame as its "crop", which is what the DeepFace stub embeds. The
+    ``"none"`` mode answers an empty list, which is what a real detector does for a frame it
+    cannot use.
+
+    Read from the ``FAKE_FACE`` *instance*, not the class: a test sets
+    ``face.FACE_COUNT = 2`` on the fixture's object, which shadows the class attribute -
+    and reading the class would quietly report one face to every caller, so the multi-face
+    guard would never fire.
+    """
+    if FAKE_FACE.FACE_MODE == "none":
+        return []
+    return [
+        {"face": image, "facial_area": {"x": 0, "y": 0, "w": 10, "h": 10}, "confidence": 0.99}
+        for _ in range(FAKE_FACE.FACE_COUNT)
+    ]
+
+
+#: What was replaced, so a test that needs the real detector can put it back. Kept here
+#: rather than reloaded from source: ``importlib.reload`` would un-stub the module for the
+#: whole session and leave every later punch test running ONNX over a synthetic JPEG.
+REAL_FACE_DETECTOR = {
+    "available": _face_detector.available,
+    "detect_and_align": _face_detector.detect_and_align,
+}
+
+_face_detector.available = _stub_available
+_face_detector.detect_and_align = _stub_detect_and_align
 
 
 # ---------------------------------------------------------------------------
@@ -369,8 +431,24 @@ def reference_path(user_id: str) -> Path:
 
 
 def reference_text() -> str:
-    """The template vector every seeded user carries (one vector: DeepFace is stubbed)."""
-    return json.dumps(_reference_embedding())
+    """The template every seeded user carries (one vector: DeepFace is stubbed).
+
+    Written in the shape ``biometrics.write_reference`` writes - the vector *and* the
+    pipeline that produced it. Seeding a bare list would seed a **stale** template, and then
+    every punch test would be measuring the re-enrollment refusal instead of the flow it
+    means to test. A test that wants the stale case should say so (see
+    ``test_biometric_identity``), not get it by accident from the fixture.
+    """
+    import face_detector
+
+    return json.dumps(
+        {
+            "model": "VGG-Face",
+            "pipeline": face_detector.PIPELINE,
+            "dimensions": len(_reference_embedding()),
+            "embedding": _reference_embedding(),
+        }
+    )
 
 
 def seed_reference(user_id: str, text: str | None = None) -> Path:

@@ -8,6 +8,9 @@ backend/certs/
 # Place it at backend/models/minifasnet.onnx (see backend/models/README.md).
 backend/models/*.onnx
 backend/models/*.onnx.*
+# ...except the face detector. 232 KB, and the difference between a 10 ms and a 308 ms
+# detection on every punch, so it ships with the code instead of behind a deploy step.
+!backend/models/face_detection_yunet_2023mar.onnx
 times.db
 # SQLite sidecar files created by WAL mode while the server runs
 times.db-wal

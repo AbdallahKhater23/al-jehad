@@ -12,3 +12,13 @@ httpx2==2.12.0
 # PyJWT is a RUNTIME dependency of the JWT remediation, and the test harness also
 # uses it to mint real tokens so the 401-vs-403 distinction is meaningful.
 PyJWT==2.14.0
+
+# Drives a real browser for tests/test_pages_boot_in_a_browser.py, which is the only test
+# that can see a page whose script a browser refuses to execute - the bug that left both
+# link pages dead on a worker's phone while looking like a slow connection.
+#
+# No browser download is required: that suite uses Playwright's bundled Chromium when it is
+# present, and a Chromium-based browser the machine already has (Edge, then Chrome)
+# otherwise. It skips, naming the command below, when there is neither.
+#     python -m playwright install chromium
+playwright==1.62.0

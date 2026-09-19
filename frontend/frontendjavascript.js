@@ -471,7 +471,11 @@ const BRAND = {
     legal: 'INTERNATIONAL CO.',
     est: 'EST 1983',
     tagline: 'STONE . MARBLE . GRANITE',
-    mark: 'logo-mark.svg'
+    mark: 'logo-mark.svg',
+    //: The vendor whose software this is, credited at the foot of every page. A wordmark
+    //: like the company's, so it is the same string in all three languages; ``poweredBy``
+    //: in i18n.js is only the words around it.
+    poweredBy: 'دوامك اسهل'
 };
 
 //  The array order is the order the tabs were built in, and it is what the
@@ -521,6 +525,11 @@ const UI = {
     get appContainer() { return document.getElementById('app'); },
 
     async init() {
+        // Before anything is drawn: the chosen language may be a file this tab has not
+        // fetched yet, and a first paint in English that corrects itself a moment later is
+        // the one thing choosing a language is meant to prevent. Resolves immediately for
+        // English and for a language already in memory, so the usual boot is untouched.
+        await I18n.loadStored();
         State.applyTheme();
         I18n.applyDirection();
         // A session restored from a build that never stored the token cannot
@@ -554,6 +563,21 @@ const UI = {
         }
         if (State.user.role === 'worker') return this.renderWorkerPortal();
         return this.renderAdminConsole();
+    },
+
+    /**
+     * The vendor's credit, which closes every page: login, the handset, the console, and
+     * the page an administrator is left on when the console cannot load.
+     *
+     * A line rather than a second lockup. The app belongs to AL-JEHAD; this is who wrote
+     * it, and a vendor mark set at the size of the company's would read as a second owner
+     * of the screen. It is returned as a ``<p>`` because every host already has a footer
+     * of its own - the login screen's company line, the handset's page, the console's
+     * frame - and a ``<footer>`` inside a ``<footer>`` is not a landmark, it is invalid.
+     */
+    creditHtml() {
+        const line = I18n.__('poweredBy').replace('{brand}', BRAND.poweredBy);
+        return `<p class="app-credit">${this.escapeHtml(line)}</p>`;
     },
 
     langSelectHtml() {
@@ -620,7 +644,7 @@ const UI = {
                     </div>
                 </section>
             </main>
-            <footer class="login-footer">${this.escapeHtml(I18n.__('companyFooter'))}</footer>`;
+            <footer class="login-footer">${this.escapeHtml(I18n.__('companyFooter'))}${this.creditHtml()}</footer>`;
         document.getElementById('loginForm').addEventListener('submit', async (e) => {
             e.preventDefault();
             const button = e.target.querySelector('button');
@@ -740,6 +764,7 @@ const UI = {
             </header>
             <main class="hand-main" id="workerMain"></main>
             ${this.workerTabBarHtml()}
+            <footer class="hand-credit">${this.creditHtml()}</footer>
         `;
         this.bindWorkerTabs(container);
         await this.renderWorkerView(State.workerTab);
@@ -755,7 +780,7 @@ const UI = {
             </header>
             <div class="hand-desk">
                 <div class="hand-desk-col">
-                    <div class="hand-card"><div id="workerDashboard"></div></div>
+                    <div class="hand-card is-bare"><div id="workerDashboard"></div></div>
                     <div class="hand-card"><div id="devicePanel"></div></div>
                 </div>
                 <div class="hand-desk-col">
@@ -768,6 +793,7 @@ const UI = {
                     <section class="hand-card"><div id="workerNotes"></div></section>
                 </div>
             </div>
+            <footer class="hand-credit is-desk">${this.creditHtml()}</footer>
         `;
         await WORKER_MODULES.renderClockPanel(document.getElementById('workerDashboard'));
         await WORKER_MODULES.renderHistory(document.getElementById('historyTable'));
@@ -968,11 +994,13 @@ const UI = {
     // -----------------------------------------------------------------
     showHelpModal(title, steps, extraHtml = '') {
         Modal.open(`
-            <h3 class="text-xl font-bold mb-3">${title}</h3>
-            ${steps.map((step, index) => `
-                <div class="help-step"><span class="help-num">${index + 1}</span><span>${step}</span></div>`).join('')}
-            ${extraHtml}
-            <button onclick="Modal.close()" class="mt-4 w-full py-3 rounded-xl bg-blue-600 text-white font-bold">${I18n.__('close')}</button>
+            <div class="ui-stack">
+                <h3 class="ui-title">${title}</h3>
+                ${steps.map((step, index) => `
+                    <div class="help-step"><span class="help-num">${index + 1}</span><span>${step}</span></div>`).join('')}
+                ${extraHtml}
+                <button onclick="Modal.close()" class="ui-btn ui-btn-primary is-block">${I18n.__('close')}</button>
+            </div>
         `);
     },
 
@@ -1011,23 +1039,25 @@ const UI = {
 
         return new Promise((resolve) => {
             Modal.open(`
-                <h3 class="text-xl font-bold mb-2">${title}</h3>
-                <p class="text-sm text-gray-600 dark:text-gray-300 mb-4">${body}</p>
-                ${steps.map((step, index) => `
-                    <div class="help-step"><span class="help-num">${index + 1}</span><span>${step}</span></div>`).join('')}
-                ${!Location.isSecure ? `
-                    <div class="my-4 p-3 rounded-xl bg-amber-50 dark:bg-amber-900/25 text-sm">
-                        <p class="font-semibold mb-1">${I18n.__('openThisLink')}</p>
-                        <p class="font-mono break-all">${Location.httpsLink}</p>
-                        <button onclick="UI.copyHttpsLink()" class="mt-2 px-3 py-2 rounded-lg bg-amber-500 text-white font-semibold">${I18n.__('copyLink')}</button>
-                        <p class="mt-2 text-xs">${I18n.__('insecureTunnelHint')}</p>
-                    </div>` : ''}
-                <hr class="my-4 border-gray-200 dark:border-gray-700">
-                <p class="text-xs text-gray-500 dark:text-gray-400 mb-4">${I18n.__('gpsBlockedBody')}</p>
-                <div class="flex flex-col sm:flex-row gap-2">
-                    <button id="retryGps" class="flex-1 py-3 rounded-xl bg-blue-600 text-white font-bold">${I18n.__('retry')}</button>
+                <div class="ui-stack">
+                    <h3 class="ui-title">${title}</h3>
+                    <p class="ui-note is-body">${body}</p>
+                    ${steps.map((step, index) => `
+                        <div class="help-step"><span class="help-num">${index + 1}</span><span>${step}</span></div>`).join('')}
+                    ${!Location.isSecure ? `
+                        <div class="ui-alert is-warn is-stacked">
+                            <p class="ui-strong">${I18n.__('openThisLink')}</p>
+                            <p class="ui-note is-mono">${Location.httpsLink}</p>
+                            <button onclick="UI.copyHttpsLink()" class="ui-btn ui-btn-warn ui-btn-sm">${I18n.__('copyLink')}</button>
+                            <p class="ui-note">${I18n.__('insecureTunnelHint')}</p>
+                        </div>` : ''}
+                    <hr class="ui-divider">
+                    <p class="ui-note">${I18n.__('gpsBlockedBody')}</p>
+                    <div class="ui-pair">
+                        <button id="retryGps" class="ui-btn ui-btn-primary is-grow">${I18n.__('retry')}</button>
+                    </div>
+                    <button id="cancelLocation" class="ui-btn ui-btn-quiet is-block">${I18n.__('cancel')}</button>
                 </div>
-                <button id="cancelLocation" class="mt-2 w-full py-2 rounded-xl text-gray-500 dark:text-gray-400">${I18n.__('cancel')}</button>
             `, { dismissible: false });
 
             const retryButton = document.getElementById('retryGps');
@@ -1094,23 +1124,23 @@ const UI = {
         overlay.className = 'camera-overlay';
         overlay.id = 'cameraOverlay';
         overlay.innerHTML = `
-            <div class="flex items-center justify-between p-4 text-white" style="padding-top:calc(16px + var(--safe-top))">
+            <div class="camera-head" style="padding-top:calc(16px + var(--safe-top))">
                 <div>
-                    <p class="font-bold text-lg">${I18n.__(actionKey)}</p>
-                    <p class="text-xs opacity-70" id="cameraCoords">📍 ${coords}</p>
+                    <p class="camera-action">${I18n.__(actionKey)}</p>
+                    <p class="camera-coords" id="cameraCoords">📍 ${coords}</p>
                     <p class="camera-window" id="cameraWindow" data-verdict="" hidden></p>
                 </div>
                 <button onclick="UI.closeCamera()" class="icon-button" style="background:rgba(255,255,255,.12);border-color:rgba(255,255,255,.25);color:#fff">✕</button>
             </div>
             <video id="attendanceVideo" autoplay playsinline muted></video>
-            <div class="camera-controls text-white">
+            <div class="camera-controls">
                 <p class="camera-framing" id="framingHint" data-framing="" hidden></p>
-                <div class="flex items-center gap-4">
-                    <div style="width:76px"></div>
+                <div class="camera-controls-row">
+                    <div class="camera-spacer"></div>
                     <button id="captureBtn" class="shutter-button" aria-label="${I18n.__('captureSubmit')}"></button>
-                    <div style="width:76px"></div>
+                    <div class="camera-spacer"></div>
                 </div>
-                <p class="text-center text-xs opacity-70 mt-3">${I18n.__('captureHint')}</p>
+                <p class="camera-hint">${I18n.__('captureHint')}</p>
             </div>
         `;
         document.body.appendChild(overlay);
@@ -1531,9 +1561,97 @@ const UI = {
     //  Admin console - rail on desktop, tab strip on a phone
     // -----------------------------------------------------------------
     renderAdminConsole() {
+        if (typeof UI_MODULES !== 'undefined') return this.paintAdminConsole();
+        // First administrator frame of the session: the console's own module is not here
+        // yet. ``loadConsoleModule`` fetches it once (two frames can race, and the second
+        // must not start a second copy of a 255 KB download), then paints. Nothing is
+        // rendered until it lands, so there is no half-console on screen.
+        return this.loadConsoleModule().then(() => {
+            // A ``#shifts=2026-08-01..2026-08-31`` fragment is parsed by the console
+            // module, which did not exist when ``init`` looked at it, so the link is
+            // adopted here - before the first paint, so the console opens on that period.
+            return this.applyShiftsLink()
+                .catch(() => {})
+                .then(() => this.paintAdminConsole());
+        }, (err) => this.renderConsoleFailure(err));
+    },
+
+    /**
+     * The console's two layouts, once its module is in memory.
+     *
+     * Separate from ``renderAdminConsole`` on purpose: every later repaint (a theme
+     * toggle, a rotate, a language switch) takes this path synchronously, so nothing the
+     * console does ends up waiting a microtask on a promise that is already resolved.
+     */
+    paintAdminConsole() {
         if (Device.isMobile) this.renderAdminMobile();
         else this.renderAdminDesktop();
-        this.renderAdminTab(State.adminTab);
+        return this.renderAdminTab(State.adminTab);
+    },
+
+    /**
+     * Fetch ``admin_modules.js``, once per session.
+     *
+     * It is the largest file in the frontend and no worker screen can reach a line of it,
+     * so it is not in ``index.html``: a phone at a gate used to download the whole back
+     * office, on the connection this app is documented to assume is the worst one. The
+     * promise is what makes it once - a repaint while the first request is still in flight
+     * joins the same download instead of starting another.
+     */
+    loadConsoleModule() {
+        if (typeof UI_MODULES !== 'undefined') return Promise.resolve(UI_MODULES);
+        if (this._consoleModule) return this._consoleModule;
+        this._consoleModule = new Promise((resolve, reject) => {
+            const script = document.createElement('script');
+            script.src = 'admin_modules.js';
+            script.addEventListener('load', () => {
+                // A 200 that is not this module - a captive portal, a truncated deploy -
+                // leaves the binding missing. Fail where the message can still name it.
+                if (typeof UI_MODULES === 'undefined') reject(new Error(I18n.__('consoleUnavailable')));
+                else resolve(UI_MODULES);
+            });
+            script.addEventListener('error', () => reject(new Error(I18n.__('consoleUnavailable'))));
+            (document.head || document.body).appendChild(script);
+        });
+        this._consoleModule = this._consoleModule.catch((err) => {
+            // A failure is not cached: the next frame tries again, so a connection that
+            // comes back is enough to get the console without a sign-out and a sign-in.
+            this._consoleModule = null;
+            throw err;
+        });
+        return this._consoleModule;
+    },
+
+    /**
+     * What an administrator sees when the console's module cannot be fetched.
+     *
+     * Deliberately not the sign-in screen: they are still signed in, their session is
+     * still valid, and telling them otherwise sends them to re-enter a password that was
+     * never the problem. What they need is the reason and a way back in.
+     */
+    renderConsoleFailure(err) {
+        const container = this.appContainer;
+        container.className = 'admin';
+        container.innerHTML = `
+            <div class="admin-frame">
+                <div class="ui-surface console-failure">
+                    <div class="ui-stack">
+                        <p class="ui-card-title">${this.escapeHtml(I18n.__('consoleUnavailable'))}</p>
+                        <p class="ui-hint">${this.escapeHtml(err && err.message ? err.message : '')}</p>
+                        <div class="ui-row">
+                            <button type="button" class="ops-btn ops-btn-primary" data-console-failure="reload">${I18n.__('reload')}</button>
+                            <button type="button" class="ops-btn" data-console-failure="logout">${I18n.__('logout')}</button>
+                        </div>
+                    </div>
+                </div>
+                <footer class="admin-credit">${this.creditHtml()}</footer>
+            </div>`;
+        // Bound here rather than in the markup: the document policy still allows inline
+        // handlers only because older screens use them, and this is not one of them.
+        container.querySelector('[data-console-failure="reload"]')
+            .addEventListener('click', () => location.reload());
+        container.querySelector('[data-console-failure="logout"]')
+            .addEventListener('click', () => this.logout());
     },
 
     //: The shell renders names, site names and timestamps, so it escapes too.
@@ -1665,6 +1783,7 @@ const UI = {
             <div class="admin-frame">
                 <p class="ui-hint admin-mobile-hint" id="adminSubtitle">${this.escapeHtml(I18n.__(active.hint))}</p>
                 <div id="adminContent" class="ui-surface"></div>
+                <footer class="admin-credit">${this.creditHtml()}</footer>
             </div>`;
     },
 
@@ -1701,6 +1820,7 @@ const UI = {
                         <div id="adminContent" class="ui-surface"></div>
                     </div>
                 </div>
+                <footer class="admin-credit">${this.creditHtml()}</footer>
             </div>`;
     },
 
@@ -1731,13 +1851,13 @@ const UI = {
                 case 'Admin': await UI_MODULES.renderAdminManagement(content); break;
                 case 'Shifts': await UI_MODULES.renderShifts(content); break;
                 default:
-                    content.innerHTML = `<div class="text-center py-10 text-gray-500">${tab} ${I18n.__('comingSoon')}</div>`;
+                    content.innerHTML = `<div class="ui-empty">${tab} ${I18n.__('comingSoon')}</div>`;
             }
         } catch (err) {
             // The server's sentence is escaped like any other server text: it is written by
             // whichever endpoint refused the request, and "it is our own message" stops
             // being true the moment one of them interpolates something a client sent.
-            content.innerHTML = `<p class="text-red-500">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`;
+            content.innerHTML = `<p class="ui-note is-body is-danger">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`;
         }
     },
 
@@ -1775,7 +1895,7 @@ const UI = {
         return `
             <div class="ops-panel-body">
                 <p class="ops-note" id="forceInHint" style="margin-top:0">${escapeHtml(I18n.__('forceInHint'))}</p>
-                <div class="grid gap-3 sm:grid-cols-3 mt-3">
+                <div class="ui-grid three">
                     <div>
                         <label class="ops-stat-label" for="forceInWorker">${escapeHtml(I18n.__('liveOpsForceWorker'))}</label>
                         <select id="forceInWorker" class="ops-field" aria-describedby="forceInHint"${disabledAttribute}>
@@ -1788,9 +1908,9 @@ const UI = {
                             ${siteNames.map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join('')}
                         </select>
                     </div>
-                    <div class="flex items-end">
+                    <div class="ui-row is-bottom">
                         <button type="button" data-force-in="true" onclick="UI.forceIn()"
-                                class="ops-btn ops-btn-primary w-full"${disabledAttribute}>${UI_MODULES.OPS_ICONS.person}${escapeHtml(I18n.__('forceIn'))}</button>
+                                class="ops-btn ops-btn-primary is-block"${disabledAttribute}>${UI_MODULES.OPS_ICONS.person}${escapeHtml(I18n.__('forceIn'))}</button>
                     </div>
                 </div>
                 <p class="ops-note" data-force-in-note role="status">${escapeHtml(note)}</p>

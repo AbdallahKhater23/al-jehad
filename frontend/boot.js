@@ -44,11 +44,17 @@
                     // wrong problem. A top-level `const` is not a property of `window` either,
                     // so `window['UI']` would say the same untrue thing; `typeof` on the name
                     // sees the global lexical binding.
+                    // Exactly the files index.html loads. admin_modules.js and the two
+                    // non-English translation tables are fetched later, by the session
+                    // that needs them, and are deliberately absent here: an administrator
+                    // whose console failed gets UI's own message on a rendered page (so
+                    // this panel never runs), and listing a file nobody has asked for yet
+                    // as "missing" would send whoever reads this after the wrong problem -
+                    // the mistake the string-built probe used to make below.
                     var files = [
                         ['i18n.js', function () { return typeof I18n; }],
                         ['frontendjavascript.js', function () { return typeof UI; }],
                         ['worker_modules.js', function () { return typeof WORKER_MODULES; }],
-                        ['admin_modules.js', function () { return typeof UI_MODULES; }],
                         ['offline_queue.js', function () { return typeof OFFLINE; }]
                     ];
                     var missing = [];
@@ -63,7 +69,13 @@
                     panel('The app did not start',
                         ['Missing scripts: ' + (missing.length ? missing.join(', ') : 'none')]
                         .concat(window.__bootErrors.length ? ['Errors: ' + window.__bootErrors.join(' | ')] : ['No JavaScript error was reported.'])
-                        .concat(['Tailwind loaded: ' + (!!window.tailwind),
+                        // The stylesheet, not a CDN: if this reads false, the page is
+                        // unstyled - which is the difference between a missing file and
+                        // a missing connection, and the two need different answers.
+                        .concat(['Stylesheet applied: ' + (function () {
+                                     try { return getComputedStyle(document.body).boxSizing === 'border-box'; }
+                                     catch (e) { return 'unknown'; }
+                                 })(),
                                  'Secure context (GPS/camera allowed): ' + (window.isSecureContext === true),
                                  'Scripts expected next to: ' + location.href.replace(/[?#].*$/, '')]));
                 }, 2500);

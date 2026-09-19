@@ -63,6 +63,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import Any, Callable, NamedTuple
 
+import face_detector
 import telemetry
 from config import settings
 
@@ -71,7 +72,11 @@ log = logging.getLogger(__name__)
 #: The detector and model every path in this application uses. Named once so a punch and an
 #: enrollment cannot drift onto different models and stop matching each other.
 FACE_MODEL = "VGG-Face"
-FACE_DETECTOR = "mtcnn"
+FACE_DETECTOR = face_detector.DETECTOR_NAME
+#: What a verification falls back to when the YuNet model is not on disk. The previous
+#: detector, through DeepFace. Reported by readiness rather than swallowed: a deployment
+#: still on it pays ~30x more for detection on every punch, and that is worth seeing.
+FACE_DETECTOR_FALLBACK = "mtcnn"
 
 
 # ---------------------------------------------------------------------------
@@ -113,28 +118,60 @@ class NoFaceDetected(ValueError):
 # ---------------------------------------------------------------------------
 # the model calls: the only place DeepFace is called for verification work
 # ---------------------------------------------------------------------------
-def _represent(image, *, detector_backend: str = FACE_DETECTOR, enforce_detection: bool = True):
-    """VGG-Face embeddings for one image. Takes a BGR array or a path.
+def _represent(image, *, detector_backend: str | None = None, enforce_detection: bool = True):
+    """VGG-Face embeddings for one image, **one entry per detected face**. BGR array or path.
 
-    Imported inside the function so that importing this module does not pull TensorFlow
-    into a process that only wants the admin routes - and so the test harness's DeepFace
-    stub is what runs, exactly as it is for the rest of the suite.
+    Detection is ``face_detector`` (YuNet) whenever its model is on disk, and the previous
+    DeepFace detector otherwise; the embedding is always ``FACE_MODEL``, run on the crop the
+    detector chose. The detector is the expensive half - measured at 308 ms for MTCNN
+    against 10 ms for YuNet at the application's working size - so which one is live decides
+    what a punch costs.
+
+    The shape of the answer is DeepFace's, deliberately: callers count the entries to answer
+    "how many faces are in this frame" (``main.compare_faces_sync`` refuses more than one),
+    and ``face_confidence`` is the key they read. Keeping that contract is what lets the
+    detector change without a caller changing.
+
+    Imported inside the function so that importing this module does not pull TensorFlow into
+    a process that only wants the admin routes - and so the test harness's DeepFace stub is
+    what runs, exactly as it is for the rest of the suite.
 
     Timed here rather than at the queue boundary because this is the number the capacity
-    decision was made from: the pool's job time includes the wait and the result handling,
-    and the promise being watched is "one embedding plus one MTCNN detection costs about
-    half a second". A failure is timed too - a model that raises instantly is not fast, it is
-    broken, and it would otherwise look like excellent latency on a graph.
+    decision was made from. A failure is timed too - a model that raises instantly is not
+    fast, it is broken, and it would otherwise look like excellent latency on a graph.
     """
     from deepface import DeepFace
 
     started = time.perf_counter()
     error: BaseException | None = None
     try:
+        if face_detector.available()[0]:
+            faces = face_detector.detect_and_align(image)
+            if not faces:
+                if enforce_detection:
+                    # The same failure, and the same exception type, that DeepFace raises for
+                    # a frame it cannot use - so every caller's existing handling (a 4xx that
+                    # names the photo rather than the server) keeps working unchanged.
+                    raise ValueError("No face detected in the photo.")
+                faces = [{"face": image, "confidence": 1.0}]
+            embeddings = []
+            for face in faces:
+                embedded = DeepFace.represent(
+                    img_path=face.get("face", image),
+                    model_name=FACE_MODEL,
+                    detector_backend="skip",
+                    enforce_detection=False,
+                )
+                # One entry per *detected* face. The call can answer with more than one (the
+                # test stub does, and so does DeepFace), and taking them all would square the
+                # face count instead of counting the faces in the frame.
+                if embedded:
+                    embeddings.append(embedded[0])
+            return embeddings
         return DeepFace.represent(
             img_path=image,
             model_name=FACE_MODEL,
-            detector_backend=detector_backend,
+            detector_backend=detector_backend or FACE_DETECTOR_FALLBACK,
             enforce_detection=enforce_detection,
         )
     except BaseException as exc:  # noqa: BLE001 - recorded, then handed to the caller unchanged
@@ -145,25 +182,35 @@ def _represent(image, *, detector_backend: str = FACE_DETECTOR, enforce_detectio
             operation="represent",
             seconds=time.perf_counter() - started,
             model=FACE_MODEL,
-            detector=detector_backend,
+            # The detector that actually ran, not the one this build prefers: on a host
+            # without the model every call is on the fallback, and a graph labelled with
+            # the ideal detector is a graph an operator cannot explain the latency of.
+            detector=detector_backend or face_detector.active_detector(),
             error=error,
         )
 
 
-def _detect(image, *, detector_backend: str = FACE_DETECTOR, enforce_detection: bool = False):
+def _detect(image, *, detector_backend: str | None = None, enforce_detection: bool = False):
     """Faces in one image, without embedding them (the cheap half of the API).
 
-    Separate operation label from ``represent`` on purpose: the detector is the part that
-    scales with the number of faces in the frame, and an operator tuning the gate needs to
-    see the two costs apart before deciding whether to change the detector.
+    Nothing else in the application detects a face: a quick clock link asks only whether one
+    is *present*, and this is that question. Separate operation label from ``represent`` on
+    purpose - an operator tuning the gate needs to see the two costs apart.
     """
     from deepface import DeepFace
 
     started = time.perf_counter()
     error: BaseException | None = None
     try:
+        if face_detector.available()[0]:
+            faces = face_detector.detect_and_align(image)
+            if not faces and enforce_detection:
+                raise ValueError("No face detected in the photo.")
+            return faces
         return DeepFace.extract_faces(
-            img_path=image, detector_backend=detector_backend, enforce_detection=enforce_detection
+            img_path=image,
+            detector_backend=detector_backend or FACE_DETECTOR_FALLBACK,
+            enforce_detection=enforce_detection,
         )
     except BaseException as exc:  # noqa: BLE001
         error = exc
@@ -172,8 +219,8 @@ def _detect(image, *, detector_backend: str = FACE_DETECTOR, enforce_detection: 
         telemetry.observe_model_call(
             operation="detect",
             seconds=time.perf_counter() - started,
-            model="mtcnn",
-            detector=detector_backend,
+            model=face_detector.active_detector(),
+            detector=detector_backend or face_detector.active_detector(),
             error=error,
         )
 

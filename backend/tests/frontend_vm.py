@@ -64,10 +64,15 @@ const fs = require('fs');
 const path = require('path');
 
 const frontend = process.argv[2];
-// Every file ``index.html`` loads, in the same order. ``worker_modules.js`` is the
-// worker half of the app (the notes tab lives there), and a suite that could not reach
-// it would be testing a console nobody's phone ever runs.
-const scripts = ['i18n.js', 'frontendjavascript.js', 'worker_modules.js', 'admin_modules.js'];
+// Every file a browser ends up with, in the order it gets them. ``index.html`` itself
+// lists only the first four; the rest are fetched on demand - the console's module the
+// first time an administrator signs in, the two translation tables when a reader asks
+// for one - and are loaded here so that in a test "shipped" and "fetched later" are as
+// distinguishable as they are in the browser. A suite that wants to drive the smaller
+// session a phone really has passes its own list as argv[3].
+const DEFAULT_SCRIPTS = ['i18n.js', 'i18n.ar.js', 'i18n.hi.js', 'frontendjavascript.js',
+                         'worker_modules.js', 'admin_modules.js'];
+const scripts = process.argv[3] ? process.argv[3].split(',') : DEFAULT_SCRIPTS;
 
 function makeStorage() {
     const map = new Map();
@@ -257,14 +262,27 @@ def script(body: str) -> str:
     return PRELUDE + "\n(async () => {\n" + body + "\n" + _EPILOGUE
 
 
-def run(body: str, frontend_dir: Path | None = None, *, timeout: int = 180) -> dict:
-    """Run ``body`` against the real frontend files and return its ``results`` object."""
+def run(
+    body: str,
+    frontend_dir: Path | None = None,
+    *,
+    timeout: int = 180,
+    scripts: list[str] | None = None,
+) -> dict:
+    """Run ``body`` against the real frontend files and return its ``results`` object.
+
+    ``scripts`` narrows the files the context starts with, for suites about what a
+    session does *not* have yet (a worker's payload has no console module in it).
+    """
     source = script(body)
     with tempfile.TemporaryDirectory(prefix="frontend_vm_") as folder:
         harness = Path(folder) / "harness.js"
         harness.write_text(source, encoding="utf-8")
+        command = [NODE, str(harness), str(frontend_dir or FRONTEND)]
+        if scripts is not None:
+            command.append(",".join(scripts))
         completed = subprocess.run(
-            [NODE, str(harness), str(frontend_dir or FRONTEND)],
+            command,
             capture_output=True, timeout=timeout,
             # Node writes UTF-8. Decoding with the console's locale encoding instead
             # (cp1252 on a default Windows box) would mangle every Arabic, Hindi or

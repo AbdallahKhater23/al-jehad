@@ -405,7 +405,7 @@ const UI_MODULES = {
                     ${this.liveOpsProgressHtml(facts)}
                 </td>
                 <td><div class="ops-badges">${this.liveOpsBadgesHtml(facts)}</div></td>
-                <td class="text-end">
+                <td class="is-end">
                     <button type="button" class="ops-btn ops-btn-danger" data-force-out="${this.escapeHtml(session.worker_id)}"
                             onclick="UI.forceAction('${this.liveOpsInlineString(session.worker_id)}', 'out', '${this.liveOpsInlineString(session.site_name)}')">${this.escapeHtml(I18n.__('forceOut'))}</button>
                 </td>
@@ -443,7 +443,7 @@ const UI_MODULES = {
         const sort = this._liveOpsSort || 'longest';
         const ariaSort = sort === 'name' ? 'none' : sort === 'newest' ? 'ascending' : 'descending';
         return `
-            <div class="overflow-x-auto">
+            <div class="ui-table-wrap">
                 <table class="ops-table" data-live-ops-table>
                     <caption class="sr-only">${this.escapeHtml(I18n.__('activeShifts'))}</caption>
                     <thead>
@@ -587,11 +587,11 @@ const UI_MODULES = {
         try {
             data = await this.fetchLiveOps();
         } catch (err) {
-            if (run !== this._liveOpsRun) return;   // a newer render owns the screen
+            if (this.liveOpsRenderIsStale(run)) return;   // a newer render owns the screen
             content.innerHTML = this.liveOpsErrorHtml(err);
             return;
         }
-        if (run !== this._liveOpsRun) return;
+        if (this.liveOpsRenderIsStale(run)) return;
         this._liveOps = data;
         content.innerHTML = this.liveOpsHtml(data);
         this.startLiveOps();
@@ -602,6 +602,19 @@ const UI_MODULES = {
         this.stopLiveOps();
         this._liveOpsTick = setInterval(() => this.tickLiveOps(), 1000);
         this._liveOpsPoll = setInterval(() => this.pollLiveOps(), this.LIVE_OPS_POLL_MS);
+    },
+
+    /**
+     * Whether the board this call started is still the one that should be on screen.
+     *
+     * Two things end a board's turn, and only the first one was ever checked. A newer
+     * render (``_liveOpsRun``) is the obvious one. The other is the reader leaving the
+     * tab: ``stopLiveOps`` silences the timers, but the four reads were already in
+     * flight, and a board painted onto the Shifts tab is not a stale number - it is the
+     * wrong screen, with the report the reader asked for gone from under it.
+     */
+    liveOpsRenderIsStale(run) {
+        return run !== this._liveOpsRun || State.adminTab !== 'Live Ops';
     },
 
     stopLiveOps() {
@@ -1405,7 +1418,7 @@ const UI_MODULES = {
         } catch (err) {
             this._links = null;
             this.paintLinks(content, this.linkCreateHtml(null) +
-                `<p class="text-red-500">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`);
+                `<p class="ui-note is-body is-danger">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`);
             return;
         }
         let users = null;
@@ -1442,40 +1455,40 @@ const UI_MODULES = {
     },
 
     linkCreateHtml(users) {
-        const field = 'p-2 rounded-lg border border-gray-200 dark:border-gray-600 dark:bg-gray-700 dark:text-white';
+        const field = 'ui-field';
         const candidates = this.linkCandidates(users);
         // The server refuses a link for a deactivated account or an administrator. Offering
         // either would be offering a request that always fails, so they are simply absent.
         const chooser = users === null
-            ? `<input id="linkWorker" class="${field} w-full" inputmode="numeric" placeholder="${I18n.__('userId')}" required>
-                        <span class="block text-xs text-amber-600 dark:text-amber-400">${I18n.__('linksRosterUnavailable')}</span>`
+            ? `<input id="linkWorker" class="${field}" inputmode="numeric" placeholder="${I18n.__('userId')}" required>
+                        <span class="ui-note is-warn">${I18n.__('linksRosterUnavailable')}</span>`
             : (candidates.length === 0
-                ? `<p class="text-sm text-amber-600 dark:text-amber-400" data-no-candidates>${I18n.__('linksNoCandidates')}</p>`
-                : `<select id="linkWorker" class="${field} w-full" required>
+                ? `<p class="ui-note is-body is-warn" data-no-candidates>${I18n.__('linksNoCandidates')}</p>`
+                : `<select id="linkWorker" class="${field}" required>
                         ${candidates.map((user) => `<option value="${this.escapeHtml(user.id)}">${this.escapeHtml(user.name || user.id)} (${this.escapeHtml(user.id)})</option>`).join('')}
                    </select>`);
         const ttl = [['24', 'linksTtlDay'], ['24 * 7', 'linksTtlWeek'], ['24 * 30', 'linksTtlMonth']]
             .map(([hours, key]) => `<option value="${hours}"${hours === '24 * 30' ? ' selected' : ''}>${I18n.__(key)}</option>`).join('');
         return `
-            <div class="p-4 rounded-xl border border-gray-200 dark:border-gray-700 mb-4">
-                <h3 class="font-bold mb-1">${I18n.__('linksIssue')}</h3>
-                <p class="text-xs text-gray-500 dark:text-gray-400 mb-3">${I18n.__('linksHint')}</p>
-                <form id="linkCreateForm" class="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
-                    <label class="text-xs text-gray-500 dark:text-gray-400">${I18n.__('linksWorker')}
+            <div class="ui-card is-stacked">
+                <h3 class="ui-card-title">${I18n.__('linksIssue')}</h3>
+                <p class="ui-note">${I18n.__('linksHint')}</p>
+                <form id="linkCreateForm" class="ui-grid four">
+                    <label class="ui-label">${I18n.__('linksWorker')}
                         ${chooser}
                     </label>
-                    <label class="text-xs text-gray-500 dark:text-gray-400">${I18n.__('linksTtl')}
-                        <select id="linkTtl" class="${field} w-full">${ttl}</select>
+                    <label class="ui-label">${I18n.__('linksTtl')}
+                        <select id="linkTtl" class="${field}">${ttl}</select>
                     </label>
-                    <label class="text-xs text-gray-500 dark:text-gray-400">${I18n.__('linksMaxUses')}
-                        <input id="linkMaxUses" class="${field} w-full" type="number" min="0" max="100" value="0" />
+                    <label class="ui-label">${I18n.__('linksMaxUses')}
+                        <input id="linkMaxUses" class="${field}" type="number" min="0" max="100" value="0" />
                     </label>
-                    <label class="text-xs text-gray-500 dark:text-gray-400">${I18n.__('linksNoteField')}
-                        <input id="linkNote" class="${field} w-full" placeholder="${I18n.__('linksNotePlaceholder')}" />
+                    <label class="ui-label">${I18n.__('linksNoteField')}
+                        <input id="linkNote" class="${field}" placeholder="${I18n.__('linksNotePlaceholder')}" />
                     </label>
-                    <button type="submit" class="sm:col-span-2 lg:col-span-4 bg-blue-600 text-white px-4 py-2 rounded-xl font-semibold">${I18n.__('linksCreate')}</button>
+                    <button type="submit" class="ui-btn ui-btn-primary ui-span-all">${I18n.__('linksCreate')}</button>
                 </form>
-                <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">${I18n.__('linksMaxUsesHint')}</p>
+                <p class="ui-note">${I18n.__('linksMaxUsesHint')}</p>
                 <div id="linkResult" data-link-result>${this._newLink ? this.newLinkHtml(this._newLink) : ''}</div>
             </div>`;
     },
@@ -1519,18 +1532,18 @@ const UI_MODULES = {
      * it is the same one still on screen.
      */
     newLinkHtml(res) {
-        const field = 'p-2 rounded-lg border border-gray-200 dark:border-gray-600 dark:bg-gray-700 dark:text-white';
+        const field = 'ui-field';
         const qr = res.qr_png_data_uri
-            ? `<img src="${this.escapeHtml(res.qr_png_data_uri)}" alt="${I18n.__('linksQr')}" class="mt-3 w-40 h-40 bg-white p-2 rounded-lg" />`
+            ? `<img src="${this.escapeHtml(res.qr_png_data_uri)}" alt="${I18n.__('linksQr')}" class="ui-qr" />`
             : '';
         return `
-            <div class="mt-3 p-3 rounded-xl border border-green-300 dark:border-green-800" data-new-link="${this.escapeHtml(res.link_id)}">
-                <p class="font-semibold">${I18n.__('linksFor')} ${this.escapeHtml(res.worker_name || res.worker_id)} (${this.escapeHtml(res.worker_id)})</p>
-                <input id="linkUrl" class="${field} w-full mt-2" readonly value="${this.escapeHtml(res.url)}" />
-                <div class="flex gap-2 mt-2">
-                    <button type="button" onclick="UI_MODULES.copyLinkUrl()" class="bg-green-600 text-white px-4 py-2 rounded-xl font-semibold">${I18n.__('linksCopy')}</button>
+            <div class="ui-alert is-ok is-stacked" data-new-link="${this.escapeHtml(res.link_id)}">
+                <p class="ui-card-title">${I18n.__('linksFor')} ${this.escapeHtml(res.worker_name || res.worker_id)} (${this.escapeHtml(res.worker_id)})</p>
+                <input id="linkUrl" class="${field}" readonly value="${this.escapeHtml(res.url)}" />
+                <div class="ui-row">
+                    <button type="button" onclick="UI_MODULES.copyLinkUrl()" class="ui-btn ui-btn-primary">${I18n.__('linksCopy')}</button>
                 </div>
-                <p class="text-xs text-amber-600 dark:text-amber-400 mt-2">${I18n.__('linksShownOnce')}</p>
+                <p class="ui-note is-warn">${I18n.__('linksShownOnce')}</p>
                 ${qr}
             </div>`;
     },
@@ -1551,37 +1564,37 @@ const UI_MODULES = {
 
     linksHtml(links) {
         if (!links || links.length === 0) {
-            return `<p class="py-6 text-center text-gray-500 dark:text-gray-400" data-no-links>${I18n.__('linksEmpty')}</p>`;
+            return `<p class="ui-empty" data-no-links>${I18n.__('linksEmpty')}</p>`;
         }
         return Device.isMobile ? this.linkCardsHtml(links) : this.linkTableHtml(links);
     },
 
     linkTableHtml(links) {
         return `
-            <div class="overflow-x-auto">
-                <table class="w-full text-left text-sm">
-                    <thead class="bg-gray-100 dark:bg-gray-700">
+            <div class="ui-table-wrap">
+                <table class="ui-table">
+                    <thead class="ui-table-head">
                         <tr>
-                            <th class="p-2">${I18n.__('linksWorker')}</th>
-                            <th class="p-2">${I18n.__('linksState')}</th>
-                            <th class="p-2">${I18n.__('linksTaps')}</th>
-                            <th class="p-2">${I18n.__('linksExpires')}</th>
-                            <th class="p-2">${I18n.__('linksLastUse')}</th>
-                            <th class="p-2">${I18n.__('activeShifts')}</th>
-                            <th class="p-2"></th>
+                            <th>${I18n.__('linksWorker')}</th>
+                            <th>${I18n.__('linksState')}</th>
+                            <th>${I18n.__('linksTaps')}</th>
+                            <th>${I18n.__('linksExpires')}</th>
+                            <th>${I18n.__('linksLastUse')}</th>
+                            <th>${I18n.__('activeShifts')}</th>
+                            <th></th>
                         </tr>
                     </thead>
-                    <tbody class="divide-y dark:divide-gray-600">
+                    <tbody>
                         ${links.map((link) => `<tr data-link="${link.id}">
-                            <td class="p-2"><span class="font-semibold">${this.escapeHtml(link.worker_name || link.worker_id)}</span>
-                                <span class="block text-xs text-gray-500 dark:text-gray-400">${this.escapeHtml(link.worker_id)}</span>
-                                ${link.note ? `<span class="block text-xs text-gray-500 dark:text-gray-400">${this.escapeHtml(link.note)}</span>` : ''}</td>
-                            <td class="p-2" data-link-state="${this.linkState(link)}">${this.linkStateHtml(link)}</td>
-                            <td class="p-2" data-link-uses="${link.uses}">${this.linkUsesLabel(link)}</td>
-                            <td class="p-2 text-xs">${this.escapeHtml(link.expires_at)}</td>
-                            <td class="p-2 text-xs">${this.linkLastUse(link)}</td>
-                            <td class="p-2 text-xs">${this.linkOpenShift(link)}</td>
-                            <td class="p-2 text-right">${this.linkActionHtml(link)}</td>
+                            <td><span class="ui-strong">${this.escapeHtml(link.worker_name || link.worker_id)}</span>
+                                <span class="ui-note">${this.escapeHtml(link.worker_id)}</span>
+                                ${link.note ? `<span class="ui-note">${this.escapeHtml(link.note)}</span>` : ''}</td>
+                            <td data-link-state="${this.linkState(link)}">${this.linkStateHtml(link)}</td>
+                            <td data-link-uses="${link.uses}">${this.linkUsesLabel(link)}</td>
+                            <td class="ui-nowrap">${this.escapeHtml(link.expires_at)}</td>
+                            <td class="ui-nowrap">${this.linkLastUse(link)}</td>
+                            <td class="ui-nowrap">${this.linkOpenShift(link)}</td>
+                            <td class="is-end">${this.linkActionHtml(link)}</td>
                         </tr>`).join('')}
                     </tbody>
                 </table>
@@ -1590,17 +1603,17 @@ const UI_MODULES = {
 
     /** The phone layout: one card per link, the same facts as the table. */
     linkCardsHtml(links) {
-        return `<div class="space-y-3">${links.map((link) => `
-            <div class="p-4 rounded-xl border border-gray-200 dark:border-gray-700" data-link="${link.id}">
-                <div class="flex justify-between gap-3">
-                    <p class="font-bold truncate">${this.escapeHtml(link.worker_name || link.worker_id)}</p>
-                    <p class="text-xs flex-none text-gray-500 dark:text-gray-400">${this.escapeHtml(link.worker_id)}</p>
+        return `<div class="ui-stack">${links.map((link) => `
+            <div class="ui-card is-stacked" data-link="${link.id}">
+                <div class="ui-spread">
+                    <p class="ui-strong ui-truncate">${this.escapeHtml(link.worker_name || link.worker_id)}</p>
+                    <p class="ui-note ui-nowrap">${this.escapeHtml(link.worker_id)}</p>
                 </div>
-                <p class="text-xs mt-1" data-link-state="${this.linkState(link)}">${this.linkStateHtml(link)}</p>
-                <p class="text-xs text-gray-500 dark:text-gray-400">${this.linkUsesLabel(link)} · ${I18n.__('linksExpires')} ${this.escapeHtml(link.expires_at)}</p>
-                <p class="text-xs text-gray-500 dark:text-gray-400">${I18n.__('linksLastUse')}: ${this.linkLastUse(link)}</p>
-                <p class="text-xs text-gray-500 dark:text-gray-400">${this.linkOpenShift(link)}</p>
-                <div class="mt-3">${this.linkActionHtml(link)}</div>
+                <p class="ui-note" data-link-state="${this.linkState(link)}">${this.linkStateHtml(link)}</p>
+                <p class="ui-note">${this.linkUsesLabel(link)} · ${I18n.__('linksExpires')} ${this.escapeHtml(link.expires_at)}</p>
+                <p class="ui-note">${I18n.__('linksLastUse')}: ${this.linkLastUse(link)}</p>
+                <p class="ui-note">${this.linkOpenShift(link)}</p>
+                <div class="ui-row">${this.linkActionHtml(link)}</div>
             </div>`).join('')}</div>`;
     },
 
@@ -1617,14 +1630,17 @@ const UI_MODULES = {
 
     linkStateHtml(link) {
         const state = this.linkState(link);
-        const colours = {
-            active: 'text-green-600 dark:text-green-400',
-            revoked: 'text-red-600 dark:text-red-400',
-            expired: 'text-amber-600 dark:text-amber-400',
-            used_up: 'text-amber-600 dark:text-amber-400',
-            account_inactive: 'text-red-600 dark:text-red-400'
+        // Roles, not colours: the four tones are the ones the badges and the stat tiles
+        // already use, and they carry the dark theme with them - which the sixteen utility
+        // strings that used to be here did not, once they were written for light only.
+        const tones = {
+            active: 'is-ok',
+            revoked: 'is-danger',
+            expired: 'is-warn',
+            used_up: 'is-warn',
+            account_inactive: 'is-danger'
         };
-        return `<span class="${colours[state] || ''}">${codeLabel('linksState', state)}</span>`;
+        return `<span class="ui-state ${tones[state] || ''}">${codeLabel('linksState', state)}</span>`;
     },
 
     linkUsesLabel(link) {
@@ -1634,13 +1650,13 @@ const UI_MODULES = {
     },
 
     linkLastUse(link) {
-        if (!link.last_used_at) return `<span class="text-gray-500 dark:text-gray-400">${I18n.__('linksNever')}</span>`;
-        return `${this.escapeHtml(link.last_used_at)}${link.last_used_ip ? ` <span class="text-gray-500 dark:text-gray-400">${this.escapeHtml(link.last_used_ip)}</span>` : ''}`;
+        if (!link.last_used_at) return `<span class="ui-tone-muted">${I18n.__('linksNever')}</span>`;
+        return `${this.escapeHtml(link.last_used_at)}${link.last_used_ip ? ` <span class="ui-tone-muted">${this.escapeHtml(link.last_used_ip)}</span>` : ''}`;
     },
 
     linkOpenShift(link) {
         if (!link.clocked_in) return '';
-        return `<span class="text-green-600 dark:text-green-400">${I18n.__('linksOnShift')}</span> ${this.escapeHtml(link.clock_in_time || '')} ${this.escapeHtml(link.open_shift_site || '')}`;
+        return `<span class="ui-tone-ok">${I18n.__('linksOnShift')}</span> ${this.escapeHtml(link.clock_in_time || '')} ${this.escapeHtml(link.open_shift_site || '')}`;
     },
 
     /**
@@ -1655,11 +1671,11 @@ const UI_MODULES = {
         const state = this.linkState(link);
         const revoke = (state === 'active' || state === 'account_inactive')
             ? `<button type="button" data-revoke-link="${id}" onclick="UI_MODULES.revokeLink(${link.id})"
-                    class="px-3 py-1.5 rounded-lg font-semibold border border-red-300 dark:border-red-800 text-red-600 dark:text-red-400 whitespace-nowrap">${I18n.__('linksRevoke')}</button>`
+                    class="ui-btn ui-btn-danger ui-btn-sm">${I18n.__('linksRevoke')}</button>`
             : '';
         return `${revoke}
             <button type="button" data-link-uses="${id}" onclick="UI_MODULES.openLinkUses(${link.id})"
-                    class="px-3 py-1.5 rounded-lg font-semibold border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 whitespace-nowrap">${I18n.__('linksUses')}</button>`;
+                    class="ui-btn ui-btn-sm">${I18n.__('linksUses')}</button>`;
     },
 
     async revokeLink(linkId) {
@@ -1680,7 +1696,7 @@ const UI_MODULES = {
             const data = await API.request(`/admin/quick_links/${linkId}/uses`);
             if (panel) panel.innerHTML = this.linkUsesHtml(data);
         } catch (err) {
-            if (panel) panel.innerHTML = `<p class="text-red-500">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`;
+            if (panel) panel.innerHTML = `<p class="ui-note is-body is-danger">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`;
         }
     },
 
@@ -1688,34 +1704,34 @@ const UI_MODULES = {
     linkUsesHtml(data) {
         const uses = data.uses || [];
         const rows = uses.length === 0
-            ? `<p class="py-4 text-center text-gray-500 dark:text-gray-400" data-no-uses>${I18n.__('linksNoUses')}</p>`
+            ? `<p class="ui-note is-center" data-no-uses>${I18n.__('linksNoUses')}</p>`
             : uses.map((use) => `
-                <div class="p-3 rounded-xl border border-gray-200 dark:border-gray-700" data-use="${use.id}">
-                    <div class="flex justify-between gap-3">
-                        <p class="font-semibold">${this.escapeHtml(use.action)} · ${this.escapeHtml(use.site_name || '')}</p>
-                        <p class="text-xs flex-none text-gray-500 dark:text-gray-400">${this.escapeHtml(use.created_at)}</p>
+                <div class="ui-card is-tight is-stacked" data-use="${use.id}">
+                    <div class="ui-spread">
+                        <p class="ui-card-title">${this.escapeHtml(use.action)} · ${this.escapeHtml(use.site_name || '')}</p>
+                        <p class="ui-note ui-nowrap">${this.escapeHtml(use.created_at)}</p>
                     </div>
-                    <p class="text-xs text-gray-500 dark:text-gray-400">
+                    <p class="ui-note">
                         ${use.hours !== null && use.hours !== undefined ? `${I18n.__('linksPaidHours')}: <b>${this.hoursLabel(use.hours)}</b> · ` : ''}
                         ${I18n.__('linksFaceCount')}: <b>${this.escapeHtml(use.face_count)}</b>
                         ${use.ip ? ` · ${this.escapeHtml(use.ip)}` : ''}
                         ${use.lat !== null && use.lat !== undefined ? ` · ${this.escapeHtml(use.lat)}, ${this.escapeHtml(use.lon)}` : ''}
                     </p>
-                    ${use.flag_reason ? `<p class="text-xs text-amber-600 dark:text-amber-400">${this.escapeHtml(use.flag_reason)}</p>` : ''}
-                    <div class="mt-2">
+                    ${use.flag_reason ? `<p class="ui-note is-warn">${this.escapeHtml(use.flag_reason)}</p>` : ''}
+                    <div class="ui-row">
                         <button type="button" data-show-photo="${use.id}" onclick="UI_MODULES.showLinkPhoto(${use.id})"
-                                class="px-3 py-1.5 rounded-lg font-semibold border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200">${I18n.__('linksShowPhoto')}</button>
-                        <img id="linkPhoto${use.id}" class="hidden mt-2 rounded-lg max-h-72" alt="${I18n.__('linksPhotoAlt')}" />
+                                class="ui-btn ui-btn-sm">${I18n.__('linksShowPhoto')}</button>
+                        <img id="linkPhoto${use.id}" class="hidden ui-photo" alt="${I18n.__('linksPhotoAlt')}" />
                     </div>
                 </div>`).join('');
         return `
-            <div class="mt-4 p-4 rounded-xl border border-gray-200 dark:border-gray-700" data-uses-for="${this.escapeHtml(data.link_id)}">
-                <div class="flex justify-between gap-3 mb-3">
-                    <h3 class="font-bold">${I18n.__('linksUsesTitle')} · ${this.escapeHtml(data.worker_name || data.worker_id)}</h3>
-                    <button type="button" onclick="UI_MODULES.closeLinkUses()" class="text-gray-500 dark:text-gray-400">✕</button>
+            <div class="ui-card is-stacked" data-uses-for="${this.escapeHtml(data.link_id)}">
+                <div class="ui-spread">
+                    <h3 class="ui-card-title">${I18n.__('linksUsesTitle')} · ${this.escapeHtml(data.worker_name || data.worker_id)}</h3>
+                    <button type="button" onclick="UI_MODULES.closeLinkUses()" class="ui-btn ui-btn-quiet ui-btn-sm is-icon">✕</button>
                 </div>
-                <p class="text-xs text-gray-500 dark:text-gray-400 mb-3">${I18n.__('linksUsesHint')}</p>
-                <div class="space-y-3">${rows}</div>
+                <p class="ui-note">${I18n.__('linksUsesHint')}</p>
+                <div class="ui-stack">${rows}</div>
             </div>`;
     },
 
@@ -1765,7 +1781,7 @@ const UI_MODULES = {
             // No roster for this screen, so nothing may be set from what is left over.
             this._credentials = null;
             this.paintCredentials(content, this.credentialsToolbarHtml() +
-                `<p class="text-red-500">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`);
+                `<p class="ui-note is-body is-danger">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`);
         }
     },
 
@@ -1917,14 +1933,10 @@ const UI_MODULES = {
 
     /**
      * The phone layout: one card per account, the same fields as the table.
-     *
-     * The leading ``p-4 rounded-xl border`` is load-bearing beyond the styling: the
-     * product suite reads these cards by that class prefix. The component class after it
-     * is what actually styles the card - including when the Tailwind CDN is unreachable.
      */
     credentialsCardsHtml(users) {
         return `<div class="ui-stack">${users.map(user => `
-            <div class="p-4 rounded-xl border ui-card" data-user="${this.escapeHtml(user.id)}">
+            <div class="ui-card is-stacked" data-user="${this.escapeHtml(user.id)}">
                 <div class="ui-spread">
                     <div class="ops-row-main">
                         ${this.liveOpsAvatarHtml(user)}
@@ -2324,33 +2336,33 @@ const UI_MODULES = {
         const user = this._credentialsEdit;
         if (!user) return '';
         const draft = this._credentialsEditDraft;
-        const box = 'p-4 mb-4 rounded-xl border border-gray-300 dark:border-gray-600 bg-gray-50 dark:bg-gray-700';
+        const box = 'ui-card is-stacked is-flat';
         const field = this.credentialsFieldClass();
-        const label = 'text-xs font-semibold text-gray-500 dark:text-gray-400';
-        const quiet = 'px-3 py-2 rounded-xl font-semibold border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200';
+        const label = 'ui-label';
+        const quiet = 'ui-btn';
         return `
             <div class="${box}" data-user-edit="${this.escapeHtml(user.id)}">
-                <p class="font-semibold mb-1">${I18n.__('credentialsEditFor')} ${this.escapeHtml(user.name || user.id)} (${this.escapeHtml(user.id)})</p>
-                <p class="text-xs text-gray-500 dark:text-gray-400 mb-3">${I18n.__('credentialsEditIdNote')}</p>
-                <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <p class="ui-card-title">${I18n.__('credentialsEditFor')} ${this.escapeHtml(user.name || user.id)} (${this.escapeHtml(user.id)})</p>
+                <p class="ui-note">${I18n.__('credentialsEditIdNote')}</p>
+                <div class="ui-grid two">
                     <input type="text" id="userEditName" value="${this.escapeHtml(draft.name)}"
                            placeholder="${I18n.__('name')}" class="${field}">
                     <input type="text" id="userEditEmail" value="${this.escapeHtml(draft.email)}"
                            placeholder="${I18n.__('emailOrPhone')}" class="${field}">
                     <input type="text" id="userEditPhone" value="${this.escapeHtml(draft.phone)}"
                            placeholder="${I18n.__('phone')}" class="${field}">
-                    <p class="text-sm p-2 rounded-lg bg-gray-100 dark:bg-gray-800" data-user-edit-role="${this.escapeHtml(user.role || '')}">
+                    <p class="ui-note is-panel" data-user-edit-role="${this.escapeHtml(user.role || '')}">
                         ${I18n.__('role')}: <b>${this.escapeHtml(this.roleLabel(user.role))}</b>
                     </p>
-                    <label class="flex flex-col gap-1 sm:col-span-2">
+                    <label class="ui-stack is-flush ui-span-all">
                         <span class="${label}">${I18n.__('credentialsHourlyRate')}</span>
                         <input type="number" id="userEditRate" step="0.5" min="0" max="1000"
                                value="${this.escapeHtml(draft.hourly_rate)}" class="${field}">
                     </label>
                 </div>
-                <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">${I18n.__('credentialsHourlyRateHint')}</p>
-                <div class="flex flex-wrap items-center gap-2 mt-2">
-                    <button type="button" onclick="UI_MODULES.saveUserEdit()" class="bg-blue-600 text-white px-5 py-2 rounded-xl font-semibold">${I18n.__('save')}</button>
+                <p class="ui-note">${I18n.__('credentialsHourlyRateHint')}</p>
+                <div class="ui-row">
+                    <button type="button" onclick="UI_MODULES.saveUserEdit()" class="ui-btn ui-btn-primary">${I18n.__('save')}</button>
                     <button type="button" onclick="UI_MODULES.closeUserEdit()" class="${quiet}">${I18n.__('cancel')}</button>
                 </div>
             </div>`;
@@ -2546,7 +2558,7 @@ const UI_MODULES = {
     },
 
     credentialsFieldClass() {
-        return 'p-2 rounded-lg border border-gray-300 dark:border-gray-600 dark:bg-gray-800 dark:text-white';
+        return 'ui-field';
     },
 
     photoSizeLabel(file) {
@@ -2647,30 +2659,30 @@ const UI_MODULES = {
     },
 
     credentialsCreateHtml() {
-        const box = 'p-4 mb-4 rounded-xl border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/30';
+        const box = 'ui-alert is-info is-stacked';
         const field = this.credentialsFieldClass();
-        const quiet = 'px-3 py-2 rounded-xl font-semibold border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200';
+        const quiet = 'ui-btn';
         const created = this._credentialsCreated;
         if (created) {
             return `
                 <div class="${box}" data-account-created="${this.escapeHtml(created.id)}">
-                    <p class="font-semibold mb-1">${I18n.__('credentialsCreatedTitle')}</p>
-                    <p class="text-sm mb-2">${I18n.__(created.face_enrolled ? 'credentialsCreatedFace' : 'credentialsCreatedNoFace')}</p>
-                    <div class="flex flex-wrap items-center gap-2">
-                        <input id="credentialsCreatedPassword" readonly value="${this.escapeHtml(created.password)}" class="${field} font-mono flex-1 sm:flex-none sm:w-72">
+                    <p class="ui-card-title">${I18n.__('credentialsCreatedTitle')}</p>
+                    <p class="ui-note is-body">${I18n.__(created.face_enrolled ? 'credentialsCreatedFace' : 'credentialsCreatedNoFace')}</p>
+                    <div class="ui-row">
+                        <input id="credentialsCreatedPassword" readonly value="${this.escapeHtml(created.password)}" class="${field} ui-mono is-flex">
                         <button type="button" onclick="UI_MODULES.copyCredentialsPassword()" class="${quiet}">${I18n.__('credentialsCopyPassword')}</button>
                         <button type="button" onclick="UI_MODULES.closeCredentialsMode()" class="${quiet}">${I18n.__('close')}</button>
                     </div>
-                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">${this.escapeHtml(created.name)} (${this.escapeHtml(created.id)})</p>
+                    <p class="ui-note">${this.escapeHtml(created.name)} (${this.escapeHtml(created.id)})</p>
                 </div>`;
         }
         const draft = this._credentialsDraft;
         const photo = this._credentialsNewPhoto;
         return `
             <div class="${box}" data-create-panel="true">
-                <p class="font-semibold mb-1">${I18n.__('credentialsNewAccount')}</p>
-                <p class="text-sm mb-3">${I18n.__('credentialsNewAccountHint')}</p>
-                <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <p class="ui-card-title">${I18n.__('credentialsNewAccount')}</p>
+                <p class="ui-note is-body">${I18n.__('credentialsNewAccountHint')}</p>
+                <div class="ui-grid two">
                     <input type="text" id="credentialsNewId" value="${this.escapeHtml(draft.id)}" inputmode="numeric"
                            placeholder="${I18n.__('credentialsNewId')}" class="${field}">
                     <input type="text" id="credentialsNewName" value="${this.escapeHtml(draft.name)}"
@@ -2682,58 +2694,58 @@ const UI_MODULES = {
                            placeholder="${I18n.__('emailOrPhone')}" class="${field}">
                     <input type="text" id="credentialsNewPhone" value="${this.escapeHtml(draft.phone)}"
                            placeholder="${I18n.__('phone')}" class="${field}">
-                    <div class="flex items-center gap-2">
+                    <div class="ui-row">
                         <input type="text" id="credentialsNewPasswordShown" value="${this.escapeHtml(this._credentialsNewPassword)}"
                                oninput="UI_MODULES.setCredentialsNewPassword(this.value)" autocomplete="new-password"
-                               placeholder="${this.escapeHtml(I18n.__('credentialsPasswordPlaceholder'))}" class="${field} font-mono flex-1">
+                               placeholder="${this.escapeHtml(I18n.__('credentialsPasswordPlaceholder'))}" class="${field} ui-mono is-flex">
                         <button type="button" onclick="UI_MODULES.regenerateCredentialsNewPassword()" class="${quiet}">${I18n.__('credentialsRegenerate')}</button>
                     </div>
-                    <p class="text-xs text-gray-500 dark:text-gray-400" data-password-hint>${this.escapeHtml(I18n.__('credentialsPasswordManual'))}</p>
+                    <p class="ui-note" data-password-hint>${this.escapeHtml(I18n.__('credentialsPasswordManual'))}</p>
                 </div>
-                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1" data-id-range="${this.escapeHtml(draft.role)}">
+                <p class="ui-note" data-id-range="${this.escapeHtml(draft.role)}">
                     ${I18n.__('credentialsIdRange')}: ${this.roleRangeHint(draft.role)}
                 </p>
-                <div class="flex flex-wrap items-center gap-2 mt-2">
+                <div class="ui-row">
                     <input type="file" id="credentialsNewPhoto" accept="image/jpeg,image/png,image/webp"
-                           onchange="UI_MODULES.pickCredentialsPhoto(this)" class="text-sm">
-                    ${photo ? `<span class="text-xs text-gray-500 dark:text-gray-400" data-photo-chosen>${this.escapeHtml(photo.name || '')} · ${this.photoSizeLabel(photo)}</span>
+                           onchange="UI_MODULES.pickCredentialsPhoto(this)" class="ui-field">
+                    ${photo ? `<span class="ui-note" data-photo-chosen>${this.escapeHtml(photo.name || '')} · ${this.photoSizeLabel(photo)}</span>
                         <button type="button" onclick="UI_MODULES.clearCredentialsPhoto()" class="${quiet}">${I18n.__('credentialsPhotoRemove')}</button>` : ''}
                 </div>
-                <p class="text-xs text-gray-500 dark:text-gray-400">${I18n.__('credentialsPhotoHint')}</p>
-                ${this._credentialsPhotoError ? `<p class="text-xs text-red-600 dark:text-red-400" data-photo-error>${this.escapeHtml(this._credentialsPhotoError)}</p>` : ''}
-                <div class="flex flex-wrap items-center gap-2 mt-3">
-                    <button type="button" onclick="UI_MODULES.createCredentialsAccount()" class="bg-blue-600 text-white px-5 py-2 rounded-xl font-semibold">${I18n.__('credentialsCreateAccount')}</button>
+                <p class="ui-note">${I18n.__('credentialsPhotoHint')}</p>
+                ${this._credentialsPhotoError ? `<p class="ui-note is-danger" data-photo-error>${this.escapeHtml(this._credentialsPhotoError)}</p>` : ''}
+                <div class="ui-row">
+                    <button type="button" onclick="UI_MODULES.createCredentialsAccount()" class="ui-btn ui-btn-primary">${I18n.__('credentialsCreateAccount')}</button>
                     <button type="button" onclick="UI_MODULES.closeCredentialsMode()" class="${quiet}">${I18n.__('cancel')}</button>
                 </div>
             </div>`;
     },
 
     credentialsInviteHtml() {
-        const box = 'p-4 mb-4 rounded-xl border border-purple-200 dark:border-purple-800 bg-purple-50 dark:bg-purple-900/30';
+        const box = 'ui-alert is-info is-stacked';
         const field = this.credentialsFieldClass();
-        const quiet = 'px-3 py-2 rounded-xl font-semibold border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200';
+        const quiet = 'ui-btn';
         const issued = this._credentialsIssued;
         if (issued) {
             return `
                 <div class="${box}" data-link-issued="${this.escapeHtml(issued.worker_id || '')}">
-                    <p class="font-semibold mb-1">${I18n.__('credentialsLinkTitle')}</p>
-                    <p class="text-sm mb-2">${I18n.__('credentialsLinkOnce')}</p>
-                    <div class="flex flex-wrap items-center gap-2">
-                        <input id="credentialsLinkUrl" readonly value="${this.escapeHtml(issued.url)}" class="${field} font-mono flex-1 sm:w-80">
+                    <p class="ui-card-title">${I18n.__('credentialsLinkTitle')}</p>
+                    <p class="ui-note is-body">${I18n.__('credentialsLinkOnce')}</p>
+                    <div class="ui-row">
+                        <input id="credentialsLinkUrl" readonly value="${this.escapeHtml(issued.url)}" class="${field} ui-mono is-flex">
                         <button type="button" onclick="UI_MODULES.copyCredentialsLink()" class="${quiet}">${I18n.__('copyLink')}</button>
                         <button type="button" onclick="UI_MODULES.shareCredentialsLink()" class="${quiet}">${I18n.__('credentialsLinkWhatsApp')}</button>
                     </div>
-                    ${issued.qr_png_data_uri ? `<img src="${this.escapeHtml(issued.qr_png_data_uri)}" alt="${I18n.__('credentialsLinkQr')}" class="mt-3 w-40 h-40 rounded-lg bg-white p-1">` : ''}
-                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">${this.escapeHtml(issued.worker_name || '')} (${this.escapeHtml(issued.worker_id || '')}) · ${I18n.__('credentialsLinkExpires')} ${this.escapeHtml(issued.expires_at || '')}</p>
-                    <button type="button" onclick="UI_MODULES.closeCredentialsMode()" class="${quiet} mt-3">${I18n.__('close')}</button>
+                    ${issued.qr_png_data_uri ? `<img src="${this.escapeHtml(issued.qr_png_data_uri)}" alt="${I18n.__('credentialsLinkQr')}" class="ui-qr">` : ''}
+                    <p class="ui-note">${this.escapeHtml(issued.worker_name || '')} (${this.escapeHtml(issued.worker_id || '')}) · ${I18n.__('credentialsLinkExpires')} ${this.escapeHtml(issued.expires_at || '')}</p>
+                    <button type="button" onclick="UI_MODULES.closeCredentialsMode()" class="${quiet}">${I18n.__('close')}</button>
                 </div>`;
         }
         const draft = this._credentialsInviteDraft;
         return `
             <div class="${box}" data-invite-panel="true">
-                <p class="font-semibold mb-1">${I18n.__('credentialsLinkTitle')}</p>
-                <p class="text-sm mb-3">${I18n.__('credentialsLinkHint')}</p>
-                <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <p class="ui-card-title">${I18n.__('credentialsLinkTitle')}</p>
+                <p class="ui-note is-body">${I18n.__('credentialsLinkHint')}</p>
+                <div class="ui-grid two">
                     <input type="text" id="credentialsLinkId" value="${this.escapeHtml(draft.id)}" inputmode="numeric"
                            placeholder="${I18n.__('credentialsNewId')}" class="${field}">
                     <input type="text" id="credentialsLinkName" value="${this.escapeHtml(draft.name)}"
@@ -2746,11 +2758,11 @@ const UI_MODULES = {
                     <input type="text" id="credentialsLinkPhone" value="${this.escapeHtml(draft.phone)}"
                            placeholder="${I18n.__('phone')}" class="${field}">
                 </div>
-                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1" data-id-range="${this.escapeHtml(draft.role)}">
+                <p class="ui-note" data-id-range="${this.escapeHtml(draft.role)}">
                     ${I18n.__('credentialsIdRange')}: ${this.roleRangeHint(draft.role)}
                 </p>
-                <div class="flex flex-wrap items-center gap-2 mt-3">
-                    <button type="button" onclick="UI_MODULES.issueCredentialsLink()" class="bg-purple-600 text-white px-5 py-2 rounded-xl font-semibold">${I18n.__('credentialsLinkCreate')}</button>
+                <div class="ui-row">
+                    <button type="button" onclick="UI_MODULES.issueCredentialsLink()" class="ui-btn ui-btn-primary">${I18n.__('credentialsLinkCreate')}</button>
                     <button type="button" onclick="UI_MODULES.closeCredentialsMode()" class="${quiet}">${I18n.__('cancel')}</button>
                 </div>
             </div>`;
@@ -3133,7 +3145,7 @@ const UI_MODULES = {
                          the product suite reads this line by that class, and the Tailwind
                          CDN is not always reachable on site, so the token class is the one
                          that has to survive the offline case. -->
-                    <p class="text-xs ui-section-note" data-rules-summary="${onSite.toFixed(2)}" style="grid-column:1/-1">
+                    <p class="ui-section-note" data-rules-summary="${onSite.toFixed(2)}" style="grid-column:1/-1">
                         ${this.escapeHtml(I18n.__('shiftRulesSummary'))}
                     </p>
                     <div style="grid-column:1/-1">
@@ -3777,7 +3789,7 @@ const UI_MODULES = {
             // The picker stays on screen with the error, so a rejected range (or a dead
             // server) is something the admin can correct and retry without leaving the tab.
             this.paintShifts(content, this.shiftsToolbarHtml(range) +
-                `<p class="text-red-500">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`);
+                `<p class="ui-note is-body is-danger">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`);
         }
     },
 
@@ -3798,14 +3810,17 @@ const UI_MODULES = {
         // holds, how much of it has been signed off, how much is still waiting - and how
         // many shifts that is. There is no rate and no estimate: this app does not pay
         // anybody, and a money card would promise a payout screen that does not exist.
+        // The fourth element is the figure's tone - ``warn`` for hours nobody has signed
+        // off, ``quiet`` for the break that is not part of the paid figure beside it - and
+        // it is a role the stylesheet knows, not a panel of colour names.
         const cards = [
-            ['hours', 'hours', this.hoursLabel(totals.hours), 'text-gray-900 dark:text-white'],
+            ['hours', 'hours', this.hoursLabel(totals.hours), ''],
             ['approved_hours', 'shiftsApproved', this.hoursLabel(totals.approved_hours), ''],
-            ['awaiting_approval_hours', 'shiftsPendingHours', this.hoursLabel(totals.awaiting_approval_hours), 'text-amber-600 dark:text-amber-400'],
-            ['awaiting_approval', 'shiftsPendingShifts', String(totals.awaiting_approval || 0), 'text-amber-600 dark:text-amber-400'],
+            ['awaiting_approval_hours', 'shiftsPendingHours', this.hoursLabel(totals.awaiting_approval_hours), 'warn'],
+            ['awaiting_approval', 'shiftsPendingShifts', String(totals.awaiting_approval || 0), 'warn'],
             // Beside the counted hours, because the two together are what a door-to-door
             // reconciliation is about: 8.0 h counted out of 8.5 h on site.
-            ['break_hours', 'shiftsBreak', this.hoursLabel(totals.break_hours), 'text-gray-500 dark:text-gray-400'],
+            ['break_hours', 'shiftsBreak', this.hoursLabel(totals.break_hours), 'quiet'],
             ['shifts', 'shiftsWorked', String(totals.shifts || 0), ''],
             ['workers', 'shiftsWorkers', String(totals.workers || 0), ''],
         ];
@@ -3829,7 +3844,7 @@ const UI_MODULES = {
         const cardsHtml = noMatches ? '' : `
             <div class="ops-stats" style="margin-bottom:20px">
                 ${cards.map(([key, label, value, tone]) => `
-                    <div class="ops-stat${tone.indexOf('amber') >= 0 ? ' is-warn' : ''}" data-total="${key}" data-value="${value}">
+                    <div class="ops-stat${tone ? ' is-' + tone : ''}" data-total="${key}" data-value="${value}">
                         <span class="ops-stat-label">${this.escapeHtml(I18n.__(label))}</span>
                         <span class="ops-stat-value">${this.escapeHtml(value)}</span>
                     </div>`).join('')}
@@ -3851,18 +3866,16 @@ const UI_MODULES = {
 
     shiftsRowsHtml(rows) {
         const columns = this.shiftsColumns();
-        // The ``p-2`` on every cell stays exactly as it is, and the cell's own classes are
-        // the one thing this table does not touch: the product suite reads these rows by
-        // that class, and a table is not worth breaking a suite over. What the table gains
-        // is the shared ``ui-table`` frame - hairline rules, uppercase column labels, the
-        // row hover - all of which come from the table element and reach the cells anyway.
+        // The cells carry no class of their own: their padding, their hairline and the row
+        // hover all come from ``.ui-table`` on the element, which is what a cell in this
+        // table looks like wherever it is drawn - the phone card included.
         if (Device.isMobile) {
             return `<div class="ui-stack">${rows.map(row => `
-                <div class="p-4 rounded-xl border ui-card"${this.shiftAttr(row)}>
+                <div class="ui-card is-stacked"${this.shiftAttr(row)}>
                     <dl class="ui-stack is-tight">
                         ${columns.map(key => `
                             <div class="ui-spread" style="align-items:baseline">
-                                <dt class="text-xs font-semibold text-gray-500 dark:text-gray-400">${this.shiftsColumnLabel(key)}</dt>
+                                <dt class="ui-note is-strong" data-shift-label>${this.shiftsColumnLabel(key)}</dt>
                                 <dd class="ui-fact-value" style="text-align:end">${this.shiftsCellHtml(row, key)}</dd>
                             </div>`).join('')}
                     </dl>
@@ -3874,12 +3887,12 @@ const UI_MODULES = {
                     <caption class="sr-only">${this.escapeHtml(I18n.__('shifts'))}</caption>
                     <thead>
                         <tr>
-                            ${columns.map(key => `<th class="p-2">${this.shiftsColumnLabel(key)}</th>`).join('')}
+                            ${columns.map(key => `<th>${this.shiftsColumnLabel(key)}</th>`).join('')}
                         </tr>
                     </thead>
                     <tbody>
                         ${rows.map(row => `<tr${this.shiftAttr(row)}>
-                            ${columns.map(key => `<td class="p-2">${this.shiftsCellHtml(row, key)}</td>`).join('')}
+                            ${columns.map(key => `<td>${this.shiftsCellHtml(row, key)}</td>`).join('')}
                         </tr>`).join('')}
                     </tbody>
                 </table>
@@ -3904,27 +3917,27 @@ const UI_MODULES = {
     shiftsCellHtml(row, key) {
         switch (key) {
             case 'date':
-                return `<span class="whitespace-nowrap">${this.escapeHtml(row.date)}</span>`;
+                return `<span class="ui-nowrap">${this.escapeHtml(row.date)}</span>`;
             case 'employee':
-                return `<span class="font-semibold">${this.escapeHtml(row.worker_name || row.worker_id)}</span>`;
+                return `<span class="ui-strong">${this.escapeHtml(row.worker_name || row.worker_id)}</span>`;
             case 'id':
-                return `<span class="text-gray-500 dark:text-gray-400">${this.escapeHtml(row.worker_id)}</span>`;
+                return `<span class="ui-tone-muted">${this.escapeHtml(row.worker_id)}</span>`;
             case 'site':
                 // An em dash, not an empty cell: a shift whose site is not on file is a gap
                 // in the record, and a blank reads as "this row has no site column".
                 return row.site_name
                     ? this.escapeHtml(row.site_name)
-                    : `<span class="text-gray-400 dark:text-gray-500">\u2014</span>`;
+                    : `<span class="ui-tone-faint">\u2014</span>`;
             case 'hours':
                 // The number the server counted, not the raw clock: a shift somebody has
                 // signed off is worth exactly the hours they signed for.
-                return `<span class="font-bold">${this.hoursLabel(row.hours)}</span>`;
+                return `<span class="ui-strong">${this.hoursLabel(row.hours)}</span>`;
             case 'awaiting':
                 return this.awaitingHtml(row);
             case 'notes':
                 return Number(row.open_notes) > 0
-                    ? `<span class="font-semibold text-amber-600 dark:text-amber-400">${Number(row.open_notes)}</span>`
-                    : `<span class="text-gray-400 dark:text-gray-500">0</span>`;
+                    ? `<span class="ui-strong ui-tone-warn">${Number(row.open_notes)}</span>`
+                    : `<span class="ui-tone-faint">0</span>`;
             default:
                 return '';
         }
@@ -3940,9 +3953,9 @@ const UI_MODULES = {
      */
     awaitingHtml(row) {
         if (row.awaiting_approval) {
-            return `<span class="px-2 py-0.5 rounded-full text-xs font-semibold bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300">${I18n.__('shiftsPending')}</span>`;
+            return `<span class="ui-badge is-warn">${I18n.__('shiftsPending')}</span>`;
         }
-        return `<span class="text-xs text-gray-500 dark:text-gray-400">${this.escapeHtml(row.status || '')}</span>`;
+        return `<span class="ui-note">${this.escapeHtml(row.status || '')}</span>`;
     },
 
     /**
@@ -4081,15 +4094,16 @@ const UI_MODULES = {
     noteStatusLabel(status) { return codeLabel('noteStatus', status); },
     noteCategoryLabel(category) { return codeLabel('noteCat', category); },
 
+    /** The badge variant for a note's status, as a class the stylesheet already has. */
     noteStatusClass(status) {
-        if (status === 'resolved') return 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300';
-        if (status === 'in_progress') return 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300';
-        if (status === 'closed') return 'bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-300';
-        return 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200';
+        if (status === 'resolved') return ' is-ok';
+        if (status === 'in_progress') return ' is-info';
+        if (status === 'closed') return ' is-quiet';
+        return ' is-warn';
     },
 
     noteStatusChip(status) {
-        return `<span class="px-2 py-0.5 rounded-full text-xs font-semibold ${this.noteStatusClass(status)}">${this.noteStatusLabel(status)}</span>`;
+        return `<span class="ui-badge${this.noteStatusClass(status)}">${this.noteStatusLabel(status)}</span>`;
     },
 
     async renderNotes(content) {
@@ -4107,7 +4121,7 @@ const UI_MODULES = {
         } catch (err) {
             this._notes = null;
             this.paintNotes(content, this.notesToolbarHtml() +
-                `<p class="text-red-500">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`);
+                `<p class="ui-note is-body is-danger">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`);
         }
     },
 
@@ -4217,47 +4231,46 @@ const UI_MODULES = {
         const shown = this.notesVisible(data);
         const query = this.notesQuery();
         if (shown.length === 0) {
-            return `<p class="py-6 text-center text-gray-500 dark:text-gray-400" data-no-matches>${I18n.__('notesNone')}</p>`;
+            return `<p class="ui-empty" data-no-matches>${I18n.__('notesNone')}</p>`;
         }
         const filterNote = query ? `
-            <p class="text-xs text-gray-500 dark:text-gray-400 mb-3" data-filter-note>
+            <p class="ui-note" data-filter-note>
                 ${I18n.__('notesFiltered')}: “${this.escapeHtml(query)}” · ${shown.length} / ${notes.length}
             </p>` : '';
         return `${filterNote}${Device.isMobile ? this.notesCardsHtml(shown) : this.notesTableHtml(shown)}`;
     },
 
     notesTableHtml(notes) {
-        // ``ui-table`` on the element, and the cells keep the ``p-2`` they are read by: the
-        // frame brings the hairlines, the uppercase column labels and the row hover, and
-        // nothing here has to be re-checked against the suite for a padding value.
+        // ``ui-table`` on the element: the frame brings the hairlines, the uppercase column
+        // labels and the row hover, and no cell below has to name a padding value.
         return `
             <div class="ui-table-wrap">
                 <table class="ui-table" data-notes-table="true">
                     <caption class="sr-only">${this.escapeHtml(I18n.__('notesInbox'))}</caption>
                     <thead>
                         <tr>
-                            <th class="p-2">${I18n.__('name')}</th>
-                            <th class="p-2">${I18n.__('noteCategory')}</th>
-                            <th class="p-2">${I18n.__('noteSubject')}</th>
-                            <th class="p-2">${I18n.__('status')}</th>
-                            <th class="p-2">${I18n.__('noteLastActivity')}</th>
-                            <th class="p-2"></th>
+                            <th>${I18n.__('name')}</th>
+                            <th>${I18n.__('noteCategory')}</th>
+                            <th>${I18n.__('noteSubject')}</th>
+                            <th>${I18n.__('status')}</th>
+                            <th>${I18n.__('noteLastActivity')}</th>
+                            <th></th>
                         </tr>
                     </thead>
                     <tbody>
                         ${notes.map((note) => `<tr data-note="${note.id}">
-                            <td class="p-2">
-                                <p class="font-semibold">${this.escapeHtml(note.worker_name || note.worker_id)}</p>
-                                <p class="text-xs text-gray-500 dark:text-gray-400">${this.escapeHtml(note.worker_id)} · ${this.escapeHtml(this.roleLabel(note.worker_role || ''))}</p>
+                            <td>
+                                <p class="ui-card-title">${this.escapeHtml(note.worker_name || note.worker_id)}</p>
+                                <p class="ui-note">${this.escapeHtml(note.worker_id)} · ${this.escapeHtml(this.roleLabel(note.worker_role || ''))}</p>
                             </td>
-                            <td class="p-2">${this.escapeHtml(this.noteCategoryLabel(note.category))}</td>
-                            <td class="p-2 max-w-xs">
-                                <p class="font-semibold truncate">${this.escapeHtml(note.subject)}</p>
-                                <p class="text-xs text-gray-500 dark:text-gray-400 truncate">${this.escapeHtml(note.body)}</p>
+                            <td>${this.escapeHtml(this.noteCategoryLabel(note.category))}</td>
+                            <td class="is-clip">
+                                <p class="ui-strong ui-truncate">${this.escapeHtml(note.subject)}</p>
+                                <p class="ui-note ui-truncate">${this.escapeHtml(note.body)}</p>
                             </td>
-                            <td class="p-2">${this.noteStatusChip(note.status)}</td>
-                            <td class="p-2 text-xs text-gray-500 dark:text-gray-400">${this.escapeHtml(note.last_reply_at || note.created_at || '')}</td>
-                            <td class="p-2 text-right">${this.noteOpenButtonHtml(note)}</td>
+                            <td>${this.noteStatusChip(note.status)}</td>
+                            <td class="ui-tone-muted">${this.escapeHtml(note.last_reply_at || note.created_at || '')}</td>
+                            <td class="is-end">${this.noteOpenButtonHtml(note)}</td>
                         </tr>`).join('')}
                     </tbody>
                 </table>
@@ -4265,34 +4278,34 @@ const UI_MODULES = {
     },
 
     notesCardsHtml(notes) {
-        return `<div class="space-y-3">${notes.map((note) => `
-            <div class="p-4 rounded-xl border border-gray-200 dark:border-gray-700" data-note="${note.id}">
-                <div class="flex justify-between gap-3">
-                    <p class="font-bold truncate">${this.escapeHtml(note.subject)}</p>
+        return `<div class="ui-stack">${notes.map((note) => `
+            <div class="ui-card is-stacked" data-note="${note.id}">
+                <div class="ui-spread">
+                    <p class="ui-strong ui-truncate">${this.escapeHtml(note.subject)}</p>
                     ${this.noteUnreadBadge(note)}
                 </div>
-                <p class="text-xs text-gray-500 dark:text-gray-400">
+                <p class="ui-note">
                     ${this.escapeHtml(note.worker_name || note.worker_id)} · ${this.escapeHtml(note.worker_id)}
                 </p>
-                <p class="text-xs mt-1">${this.escapeHtml(this.noteCategoryLabel(note.category))} · ${this.noteStatusChip(note.status)}</p>
-                <p class="text-sm mt-2 text-gray-600 dark:text-gray-300">${this.escapeHtml(note.body)}</p>
-                <p class="text-xs text-gray-400 mt-1">${this.escapeHtml(note.last_reply_at || note.created_at || '')}</p>
-                <div class="mt-3">${this.noteOpenButtonHtml(note)}</div>
+                <p class="ui-note">${this.escapeHtml(this.noteCategoryLabel(note.category))} · ${this.noteStatusChip(note.status)}</p>
+                <p class="ui-note is-body">${this.escapeHtml(note.body)}</p>
+                <p class="ui-note ui-tone-faint">${this.escapeHtml(note.last_reply_at || note.created_at || '')}</p>
+                <div class="ui-row">${this.noteOpenButtonHtml(note)}</div>
             </div>`).join('')}</div>`;
     },
 
     noteUnreadBadge(note) {
         const unread = Number(note.admin_unread) || 0;
         if (unread <= 0) return '';
-        return `<span class="flex-none px-2 py-0.5 rounded-full text-xs font-bold bg-blue-600 text-white" data-admin-unread>${I18n.__('noteWaitingReply')}</span>`;
+        return `<span class="ui-badge is-solid" data-admin-unread>${I18n.__('noteWaitingReply')}</span>`;
     },
 
     noteOpenButtonHtml(note) {
         return `
-            ${note.priority === 'high' ? `<span data-urgent="1" class="mr-2 px-2 py-0.5 rounded-full text-xs font-bold bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300">${I18n.__('notePriorityHigh')}</span>` : ''}
+            ${note.priority === 'high' ? `<span data-urgent="1" class="ui-badge is-danger ui-spaced-end">${I18n.__('notePriorityHigh')}</span>` : ''}
             ${this.noteUnreadBadge(note)}
             <button type="button" data-open-note onclick="UI_MODULES.openNote(${note.id})"
-                    class="ml-2 bg-blue-600 text-white px-3 py-1.5 rounded-lg font-semibold whitespace-nowrap">${I18n.__('open')}</button>`;
+                    class="ui-btn ui-btn-primary ui-btn-sm ui-spaced-start">${I18n.__('open')}</button>`;
     },
 
     /**
@@ -4318,7 +4331,7 @@ const UI_MODULES = {
         try {
             note = await API.request(`/admin/notes/${noteId}`);
         } catch (err) {
-            content.innerHTML = `<p class="text-red-500">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`;
+            content.innerHTML = `<p class="ui-note is-body is-danger">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`;
             return;
         }
         this._noteThread = note;
@@ -4327,43 +4340,43 @@ const UI_MODULES = {
 
     noteThreadHtml(note) {
         const messages = note.messages || [];
-        const field = 'w-full p-3 rounded-xl border border-gray-200 dark:border-gray-600 dark:bg-gray-700 dark:text-white';
-        const quiet = 'px-4 py-2 rounded-xl font-semibold border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200';
+        const field = 'ui-field';
+        const quiet = 'ui-btn ui-btn-quiet';
         return `
             <button type="button" onclick="UI_MODULES.backToNotes()"
-                    class="mb-3 text-sm font-semibold text-blue-600 dark:text-blue-400" data-notes-back>
+                    class="ui-btn is-link" data-notes-back>
                 ← ${I18n.__('noteBackAdmin')}
             </button>
-            <div class="flex flex-wrap items-start justify-between gap-3 mb-3">
-                <div class="min-w-0">
-                    <p class="font-bold text-lg">${this.escapeHtml(note.subject)}</p>
-                    <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+            <div class="ui-spread is-top">
+                <div class="ui-stack is-tight">
+                    <p class="ui-title">${this.escapeHtml(note.subject)}</p>
+                    <p class="ui-note">
                         ${this.escapeHtml(note.worker_name || note.worker_id)} (${this.escapeHtml(note.worker_id)})
                         · ${this.escapeHtml(this.roleLabel(note.worker_role || ''))}
                         · ${this.escapeHtml(this.noteCategoryLabel(note.category))}
                         · ${I18n.__('noteOpened')}: ${this.escapeHtml(note.created_at || '')}
                     </p>
                 </div>
-                <div class="flex items-center gap-2">${this.noteStatusChip(note.status)}
-                    ${note.priority === 'high' ? `<span data-urgent="1" class="px-2 py-0.5 rounded-full text-xs font-bold bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300">${I18n.__('notePriorityHigh')}</span>` : ''}
+                <div class="ui-row">${this.noteStatusChip(note.status)}
+                    ${note.priority === 'high' ? `<span data-urgent="1" class="ui-badge is-danger">${I18n.__('notePriorityHigh')}</span>` : ''}
                 </div>
             </div>
             ${this.notePasswordPanelHtml(note, field, quiet)}
-            <div class="space-y-2 mb-4">${messages.map((message) => this.noteMessageHtml(message)).join('')}</div>
-            <div class="p-3 rounded-xl border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800" data-note-composer>
+            <div class="ui-stack is-tight">${messages.map((message) => this.noteMessageHtml(message)).join('')}</div>
+            <div class="ui-card is-tight is-stacked is-flat" data-note-composer>
                 <textarea id="noteReplyBody" rows="3" maxlength="2000"
                           placeholder="${I18n.__('noteReplyToWorker')}" class="${field}"></textarea>
-                <div class="flex flex-wrap items-center gap-2 mt-2">
-                    <select id="noteReplyStatus" class="p-2 rounded-lg border border-gray-200 dark:border-gray-600 dark:bg-gray-700 dark:text-white">
+                <div class="ui-row">
+                    <select id="noteReplyStatus" class="ui-field">
                         ${[['', 'noteKeepStatus'], ['in_progress', 'noteMarkInProgress'], ['resolved', 'noteMarkResolved'], ['open', 'noteMarkOpen']]
                             .map(([value, key]) => `<option value="${value}" ${this._noteStatusDraft === value ? 'selected' : ''}>${I18n.__(key)}</option>`).join('')}
                     </select>
-                    <label class="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-300">
+                    <label class="ui-check">
                         <input type="checkbox" id="noteInternal">
                         <span>${I18n.__('noteInternal')}</span>
                     </label>
                     <button type="button" data-send-reply onclick="UI_MODULES.replyToNote(${note.id}, this)"
-                            class="ml-auto bg-blue-600 text-white px-5 py-2 rounded-xl font-semibold">${I18n.__('noteReply')}</button>
+                            class="ui-btn ui-btn-primary ui-push">${I18n.__('noteReply')}</button>
                 </div>
             </div>`;
     },
@@ -4375,17 +4388,14 @@ const UI_MODULES = {
     noteMessageHtml(message) {
         const mine = !!message.from_admin;
         const who = mine ? I18n.__('noteFromAdmin') : I18n.__('noteFromWorker');
-        const bubble = mine
-            ? 'bg-blue-600 text-white'
-            : 'bg-white dark:bg-gray-700 border border-gray-200 dark:border-gray-600';
         const tag = message.internal
-            ? `<span class="ml-2 px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-200 text-amber-900">${I18n.__('noteInternalTag')}</span>`
+            ? `<span class="ui-badge is-warn ui-spaced-start">${I18n.__('noteInternalTag')}</span>`
             : '';
         return `
-            <div class="flex ${mine ? 'justify-end' : 'justify-start'}" data-message="${message.id}" data-internal="${message.internal ? 1 : 0}">
-                <div class="max-w-[85%] p-3 rounded-xl ${bubble}">
-                    <p class="text-[11px] opacity-70 mb-1">${who} · ${this.escapeHtml(message.created_at || '')}${tag}</p>
-                    <p class="text-sm whitespace-pre-wrap break-words">${this.escapeHtml(message.body)}</p>
+            <div class="hand-bubble-row${mine ? ' is-mine' : ''}" data-message="${message.id}" data-internal="${message.internal ? 1 : 0}">
+                <div class="hand-bubble${mine ? ' is-mine' : ''}">
+                    <p class="hand-bubble-who">${who} · ${this.escapeHtml(message.created_at || '')}${tag}</p>
+                    <p class="hand-bubble-body">${this.escapeHtml(message.body)}</p>
                 </div>
             </div>`;
     },
@@ -4455,29 +4465,29 @@ const UI_MODULES = {
         const revealed = this._noteRevealed;
         if (revealed) {
             return `
-                <div class="p-4 mb-4 rounded-xl border border-green-300 dark:border-green-700 bg-green-50 dark:bg-green-900/30" data-note-password-reveal="${this.escapeHtml(revealed.worker_id)}">
-                    <p class="font-semibold mb-1">${I18n.__('notePasswordSetFor')} ${this.escapeHtml(note.worker_name || revealed.worker_id)}</p>
-                    <p class="text-sm mb-2">${I18n.__('credentialsRevealNote')}</p>
-                    <div class="flex flex-wrap items-center gap-2">
-                        <input id="noteRevealedPassword" readonly value="${this.escapeHtml(revealed.password)}" class="p-2 rounded-lg border border-gray-300 dark:border-gray-600 dark:bg-gray-800 font-mono flex-1 sm:flex-none sm:w-72">
+                <div class="ui-alert is-ok is-stacked" data-note-password-reveal="${this.escapeHtml(revealed.worker_id)}">
+                    <p class="ui-card-title">${I18n.__('notePasswordSetFor')} ${this.escapeHtml(note.worker_name || revealed.worker_id)}</p>
+                    <p class="ui-note is-body">${I18n.__('credentialsRevealNote')}</p>
+                    <div class="ui-row">
+                        <input id="noteRevealedPassword" readonly value="${this.escapeHtml(revealed.password)}" class="ui-field ui-mono is-flex">
                         <button type="button" onclick="UI_MODULES.copyNotePassword()" class="${quiet}">${I18n.__('credentialsCopyPassword')}</button>
                         <button type="button" onclick="UI_MODULES.dismissNotePassword()" class="${quiet}">${I18n.__('close')}</button>
                     </div>
-                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">${I18n.__('noteSetPasswordHint')}</p>
+                    <p class="ui-note">${I18n.__('noteSetPasswordHint')}</p>
                 </div>`;
         }
         const protectedTarget = note.can_reset_password === false;
         return `
-            <div class="p-3 mb-4 rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800" data-note-password-panel>
-                <div class="flex flex-wrap items-center gap-2">
+            <div class="ui-card is-tight is-stacked" data-note-password-panel>
+                <div class="ui-row">
                     <input type="text" id="noteSetPasswordManual" value="${this.escapeHtml(this._notePasswordDraft)}"
                            oninput="UI_MODULES.setNotePasswordDraft(this.value)" autocomplete="new-password"
                            ${protectedTarget ? 'disabled' : ''}
-                           placeholder="${this.escapeHtml(I18n.__('credentialsPasswordPlaceholder'))}" class="${field} font-mono flex-1 sm:flex-none sm:w-72">
+                           placeholder="${this.escapeHtml(I18n.__('credentialsPasswordPlaceholder'))}" class="${field} ui-mono is-flex">
                     <button type="button" data-reset-password onclick="UI_MODULES.resetPasswordFromNote()"
                             ${protectedTarget ? 'disabled' : ''}
-                            class="bg-amber-500 text-white px-4 py-2 rounded-xl font-semibold ${protectedTarget ? 'opacity-50' : ''}">${I18n.__('noteSetPassword')}</button>
-                    <p class="text-xs text-gray-500 dark:text-gray-400 max-w-lg">${protectedTarget ? I18n.__('notePasswordProtected') : I18n.__('noteSetPasswordHint')}</p>
+                            class="ui-btn ui-btn-warn">${I18n.__('noteSetPassword')}</button>
+                    <p class="ui-note">${protectedTarget ? I18n.__('notePasswordProtected') : I18n.__('noteSetPasswordHint')}</p>
                 </div>
             </div>`;
     },

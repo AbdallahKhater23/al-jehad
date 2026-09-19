@@ -65,13 +65,13 @@ WHAT THIS IS NOT
   a script that arrived through a route none of them anticipated.
 * **Not a fully strict policy yet, and the gap is written down rather than implied.**
   ``CSP_HTML`` no longer allows inline ``<script>`` *elements* - those blocks were moved
-  into ``frontend/boot.js``, ``tailwind_boot.js``, ``enroll.js`` and ``quick.js`` - so the
-  browser refuses an injected script tag. Two allowances remain, each for a reason that is
-  visible in the policy string itself: ``cdn.tailwindcss.com`` (the frontend's utility CSS
-  is compiled in the browser by that script, so removing it means shipping a build) and
-  ``script-src-attr 'unsafe-inline'`` (the console builds its markup as strings and puts
-  the handler in an ``onclick=`` attribute; making that a delegated listener is the
-  refactor that removes it). ``/api/v1/readiness`` reports both, and
+  into ``frontend/boot.js``, ``enroll.js`` and ``quick.js`` - so the browser refuses an
+  injected script tag, and it names no third-party origin: the utility classes the frontend
+  used to have compiled in the browser are components in ``frontend/style.css`` now, so
+  ``script-src`` is ``'self'`` alone. One allowance remains, for a reason that is visible in
+  the policy string itself: ``script-src-attr 'unsafe-inline'`` (the console builds its
+  markup as strings and puts the handler in an ``onclick=`` attribute; making that a
+  delegated listener is the refactor that removes it). ``/api/v1/readiness`` reports it, and
   ``tests/test_network_hardening.py`` pins the count of inline handlers so it can only go
   down.
 """
@@ -125,13 +125,15 @@ CSP_API = "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-act
 #: ``frontend/``, which is what makes an injected ``<script>`` block - the payload a stored
 #: XSS actually needs - a refusal rather than an execution.
 #:
-#: The two remaining allowances are named separately so nobody has to guess which one is in
-#: force from the word "inline":
+#: ``script-src`` names one source, ``'self'``: the frontend has no build step and no
+#: third-party script any more. It used to name ``cdn.tailwindcss.com``, the Play CDN that
+#: compiled the utility classes in the browser on every load; those classes are components
+#: in ``style.css`` now, so the origin - and the download - is gone from the page and from
+#: this policy.
 #:
-#: * **``cdn.tailwindcss.com``** in ``script-src`` and ``style-src``. The frontend has no
-#:   build step, so its utility CSS is compiled in the browser by the Play CDN; dropping
-#:   the host means committing a generated stylesheet. ``CSP_HTML`` is a setting, so a
-#:   deployment that does that build removes the host without touching code.
+#: The one allowance that remains is named separately so nobody has to guess which one is
+#: in force from the word "inline":
+#:
 #: * **``script-src-attr 'unsafe-inline'``**. The document contains no inline ``<script>``
 #:   *element*, but the console builds its tables and buttons as HTML strings and puts the
 #:   handler in an ``onclick=`` attribute, which CSP treats as inline script. The directive
@@ -145,9 +147,9 @@ CSP_HTML = (
     "frame-ancestors 'none'; "
     "frame-src 'none'; "
     "form-action 'self'; "
-    "script-src 'self' https://cdn.tailwindcss.com; "
+    "script-src 'self'; "
     "script-src-attr 'unsafe-inline'; "
-    "style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; "
+    "style-src 'self' 'unsafe-inline'; "
     "img-src 'self' data: blob:; "
     "font-src 'self' data:; "
     "media-src 'self' blob:; "
@@ -576,9 +578,9 @@ def build_policy(
         )
     if "cdn.tailwindcss.com" in effective_html:
         remarks.append(
-            "the document CSP loads cdn.tailwindcss.com: the frontend's utility CSS is "
-            "compiled in the browser, so the policy names a third-party script origin - "
-            "self-hosting the build removes it"
+            "the document CSP loads cdn.tailwindcss.com: the bundled frontend no longer "
+            "needs it - every class it uses is a rule in frontend/style.css - so this is "
+            "either a stale setting or a page that reintroduced the browser-side compiler"
         )
 
     paths = tuple(str(path).rstrip("/") or "/" for path in (admin_paths or DEFAULT_ADMIN_PATHS) if str(path).strip())

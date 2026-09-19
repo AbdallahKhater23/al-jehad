@@ -230,7 +230,9 @@ def shift_timesheet_rows(
     params = list(OPEN_NOTE_STATUSES) + params
 
     with db() as conn:
-        records = [dict(row) for row in conn.execute(sql, tuple(params)).fetchall()]
+        # The cursor's own rows, not a dict each: every read below is string-keyed, and
+        # ``sqlite3.Row`` answers that in C without materialising ~1 400 dicts per quarter.
+        records = conn.execute(sql, tuple(params)).fetchall()
 
     rows: list[dict] = []
     approved_total = 0.0
@@ -317,7 +319,7 @@ def attendance_rows(*, start: str, end: str, worker_id: str | None = None) -> di
 
     with db() as conn:
         working_days = _working_days(conn)
-        records = [dict(row) for row in conn.execute(ATTENDANCE_SQL.format(extra=extra), tuple(params)).fetchall()]
+        records = conn.execute(ATTENDANCE_SQL.format(extra=extra), tuple(params)).fetchall()
         known = {
             str(row["id"]): row["name"]
             for row in conn.execute("SELECT id, name FROM users").fetchall()

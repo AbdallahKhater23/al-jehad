@@ -45,6 +45,27 @@ The one thing the fallback could get wrong is handled where it would happen: a
 *new* account created on an id that somebody else used to hold clears any leftover
 legacy file for that id first (``new_account_id``), so it can never resolve to a
 face that is not its own.
+
+What produced the embedding (and why it is recorded)
+----------------------------------------------------
+The file used to be a bare JSON list - ``[0.013, -0.24, ...]`` - and every reader had
+to know that by convention. That is not enough any more, because the *crop* the
+embedding is computed from is part of the template's meaning: the face detector was
+replaced (MTCNN -> YuNet, see ``face_detector``) and its box around a face is ~19%
+different, so an embedding made under the old detector does not describe the same
+picture a new punch produces. Scoring the two against each other gives a number that
+means nothing - and worse, a number that can look like a *mismatch*, accusing a worker
+of being somebody else when the real answer is "this template is from the old pipeline".
+
+So the template now records what made it::
+
+    {"model": "VGG-Face", "pipeline": "yunet-2023mar", "dimensions": 4096,
+     "embedding": [0.013, -0.24, ...]}
+
+A bare list is still *read* - an upgraded site has thousands of them and none of them
+is unreadable - but it is read as ``pipeline = None``: "made before we recorded this",
+which is exactly as stale as the recorded names say it is. The two shapes are handled
+in one place, ``read_reference``, so no caller has to ask which one it is holding.
 """
 
 from __future__ import annotations
@@ -54,6 +75,7 @@ import logging
 import os
 import secrets
 import sqlite3
+from dataclasses import dataclass
 from typing import Any
 
 from database import db
@@ -225,6 +247,202 @@ def is_enrolled(user_id: str, biometric_id: str | None = None) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# what a template is made of
+# ---------------------------------------------------------------------------
+#: Why a template can be present and still not usable, in a sentence an administrator can
+#: act on. The value is a *code*; the words beside it are written where they are shown.
+STALE_UNREADABLE = "unreadable"
+STALE_NO_PROVENANCE = "no_provenance"
+STALE_OTHER_PIPELINE = "other_pipeline"
+
+
+@dataclass(frozen=True)
+class Reference:
+    """A stored template: the vector, and what produced it.
+
+    ``pipeline`` is ``None`` for a file written before provenance was recorded - the bare
+    JSON lists every existing site is full of. ``None`` is not "unknown, probably fine":
+    it means the template predates the detector change and is exactly the case that needs
+    re-enrollment.
+    """
+
+    embedding: list[float]
+    pipeline: str | None
+    model: str | None = None
+
+    def __len__(self) -> int:
+        return len(self.embedding)
+
+
+def current_pipeline() -> str:
+    """The pipeline this build writes, from the detector that is actually compiled in.
+
+    Read from ``face_detector`` rather than duplicated as a constant here, so the version
+    recorded beside a template and the version a punch compares it against cannot drift -
+    which is the one failure that would make every template look current or every template
+    look stale. ``active_pipeline``, not the prototype: on a host without the detector model
+    the application falls back to the previous one, and a template written there has to be
+    labelled with what made it.
+    """
+    import face_detector
+
+    return face_detector.active_pipeline()
+
+
+def _model_name() -> str:
+    """The recognition model beside the pipeline, for a log line or a forensic read."""
+    import face_engine
+
+    return face_engine.FACE_MODEL
+
+
+def read_reference(path: str) -> Reference:
+    """The template at ``path``, in either shape. Raises on a file that is neither.
+
+    The only reader. Everything that needs an embedding or needs to know what made one
+    comes through here, so the two on-disk formats are one concept with one parser.
+    """
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if isinstance(payload, dict):
+        embedding = payload.get("embedding")
+        if not isinstance(embedding, list):
+            raise ValueError(f"template at {os.path.basename(path)} carries no embedding")
+        pipeline = payload.get("pipeline")
+        model = payload.get("model")
+        return Reference(
+            embedding=[float(value) for value in embedding],
+            pipeline=str(pipeline) if pipeline else None,
+            model=str(model) if model else None,
+        )
+    if isinstance(payload, list):
+        return Reference(embedding=[float(value) for value in payload], pipeline=None)
+    raise ValueError(f"template at {os.path.basename(path)} is neither a vector nor a record")
+
+
+def stale_reason(reference: Reference, *, expected_dimensions: int | None = None) -> str | None:
+    """Why ``reference`` cannot be scored, or ``None`` when it can.
+
+    Ordered by what an administrator has to do about it, most actionable first. A wrong
+    *dimension* is checked too: an embedding of a different size cannot be compared at
+    all, and the failure that produces is a shape error deep inside a numpy call, which
+    surfaces to a worker as "Internal processing error" - a 500 that says nothing. Here it
+    is the same refusal as a stale template, which names the fix.
+    """
+    if expected_dimensions is not None and len(reference.embedding) != expected_dimensions:
+        return STALE_UNREADABLE
+    if reference.pipeline is None:
+        return STALE_NO_PROVENANCE
+    if reference.pipeline != current_pipeline():
+        return STALE_OTHER_PIPELINE
+    return None
+
+
+def reference_health(
+    user_id: str, biometric_id: str | None = None, *, expected_dimensions: int | None = None
+) -> tuple[bool, str | None]:
+    """``(usable, reason)`` for this account's template. Never raises.
+
+    ``usable`` is ``False`` when a punch against this template would be meaningless. A
+    caller that only wants "can this person clock in" should keep using ``is_enrolled``:
+    that answers whether a *file* is there, which is a different question from whether the
+    template in it still describes the same kind of picture.
+    """
+    path = resolve_reference(user_id, biometric_id)
+    if not os.path.exists(path):
+        return False, "missing"
+    try:
+        reference = read_reference(path)
+    except (OSError, ValueError, TypeError):
+        return False, STALE_UNREADABLE
+    reason = stale_reason(reference, expected_dimensions=expected_dimensions)
+    return reason is None, reason
+
+
+#: What each reason means to the person who has to clear it. One place, so the roster, the
+#: admin list and a log line all say the same thing.
+STALE_EXPLANATIONS: dict[str, str] = {
+    STALE_UNREADABLE: (
+        "the stored face template cannot be used (it is unreadable, or was made by a "
+        "different face model) and needs to be taken again"
+    ),
+    STALE_NO_PROVENANCE: (
+        "the stored face template was made before the face detector was replaced; it "
+        "pictures a different crop of the face and has to be re-enrolled"
+    ),
+    STALE_OTHER_PIPELINE: (
+        "the stored face template was made by a different face pipeline and has to be "
+        "re-enrolled"
+    ),
+}
+
+
+def stale_references(*, expected_dimensions: int | None = None) -> dict[str, Any]:
+    """Every enrolled account whose template cannot be scored, and why.
+
+    The re-enrollment worklist. Reported rather than repaired: replacing a face template
+    means a human taking a photograph, which is the whole point of the enrollment flow -
+    so this answers "who has to be photographed again", and the existing enrollment paths
+    (``/admin/enroll``, or an enrollment link for a worker who is somewhere else) do the
+    repair.
+
+    An account with *no* template is deliberately absent: it is not stale, it is
+    unenrolled, and the roster already says so.
+    """
+    import face_detector
+
+    worklist: list[dict[str, Any]] = []
+    try:
+        with db() as conn:
+            rows = conn.execute(
+                "SELECT id, name, role, biometric_id FROM users "
+                "WHERE biometric_id IS NOT NULL AND biometric_id <> '' "
+                "ORDER BY CAST(id AS INTEGER) ASC"
+            ).fetchall()
+    except sqlite3.Error as exc:  # pragma: no cover - the database is not there yet
+        return {
+            "pipeline": face_detector.active_pipeline(),
+            "stale": [],
+            "count": 0,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    for row in rows:
+        user_id = str(row["id"])
+        path = resolve_reference(user_id, str(row["biometric_id"]))
+        if not os.path.exists(path):
+            continue
+        reason: str | None
+        pipeline: str | None = None
+        try:
+            reference = read_reference(path)
+            pipeline = reference.pipeline
+            reason = stale_reason(reference, expected_dimensions=expected_dimensions)
+        except (OSError, ValueError, TypeError):
+            reason = STALE_UNREADABLE
+        if reason is None:
+            continue
+        worklist.append(
+            {
+                "id": user_id,
+                "name": row["name"],
+                "role": row["role"],
+                "reason": reason,
+                "template_pipeline": pipeline,
+                "file": os.path.basename(path),
+            }
+        )
+
+    return {
+        "pipeline": face_detector.active_pipeline(),
+        "detector": face_detector.active_detector(),
+        "stale": worklist,
+        "count": len(worklist),
+        "enrolled_checked": len(rows),
+    }
+
+
+# ---------------------------------------------------------------------------
 # writing
 # ---------------------------------------------------------------------------
 def write_reference(user_id: str, image, embedding: list[float]) -> str:
@@ -247,7 +465,18 @@ def write_reference(user_id: str, image, embedding: list[float]) -> str:
     reference = reference_path(resolved)
     temporary_reference = f"{reference}.{secrets.token_hex(6)}.tmp"
     with open(temporary_reference, "w", encoding="utf-8") as handle:
-        json.dump(list(embedding), handle)
+        # Provenance beside the vector, in the same file and the same write. A separate
+        # sidecar could be orphaned by a crash between the two writes, and the one thing
+        # this record must never do is describe a template that is not the one on disk.
+        json.dump(
+            {
+                "model": _model_name(),
+                "pipeline": current_pipeline(),
+                "dimensions": len(embedding),
+                "embedding": [float(value) for value in embedding],
+            },
+            handle,
+        )
     os.replace(temporary_reference, reference)
 
     thumbnail = image.copy()
