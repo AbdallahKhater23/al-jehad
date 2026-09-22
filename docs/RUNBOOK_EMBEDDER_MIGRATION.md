@@ -22,6 +22,8 @@ is about the pipeline that feeds it.
 
 | module | what it owns |
 | --- | --- |
+| `backend/corpus.py` | the labelled corpus: capture, label, export, statistics, erasure, and the live punch hook |
+| `backend/tools/corpus_admin.py` | the operator command for it (not `corpus.py`: every tool here puts its own directory on `sys.path`, and a tool called `corpus.py` would shadow the store for the punch path) |
 | `backend/detector_640.py` | resolution-correct localisation: an invertible `Letterbox`, YuNet at 640 (square or aspect-matched), an optional `tiles x tiles` pass with greedy NMS merging, and a `ScrfdDetector` for extreme range |
 | `backend/face_align.py` | one-resample alignment: a closed-form Umeyama similarity transform from native-frame landmarks straight onto the 160x160 template, plus the four input `Contract`s |
 | `backend/facenet_ort.py` | the ORT session (IOBinding, thread tuning, warmup) and **host-side L2** on the raw output |
@@ -31,6 +33,62 @@ is about the pipeline that feeds it.
 
 None of these is wired into the punch path. They are parallel, drop-in modules on purpose: the
 rollout below is an A/B, and an A/B needs both sides to be runnable.
+
+## Phase 0 - a corpus that can carry a measurement
+
+Neither of the next two phases can be run on synthetic frames, and a corpus assembled from whatever was
+lying around is worse than none: a band derived from it is authoritative-looking and unmeasured. So the
+first artefact of this rollout is a corpus of **real captures, with the crop that was measured on them**.
+
+Two ways in, one store:
+
+```bash
+# (a) from live traffic, gradually - off by default, and never in a punch's critical path
+#     CALIBRATION_CAPTURE_ENABLED=1
+# (b) an operator importing a folder, one detection pass per image
+venv/Scripts/python.exe tools/corpus_admin.py add --source ./lab-2026-09 \
+    --consent "staff calibration session, signed form 2026-09-22" --actor "R. Ops" \
+    --input-size 640 --tiles 2
+venv/Scripts/python.exe tools/corpus_admin.py label --all-unlabelled --identity "Bilal Khan"
+venv/Scripts/python.exe tools/corpus_admin.py stats
+```
+
+Four things about that store decide whether it is usable later, and each is enforced rather than
+recommended:
+
+1. **Only a verified capture carries a label.** A punch the band approved is a capture whose identity the
+   system established; a flagged or refused one lands **unlabelled**, visible in `list --unlabelled` and
+   in `stats`, for a human to decide. A corpus of assumed labels inherits the assumption into every
+   number derived from it.
+2. **The crop travels with the detector that made it** - model digest, input size, square, tiles,
+   overlap. Both tools verify it and **refuse** a mismatch rather than re-detecting, because the
+   alternative is a report carrying one configuration's name over another's pixels. `--landmarks detect`
+   is how an operator says "I mean to measure a new crop on this corpus".
+3. **Landmarks are in the stored image's coordinates**, and both face sizes are recorded (`face_px` and
+   `native_face_px`), so a corpus capped at 1280 cannot quietly become a corpus of small faces.
+4. **A basis is recorded per capture**, and erasure is the operator's explicit command - the corpus is
+   *not* swept by `retention`, by design (a corpus is calibration material, not attendance data, so it
+   has its own switch, its own reader and its own purge):
+
+```bash
+venv/Scripts/python.exe tools/corpus_admin.py purge --older-than-days 180   # previews
+venv/Scripts/python.exe tools/corpus_admin.py purge --identity "Bilal Khan" --apply
+```
+
+`stats` is the gate before a measurement, and it answers the questions that decide whether a run is
+worth starting: how many **different-people pairs** exist (a floor needs at least 100), how much of the
+corpus is in the small-face regime the failures are at, and whether more than one crop configuration is
+mixed in. Then `export` writes the folder contract the two tools read, and the same crops come back out:
+
+```bash
+venv/Scripts/python.exe tools/corpus_admin.py export --destination ./corpus-export
+venv/Scripts/python.exe tools/contract_ab.py --corpus ./corpus-export --landmarks stored
+```
+
+**What this does not solve.** The corpus is a biometric store: it needs a stated basis, a retention
+period, and a per-identity erasure when a person asks - `purge --identity` is that last one, and it is
+an operator's obligation rather than an automated one. The runbook that says so is this paragraph; the
+mechanism that makes it possible is the command above.
 
 ## Phase 1 - coverage
 
@@ -80,6 +138,9 @@ symptom but a closed separation window. Measure it:
 
 ```bash
 venv/Scripts/python.exe tools/contract_ab.py --corpus ./calibration --json contracts.json
+# a corpus captured by the live pipeline, measured on its own stored crops, with no detection at all:
+venv/Scripts/python.exe tools/contract_ab.py --corpus ./corpus-export --landmarks stored \
+    --input-size 320 --overlap 0.0
 ```
 
 It scores **all four permutations on one shared crop set** (detection and alignment run once per

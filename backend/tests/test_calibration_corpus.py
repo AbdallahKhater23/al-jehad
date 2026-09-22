@@ -215,7 +215,9 @@ def test_a_failed_sidecar_write_leaves_no_orphan_frame():
             corpus.store(prepared, detector=_fingerprint(), landmarks=LANDMARKS, consent="test")
     finally:
         corpus._write_sidecar = original
-    frames = [name for name in __import__("os").listdir(corpus.captures_dir()) if name.endswith(".jpg")]
+    # *Anywhere* under the root, partitions included: a store whose layout gained a level would pass a
+    # check that only listed the top one while leaving exactly the orphan this test exists for.
+    frames = sorted(str(path.relative_to(corpus.root_dir())) for path in Path(corpus.root_dir()).rglob("*.jpg"))
     assert frames == [], f"a frame survived a failed sidecar write: {frames}"
 
 
@@ -409,10 +411,15 @@ def test_purge_is_a_dry_run_until_it_is_told_otherwise():
 def test_purge_by_identity_leaves_everybody_else_alone():
     keep = _capture(identity="keeper")
     drop = _capture(identity="leaver")
+    # Paths first, because after an erasure there is no longer a *lookup* to ask for one: the capture is
+    # gone, and that is the point.
+    dropped_frame = Path(corpus.image_path(drop.capture_id))
+    kept_frame = Path(corpus.image_path(keep.capture_id))
     applied = corpus.purge(identity="leaver", dry_run=False)
     assert applied["captures"] == 1 and applied["identities"] == ["leaver"]
-    assert not Path(corpus.image_path(drop.capture_id)).exists()
-    assert Path(corpus.image_path(keep.capture_id)).exists()
+    assert not dropped_frame.exists()
+    assert not corpus.exists(drop.capture_id), "the record went with the frame"
+    assert kept_frame.exists()
     assert [record.identity for record in corpus.sidecars()] == ["keeper"]
 
 
@@ -421,10 +428,11 @@ def test_purge_by_age_uses_the_capture_time_and_needs_a_selector():
     fresh = _capture(captured_at="2026-09-01 09:00:00")
     from datetime import datetime
 
+    old_frame = Path(corpus.image_path(old.capture_id))
     report = corpus.purge(older_than_days=180, now=datetime(2026, 9, 22, 12, 0, 0), dry_run=False)
     assert [record.capture_id for record in corpus.sidecars()] == [fresh.capture_id]
     assert report["captures"] == 1
-    assert not Path(corpus.image_path(old.capture_id)).exists()
+    assert not old_frame.exists() and not corpus.exists(old.capture_id)
 
     with pytest.raises(corpus.CorpusError):
         corpus.purge()

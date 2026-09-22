@@ -1,0 +1,42 @@
+# Everything the image does not need — mostly so the 87 MB model is the only large
+# thing that travels, and so no test environment, venv or local database leaks in.
+
+# Python noise
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+**/.pytest_cache/
+
+# The virtualenv is rebuilt from requirements.txt inside the image.
+backend/venv/
+
+# Test-only: the suite and its browser stack never run on the host.
+backend/tests/
+backend/requirements-dev.txt
+backend/requirements-optional.txt
+
+# Local state and biometric data — never in an image layer.
+times.db
+times.db-wal
+times.db-shm
+*.db.bak
+backend/certs/
+worker_photos/
+local_references/
+punch_frames/
+quick_link_photos/
+calibration_corpus/
+temp/
+backups/
+
+# Development machinery
+.freebuff/
+.vscode/
+.git/
+docs/
+deploy/cloudflare/__pycache__/
+
+# One-off scratch files from the checkout, not the application.
+*.bak
+test_odoo.py

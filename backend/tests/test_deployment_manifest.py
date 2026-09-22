@@ -143,8 +143,18 @@ def test_the_python_version_matches_the_interpreter_the_manifest_was_frozen_from
 
 
 def test_the_railway_config_has_the_pieces_a_deploy_needs():
+    """The build is stated, not guessed: DOCKERFILE with the Dockerfile named.
+
+    Nixpacks infers a build from the repository's shape, which is how the two facts it
+    cannot see from file names were lost: ``import cv2`` needs libGL at runtime (a green
+    build that crash-loops on start), and the 87 MB ``facenet128.onnx`` the startup gate
+    refuses to serve without has to survive the build context. The Dockerfile says both
+    out loud, so the builder is pinned to it.
+    """
     config = json.loads(RAILWAY.read_text(encoding="utf-8"))
-    assert config["build"]["builder"] == "NIXPACKS"
+    assert config["build"]["builder"] == "DOCKERFILE", config["build"]
+    dockerfile = PROJECT_ROOT / config["build"].get("dockerfilePath", "Dockerfile")
+    assert dockerfile.exists(), "railway.json names a Dockerfile the repository does not have"
     start = config["deploy"]["startCommand"]
     assert "backend/serve.py" in start, start
     assert "--tunnel" in start, (
@@ -154,6 +164,29 @@ def test_the_railway_config_has_the_pieces_a_deploy_needs():
     assert config["deploy"]["healthcheckTimeout"] >= 120, (
         "the first start runs migrations and imports TensorFlow; a short timeout marks a "
         "healthy deploy unhealthy"
+    )
+
+
+def test_the_dockerfile_carries_what_the_manifest_cannot_name():
+    """The three facts a Docker build needs that requirements.txt cannot express.
+
+    * opencv-python links against libGL at import time, so the image needs the system
+      packages - a slim image without them builds green and crash-loops at start with
+      ``libGL.so.1: cannot open shared object file``;
+    * the embedding model must be in the build context: the startup gate refuses to
+      serve without it, so a build that silently drops it is an app that never boots;
+    * the state directories are owned by the image so a first boot without a volume
+      works, and everything writable lives under one mountable root (/data).
+    """
+    dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "libgl1" in dockerfile, "cv2 imports libGL: without this the app crash-loops at start"
+    assert "COPY backend/ backend/" in dockerfile, "the models ride in backend/models/"
+    assert "DATABASE_PATH=/data" in dockerfile, "state has to land under one mountable root"
+
+    dockerignore = (PROJECT_ROOT / ".dockerignore").read_text(encoding="utf-8")
+    assert "backend/tests/" in dockerignore, "the test stack does not belong on a host we pay for"
+    assert "backend/models/" not in dockerignore.split("!")[-1], (
+        "a .dockerignore that excludes backend/models/ ships an app that cannot boot"
     )
 
 
