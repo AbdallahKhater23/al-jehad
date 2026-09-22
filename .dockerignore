@@ -40,3 +40,6 @@ deploy/cloudflare/__pycache__/
 # One-off scratch files from the checkout, not the application.
 *.bak
 test_odoo.py
+
+# NOT the entrypoint - it is COPYied in the Dockerfile and must travel with the image.
+!docker-entrypoint.sh

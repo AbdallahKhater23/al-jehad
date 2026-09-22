@@ -40,20 +40,48 @@ Neither of the next two phases can be run on synthetic frames, and a corpus asse
 lying around is worse than none: a band derived from it is authoritative-looking and unmeasured. So the
 first artefact of this rollout is a corpus of **real captures, with the crop that was measured on them**.
 
-Two ways in, one store:
+Three ways in, one pipeline. The commands below are all thin fronts for `corpus_ingest.py` - the
+importer, the camera puller and the live punch hook run the *same* detector, the *same* quality judgment
+and the *same* store, so there is no second definition of "a usable capture" to drift:
 
 ```bash
-# (a) from live traffic, gradually - off by default, and never in a punch's critical path
-#     CALIBRATION_CAPTURE_ENABLED=1
-# (b) an operator importing a folder, one detection pass per image
+# (a) a live gate, sampled: detect on the stored copy, judge quality, file under the identity
+venv/Scripts/python.exe tools/corpus_admin.py ingest --camera rtsp://10.0.0.9/gate \
+    --camera-name gate-north --identity W-1042 --consent "deployment notice 2026-08" \
+    --actor "R. Ops" --limit 60 --every 25 --coverage --expected-face-px 40
+
+# (b) enrolment: bind a session's frames to a worker id that exists in the roster
+venv/Scripts/python.exe tools/corpus_admin.py enroll --identity W-1042 \
+    --source ./session-2026-09-22 --check-roster \
+    --consent "signed form 2026-09-22" --actor "R. Ops"
+
+# (c) a controlled sitting: the folder is the material, and the gate is permissive
 venv/Scripts/python.exe tools/corpus_admin.py add --source ./lab-2026-09 \
     --consent "staff calibration session, signed form 2026-09-22" --actor "R. Ops" \
     --input-size 640 --tiles 2
-venv/Scripts/python.exe tools/corpus_admin.py label --all-unlabelled --identity "Bilal Khan"
+
+venv/Scripts/python.exe tools/corpus_admin.py label --all-unlabelled --identity "W-1042"
 venv/Scripts/python.exe tools/corpus_admin.py stats
 ```
 
-Four things about that store decide whether it is usable later, and each is enforced rather than
+The punch path can also contribute, and it is **off** unless a deployment turns it on
+(`CALIBRATION_CAPTURE_ENABLED=1`); it never fails a punch and never takes one over.
+
+The store is a directory, one partition per identity:
+
+```
+<corpus_root>/
+  W-1042/                         identity is the directory, so an operator sees the corpus
+    20260922T204113_9f3a2b1c.jpg    the frame, capped at CALIBRATION_CORPUS_MAX_PX
+    20260922T204113_9f3a2b1c.json   crop, landmarks (stored-image pixels), detector, camera, quality
+  _unlabelled/                    captures nobody has decided about yet - a state, not a gap
+```
+
+The name is `<timestamp>_<random>`: sortable, and it does not encode who the person is - a countable
+filename for a face is a directory anybody can enumerate. `label` **moves** the pair between partitions
+(copy, then remove, so a crash leaves a visible duplicate rather than an image with no provenance).
+
+Six things about that store decide whether it is usable later, and each is enforced rather than
 recommended:
 
 1. **Only a verified capture carries a label.** A punch the band approved is a capture whose identity the
@@ -72,8 +100,37 @@ recommended:
 
 ```bash
 venv/Scripts/python.exe tools/corpus_admin.py purge --older-than-days 180   # previews
-venv/Scripts/python.exe tools/corpus_admin.py purge --identity "Bilal Khan" --apply
+venv/Scripts/python.exe tools/corpus_admin.py purge --identity "W-1042" --apply
 ```
+
+5. **Quality has two lines, not one.** *Discard* is where a capture is evidence of nothing - no face, or
+   one so small or so far off-angle that the template it would produce is not a picture of anybody.
+   *Flag* is where it stops being typical: kept, marked, and **left out of a measurement by default**.
+   This is deliberate, because a coverage experiment needs exactly the frames a band must not be fitted
+   to. `stats` and `export` report what they left behind, so a run of 200 images cannot quietly be 180:
+
+```bash
+venv/Scripts/python.exe tools/corpus_admin.py stats      # measured N of M; hard cases left out: K
+venv/Scripts/python.exe tools/corpus_admin.py export --destination ./corpus-export
+venv/Scripts/python.exe tools/corpus_admin.py export --destination ./corpus-edge --include-hard-cases
+```
+
+   Thresholds live in `corpus_ingest.GateConfig`, and every capture records the gate that judged it, so a
+   stored corpus can be re-read under a different policy later. Roll is a real measurement; yaw and pitch
+   are **stated proxies** measured against the alignment template's own pose - see the module docstring
+   for exactly what they do and do not mean, because "severe pitch" is not a claim about degrees.
+
+6. **Coverage is checked before anything is derived from the corpus.** The failure mode of building one is
+   quietly collecting the staff who happened to walk close to the camera:
+
+```bash
+venv/Scripts/python.exe tools/corpus_admin.py ingest --source ./gate-dump --coverage --expected-face-px 40
+#   coverage verdict: thin: fewer than 20 captures at or below the expected face size - the corpus is
+#   mostly the easy regime, so a band derived from it will look better than the gate does
+```
+
+   The same sentence is why the detector's own reach is worth printing next to the corpus: "we have no
+   small faces" and "our detector cannot see small faces" are different findings with the same symptom.
 
 `stats` is the gate before a measurement, and it answers the questions that decide whether a run is
 worth starting: how many **different-people pairs** exist (a floor needs at least 100), how much of the

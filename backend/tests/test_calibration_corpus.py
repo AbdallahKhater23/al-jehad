@@ -522,3 +522,48 @@ def test_the_live_hook_skips_a_frame_it_cannot_crop(monkeypatch):
     _live(monkeypatch, faces=2)
     assert corpus.maybe_capture_punch(_image(), worker_id="W-1", verdict="approved") is None
     assert corpus.sidecars() == []
+
+
+def test_the_live_hook_records_the_same_assessment_the_camera_gate_would(monkeypatch):
+    """A live punch capture is *assessed*, not merely taken.
+
+    A capture with no ``quality`` reads as "assessed and fine" to every downstream tool, which would make
+    the one frame source nobody inspects the one that never gets flagged. The stub's face is a normal one,
+    so the assertion is that the assessment is *present and clean* - and it is the same gate object the
+    camera puller uses, so the two paths cannot drift.
+    """
+    _live(monkeypatch)
+    corpus.maybe_capture_punch(_image(), worker_id="W-1", verdict="approved")
+    record = corpus.sidecars()[0]
+    assert record.quality, "a punch capture carries its assessment"
+    assert record.quality["flags"] == [] and record.quality["hard_case"] is False
+    assert record.quality["gate"]["min_face_px"] == 30.0, "the same gate the ingest path applies"
+    assert record.landmark_source == "yunet"
+
+
+def test_the_live_hook_does_not_store_a_frame_the_gate_would_discard(monkeypatch):
+    """A face the gate calls unusable is not evidence, here or anywhere else."""
+    import face_detector
+
+    import corpus_ingest
+
+    class _TinyFace:
+        """Eight pixels of face: the gate's discard floor, reached from the punch path."""
+
+        def __call__(self, image):
+            return [
+                {
+                    "landmarks": np.array(
+                        [[150.0, 120.0], [162.0, 120.0], [156.0, 126.0], [152.0, 132.0], [160.0, 132.0]],
+                        dtype=np.float32,
+                    ),
+                    "facial_area": {"x": 148, "y": 118, "w": 8, "h": 8},
+                    "confidence": 0.8,
+                }
+            ]
+
+    _live(monkeypatch)
+    monkeypatch.setattr(face_detector, "detect_landmarks", _TinyFace())
+    assert corpus.maybe_capture_punch(_image(), worker_id="W-1", verdict="approved") is None
+    assert corpus.sidecars() == []
+    assert corpus_ingest.GateConfig().discard_face_px == 16.0

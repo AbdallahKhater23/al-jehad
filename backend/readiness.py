@@ -1680,17 +1680,36 @@ def _check_clock_sanity(ctx: dict) -> Check:
 
 
 def _check_database_path(ctx: dict) -> Check:
+    """Whether the database sits at the canonical project-root file.
+
+    A **configured** ``DATABASE_PATH`` is not the state this check is looking for. The
+    deployment this check was written for points the database at a mounted volume
+    (``/data/times.db`` on Railway) by declaring ``DATABASE_PATH`` in the image - so
+    "somewhere other than the project root" is the declared design, and reporting it
+    degraded makes the report red on every boot for a decision that was made on purpose.
+    The accident worth surfacing is the opposite one: a path that arrives from somewhere
+    nobody configured - a leftover from an old shell, a stray environment probe - while
+    the operator believes the project-root file is in use.
+    """
     expected = (PROJECT_ROOT / "times.db").resolve()
     actual = Path(ctx.get("db_path") or settings.database_path).resolve()
-    ok = actual == expected
+    configured = bool((os.environ.get("DATABASE_PATH") or "").strip())
+    ok = actual == expected or configured
     return Check(
         "database_path_is_project_root",
         TIER_ADVISORY,
         ok,
         "database resolves to the canonical project-root file"
-        if ok
-        else f"database resolves to {actual} rather than {expected} (valid for a migration or a test run)",
-        {"actual": str(actual), "expected": str(expected)},
+        if actual == expected
+        else (
+            f"database resolves to {actual} via a configured DATABASE_PATH"
+            if configured
+            else (
+                f"database resolves to {actual} rather than {expected} with no DATABASE_PATH "
+                "configured (valid for a migration or a test run)"
+            )
+        ),
+        {"actual": str(actual), "expected": str(expected), "configured": configured},
     )
 
 
