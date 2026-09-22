@@ -130,9 +130,14 @@ def _alerts() -> list[sqlite3.Row]:
 def push_ready(monkeypatch):
     """A deployment that *is* trying to deliver - the state the alert exists for.
 
-    ``pywebpush`` is the optional dependency and is not installed here, so the late import is
-    stubbed rather than installed - and the stub refuses to send, because no test in this file
-    may reach a push service (the outbound guard would refuse it anyway).
+    Every half of the state is *stated* rather than assumed, which is the whole reason this
+    fixture exists: whether the developer's checkout has a VAPID key pair in ``.env`` and whether
+    ``pywebpush`` happens to be installed are properties of the machine, and a test that reads
+    them from the ambient environment is a test that reports the machine rather than the code
+    (two of these did exactly that the moment the runbook was followed on this laptop). So the
+    key pair is set here, and the late import is stubbed rather than installed - the stub refuses
+    to send, because no test in this file may reach a push service (the outbound guard would
+    refuse it anyway).
     """
 
     def _never_push(subscription_info, data, vapid_private_key, vapid_claims):  # pragma: no cover
@@ -331,9 +336,15 @@ def test_a_deployment_that_does_not_intend_to_push_is_never_told_about_its_own_i
     meant to ring. With ``PUSH_ENABLED=0`` the same is true by explicit decision. In both cases
     an alert would be a standing alarm about a choice, not a reading of a fault - and it would
     hide the one case that matters, where the keys are set and nothing arrives.
+
+    "No key pair" is set here rather than hoped for: this checkout may well have one in ``.env``
+    (following the runbook puts it there), and the point of the test is the *state*, not the
+    laptop's environment file.
     """
     _seed_notice(age_minutes=600)
 
+    monkeypatch.setattr(settings, "vapid_public_key", None, raising=False)
+    monkeypatch.setattr(settings, "vapid_private_key", None, raising=False)
     unconfigured = push.alert_stranded_notices(now=ANCHOR)
     assert unconfigured["checked"] is False
     assert unconfigured["alerted"] is False
@@ -376,8 +387,15 @@ def test_the_dispatch_path_takes_the_reading_too(monkeypatch, app_module):
     assert json.loads(rows[0]["payload"])["notices"] == 1
 
 
-def test_a_dispatch_on_a_deployment_that_cannot_push_stays_silent(app_module):
-    """The same rule as the alert, asserted on the path a punch takes."""
+def test_a_dispatch_on_a_deployment_that_cannot_push_stays_silent(monkeypatch, app_module):
+    """The same rule as the alert, asserted on the path a punch takes.
+
+    The unusable transport is stated (no key pair), not inherited: a checkout with a pair in
+    ``.env`` and ``pywebpush`` installed is a deployment that *can* push, which is a different
+    test's subject.
+    """
+    monkeypatch.setattr(settings, "vapid_public_key", None, raising=False)
+    monkeypatch.setattr(settings, "vapid_private_key", None, raising=False)
     _seed_notice(age_minutes=600)
     with db(write=True) as conn:
         summary = push.dispatch(conn, now=ANCHOR)

@@ -778,9 +778,26 @@ def _generate_keys() -> str:
     works against one push service and fails against the next. ``py-vapid`` ships with
     ``pywebpush`` and is the reference implementation, so the honest answer when it is absent
     is to say which command installs it.
+
+    TWO THINGS THIS FUNCTION LEARNED THE HARD WAY, both worth keeping:
+
+    * **the encoding is assembled from the libraries' own primitives, not from a helper that
+      may not exist.** py-vapid 1.9 (what ``pip install pywebpush`` brings) dropped
+      ``public_key_urlsafe_base64`` / ``private_key_urlsafe_base64``, which is what this
+      function used to call - so the documented command printed a message about a missing
+      attribute instead of a key pair, on a deployment whose whole push advisory then could not
+      be satisfied. The two forms it needs are the ones the sender and the browser read:
+      ``py_vapid.b64urlencode`` of the raw 32-byte scalar for the private half (which is what
+      ``Vapid.from_string`` - the call ``pywebpush`` makes when handed this string - decodes),
+      and the same encoding of ``encode_point()`` for the public half: the SEC1 uncompressed
+      point a browser wants as ``applicationServerKey``.
+    * **the pair is reloaded from the exact strings it prints, and refused if they do not
+      round-trip.** That check is the whole safeguard the paragraph above is about: an encoding
+      that is "almost right" loads back as a *different* key, and the only moment the
+      difference is cheap to notice is here rather than at the first subscribe on a phone.
     """
     try:
-        from py_vapid import Vapid  # noqa: PLC0415 - optional dependency
+        from py_vapid import Vapid, b64urlencode  # noqa: PLC0415 - optional dependency
     except Exception:
         return (
             "Generating a VAPID key pair needs the optional dependency:\n"
@@ -790,10 +807,19 @@ def _generate_keys() -> str:
             "half out of the repository, the frontend and any log."
         )
     try:
+        from cryptography.hazmat.primitives.serialization import (  # noqa: PLC0415
+            Encoding,
+            PublicFormat,
+        )
+
         key = Vapid()
         key.generate_keys()
-        public = key.public_key_urlsafe_base64()
-        private = key.private_key_urlsafe_base64()
+        private = b64urlencode(key.private_key.private_numbers().private_value.to_bytes(32, "big"))
+        # ``Encoding.X962`` + ``UncompressedPoint`` is cryptography's own name for the SEC1
+        # uncompressed point (65 bytes, leading 0x04): the exact bytes a browser takes as
+        # ``applicationServerKey``. Serialised by the library, never assembled by hand.
+        point = key.public_key.public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+        public = b64urlencode(point)
     except Exception as exc:  # pragma: no cover - depends on the optional package's API
         return (
             f"Could not generate a key pair with this py-vapid version: {type(exc).__name__}: {exc}\n"
@@ -801,11 +827,51 @@ def _generate_keys() -> str:
             "README is the reference. What must not happen is a hand-rolled encoding that works\n"
             "against one push service and fails against the next."
         )
+
+    problem = _pair_is_usable(public, private)
+    if problem:
+        return (
+            f"Refusing to print a key pair that does not load back: {problem}\n"
+            "The sender reads the private half through pywebpush's own ``Vapid.from_string`` and\n"
+            "the browser reads the public half as ``applicationServerKey``; a pair that fails\n"
+            "either of those subscribes nowhere, so it is not a deployment secret worth keeping."
+        )
     return (
         f"VAPID_PUBLIC_KEY={public}\n"
         f"VAPID_PRIVATE_KEY={private}\n"
         "Keep the private half secret; the public half is served to the browser."
     )
+
+
+def _pair_is_usable(public: str, private: str) -> str | None:
+    """``None`` when these two strings are a working VAPID pair, otherwise why they are not.
+
+    Deliberately checked through the same entry points the running system uses: ``from_string``
+    for the private half (pywebpush's call) and the uncompressed-point form for the public half
+    (the browser's format, 65 bytes beginning with the ``0x04`` that marks a point as
+    uncompressed - the length the runbook tells an operator to eyeball before deploying).
+    """
+    from py_vapid import Vapid, b64urldecode, b64urlencode  # noqa: PLC0415 - optional dependency
+
+    try:
+        loaded = Vapid.from_string(private_key=private)
+    except Exception as exc:  # pragma: no cover - only reachable with a broken library
+        return f"pywebpush could not load the private half ({type(exc).__name__}: {exc})"
+    from cryptography.hazmat.primitives.serialization import (  # noqa: PLC0415
+        Encoding,
+        PublicFormat,
+    )
+
+    derived = b64urlencode(loaded.public_key.public_bytes(Encoding.X962, PublicFormat.UncompressedPoint))
+    if derived != public:
+        return "the public half is not the pair of the private half"
+    # py-vapid decodes *bytes* (its own ``from_string`` encodes first), so these go in as bytes.
+    raw = b64urldecode(public.encode())
+    if len(raw) != 65 or raw[0] != 0x04:
+        return f"the public half is not an uncompressed P-256 point ({len(raw)} bytes)"
+    if len(b64urldecode(private.encode())) != 32:
+        return "the private half is not a 32-byte scalar"
+    return None
 
 
 if __name__ == "__main__":  # pragma: no cover - an operator's one-off

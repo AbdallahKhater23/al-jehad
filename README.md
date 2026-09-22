@@ -88,8 +88,9 @@ after the first deploy.
 
 The backend runs on a host rather than this laptop, which is what makes the address the Worker
 points at stop changing - and what stops the app depending on a machine being awake.
-`railway.json`, `.python-version` and `requirements.txt` at the root are the whole config: build
-with Nixpacks, start with `python backend/serve.py --tunnel`, and check `GET /api/v1/status`
+`railway.json`, `.python-version`, `requirements.txt` and the `Dockerfile` that `railway.json`
+names are the whole config: build the image (Docker, not Nixpacks - the builder is stated in
+`railway.json`), start with `python backend/serve.py --tunnel`, and check `GET /api/v1/status`
 before releasing traffic.
 
 ```bash
@@ -103,20 +104,28 @@ Set these as **service variables** (not in a committed file):
 | --- | --- |
 | `SECRET_KEY` | **Required.** 32+ random chars (`python -m config --write-env`). Without it `build_settings()` raises and the app never imports - which on a host looks like a 502 from the edge, not like a configuration error. |
 | `DATABASE_PATH=/data/times.db` | Points the database at the mounted volume. Set `BACKUP_DIR=/data/backups` too. |
-| `TRUSTED_PROXIES` | The host's edge is not loopback, so until this lists it every worker is bucketed under one address: they hit `429`s together and the audit log records the proxy as the actor. `serve.py` prints the list it is using at startup; `GET /api/v1/readiness` reports `proxy_not_trusted`. |
+| `TRUSTED_PROXIES` | The host's edge is not loopback, so until this lists it every worker is bucketed under one address: they hit `429`s together and the audit log records the proxy as the actor. Railway's internal hop is in `100.64.0.0/10`; the exact peer the app sees is in `GET /api/v1/admin/readiness` under `network_policy.value.forward_misuse.last_peer`. `serve.py` prints the list it is using at startup; `GET /api/v1/readiness` reports `network_policy`. |
+| `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY` | The Web Push key pair. Without it the worker inbox still records every notice and `readiness` reports `worker_push_delivery` as an advisory - the phones simply do not ring. Generate the pair with `python -m push --generate-keys`; `docs/RUNBOOK_WORKER_PUSH.md` is the whole procedure and `deploy/railway/README.md` is the deployment half of it. |
 | `ENABLE_API_DOCS=0` | The default. Leave it unless you are debugging. |
+
+The service's own self-test is the check that all of this landed: `python
+deploy/railway/verify_readiness.py` reads the deployed `GET /api/v1/readiness` and exits non-zero
+when any check is failing, and `deploy/railway/README.md` says what each failing check needs.
 
 Three things that are easy to get wrong and silent when you do:
 
 - **A volume is not optional.** SQLite lives in a file; without one, every deploy and every
   restart replaces the container's filesystem and the punches are gone. Run **one replica**:
   SQLite is single-writer, and two instances on one file corrupts it.
-- **Memory.** The image imports TensorFlow and DeepFace, so the container wants roughly 1.5-2 GB
-  and a slow first start while the models load. `healthcheckTimeout` is 300s in `railway.json`
-  for that reason - a shorter one marks a healthy deploy unhealthy.
-- **Onnxruntime is not installed** (it is an optional extra), so liveness is advisory: when the
-  model is absent the API reports it and face *matching* still runs. Do not read the readiness
-  warnings as a broken deploy.
+- **Memory.** The image loads the embedding model (87 MB) and the YuNet detector at start, on top
+  of onnxruntime and OpenCV. The training framework the engine used to run on is gone, so this is
+  lighter than it was, and a first start is still slower than a restart while the models load.
+  `healthcheckTimeout` is 300s in `railway.json` for that reason - a shorter one marks a healthy
+  deploy unhealthy.
+- **Onnxruntime is a runtime dependency** (`requirements.txt`), so face *matching* works on any
+  host built from this repository. The MiniFASNet liveness model is a separate download
+  (`backend/models/README.md`): absent, the API says so and liveness degrades while matching is
+  unaffected. Readiness names each as a check rather than as a broken deploy.
 
 Verify the host's own address before pointing anything at it - this deployment's is
 `https://al-jehad-production.up.railway.app`, so

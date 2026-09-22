@@ -121,27 +121,52 @@ def rules(conn: sqlite3.Connection | None = None) -> dict:
     """Current shift rules, falling back to the shipped defaults.
 
     Read directly here rather than imported from ``main`` so this module has no
-    dependency on the application module (``main`` imports *this*)."""
+    dependency on the application module (``main`` imports *this*).
+
+    TWO WAYS IN, AND THE DIFFERENCE IS WHO OWNS THE CONNECTION. A caller that passes one keeps
+    it, because it is in the middle of a transaction of its own. A caller that passes nothing
+    gets one from ``database.db()``, which is a **context manager, not a connection** - so the
+    owned case is a ``with`` block, and the handle is never closed by hand.
+
+    That distinction is written down because it was wrong here, and quietly: the owned handle was
+    closed in a ``finally``, and ``.close()`` on what the module actually held raised
+    ``AttributeError: '_GeneratorContextManager' object has no attribute 'close'``. The only
+    caller that passes no connection is ``start_watcher``, inside a ``try/except`` whose whole
+    purpose is that the timer starts anyway - so the failure was one warning line at every
+    startup and nothing else, while the watcher went on to announce the *shipped* precedence
+    rather than the deployment's. A function that cannot read the rules is the one failure here
+    that must not be quiet, so it is not: the owned path either returns the stored row or raises.
+    """
     values = dict(migrations.DEFAULT_SHIFT_RULES)
-    owns = conn is None
-    handle = conn or db()
-    try:
-        try:
-            row = handle.execute("SELECT * FROM shift_rules WHERE id = 1").fetchone()
-        except sqlite3.Error:
-            row = None
-        if row is not None:
-            for key in values:
-                try:
-                    value = row[key]
-                except (IndexError, KeyError):
-                    continue
-                if value is not None:
-                    values[key] = value
-    finally:
-        if owns:
-            handle.close()
+    if conn is not None:
+        _overlay_stored_rules(values, conn)
+        return values
+    with db() as handle:
+        _overlay_stored_rules(values, handle)
     return values
+
+
+def _overlay_stored_rules(values: dict, conn: sqlite3.Connection) -> None:
+    """Overlay the stored ``shift_rules`` row onto ``values``, in place.
+
+    A missing table is not an error: ``shift_rules`` arrives with a migration, and a database that
+    predates it answers with the shipped defaults, which is what the defaults are for. A present row
+    wins column by column, and only where the column is not NULL - a NULL is the database saying
+    "unset", not "zero".
+    """
+    try:
+        row = conn.execute("SELECT * FROM shift_rules WHERE id = 1").fetchone()
+    except sqlite3.Error:
+        return
+    if row is None:
+        return
+    for key in values:
+        try:
+            value = row[key]
+        except (IndexError, KeyError):
+            continue
+        if value is not None:
+            values[key] = value
 
 
 def _audit_system(conn: sqlite3.Connection, *, action: str, entity_id: str, after: dict) -> None:
@@ -1391,7 +1416,12 @@ def start_watcher(*, interval: int | None = None, enabled: bool | None = None) -
         else:
             log.info("overtime watcher started (interval %ss): %s", seconds, day_end["detail"])
     except Exception as exc:  # pragma: no cover - the timer must start regardless
-        log.warning("could not read the day-end rules: %s", exc)
+        # With the traceback, deliberately. This clause is the reason a rule reader that could not read
+        # the rules survived in production as one benign-sounding line at every startup - the settings
+        # it announced were the shipped defaults, and nothing said so. Whatever lands here next is
+        # either a database that is unreadable (in which case the traceback costs one screen once) or a
+        # bug in the reader (in which case that screen is the only way it is ever going to be seen).
+        log.warning("could not read the day-end rules: %s", exc, exc_info=True)
 
     _thread = threading.Thread(target=_loop, args=(seconds,), name="overtime-watcher", daemon=True)
     _thread.start()

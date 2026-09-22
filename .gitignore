@@ -20,6 +20,12 @@ times.db
 times.db-wal
 times.db-shm
 .env
+# The Railway service variables an operator applies by hand (VAPID key pair, trusted proxies).
+# Same class as .env above: VAPID_PRIVATE_KEY signs pushes as this deployment to every endpoint
+# it has stored, so it is a secret, and the file exists so it never has to be pasted into an
+# issue, a log or a screenshot. 
+# deploy/railway/README.md documents every value in it.
+deploy/railway/variables.env
 worker_photos
 local_references
 # Selfies taken with a quick clock link. Biometric data, like the two above: never in git.
