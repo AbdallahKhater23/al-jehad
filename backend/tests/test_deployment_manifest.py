@@ -142,6 +142,29 @@ def test_the_python_version_matches_the_interpreter_the_manifest_was_frozen_from
     )
 
 
+def _start_command() -> str:
+    """The command line the container actually runs.
+
+    Railway appends ``deploy.startCommand`` to the image's ENTRYPOINT as arguments, so a
+    startCommand that repeats the entrypoint's own command is a server that receives its
+    whole command line again as positional arguments - which ``serve.py`` refuses, and a
+    crash-looping container is a 502 from the edge. The command lives in the entrypoint
+    alone; a startCommand is only allowed when it does NOT repeat it.
+    """
+    config = json.loads(RAILWAY.read_text(encoding="utf-8"))
+    entrypoint = (PROJECT_ROOT / "docker-entrypoint.sh").read_text(encoding="utf-8")
+    assert "backend/serve.py" in entrypoint, "the entrypoint carries the server command"
+    start = config["deploy"].get("startCommand", "")
+    if start:
+        assert "backend/serve.py" not in start, (
+            f"startCommand {start!r} repeats the entrypoint's command; Railway appends it to "
+            "the ENTRYPOINT as arguments, so serve.py exits on the unrecognized arguments "
+            "and the deploy 502s (this exact bug shipped once)"
+        )
+        return start
+    return "python backend/serve.py --tunnel"
+
+
 def test_the_railway_config_has_the_pieces_a_deploy_needs():
     """The build is stated, not guessed: DOCKERFILE with the Dockerfile named.
 
@@ -155,9 +178,8 @@ def test_the_railway_config_has_the_pieces_a_deploy_needs():
     assert config["build"]["builder"] == "DOCKERFILE", config["build"]
     dockerfile = PROJECT_ROOT / config["build"].get("dockerfilePath", "Dockerfile")
     assert dockerfile.exists(), "railway.json names a Dockerfile the repository does not have"
-    start = config["deploy"]["startCommand"]
-    assert "backend/serve.py" in start, start
-    assert "--tunnel" in start, (
+    assert "backend/serve.py" in _start_command()
+    assert "--tunnel" in _start_command(), (
         "the host terminates TLS: serving a self-signed certificate behind it is what makes "
         "GPS and the camera fail on a phone"
     )
@@ -256,10 +278,11 @@ def test_the_start_command_is_accepted_and_means_plain_http(serve_module, monkey
 
     A bad flag here is a deploy that fails at start, and ``--tunnel`` is the flag that matters:
     it must turn the bundled certificate *off*, because a proxy has already done the handshake.
+    The command line comes from the entrypoint (see ``_start_command`` for why it is not
+    duplicated in railway.json's startCommand).
     """
-    command = json.loads(RAILWAY.read_text(encoding="utf-8"))["deploy"]["startCommand"]
-    argv = command.split()
-    assert argv[0].startswith("python"), command
+    argv = _start_command().split()
+    assert argv[0].startswith("python"), argv
 
     monkeypatch.setenv("PORT", "7431")
     args = serve_module.parse_args(argv[2:])  # the flags, i.e. ["--tunnel"]
