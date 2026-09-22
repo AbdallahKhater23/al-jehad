@@ -4682,9 +4682,7 @@ async def developer_trace_and_alerts(request: Request, call_next):
 
 if settings.face_model_preload:  # pragma: no cover - heavy, skipped when disabled
     try:
-        # The ONNX session, not a Keras graph: ~0.2 s and ~150 MiB against ~2.7 s and a
-        # 553 MiB framework. Preloading it means a worker's first punch does not pay for
-        # the load, and a missing graph is reported here rather than at the gate.
+
         import face_onnx
 
         face_onnx.load_now()

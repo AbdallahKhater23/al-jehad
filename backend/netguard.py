@@ -666,38 +666,25 @@ def security_headers(
     peer_trusted: bool,
     is_document: bool,
 ) -> list[tuple[bytes, bytes]]:
-    """The header set for one response.
-
-    ``is_document`` splits the CSP in two: a page gets a policy that names the resources it
-    uses, and an API response gets one that denies everything (a JSON body has no business
-    loading a script or being framed).
-
-    HSTS is sent only when the connection really is TLS from our point of view: the request
-    scheme is ``https``, or a *trusted* proxy says it terminated TLS
-    (``X-Forwarded-Proto: https``). Pinning a host to HTTPS from a plain-HTTP deployment
-    would lock out exactly the worker whose phone is talking to a site server over HTTP,
-    and the header is ignored by browsers on HTTP anyway - so sending it blind is all risk.
-    """
     headers: list[tuple[bytes, bytes]] = [
         (b"x-content-type-options", b"nosniff"),
         (b"x-frame-options", b"DENY"),
-        #: A document gets ``strict-origin-when-cross-origin`` - the browser default that
-        #: still sends the origin on a cross-origin navigation and nothing at all on a
-        #: downgrade to HTTP, which is what a page at a site needs when it is opened from a
-        #: tunnel or a LAN address. A JSON response gets ``no-referrer``, because a JSON
-        #: body is not a navigation source and cannot be one: the stricter value is free
-        #: there, and it stops an error payload from ever being quoted as a referrer.
         (
             b"referrer-policy",
             b"strict-origin-when-cross-origin" if is_document else b"no-referrer",
         ),
         (b"cross-origin-opener-policy", b"same-origin"),
-        (b"cross-origin-resource-policy", b"same-origin"),
+
+        # Changed from same-origin to cross-origin so external frontends can read responses:
+        (b"cross-origin-resource-policy", b"cross-origin"),
+
+        # CORS headers:
+        (b"access-control-allow-origin", b"*"),
+        (b"access-control-allow-methods", b"GET, POST, PUT, DELETE, OPTIONS"),
+        (b"access-control-allow-headers", b"Content-Type, Authorization, ngrok-skip-browser-warning"),
+
         (
             b"permissions-policy",
-            # Camera and location are the two the app legitimately asks for; everything
-            # listed as denied is a capability this application never uses, closed off
-            # before somebody adds a third-party widget that does.
             b"camera=(self), geolocation=(self), microphone=(), display-capture=(), "
             b"payment=(), usb=(), serial=()",
         ),
