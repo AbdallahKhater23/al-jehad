@@ -42,6 +42,10 @@ const State = {
     gpsCoords: null,
     workerTab: localStorage.getItem('workerTab') || 'clock',
     adminTab: 'Live Ops',
+    //: An administrator who has stepped out of the console and onto the handset to clock
+    //: in. The clock, history and profile screens a worker gets, with a way back - because
+    //: a manager who covers a site as well has hours of their own to record.
+    handsetMode: false,
     // Held here so switching tabs (or language, which re-renders) does not silently
     // drop the search an admin is in the middle of reading the roster through.
     credentialsQuery: '',
@@ -79,6 +83,9 @@ const State = {
     clearUser() {
         this.user = null;
         sessionStorage.removeItem('user');
+        // Whoever signs in next is a different account, and the handset choice belonged to
+        // the last one. A stored session is not a screen anybody was looking at.
+        this.handsetMode = false;
         this.stopCamera();
     },
     setWorkerTab(tab) {
@@ -116,9 +123,12 @@ const Toast = {
 };
 
 const Modal = {
-    open(html, { dismissible = true } = {}) {
+    open(html, { dismissible = true, overCamera = false } = {}) {
         const root = document.getElementById('modalRoot');
-        root.innerHTML = `<div class="modal-backdrop"><div class="modal-card" role="dialog" aria-modal="true">${html}</div></div>`;
+        // ``overCamera`` lifts this dialog above the open camera overlay, which otherwise
+        // covers it: the early clock-out question is asked mid-punch, with the camera up.
+        const layer = overCamera ? 'modal-backdrop is-over-camera' : 'modal-backdrop';
+        root.innerHTML = `<div class="${layer}"><div class="modal-card" role="dialog" aria-modal="true">${html}</div></div>`;
         const backdrop = root.firstElementChild;
         if (dismissible) {
             backdrop.addEventListener('click', (event) => {
@@ -231,7 +241,18 @@ const API = {
                 }
                 throw new Error(I18n.__('sessionExpiredSignInAgain'));
             }
-            throw new Error(this.describeError(err, response));
+            // The throw stays one readable sentence, but the parts a caller may need to
+            // *act* on travel with it. A refusal that is really a question - the early
+            // clock-out warning - is indistinguishable from a refusal that is an answer
+            // once it has been flattened to a string.
+            const failure = new Error(this.describeError(err, response));
+            failure.status = response.status;
+            const detail = err && err.detail;
+            if (detail && typeof detail === 'object' && !Array.isArray(detail)) {
+                failure.errorCode = detail.error_code || null;
+                failure.detail = detail;
+            }
+            throw failure;
         }
         return response.json();
     },
@@ -276,6 +297,169 @@ const API = {
             return JSON.stringify(detail);
         }
         return `HTTP ${response.status}`;
+    }
+};
+
+// =====================================================================
+//  The printable half of a download
+// =====================================================================
+/**
+ * Reporting on paper - the PDF half of a download, for either role.
+ *
+ * Printed by the browser rather than generated on the server, and deliberately: no PDF
+ * library is pinned, no Arabic-capable font ships with one, and a sheet the browser draws
+ * already has the reader's own fonts and text direction right - in Cairo, in Muscat, on a
+ * machine whose fonts nobody configured. "Save as PDF" in that dialog is what writes the
+ * file, which is why nothing in this app ever writes a PDF itself.
+ *
+ * It lives here, between the two roles, because both of them print: the console's Shifts
+ * tab and the worker's own timesheet build different sheets, but the same three things
+ * have to be true of the paper - and the frame around the report is the same document
+ * either way, so this is also where a report sheet is *built* (``sheetHtml``).
+ */
+const PrintReport = {
+    //: The sheet this object put in the page, so it is the one taken back out. A
+    //: document-wide search for ``.print-sheet`` would also find one left behind by a
+    //: print whose dialog never closed.
+    _sheet: null,
+
+    /**
+     * The sheet itself, for either report: the title, what it covers, the table, what it
+     * adds up to, and the note that says which of those figures count.
+     *
+     * A report on paper is the same document twice over. Only the *content* is the
+     * report's own - the console's columns are the administrator's, the worker's are
+     * theirs - and the frame around it has to be identical, because it is the same piece
+     * of paper to whoever is holding it. Hand-built twice, the frame is how one screen
+     * ends up printing a sheet that says something subtly different about the same rule
+     * (the note at the foot, the arrow between two dates, the \"no rows\" sentence), and
+     * how a class the stylesheet knows about ends up on one sheet and not the other.
+     *
+     * ``title``, the ``meta`` lines, the ``columns`` and ``empty`` are plain text and are
+     * escaped here. Each cell of ``rows`` is the opposite on purpose: HTML the caller has
+     * already built and escaped, because building a cell is the one thing that is
+     * genuinely the report's own (a console cell is a badge with a tone, a worker's is a
+     * figure with a unit). ``totals`` is the same kind of hand-built HTML: a figure with
+     * the emphasis the report gives it.
+     */
+    sheetHtml({ title, meta, columns, rows, totals, empty, note }) {
+        const lines = (meta || []).filter(Boolean)
+            .map((line) => `<p class="print-sheet-meta">${UI.escapeHtml(line)}</p>`).join('');
+        const body = (rows || []).length > 0
+            ? `<table class="print-sheet-table">
+                    <thead><tr>${(columns || []).map((label) => `<th>${UI.escapeHtml(label)}</th>`).join('')}</tr></thead>
+                    <tbody>${rows.map((cells) => `<tr>${cells.map((cell) => `<td>${cell}</td>`).join('')}</tr>`).join('')}</tbody>
+               </table>`
+            : (empty ? `<p class="print-sheet-empty">${UI.escapeHtml(empty)}</p>` : '');
+        // The note is not a parameter of the report: it is the rule both reports are read
+        // under - only approved hours count - and a sheet that stated it differently would
+        // be describing different arithmetic. The company's own name is the same kind of
+        // thing, and is drawn by the same rule: on every sheet, because a timesheet handed
+        // to payroll belongs to somebody.
+        const foot = note || I18n.__('shiftsApprovedOnly');
+        return `${this.brandHtml()}<p class="print-sheet-title">${UI.escapeHtml(title)}</p>${lines}${body}
+            ${totals ? `<p class="print-sheet-totals">${totals}</p>` : ''}
+            <p class="print-sheet-note">${UI.escapeHtml(foot)}</p>`;
+    },
+
+    /**
+     * Whose document this is, at the top of the sheet: the company's name, its legal
+     * suffix and founding year, and its mark.
+     *
+     * Not a parameter of ``sheetHtml``, for the reason the note at the foot is not: a
+     * report is *this company's* report, and a sheet that could be built without it would
+     * be one that reaches payroll anonymously. The name and the mark come from the same
+     * ``BRAND`` record the login panel and the console rail draw (see ``Brand``), so a
+     * company that renamed itself prints its new name on the paper it already had, with no
+     * code change - which is the whole point of the settings row.
+     *
+     * Two details worth keeping:
+     *
+     * * **A line the company set to empty is not printed.** That is the difference between
+     *   ``null`` (nobody configured it, the shipped lockup prints) and ``''`` (the company
+     *   removed it) all the way out here on paper, and it is why these are filtered rather
+     *   than ``||``-ed onto a default;
+     * * **``dir="ltr"`` on the lockup.** A wordmark does not mirror: in an Arabic build
+     *   the page is RTL, and the trailing period of "INTERNATIONAL CO." is bidi-neutral, so
+     *   the browser would park it at the left of the Latin run. The login panel carries the
+     *   same note for the same reason.
+     *
+     * ``alt=""`` on the mark on purpose: the company's name is printed right beside it, and
+     * a screen reader describing the logo as well would say the same thing twice.
+     */
+    brandHtml() {
+        const lines = [BRAND.name, BRAND.legal, BRAND.est, BRAND.tagline]
+            .map((line) => String(line === null || line === undefined ? '' : line).trim());
+        const [name, legal, est, tagline] = lines;
+        const under = [legal, est].filter(Boolean).join(' · ');
+        const lockup = [
+            name ? `<p class="print-sheet-company">${UI.escapeHtml(name)}</p>` : '',
+            under ? `<p class="print-sheet-sub">${UI.escapeHtml(under)}</p>` : '',
+            tagline ? `<p class="print-sheet-tagline">${UI.escapeHtml(tagline)}</p>` : ''
+        ].join('');
+        const mark = BRAND.mark
+            ? `<img class="print-sheet-mark" src="${UI.escapeHtml(BRAND.mark)}" alt="">`
+            : '';
+        // Nothing configured at all - every line removed and no mark - is a company that
+        // has said so, and a titled header with nothing in it is worse than no header.
+        if (!mark && !lockup) return '';
+        return `<header class="print-sheet-brand">${mark}<div class="print-sheet-lockup" dir="ltr">${lockup}</div></header>`;
+    },
+
+    /**
+     * "Period: 2026-08-01 → 2026-08-31", the line both sheets say it on.
+     *
+     * One label, one arrow, one separator - so two reports printed from the same month
+     * cannot describe it two ways - and it is built left to right like the rest of the
+     * page, which is what a reader of an RTL build expects of a date range that is
+     * mirroring around it. ``extra`` is what the sheet was narrowed to, in plain text.
+     */
+    periodLine(period, extra) {
+        const range = `${(period && period.start) || ''} → ${(period && period.end) || ''}`;
+        return `${I18n.__('shiftsPeriod')}: ${range}${extra ? ` · ${extra}` : ''}`;
+    },
+
+    /**
+     * Prints ``html`` as the whole document, named ``filename`` in the dialog.
+     *
+     * The page behind it is still on screen, and the stylesheet is what takes it out of
+     * the paper: ``body.is-printing-report`` hides everything that is not the sheet, and
+     * only while a sheet is being printed - so a plain Ctrl+P on the page still prints
+     * the page.
+     *
+     * Cleanup waits for ``afterprint``. Firefox and Safari render the sheet *after*
+     * ``print()`` returns, so emptying it here would hand the reader a blank page. The
+     * listener takes itself off, because one per print would pile up on ``window`` for as
+     * long as the tab lives, each restoring a title that is no longer the tab's.
+     */
+    sheet(html, filename) {
+        this.clear();
+        const node = document.createElement('div');
+        node.className = 'print-sheet';
+        node.innerHTML = html;
+        document.body.appendChild(node);
+        this._sheet = node;
+        document.body.classList.add('is-printing-report');
+        // The dialog names the file after the document title, so the title carries the
+        // period exactly as the CSV's own file name does - and no extension, because the
+        // dialog appends one: a title already ending in ".pdf" saves as "....pdf.pdf".
+        const screenTitle = document.title;
+        document.title = filename;
+        const afterPrint = () => {
+            window.removeEventListener('afterprint', afterPrint);
+            document.title = screenTitle;
+            this.clear();
+        };
+        window.addEventListener('afterprint', afterPrint);
+        window.print();
+    },
+
+    /** Take the sheet back out, and the page back out of the way of nothing. */
+    clear() {
+        document.body.classList.remove('is-printing-report');
+        const node = this._sheet;
+        this._sheet = null;
+        if (node && typeof node.remove === 'function') node.remove();
     }
 };
 
@@ -363,6 +547,23 @@ const Camera = {
         State.mediaStream = stream;
         return stream;
     },
+    /**
+     * The frame on screen, as a JPEG. The one step every capture path shares.
+     *
+     * What the bytes are *for* differs - a punch posts them to the punch endpoint, the
+     * console's Credentials tab posts them as the reference photo the punches will be
+     * matched against - but turning a live video element into bytes is the same three lines
+     * either way, and two copies of it is how one path starts sending a full-resolution
+     * frame while the other sends something cropped or re-compressed.
+     */
+    async snapshot(video) {
+        const canvas = document.createElement('canvas');
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        canvas.getContext('2d').drawImage(video, 0, 0);
+        return new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.9));
+    },
+
     explain(error) {
         const name = error && error.name;
         if (name === 'NotAllowedError' || name === 'SecurityError') {
@@ -406,6 +607,9 @@ const ADMIN_ICONS = {
     admin: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h8M16 6h4M4 12h4M12 12h8M4 18h8M16 18h4"></path><circle cx="14" cy="6" r="2"></circle><circle cx="10" cy="12" r="2"></circle><circle cx="14" cy="18" r="2"></circle></svg>',
     info: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="M12 11v5"></path><path d="M12 8h.01"></path></svg>',
     alert: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.3 4.3 2.6 17.5A2 2 0 0 0 4.3 20.5h15.4a2 2 0 0 0 1.7-3L13.7 4.3a2 2 0 0 0-3.4 0Z"></path><path d="M12 9v4"></path><path d="M12 16.5h.01"></path></svg>',
+    // A bell rather than the triangle: the triangle is the "late" badge on the shift board,
+    // and an Alerts tab that wears the same glyph as a late shift reads as one more board.
+    alerts: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 9a6 6 0 1 0-12 0c0 4.5-1.2 5.8-2 7h16c-.8-1.2-2-2.5-2-7Z"></path><path d="M10 19.5a2 2 0 0 0 4 0"></path></svg>',
     theme: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5Z"></path></svg>',
     logout: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3"></path><path d="M10 8l-4 4 4 4"></path><path d="M6 12h9"></path></svg>'
 };
@@ -466,7 +670,13 @@ function codeLabel(namespace, code) {
 //: SVG rather than the supplied PNG because that PNG carries its own dark-green
 //: rectangle - which would be a second, slightly-off green on the login panel, and a
 //: green box on the console's rail. See frontend/logo-mark.svg for the geometry.
-const BRAND = {
+//:
+//: This is what the application *ships with*, and for a deployment that never opens the
+//: Company panel it is also what every screen prints, byte for byte. What the company
+//: actually configured lives in the server's settings row and is merged over these values
+//: by ``Brand`` below - so ``BRAND`` is the record every screen and every sheet reads, and
+//: there is exactly one of it.
+const BRAND_DEFAULTS = {
     name: 'AL-JEHAD',
     legal: 'INTERNATIONAL CO.',
     est: 'EST 1983',
@@ -474,8 +684,128 @@ const BRAND = {
     mark: 'logo-mark.svg',
     //: The vendor whose software this is, credited at the foot of every page. A wordmark
     //: like the company's, so it is the same string in all three languages; ``poweredBy``
-    //: in i18n.js is only the words around it.
+    //: in i18n.js is only the words around it. Not a setting: this is whose product it is,
+    //: which is not something the customer decides.
     poweredBy: 'دوامك اسهل'
+};
+
+//: The lockup as the whole app reads it - login panel, handset header, console rail, every
+//: printed sheet. Mutated **in place** by ``Brand`` rather than replaced, so a screen that
+//: holds a reference to it (or a template string that read it a line earlier) cannot be
+//: reading yesterday's copy.
+const BRAND = { ...BRAND_DEFAULTS };
+
+/**
+ * Whose company this is, as configured on the server - and it is not a constant any more.
+ *
+ * The name, the legal suffix, the founding year, the tagline and the mark used to be the
+ * object above: a code change and a redeploy to rename the company, and a company that
+ * wanted its own logo at the top of the sheet it hands to payroll got the shipped one. They
+ * are a settings row now (``company_settings``), edited on the console's Admin tab beside
+ * the shift rules, and this is the one place that turns that row into what the app draws.
+ *
+ * THREE THINGS IT IS CAREFUL ABOUT
+ * --------------------------------
+ * * **It never blocks the first paint.** ``load`` is not awaited: the cache is applied
+ *   synchronously before the first render, and the network answer only corrects what
+ *   changed since - because a login screen that waits for a cell tower to tell it the
+ *   company's name is worse than a name that lands a moment later. The one exception is
+ *   ``restore`` with a warm cache, which is right before anything is drawn at all.
+ * * **``null`` and ``''`` are different answers.** The server sends ``null`` for a line
+ *   nobody configured (the shipped lockup prints) and ``''`` for one the company deleted
+ *   (nothing prints there). Flattening them would put a legal suffix back on the sheet of
+ *   a company that deliberately removed it.
+ * * **The mark is a URL, not a file name.** A configured logo is served by the API, so it
+ *   is resolved against ``API.baseURL`` - the page may be on a LAN address, a chosen port
+ *   or a tunnel, and only this browser knows which origin it is talking to. The version
+ *   travels in the query string the server sent, so a replaced logo is a different URL.
+ */
+const Brand = {
+    //: Where the last answer from the server is kept. A reload with a warm cache draws the
+    //: company's own name immediately, and an offline handset still shows it.
+    KEY: 'branding',
+
+    cached() {
+        try {
+            const raw = localStorage.getItem(this.KEY);
+            return raw ? JSON.parse(raw) : null;
+        } catch (error) {
+            // A cached lockup that cannot be parsed is not a reason to fail a boot.
+            return null;
+        }
+    },
+
+    remember(data) {
+        try {
+            localStorage.setItem(this.KEY, JSON.stringify(data));
+        } catch (error) {
+            // Private mode, or a full quota. The lockup is on screen either way.
+        }
+    },
+
+    /**
+     * Merges one server answer (or one cache entry) into ``BRAND``, and says whether
+     * anything changed - the caller repaints only when it did.
+     */
+    apply(data) {
+        let changed = false;
+        const lines = ['name', 'legal', 'est', 'tagline'];
+        for (const key of lines) {
+            const stored = data ? data[key] : null;
+            const value = (stored === null || stored === undefined) ? BRAND_DEFAULTS[key] : String(stored);
+            if (BRAND[key] !== value) {
+                BRAND[key] = value;
+                changed = true;
+            }
+        }
+        const logo = data && data.logo_url ? String(data.logo_url) : null;
+        const mark = logo ? `${API.baseURL}${logo}` : BRAND_DEFAULTS.mark;
+        if (BRAND.mark !== mark) {
+            BRAND.mark = mark;
+            changed = true;
+        }
+        return changed;
+    },
+
+    /** The last known settings, synchronously. Called before the first render. */
+    restore() {
+        return this.apply(this.cached());
+    },
+
+    /**
+     * The company's name as prose rather than as a wordmark: "AL-JEHAD INTERNATIONAL CO.".
+     *
+     * The lockup's two lines carry a line break that only the artwork knows about, so a
+     * sentence that names the company has to join them itself. Either being empty is fine -
+     * a company with no legal suffix is one wordmark - and both being empty is a login
+     * footer that does not pretend to know whose app this is.
+     */
+    fullName() {
+        return [BRAND.name, BRAND.legal]
+            .map((part) => String(part === null || part === undefined ? '' : part).trim())
+            .filter(Boolean)
+            .join(' ');
+    },
+
+    /**
+     * Asks the server whose company this is. Returns whether it changed anything.
+     *
+     * A failure - offline, a tunnel that is down, a server that has not been migrated yet -
+     * is not an error the reader needs to see: the lockup on screen is the last one that was
+     * known, which on a first visit is the shipped one. Nothing about a name is worth an
+     * alarm on the login screen.
+     */
+    async load() {
+        let data = null;
+        try {
+            data = await API.request('/branding');
+        } catch (error) {
+            return false;
+        }
+        if (!data) return false;
+        this.remember(data);
+        return this.apply(data);
+    }
 };
 
 //  The array order is the order the tabs were built in, and it is what the
@@ -486,6 +816,10 @@ const BRAND = {
 const ADMIN_TABS = [
     { id: 'Live Ops', key: 'activeShifts', hint: 'hintLiveOps', group: 'navGroupOperations', icon: 'liveOps' },
     { id: 'Approvals', key: 'pendingReviews', hint: 'hintApprovals', group: 'navGroupOperations', icon: 'approvals' },
+    // What the server has written for an administrator, and - for the ones that record a
+    // decision - what nobody has accepted yet. Sits beside Approvals because both are queues
+    // waiting on a person, and this is the one whose items nobody typed.
+    { id: 'Alerts', key: 'adminAlerts', hint: 'hintAlerts', group: 'navGroupOperations', icon: 'alerts' },
     { id: 'Sites', key: 'sites', hint: 'hintSites', group: 'navGroupConfig', icon: 'sites' },
     { id: 'Shifts', key: 'shifts', hint: 'hintShifts', group: 'navGroupConfig', icon: 'shifts' },
     // Was three tabs - Users, Pass, Enroll - of which only one did anything: the Users
@@ -548,11 +882,79 @@ const UI = {
         // work without a reload - the app itself never navigates.
         this.applyShiftsLink();
         window.addEventListener('hashchange', () => this.applyShiftsLink());
+        // Whose company this is: the cache first, so a reload draws the company's own
+        // name on the very first paint, then the settings row when it answers. Both are
+        // deliberately not awaited - see ``Brand`` - and the repaint is skipped when
+        // somebody has already started typing.
+        Brand.restore();
+        Brand.load().then((changed) => { if (changed) this.repaintAfterBrand(); }).catch(() => {});
         this.renderApp();
         // Registers this phone as a signing device, refreshes the server-signed time
         // anchor and drains anything left queued from a previous offline stint.
         // Deliberately not awaited: it must never delay the first paint.
         if (typeof OFFLINE !== 'undefined') OFFLINE.init().catch(() => {});
+        // The push channel's service worker registers here rather than at the moment
+        // a worker first enables notifications, so the first enable is one tap instead
+        // of a tap plus a registration wait on a site's cellular link. It registers
+        // for everybody including admins (any account can hold a subscription); no
+        // permission is requested here - that is the switch on the profile tab, and a
+        // prompt fired at boot is how an app teaches people to refuse.
+        if (typeof WORKER_MODULES !== 'undefined') WORKER_MODULES.initPush().catch(() => {});
+        // A push tapped with the app closed lands here: the worker has no way to say
+        // "that one" except through this message, and marking it read is what makes
+        // the badge agree with the lock screen they just cleared.
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.addEventListener('message', (event) => {
+                const data = event.data || {};
+                if (data.type !== 'alert-clicked' || data.id == null) return;
+                WORKER_MODULES.markAlertRead(String(data.id)).catch(() => {});
+            });
+        }
+        // A notice read on *another* device is the one read this tab cannot hear about - the
+        // message above only covers a push tapped in this tab - so coming back to the tab is
+        // the moment the badge is re-read. Both events are watched because they are not the
+        // same one: ``visibilitychange`` fires when the page is hidden and shown (a phone
+        // locked and unlocked), ``focus`` when the window is returned to without the page
+        // ever being hidden (a desktop alt-tab). ``resyncUnreadBadge`` collapses the pair.
+        this.bindUnreadResync();
+    },
+
+    //: Set once: ``init`` runs a single time in production, but the suites call it on several
+    //: environments, and a second ``focus`` listener would ask the server twice per return.
+    _unreadResyncBound: false,
+
+    /** Watch for the tab being returned to, so the unread badge can be re-read. */
+    bindUnreadResync() {
+        if (this._unreadResyncBound) return;
+        this._unreadResyncBound = true;
+        if (typeof window !== 'undefined' && window.addEventListener) {
+            window.addEventListener('focus', () => this.resyncUnreadBadge());
+        }
+        if (typeof document !== 'undefined' && document.addEventListener) {
+            document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState !== 'hidden') this.resyncUnreadBadge();
+            });
+        }
+    },
+
+    /**
+     * Draws again with the company's own name, once the settings row has answered.
+     *
+     * A first visit on a cold cache paints the shipped lockup and corrects it a moment
+     * later; a second visit paints the configured one immediately and never gets here.
+     * The one thing not worth a company's name is losing what somebody has typed, so a
+     * panel with a filled-in field keeps its values - and is drawn correctly on the next
+     * navigation, because by then the answer is in the cache either way.
+     */
+    repaintAfterBrand() {
+        if (this.isMidEntry()) return;
+        this.renderApp();
+    },
+
+    /** Whether any field on screen already holds something somebody typed. */
+    isMidEntry() {
+        const fields = document.querySelectorAll('#app input, #app textarea, #app select');
+        return Array.prototype.some.call(fields, (field) => String(field.value || '') !== '');
     },
 
     renderApp() {
@@ -561,7 +963,18 @@ const UI = {
             container.className = '';
             return this.renderLogin();
         }
-        if (State.user.role === 'worker') return this.renderWorkerPortal();
+        // A ``worker`` belongs on the handset and nowhere else, and a ``moallem`` with them:
+        // a lead worker is not a console operator here - every ``/admin/*`` endpoint refuses
+        // that role (``admin_only`` names ``admin`` and ``head_admin``) - so the console was
+        // a screen of failing requests for them, and the handset, where they clock in and
+        // read their own hours exactly like a worker, is the one screen they can use.
+        if (State.user.role === 'worker' || State.user.role === 'moallem') {
+            return this.renderWorkerPortal();
+        }
+        // An administrator reaches the console by default and steps onto the handset from it:
+        // ``handsetMode`` is set only through ``openHandset()``, which refuses a role that
+        // cannot clock in, so the two ways onto this screen are one rule that cannot drift.
+        if (State.handsetMode && this.canOpenHandset()) return this.renderWorkerPortal();
         return this.renderAdminConsole();
     },
 
@@ -575,13 +988,138 @@ const UI = {
      * of its own - the login screen's company line, the handset's page, the console's
      * frame - and a ``<footer>`` inside a ``<footer>`` is not a landmark, it is invalid.
      */
+    // -----------------------------------------------------------------
+    //  The console, and the handset an administrator may step onto
+    // -----------------------------------------------------------------
+    //: Roles that run the console *and* work a shift of their own. ``worker`` is absent
+    //: because the handset is already where it lives, and ``head_admin`` is absent on
+    //: purpose: it is the role that owns the deployment rather than a rota. Adding one
+    //: here is the whole change - every control below reads this list.
+    handsetRoles: ['admin'],
+
+    /** Does this account reach the console but still clock in? */
+    canOpenHandset() {
+        return this.handsetRoles.includes((State.user || {}).role);
+    },
+
+    /**
+     * Leave the console for the clock.
+     *
+     * This is not a second, lighter flow: an administrator who works a site gets the
+     * identical punch card a worker gets - the same geofence, the same liveness check and
+     * the same face match against their own enrolled template - because the record has to
+     * rest on the same evidence whoever the worker is. The role buys nothing at the gate.
+     */
+    openHandset() {
+        if (!this.canOpenHandset()) return;
+        State.handsetMode = true;
+        this.renderApp();
+    },
+
+    /** Back to the console, releasing the camera the punch card had open. */
+    closeHandset() {
+        State.handsetMode = false;
+        State.stopCamera();
+        this.renderApp();
+    },
+
+    /** The way from the console to the clock, for the roles that have one. */
+    handsetButtonHtml() {
+        if (!this.canOpenHandset()) return '';
+        return `<button type="button" class="ui-btn ui-btn-sm" data-open-handset="true" title="${this.escapeHtml(I18n.__('handsetHint'))}">${HAND_ICONS.clock}<span>${this.escapeHtml(I18n.__('clockIn'))}</span></button>`;
+    },
+
+    /**
+     * One listener each for the two controls that move between the console and the
+     * handset.
+     *
+     * Bound on the elements that were just rendered, like ``bindWorkerTabs``, so a repaint
+     * cannot leave a second listener behind. Deliberate rather than an ``onclick``: the
+     * document policy still allows inline event attributes only because the console has
+     * them at 86 call sites, and that allowance is exactly what an injected
+     * ``<img onerror>`` needs. ``tests/test_frontend_xss.py`` pins the count per file and
+     * refuses a rise, so a new button is bound here instead.
+     */
+    bindHandsetControls(root) {
+        const scope = root || document;
+        const bind = (selector, run) => {
+            const button = typeof scope.querySelector === 'function' ? scope.querySelector(selector) : null;
+            if (!button || typeof button.addEventListener !== 'function') return;
+            button.addEventListener('click', (event) => {
+                event.preventDefault();
+                run.call(this);
+            });
+        };
+        bind('[data-open-handset]', this.openHandset);
+        bind('[data-close-handset]', this.closeHandset);
+    },
+
+    /** A role code in the reader's own language. */
+    roleLabel(role) {
+        const keys = {
+            worker: 'roleWorker',
+            moallem: 'roleMoallem',
+            admin: 'roleAdmin',
+            head_admin: 'roleHeadAdmin'
+        };
+        return keys[role] ? I18n.__(keys[role]) : String(role || '');
+    },
+
+    /**
+     * The way back to the console, on the handset's own header.
+     *
+     * Only for an administrator who stepped out here. A worker has no console to return
+     * to, and a button that promised one would be a dead end on their screen.
+     */
+    closeHandsetButtonHtml() {
+        if (!State.handsetMode || !this.canOpenHandset()) return '';
+        return `<button type="button" class="icon-button" data-close-handset="true" aria-label="${this.escapeHtml(I18n.__('backToConsole'))}" title="${this.escapeHtml(I18n.__('backToConsole'))}">${ADMIN_ICONS.admin}</button>`;
+    },
+
     creditHtml() {
         const line = I18n.__('poweredBy').replace('{brand}', BRAND.poweredBy);
         return `<p class="app-credit">${this.escapeHtml(line)}</p>`;
     },
 
+    /**
+     * The company's four lines as the login panel draws them.
+     *
+     * A line the company emptied is **not drawn**, which is the visible half of the rule the
+     * settings row stores: ``''`` means "this line is not printed", and a paragraph that
+     * exists to hold nothing is a blank row in the middle of the lockup - the same reason the
+     * printed sheet omits it. ``null`` never reaches here; it was resolved to the shipped
+     * line when the settings were merged (see ``Brand``).
+     */
+    loginLockupHtml() {
+        const lines = [
+            ['login-company', BRAND.name],
+            ['login-legal', BRAND.legal],
+            ['login-est', BRAND.est],
+            ['login-tagline', BRAND.tagline]
+        ];
+        return lines
+            .filter(([, value]) => String(value === null || value === undefined ? '' : value).trim() !== '')
+            .map(([className, value]) => `<p class="${className}">${this.escapeHtml(value)}</p>`)
+            .join('');
+    },
+
+    /**
+     * The sentence at the foot of the login screen, naming the company this is running for.
+     *
+     * It used to be a translated constant with the name typed into it, which is how the one
+     * screen whose job is to say whose app this is would have gone on naming the old company
+     * after a rename. The prose stays in the translation tables; the name in it is the
+     * company's own, and a company that removed both of its lockup lines gets no sentence
+     * rather than one that cannot say whose it is.
+     */
+    companyFooterHtml() {
+        const name = Brand.fullName();
+        if (!name) return '';
+        return this.escapeHtml(I18n.__('companyFooter').replace('{brand}', name));
+    },
+
     langSelectHtml() {
-        const options = [['en', 'EN'], ['ar', 'AR'], ['hi', 'HI']];
+        const options = [['en', 'EN'], ['ar', 'AR'], ['hi', 'HI'], ['ur', 'UR']];
         return `<select onchange="I18n.setLang(this.value)" class="icon-button" style="width:auto;padding:0 8px" aria-label="${I18n.__('lang')}">
             ${options.map(([code, label]) =>
                 `<option value="${code}" ${I18n.lang === code ? 'selected' : ''}>${label}</option>`).join('')}
@@ -607,17 +1145,12 @@ const UI = {
             <main class="login-stage">
                 <section class="login-card">
                     <div class="login-brand">
-                        <img class="login-mark" src="${BRAND.mark}" alt="" width="78" height="103" decoding="async">
+                        <img class="login-mark" src="${this.escapeHtml(BRAND.mark)}" alt="" width="78" height="103" decoding="async">
                         <!-- dir="ltr" is load-bearing: in Arabic the page is RTL, and a
                              trailing period on "INTERNATIONAL CO." is bidi-neutral, so the
                              browser parks it at the *left* of the Latin run. A logo does
                              not mirror. -->
-                        <div class="login-lockup" dir="ltr">
-                            <p class="login-company">${this.escapeHtml(BRAND.name)}</p>
-                            <p class="login-legal">${this.escapeHtml(BRAND.legal)}</p>
-                            <p class="login-est">${this.escapeHtml(BRAND.est)}</p>
-                            <p class="login-tagline">${this.escapeHtml(BRAND.tagline)}</p>
-                        </div>
+                        <div class="login-lockup" dir="ltr">${this.loginLockupHtml()}</div>
                     </div>
                     <div class="login-form-panel">
                         <div>
@@ -644,7 +1177,7 @@ const UI = {
                     </div>
                 </section>
             </main>
-            <footer class="login-footer">${this.escapeHtml(I18n.__('companyFooter'))}${this.creditHtml()}</footer>`;
+            <footer class="login-footer">${this.companyFooterHtml()}${this.creditHtml()}</footer>`;
         document.getElementById('loginForm').addEventListener('submit', async (e) => {
             e.preventDefault();
             const button = e.target.querySelector('button');
@@ -700,9 +1233,10 @@ const UI = {
             <span class="hand-brand" aria-hidden="true"><img src="${BRAND.mark}" alt=""></span>
             <div class="hand-who">
                 <p class="hand-who-name">${this.escapeHtml(State.user.name || '')}</p>
-                <p class="hand-who-role">${this.escapeHtml(I18n.__(State.user.role === 'moallem' ? 'roleMoallem' : 'roleWorker'))}</p>
+                <p class="hand-who-role">${this.escapeHtml(this.roleLabel(State.user.role))}</p>
             </div>
             <div class="hand-actions">
+                ${this.closeHandsetButtonHtml()}
                 ${this.langSelectHtml()}
                 <button type="button" onclick="UI.toggleTheme()" class="icon-button" aria-label="${this.escapeHtml(I18n.__('theme'))}">${ADMIN_ICONS.theme}</button>
                 <button type="button" onclick="UI.logout()" class="icon-button" aria-label="${this.escapeHtml(I18n.__('logout'))}">${ADMIN_ICONS.logout}</button>
@@ -711,13 +1245,17 @@ const UI = {
 
     //: The worker's bottom tabs. ``notes`` is the written channel to the admin: a
     //: password request, a missing item, a question about hours - each of which used to
-    //: require catching somebody on the phone, and then leaving no record of it.
-    workerTabIds: ['clock', 'history', 'notes', 'profile'],
+    //: require catching somebody on the phone, and then leaving no record of it. ``alerts``
+    //: is the other direction, and the newer of the two: what the *system* has told the
+    //: worker, which until now had nowhere to land - a push went to a phone that had never
+    //: subscribed, and the record behind it was readable by nobody.
+    workerTabIds: ['clock', 'history', 'alerts', 'notes', 'profile'],
 
     workerTabBarHtml() {
         const tabs = [
             { id: 'clock', icon: 'clock', label: I18n.__('clock') },
             { id: 'history', icon: 'history', label: I18n.__('history') },
+            { id: 'alerts', icon: 'alert', label: I18n.__('alerts') },
             { id: 'notes', icon: 'notes', label: I18n.__('notes') },
             { id: 'profile', icon: 'profile', label: I18n.__('profile') }
         ];
@@ -732,8 +1270,73 @@ const UI = {
                         ${State.workerTab === tab.id ? 'aria-current="page"' : ''}>
                     ${HAND_ICONS[tab.icon]}
                     <span>${this.escapeHtml(tab.label)}</span>
+                    ${this.alertTabBadgeHtml(tab.id)}
                 </button>`).join('')}
         </nav>`;
+    },
+
+    /**
+     * The unread count, on the alerts tab's icon.
+     *
+     * A number in the corner rather than a dot: "there is something" is not the useful
+     * half of it - how much is waiting is what decides whether this is worth reading now.
+     * It sits over the icon because a numeral appended to the tab's word would push the
+     * word off the bar's centre line, and the tab bar is a grid of equal columns.
+     *
+     * ``aria-hidden`` on purpose. The button's accessible name is the tab's label, and
+     * "Alerts 3" announced as the name of the tab is not what the tab is called; the count
+     * reaches a screen reader in a sentence that says what it is counting - the banner on
+     * the clock panel, which is a button reading "3 new alerts, <the newest one>, See all".
+     */
+    alertTabBadgeHtml(tabId) {
+        const count = (typeof WORKER_MODULES === 'undefined' || tabId !== 'alerts')
+            ? 0 : Math.max(0, Number(WORKER_MODULES.alertCount) || 0);
+        if (count <= 0) return '';
+        return `<span class="hand-tab-count" data-alert-count="${count}" aria-hidden="true">${
+            count > 99 ? '99+' : count}</span>`;
+    },
+
+    /**
+     * The tab bar redrawn where it stands.
+     *
+     * The bar is painted from one string that reads the current tab and the current count,
+     * so anything that changes either has the same three lines to run. Called by tab
+     * switches and by the alerts count arriving - a badge that only appeared after the next
+     * tab switch would be a badge nobody sees.
+     */
+    repaintWorkerTabBar() {
+        const nav = document.querySelector('.hand-tabs');
+        if (!nav) return;
+        nav.outerHTML = this.workerTabBarHtml();
+        this.bindWorkerTabs(this.appContainer);
+    },
+
+    //: When the unread count was last re-read on returning to this tab, so the pair of events
+    //: that one return produces (``visibilitychange`` and ``focus``) costs one request.
+    _alertsResyncedAt: 0,
+
+    /**
+     * Re-read the unread count when this tab comes back into view.
+     *
+     * The badge is a number from the moment it was last fetched, and a notice can be read
+     * somewhere else entirely: a push tapped on the worker's other phone, a shift closed by an
+     * administrator. This tab has no way to hear about that, so a number painted before the
+     * phone was put down would point at an inbox that is already empty. Returning to the tab
+     * is that moment, and the count is re-asked rather than remembered.
+     *
+     * The handset is the only screen with a badge, so this asks nothing on the console or the
+     * sign-in screen. A failure is silence, for the same reason it is on the clock panel: a
+     * count that cannot be read is not worth an error on a phone at a gate, and the badge keeps
+     * whatever it last said rather than being cleared on a guess.
+     */
+    resyncUnreadBadge() {
+        const worker = !!State.user && (State.user.role === 'worker' || State.user.role === 'moallem');
+        if (!State.token || !(worker || State.handsetMode)) return;
+        if (typeof WORKER_MODULES === 'undefined' || !WORKER_MODULES.refreshAlerts) return;
+        const now = Date.now();
+        if (now - this._alertsResyncedAt < 1000) return;
+        this._alertsResyncedAt = now;
+        WORKER_MODULES.refreshAlerts().catch(() => {});
     },
 
     /** One listener for the whole tab bar, so a tab needs no inline handler. */
@@ -767,6 +1370,7 @@ const UI = {
             <footer class="hand-credit">${this.creditHtml()}</footer>
         `;
         this.bindWorkerTabs(container);
+        this.bindHandsetControls(container);
         await this.renderWorkerView(State.workerTab);
     },
 
@@ -784,6 +1388,12 @@ const UI = {
                     <div class="hand-card"><div id="devicePanel"></div></div>
                 </div>
                 <div class="hand-desk-col">
+                    ${/* The inbox leads the column on a desk, because it is the only thing on
+                         this screen that is addressed to the reader rather than recorded about
+                         them - and on a wide screen there is room to show it open rather than
+                         behind a tab. Read notices stay in the list: the point of the record is
+                         that it is still there next week. */ ''}
+                    <section class="hand-card"><div id="workerAlerts"></div></section>
                     <section class="hand-card">
                         <div class="hand-section-head">
                             <h3 class="hand-section-title">${this.escapeHtml(I18n.__('timesheetHistory'))}</h3>
@@ -791,13 +1401,21 @@ const UI = {
                         <div id="historyTable">${this.loadingHtml()}</div>
                     </section>
                     <section class="hand-card"><div id="workerNotes"></div></section>
+                    <section class="hand-card"><div id="pushSettings"></div></section>
                 </div>
             </div>
             <footer class="hand-credit is-desk">${this.creditHtml()}</footer>
         `;
+        this.bindHandsetControls(container);
         await WORKER_MODULES.renderClockPanel(document.getElementById('workerDashboard'));
+        await WORKER_MODULES.renderAlerts(document.getElementById('workerAlerts'));
         await WORKER_MODULES.renderHistory(document.getElementById('historyTable'));
         await WORKER_MODULES.renderNotes(document.getElementById('workerNotes'));
+        const pushHost = document.getElementById('pushSettings');
+        if (pushHost) {
+            pushHost.innerHTML = WORKER_MODULES.pushSettingsHtml();
+            WORKER_MODULES.bindPushSettings(pushHost);
+        }
         this.renderDevicePanel(document.getElementById('devicePanel'));
     },
 
@@ -806,9 +1424,7 @@ const UI = {
         if (Device.isMobile) {
             // The bar is repainted from the same source that drew it, so the aria-current
             // and what is on screen cannot disagree after a tab switch.
-            const nav = document.querySelector('.hand-tabs');
-            if (nav) nav.outerHTML = this.workerTabBarHtml();
-            this.bindWorkerTabs(this.appContainer);
+            this.repaintWorkerTabBar();
             this.renderWorkerView(tab);
         } else {
             this.renderWorkerPortal();
@@ -822,12 +1438,23 @@ const UI = {
         if (tab === 'history') {
             main.innerHTML = `<div id="historyTable"></div>`;
             await WORKER_MODULES.renderHistory(document.getElementById('historyTable'));
+        } else if (tab === 'alerts') {
+            main.innerHTML = `<div id="workerAlerts"></div>`;
+            await WORKER_MODULES.renderAlerts(document.getElementById('workerAlerts'));
         } else if (tab === 'notes') {
             main.innerHTML = `<div id="workerNotes"></div>`;
             await WORKER_MODULES.renderNotes(document.getElementById('workerNotes'));
         } else if (tab === 'profile') {
-            main.innerHTML = `<div id="workerProfile"></div><div id="devicePanel"></div>`;
+            main.innerHTML = `<div id="workerProfile"></div><div id="pushSettings"></div><div id="devicePanel"></div>`;
             this.renderWorkerProfile(document.getElementById('workerProfile'));
+            // The push card is bound to its own host rather than the profile's: two
+            // delegated listeners on one ancestor would both answer a tap, and the
+            // card re-renders in place while the account card does not.
+            const pushHost = document.getElementById('pushSettings');
+            if (pushHost) {
+                pushHost.innerHTML = WORKER_MODULES.pushSettingsHtml();
+                WORKER_MODULES.bindPushSettings(pushHost);
+            }
             this.renderDevicePanel(document.getElementById('devicePanel'));
         } else {
             main.innerHTML = `<div id="workerDashboard"></div><div id="devicePanel"></div>`;
@@ -1168,7 +1795,7 @@ const UI = {
         document.getElementById('captureBtn').addEventListener('click', () => this.submitAttendance(action, coords));
     },
 
-    async submitAttendance(action, coords) {
+    async submitAttendance(action, coords, confirmedEarly = false) {
         const video = document.getElementById('attendanceVideo');
         const captureButton = document.getElementById('captureBtn');
         // The session is the credential, so this is the only check in front of the punch.
@@ -1186,12 +1813,7 @@ const UI = {
         }
 
         captureButton.disabled = true;
-        const canvas = document.createElement('canvas');
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-        canvas.getContext('2d').drawImage(video, 0, 0);
-
-        const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.9));
+        const blob = await Camera.snapshot(video);
         // A geofence is a claim about *now*, and the fix taken when the camera card opened
         // can be stale by the time the shutter is pressed. Re-sending it made a rejected
         // punch only ever repeatable: the worker walked inside the gate, tapped the shutter
@@ -1206,6 +1828,9 @@ const UI = {
         formData.append('action', action);
         formData.append('location_input', punchCoords);
         formData.append('selfie', blob, 'selfie.jpg');
+        // Only on the second attempt: the server decides whether a shift is short, and
+        // this is the phone saying the worker was told and meant it.
+        if (confirmedEarly) formData.append('confirm_early_checkout', '1');
 
         try {
             const res = await API.request('/attendance/verify', { method: 'POST', body: formData });
@@ -1218,6 +1843,17 @@ const UI = {
             }
             await this.renderApp();
         } catch (err) {
+            // The early clock-out warning is a question, not a refusal: the server stopped
+            // *before* it wrote a row or closed the shift, so answering it is just another
+            // punch. A cancel therefore costs the worker nothing but the tap - the shift,
+            // the hours and the open camera are all exactly as they were.
+            if (err && err.errorCode === 'confirm_early_checkout') {
+                captureButton.disabled = false;
+                if (await this.confirmEarlyClockOut(err.detail)) {
+                    return this.submitAttendance(action, coords, true);
+                }
+                return;
+            }
             if (await this.queueOfflinePunch(action, punchCoords, blob, err)) return;
             // A 401 here is always about the token - the account was deactivated, the
             // password was rotated, or another tab signed out - and ``API.request`` has
@@ -1234,6 +1870,37 @@ const UI = {
             Toast.error(`${I18n.__('attendanceError')}: ${err.message}`);
             captureButton.disabled = false;
         }
+    },
+
+    /**
+     * Ask before recording a shift that is short of the paid day.
+     *
+     * Resolves ``true`` when the worker chose to record it and ``false`` when they changed
+     * their mind. The numbers are the server's - it sent them with the refusal - so the
+     * sentence the worker reads on a site in Cairo says the same thing the record will.
+     */
+    confirmEarlyClockOut(detail) {
+        const paid = Number((detail && detail.paid_hours) || 0).toFixed(2);
+        const regular = Number((detail && detail.regular_hours) || 0).toFixed(2);
+        return new Promise((resolve) => {
+            Modal.open(`
+                <div class="ui-stack">
+                    <h3 class="ui-title">${I18n.__('earlyClockOutTitle')}</h3>
+                    <p class="ui-note is-body">${I18n.__('earlyClockOutBody')
+                        .replace('{paid}', paid)
+                        .replace('{regular}', regular)}</p>
+                    <div class="ui-pair">
+                        <button id="confirmEarlyOut" class="ui-btn ui-btn-primary is-grow">${I18n.__('earlyClockOutConfirm')}</button>
+                        <button id="cancelEarlyOut" class="ui-btn ui-btn-quiet is-grow">${I18n.__('cancel')}</button>
+                    </div>
+                </div>
+            `, { dismissible: false, overCamera: true });
+            // Not dismissible: the worker must choose. A backdrop tap that silently
+            // resolved the promise would leave a punch in limbo, neither sent nor cancelled.
+            const finish = (answer) => { Modal.close(); resolve(answer); };
+            document.getElementById('confirmEarlyOut').addEventListener('click', () => finish(true));
+            document.getElementById('cancelEarlyOut').addEventListener('click', () => finish(false));
+        });
     },
 
     /**
@@ -1679,13 +2346,13 @@ const UI = {
     adminIdentityHtml() {
         const user = State.user || {};
         const name = user.name || user.id || '';
-        const roleKey = { worker: 'roleWorker', moallem: 'roleMoallem', admin: 'roleAdmin', head_admin: 'roleHeadAdmin' }[user.role];
+        const role = this.roleLabel(user.role);
         return `
             <span class="admin-identity">
                 <span class="ops-avatar" aria-hidden="true">${this.escapeHtml(this.adminInitials(name))}</span>
                 <span class="admin-identity-text">
                     <span class="admin-identity-name">${this.escapeHtml(name)}</span>
-                    <span class="admin-identity-role">${this.escapeHtml(roleKey ? I18n.__(roleKey) : (user.role || ''))}</span>
+                    <span class="admin-identity-role">${this.escapeHtml(role)}</span>
                 </span>
             </span>`;
     },
@@ -1759,6 +2426,45 @@ const UI = {
             if (active) button.setAttribute('aria-current', 'page');
             else button.removeAttribute('aria-current');
         });
+        this.revealActiveConsoleTab();
+    },
+
+    /**
+     * Scroll the phone's tab strip far enough to show the tab that is lit up.
+     *
+     * Eight tabs come to about 820px and only about 290-360 of them fit on a handset,
+     * so the strip is a window onto a list that is mostly off screen - and nothing ever
+     * moved that window. Tapping "Admin", the last tab, left it at x=729 inside a 358px
+     * strip: the band kept showing "Active Shifts" while the pane below changed to a
+     * screen the header could no longer name. It is the same on a reload, whenever the
+     * remembered tab is not one of the first two.
+     *
+     * The strip is moved and nothing else - ``scrollIntoView`` scrolls the page as well,
+     * and on this screen that would yank the pane out from under the thumb that tapped.
+     * Instant, not smooth, for the same reason: the pane is being replaced in the same
+     * frame, and a strip still gliding into place afterwards reads as lag.
+     *
+     * ``move`` is a *visual* distance, so it needs no left-to-right branch: in a
+     * right-to-left strip (Arabic, Urdu) ``scrollLeft`` counts the other way and the
+     * arithmetic below lands on the same answer.
+     */
+    revealActiveConsoleTab() {
+        const strip = document.querySelector('.admin-tabs');
+        if (!strip) return; // the desktop rail does not scroll, and has no strip
+        const active = strip.querySelector('[aria-current="page"]');
+        if (!active) return;
+        const frame = strip.getBoundingClientRect();
+        const box = active.getBoundingClientRect();
+        if (!box.width || !frame.width) return;
+        // 14px of the neighbouring tab stays in view. It is the only affordance this
+        // strip has: tabs run to both edges, so a strip scrolled to the end looks
+        // exactly like a strip that does not scroll.
+        const margin = 14;
+        let move = 0;
+        if (box.left < frame.left + margin) move = box.left - frame.left - margin;
+        else if (box.right > frame.right - margin) move = box.right - frame.right + margin;
+        if (!move) return;
+        strip.scrollLeft += move;
     },
 
     renderAdminMobile() {
@@ -1767,24 +2473,26 @@ const UI = {
         const active = adminTabRecord(State.adminTab);
         container.innerHTML = `
             <header class="admin-mobile-head">
-                <div class="ui-spread" style="padding:10px 0 8px">
-                    <div class="ui-row" style="gap:10px;min-width:0">
+                ${this.adminNavHtml('strip')}
+            </header>
+            <div class="admin-frame">
+                <div class="admin-mobile-bar">
+                    <div class="admin-mobile-bar-lead">
                         <span class="admin-brand-mark" aria-hidden="true"><img src="${BRAND.mark}" alt="" width="18" height="24"></span>
                         <h2 class="admin-title" id="adminTitle">${this.escapeHtml(I18n.__(active.key))}</h2>
                     </div>
                     <div class="admin-actions">
+                        ${this.handsetButtonHtml()}
                         ${this.langSelectHtml()}
                         <button type="button" onclick="UI.toggleTheme()" class="icon-button" aria-label="${this.escapeHtml(I18n.__('theme'))}">${ADMIN_ICONS.theme}</button>
                         <button type="button" onclick="UI.logout()" class="icon-button" aria-label="${this.escapeHtml(I18n.__('logout'))}">${ADMIN_ICONS.logout}</button>
                     </div>
                 </div>
-                ${this.adminNavHtml('strip')}
-            </header>
-            <div class="admin-frame">
                 <p class="ui-hint admin-mobile-hint" id="adminSubtitle">${this.escapeHtml(I18n.__(active.hint))}</p>
                 <div id="adminContent" class="ui-surface"></div>
                 <footer class="admin-credit">${this.creditHtml()}</footer>
             </div>`;
+        this.bindHandsetControls(container);
     },
 
     renderAdminDesktop() {
@@ -1811,6 +2519,7 @@ const UI = {
                                 <p class="admin-subtitle" id="adminSubtitle">${this.escapeHtml(I18n.__(active.hint))}</p>
                             </div>
                             <div class="admin-actions">
+                                ${this.handsetButtonHtml()}
                                 ${this.adminIdentityHtml()}
                                 ${this.langSelectHtml()}
                                 <button type="button" onclick="UI.toggleTheme()" class="icon-button" aria-label="${this.escapeHtml(I18n.__('theme'))}">${ADMIN_ICONS.theme}</button>
@@ -1822,6 +2531,7 @@ const UI = {
                 </div>
                 <footer class="admin-credit">${this.creditHtml()}</footer>
             </div>`;
+        this.bindHandsetControls(container);
     },
 
     async renderAdminTab(tab) {
@@ -1844,6 +2554,7 @@ const UI = {
                 // because the panel's buttons call back into ``UI.forceIn()``.
                 case 'Live Ops': await UI_MODULES.renderLiveOps(content); break;
                 case 'Approvals': await UI_MODULES.renderApprovals(content); break;
+                case 'Alerts': await UI_MODULES.renderAlerts(content); break;
                 case 'Sites': await UI_MODULES.renderSites(content); break;
                 case 'Credentials': await UI_MODULES.renderCredentials(content); break;
                 case 'Links': await UI_MODULES.renderLinks(content); break;

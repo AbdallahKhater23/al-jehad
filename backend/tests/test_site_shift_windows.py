@@ -348,7 +348,7 @@ def test_the_helper_loaders_own_signature_works_on_a_plain_mapping():
 
 
 def test_the_defaults_cannot_make_anybody_late_by_accident():
-    assert shift_windows.DEFAULT_TIMEZONE == "Africa/Cairo", (
+    assert shift_windows.DEFAULT_TIMEZONE == "Asia/Kuwait", (
         "the fallback zone is a documented value: changing it silently moves every window at "
         "a site that has not configured one"
     )
@@ -391,9 +391,9 @@ def _hand_edit(app_module, column: str, value):
 def test_the_window_columns_are_additive_nullable_and_undefaulted():
     """NULL is the encoding of "this site has not chosen", and it is load-bearing.
 
-    A column default of 'Africa/Cairo' would have been written into every existing site by the
+    A column default of 'Asia/Kuwait' would have been written into every existing site by the
     migration, and a *set* timezone overrides the global one - so an installation whose global
-    zone is not Cairo would have had every site silently moved there on upgrade.
+    zone is not Kuwait would have had every site silently moved there on upgrade.
     """
     columns = _columns("construction_sites")
     for name in ("clock_in_window_start", "clock_in_window_end", "site_timezone"):
@@ -465,8 +465,12 @@ def test_the_schema_version_names_the_newest_migration():
 
     assert migrations.SCHEMA_VERSION == max(version for version, _, _ in migrations.MIGRATIONS)
     # Pinned as a number so that bumping the schema is a deliberate act with a test to update,
-    # rather than something that happens on the way past. (13 added ``retention_runs``.)
-    assert migrations.SCHEMA_VERSION == 13
+    # rather than something that happens on the way past. (13 added ``retention_runs``, 14 the
+    # worker notification tables, 15 ``users.report_columns``, 16 ``company_settings`` - the
+    # company's own name and mark, which the login panel and every printed sheet read - 17
+    # ``punch_queue.photo_scored_at``, which is how a queued selfie is scored exactly once, and
+    # 18 ``attendance_logs.punch_frame``, the review card's evidence frame.)
+    assert migrations.SCHEMA_VERSION == 18
 
 
 def test_the_migration_is_replayable_and_idempotent():
@@ -537,7 +541,7 @@ def test_the_site_list_reports_both_what_is_configured_and_what_is_in_force(clie
         window_info = site["window"]
         assert window_info["clock_in_window_start"] == "04:00"
         assert window_info["clock_in_window_end"] == "06:30"
-        assert window_info["site_timezone"] == "Africa/Cairo"
+        assert window_info["site_timezone"] == "Asia/Kuwait"
         assert window_info["site_specific"] is False
         assert window_info["source"]["clock_in_window_start"] == "global"
 
@@ -708,7 +712,7 @@ def test_the_company_window_is_validated_where_an_administrator_enters_it(client
     rules = client.get("/api/v1/admin/shift_rules", headers=bearer(ADMIN)).json()
     assert rules["clock_in_window_start"] == "04:00", "a refused change must not have been written"
     assert rules["clock_in_window_end"] == "06:30"
-    assert rules["site_timezone"] == "Africa/Cairo"
+    assert rules["site_timezone"] == "Asia/Kuwait"
 
 
 def test_an_emptied_company_window_goes_back_to_the_shipped_default(client):
@@ -733,7 +737,7 @@ def test_an_emptied_company_window_goes_back_to_the_shipped_default(client):
     )
     assert cleared["clock_in_window_start"] == "04:00"
     assert cleared["clock_in_window_end"] == "06:30"
-    assert cleared["site_timezone"] == "Africa/Cairo"
+    assert cleared["site_timezone"] == "Asia/Kuwait"
     assert db_scalar("SELECT clock_in_window_start FROM shift_rules WHERE id = 1") == ""
 
 

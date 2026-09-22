@@ -57,9 +57,9 @@
         admin_modules.js   255 KB, the console's eight screens. A worker can never reach
                            one - UI.renderApp sends a worker to the handset - so UI
                            injects this the first time an administrator signs in.
-        i18n.ar.js         40 KB, and i18n.hi.js at 53 KB, the two translations a reader
-                           who kept English will never read. I18n.load fetches the one
-                           a reader asks for.
+        i18n.ar.js         40 KB, i18n.hi.js 53 KB and i18n.ur.js, the translations a
+                           reader who kept English will never read. I18n.load fetches
+                           the one a reader asks for.
 
       Both are injected as a plain classic script tag pointing at the file, so the globals
       they declare (UI_MODULES, TRANSLATIONS) are the same bindings the eager tags created.

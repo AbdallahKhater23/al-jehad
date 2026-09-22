@@ -45,6 +45,7 @@ from pathlib import Path
 import pytest
 
 import harness
+import punch_frames
 import quick_links
 import retention
 from harness import (
@@ -86,6 +87,21 @@ def _quick_photo_dir(tmp_path_factory):
     quick_links.PHOTOS_DIR = str(directory)
     yield directory
     quick_links.PHOTOS_DIR = original
+
+
+@pytest.fixture(autouse=True)
+def _punch_frame_dir(tmp_path_factory):
+    """Keep punch frames out of the repository, for the same reason as the selfies above.
+
+    ``punch_frames.FRAMES_DIR`` is read at call time (``frames_dir()``), so repointing the
+    module attribute is enough - and the sweep reads the same attribute, so the test and the
+    code under test are always looking at the same throwaway tree.
+    """
+    original = punch_frames.FRAMES_DIR
+    directory = tmp_path_factory.mktemp("retention_punch_frames")
+    punch_frames.FRAMES_DIR = str(directory)
+    yield directory
+    punch_frames.FRAMES_DIR = original
 
 
 # ---------------------------------------------------------------------------
@@ -283,12 +299,15 @@ def test_the_policy_mirrors_the_settings(monkeypatch):
     from config import settings
 
     monkeypatch.setattr(settings, "retention_punch_photo_days", 3, raising=False)
+    monkeypatch.setattr(settings, "retention_punch_frame_days", 3, raising=False)
     monkeypatch.setattr(settings, "retention_audit_days", 7, raising=False)
     current = retention.policy()
     assert current.punch_photo_days == 3
+    assert current.punch_frame_days == 3
     assert current.audit_days == 7
     assert set(current.as_dict()) == {
         "punch_photo_days",
+        "punch_frame_days",
         "biometric_days",
         "audit_days",
         "notification_days",
@@ -593,6 +612,104 @@ def test_punch_photos_are_kept_forever_when_the_period_is_zero(client, app_modul
     assert photo.exists()
     assert db_scalar("SELECT photo_path FROM quick_link_uses WHERE id = ?", (use_id,)) == "ancient.jpg"
     assert "0" in str(_target(report, "punch_photos")["skipped"])
+
+
+# ---------------------------------------------------------------------------
+# punch frames (the review-card evidence)
+# ---------------------------------------------------------------------------
+def _punch_frame(name: str, *, age_days: float = 0.0) -> Path:
+    return _file(Path(punch_frames.FRAMES_DIR), name, age_days=age_days, content=b"\xff\xd8\xffframe")
+
+
+def _seed_log_frame(frame_name: str | None, *, age_days: float) -> int:
+    """One ``attendance_logs`` row claiming a frame, aged. Returns its id.
+
+    The row itself is never deleted - that is the target above this one - so only its frame
+    column is at stake here.
+    """
+    conn = sqlite3.connect(harness.DB_PATH)
+    try:
+        cursor = conn.execute(
+            "INSERT INTO attendance_logs (worker_id, site_name, action, timestamp, hours, score, status, punch_frame) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (WORKER, harness.DOWNTOWN, "Clock In", _old(age_days), 8.0, 0.1, "pending_review", frame_name),
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
+    finally:
+        conn.close()
+
+
+def test_a_punch_frame_past_the_window_is_wiped_and_its_row_cleared(client, app_module):
+    """Evidence expires with the window - and the row stops claiming what is no longer there.
+
+    Clearing the column is the point: a review card whose frame answers 404 must say "no frame
+    was stored", not leave the row pointing at a file an earlier sweep removed.
+    """
+    log_id = _seed_log_frame("aabb" * 8 + ".jpg", age_days=400)
+    frame = _punch_frame("aabb" * 8 + ".jpg", age_days=400)
+
+    report = _sweep(dry_run=False)
+
+    assert not frame.exists()
+    assert db_scalar("SELECT punch_frame FROM attendance_logs WHERE id = ?", (log_id,)) is None
+    target = _target(report, "punch_frames")
+    assert target["deleted"] >= 1
+    assert target["references"] >= 1
+
+
+def test_a_punch_frame_inside_the_window_survives_its_review(client, app_module):
+    """The review is still sitting in the queue, and its evidence stays with it."""
+    log_id = _seed_log_frame("ccdd" * 8 + ".jpg", age_days=0)
+    frame = _punch_frame("ccdd" * 8 + ".jpg", age_days=0)
+
+    _sweep(dry_run=False)
+
+    assert frame.exists()
+    assert db_scalar("SELECT punch_frame FROM attendance_logs WHERE id = ?", (log_id,)) == "ccdd" * 8 + ".jpg"
+
+
+def test_an_orphaned_punch_frame_past_the_window_is_wiped(client, app_module):
+    """A rolled-back punch leaves a file no row claims; the residue pass collects it."""
+    frame = _punch_frame("eeff" * 8 + ".jpg", age_days=400)
+    _sweep(dry_run=False)
+    assert not frame.exists()
+
+
+def test_an_orphaned_punch_frame_inside_the_window_is_left_alone(client, app_module):
+    frame = _punch_frame("1122" * 8 + ".jpg", age_days=0)
+    _sweep(dry_run=False)
+    assert frame.exists()
+
+
+def test_a_claimed_frame_is_never_swept_as_residue(client, app_module):
+    """The residue pass must not eat a frame some *other* row still points at.
+
+    The old row's frame goes (past the window, row cleared first), the fresh row's frame is
+    claimed by a live reference and survives even though it sits in the same directory.
+    """
+    old_id = _seed_log_frame("3344" * 8 + ".jpg", age_days=400)
+    old_frame = _punch_frame("3344" * 8 + ".jpg", age_days=400)
+    fresh_id = _seed_log_frame("5566" * 8 + ".jpg", age_days=0)
+    fresh_frame = _punch_frame("5566" * 8 + ".jpg", age_days=0)
+
+    _sweep(dry_run=False)
+
+    assert not old_frame.exists()
+    assert fresh_frame.exists()
+    assert db_scalar("SELECT punch_frame FROM attendance_logs WHERE id = ?", (fresh_id,)) == "5566" * 8 + ".jpg"
+
+
+def test_punch_frames_are_kept_forever_when_the_period_is_zero(client, app_module, monkeypatch):
+    from config import settings
+
+    monkeypatch.setattr(settings, "retention_punch_frame_days", 0, raising=False)
+    frame = _punch_frame("7788" * 8 + ".jpg", age_days=4000)
+    log_id = _seed_log_frame("7788" * 8 + ".jpg", age_days=4000)
+    report = _sweep(dry_run=False)
+    assert frame.exists()
+    assert db_scalar("SELECT punch_frame FROM attendance_logs WHERE id = ?", (log_id,)) == "7788" * 8 + ".jpg"
+    assert "0" in str(_target(report, "punch_frames")["skipped"])
 
 
 # ---------------------------------------------------------------------------

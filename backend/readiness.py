@@ -36,6 +36,7 @@ a critical check fails. Three tiers, because blocking boot is a blunt instrument
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import platform
 import sqlite3
@@ -52,7 +53,9 @@ from fastapi.responses import JSONResponse
 import database
 import migrations
 import notifications
+import push
 import schema_guard
+import shift_hours
 import shift_windows
 from config import PROJECT_ROOT, settings
 from security import CurrentUser, admin_only, create_access_token, decode_access_token, hash_password, verify_password
@@ -138,7 +141,11 @@ class GateReport:
 # individual checks
 # ---------------------------------------------------------------------------
 def _open(db_path: Path | None = None, *, read_only: bool = False) -> sqlite3.Connection:
-    target = Path(db_path or settings.database_path)
+    # Resolved past a directory junction/symlink for the same reason ``database.connect``
+    # resolves: the test harness's stable path points at a fresh database each reset, and a
+    # WAL connection opened through the old link can still contend with the new file. See
+    # ``database.resolve_path``.
+    target = Path(os.path.realpath(str(Path(db_path or settings.database_path))))
     if read_only:
         return sqlite3.connect(f"file:{target}?mode=ro", uri=True)
     return sqlite3.connect(str(target))
@@ -225,6 +232,69 @@ def _check_migrations(ctx: dict) -> Check:
         ok,
         detail,
         {"applied": sorted(applied), "pending": [version for version, _ in pending]},
+    )
+
+
+def _check_schema_version_ahead(ctx: dict) -> Check:
+    """Whether this build's ``SCHEMA_VERSION`` is ahead of the migrations the database recorded.
+
+    Advisory, and deliberately *not* the check that decides whether the server starts. The two
+    fatal-tier schema checks above - ``schema_current`` and ``migrations_all_applied`` - are the
+    ones that refuse to serve when the code expects columns the database has not created yet,
+    and they are right to. This check states the same fact as a warning instead of a refusal,
+    because there are two places the fatal verdict is easy to miss:
+
+    * the readiness surfaces run *every* check whether or not the startup gate blocked on one
+      of them, so an operator reading ``/admin/readiness`` sees the divergence named here too;
+    * a deployment started with ``STARTUP_OVERRIDE_REASON`` logs its fatal failures and then
+      serves anyway, and "the code is ahead of the data" then reads as one warning among the
+      degraded checks rather than as a line in a list of failures already scrolled past.
+
+    It reads ``applied_versions`` rather than ``current_version`` on purpose: the question is
+    whether the migration ``SCHEMA_VERSION`` names is really recorded as applied, which is not
+    quite the same as the newest number in the ledger being high enough. A gap below the newest
+    migration is the fatal ``migrations_all_applied``'s business, not this check's - this one
+    only ever warns when the code is ahead of everything the database has applied.
+    """
+    try:
+        conn = _open(ctx.get("db_path"), read_only=True)
+        try:
+            applied = migrations.applied_versions(conn)
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        # An unreadable ledger is the fatal ``migrations_all_applied``'s to report; a warning
+        # must never become a second failure stacked on the same problem.
+        return Check("schema_version_ahead", TIER_ADVISORY, True, f"could not be checked: {exc}")
+
+    expected = migrations.SCHEMA_VERSION
+    database_version = max(applied) if applied else 0
+    missing = [version for version, _, _ in migrations.MIGRATIONS if version not in applied]
+    value = {
+        "code": expected,
+        "database": database_version,
+        "applied": sorted(applied),
+        "missing": missing,
+    }
+    if database_version >= expected:
+        # Level with or ahead of the code: not this check's subject. A database *ahead* of the
+        # running code is what the fatal ``schema_current`` reports on its own.
+        return Check(
+            "schema_version_ahead",
+            TIER_ADVISORY,
+            True,
+            f"the running code expects schema {expected}; the database has applied up to {database_version}",
+            value,
+        )
+    return Check(
+        "schema_version_ahead",
+        TIER_ADVISORY,
+        False,
+        f"the running code expects schema {expected} but the database has applied only up to "
+        f"{database_version} (missing {missing}): the migrations a newer build needs have not "
+        f"run, so the columns it reads may not exist. This is warned here and refused at startup "
+        f"by schema_current unless STARTUP_OVERRIDE_REASON is set",
+        value,
     )
 
 
@@ -335,6 +405,339 @@ def _check_site_windows(ctx: dict) -> Check:
         True,
         f"{len(rows)} site(s) checked; every configured window is usable",
         {"sites": len(rows)},
+    )
+
+
+def _stored_shift_rules(ctx: dict) -> dict | None:
+    """The stored shift rules over the shipped defaults, or ``None`` when unreadable.
+
+    Lifted out of the two overtime checks rather than written twice, because they are two
+    verdicts about the *same* pair of settings and reading them from two places is how they
+    would come to disagree.
+    """
+    try:
+        conn = _open(ctx.get("db_path"))
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute("SELECT * FROM shift_rules WHERE id = 1").fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+    values = dict(migrations.DEFAULT_SHIFT_RULES)
+    if row is not None:
+        for key in values:
+            try:
+                if row[key] is not None:
+                    values[key] = row[key]
+            except (IndexError, KeyError):
+                continue
+    return values
+
+
+def _day_end_fields(day_end: dict) -> dict:
+    """The day-end verdict, as the handful of figures both checks report."""
+    return {
+        "notify_hours": day_end["notify_hours"],
+        "regular_hours": day_end["regular_hours"],
+        "close_at_paid_hours": day_end["close_at_paid_hours"],
+        "close_defers": day_end["close_defers"],
+        "day_ended_by": day_end["day_ended_by"],
+    }
+
+
+def _check_overtime_alert(ctx: dict) -> Check:
+    """Can the overtime crossing alert actually fire with these rules?
+
+    Advisory, and never a repair: the settings are consistent with each other and with the
+    policy - what disagrees is the *pair* of them. A shift the automatic close has ended
+    cannot be observed crossing the alert line, so the pair only works when the alert is
+    reachable before the close acts. That is decided in ``shift_hours.day_end_rules``, which
+    also resolves the conflict by standing the close down when the alert sits above the paid
+    day; the one remaining unreachable case is the alert set *on* the paid day, where there
+    is nothing to observe and alerting on every full day would page the manager for ordinary
+    work.
+
+    That is a configuration an operator chose (or accepted by default), so it is reported
+    rather than corrected - and reported here, because the alternative is finding out months
+    later that no shift was ever flagged.
+    """
+    values = _stored_shift_rules(ctx)
+    if values is None:
+        return Check(
+            "overtime_alert_reachable", TIER_ADVISORY, True, "could not be checked: the shift rules could not be read"
+        )
+
+    day_end = shift_hours.day_end_rules(values)
+    reachable = day_end["alert_reachable"]
+    return Check(
+        "overtime_alert_reachable",
+        TIER_ADVISORY,
+        reachable,
+        day_end["detail"],
+        _day_end_fields(day_end) | {"alert_reachable": reachable},
+    )
+
+
+def _check_overtime_close_deferred(ctx: dict) -> Check:
+    """Is the automatic close standing down for the overtime workflow?
+
+    Advisory, and not a fault: the reconciliation the day-end rules perform is exactly this,
+    and it is the right answer when the alert line sits above the paid day. But it means the
+    setting an operator typed - *close the shift at 8 paid hours* - no longer does that, and
+    nothing else in the application would say so: the watcher keeps running, the console
+    keeps showing the switch as on, and shifts simply never get closed. Reported here for the
+    same reason the unreachable alert is: a rule that has quietly stopped acting is
+    indistinguishable from a rule with nothing to act on.
+    """
+    values = _stored_shift_rules(ctx)
+    if values is None:
+        return Check(
+            "overtime_close_deferred", TIER_ADVISORY, True, "could not be checked: the shift rules could not be read"
+        )
+
+    day_end = shift_hours.day_end_rules(values)
+    return Check(
+        "overtime_close_deferred",
+        TIER_ADVISORY,
+        not day_end["close_defers"],
+        day_end["detail"],
+        _day_end_fields(day_end),
+    )
+
+
+def _check_startup_override_acknowledged(ctx: dict) -> Check:
+    """Has somebody accepted the last forced start, and said why?
+
+    ``STARTUP_OVERRIDE_REASON`` is the hatch that lets a deployment serve past a failing
+    self-test, and by design it demands a reason: an unattributed escape hatch is
+    indistinguishable from a permanent bypass. What nothing demanded was the *other* half -
+    nobody had to accept it. The alert could be marked read, which records that somebody
+    looked, and the audit trail had no acknowledgement at all, so "who decided this was
+    acceptable, and why" was answerable only by asking around.
+
+    Advisory, read-only, and answered by ``POST /admin/notifications/{id}/acknowledge``. It
+    fails while the newest ``startup_override`` alert has no acknowledgement and passes as soon
+    as one is written; a deployment that has never been forced up has nothing to answer and
+    passes too, with a detail that says so rather than staying silent.
+
+    The *newest* alert is the one that counts: alerts are keyed per reason, so an
+    acknowledgement given for last month's reason must not answer this month's override.
+    """
+    try:
+        conn = _open(ctx.get("db_path"), read_only=True)
+        try:
+            conn.row_factory = sqlite3.Row
+            row = notifications.newest_of_kind(conn, notifications.KIND_STARTUP_OVERRIDE)
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return Check(
+            "startup_override_acknowledged",
+            TIER_ADVISORY,
+            False,
+            f"could not read the forced-start record: {type(exc).__name__}: {exc}",
+            {"measured": False},
+        )
+    if row is None:
+        return Check(
+            "startup_override_acknowledged",
+            TIER_ADVISORY,
+            True,
+            "no forced start has been recorded on this deployment",
+            {"forced_start": False, "acknowledged": True},
+        )
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+    except (TypeError, ValueError):  # pragma: no cover - a payload this module wrote
+        payload = {}
+    value = {
+        "forced_start": True,
+        "alert_id": int(row["id"]),
+        "reason": payload.get("reason"),
+        "override_until": payload.get("override_until"),
+        "forced_at": row["created_at"],
+        "acknowledged": bool(row["acknowledged_at"]),
+        "acknowledged_by": row["acknowledged_by"],
+        "acknowledged_at": row["acknowledged_at"],
+        "note": row["acknowledgement_note"],
+    }
+    if row["acknowledged_at"]:
+        return Check(
+            "startup_override_acknowledged",
+            TIER_ADVISORY,
+            True,
+            f"the forced start of {row['created_at']} was accepted by {row['acknowledged_by']} "
+            f"on {row['acknowledged_at']}",
+            value,
+        )
+    return Check(
+        "startup_override_acknowledged",
+        TIER_ADVISORY,
+        False,
+        f"this deployment was forced up past a failing self-test on {row['created_at']} "
+        f"(reason given: {payload.get('reason') or 'not recorded'}) and no administrator has "
+        f"accepted it: POST /api/v1/admin/notifications/{int(row['id'])}/acknowledge with a note, "
+        "or remove STARTUP_OVERRIDE_REASON and fix the check that failed",
+        value,
+    )
+
+
+def _check_worker_push(ctx: dict) -> Check:
+    """Can this deployment reach a worker who is not looking at the app?
+
+    Advisory, and it is the *opposite* of a fault: the worker inbox records every event
+    whatever this says, and an operator who has not set up Web Push has lost a convenience,
+    not correctness. It is reported because the difference is invisible from the outside -
+    "the worker is notified when their shift runs long" is true of the inbox and false of the
+    phone, and the only place that distinction can be seen is here and
+    ``GET /worker/me/push``.
+
+    Switched off on purpose (``PUSH_ENABLED=0``) is a pass, not a warning: an operator who
+    decided nobody's phone should ring has got what they asked for. Missing keys or a missing
+    ``pywebpush`` is not - that is the state where the app quietly cannot do what the previous
+    sentence says it can.
+    """
+    if not settings.push_enabled:
+        return Check(
+            "worker_push_delivery",
+            TIER_ADVISORY,
+            True,
+            "push is switched off (PUSH_ENABLED=0); the worker inbox still records every event",
+            {"available": False, "enabled": False},
+        )
+    usable, reason = push.transport_available()
+    return Check(
+        "worker_push_delivery",
+        TIER_ADVISORY,
+        usable,
+        reason if usable else f"a worker with the app closed is not notified: {reason}",
+        {
+            "available": usable,
+            "enabled": True,
+            #: Booleans, never the values: readiness output is logged, mailed and pasted into
+            #: issues, and a private key in any of those is a leaked private key.
+            "public_key_configured": bool(settings.vapid_public_key),
+            "private_key_configured": bool(settings.vapid_private_key),
+        },
+    )
+
+
+def _check_worker_notice_backlog(ctx: dict) -> Check:
+    """The channel's *output*: notices that passed the push window still undelivered.
+
+    ``worker_push_delivery`` above answers "is this deployment configured to push", which is a
+    reading of the settings and says nothing about whether anything is arriving. A push service
+    that has started answering 401, a subscription table emptied by a well-meaning script, a
+    phone whose permission was revoked - each of those leaves the settings perfectly valid and
+    the channel silent. The only evidence of that is the missing ``delivered_at`` stamps, and
+    this is where it is read without anybody opening a database.
+
+    Advisory, and deliberately not a second copy of the configuration check: when this
+    deployment does not intend to push (no key pair, ``PUSH_ENABLED=0``) the backlog is the
+    expected state, and the honest verdict is a pass whose detail says so. The check has teeth
+    exactly when the deployment is trying to deliver and cannot - which is the case nobody
+    sees from the outside, because from there a quiet channel and a quiet workforce look the
+    same.
+
+    Read-only. An operator polling readiness must not be made to write, and the counts here
+    are the same ones the alert row and ``push.stranded_notices`` report.
+    """
+    usable, reason = push.transport_available()
+    if not usable:
+        return Check(
+            "worker_notice_backlog",
+            TIER_ADVISORY,
+            True,
+            f"not measured: {reason}; undelivered notices are expected and the inbox is the record",
+            {"measured": False, "reason": reason},
+        )
+    try:
+        conn = _open(ctx.get("db_path"), read_only=True)
+        try:
+            # ``push`` reads its rows by column name, the way every query in this application
+            # does; a bare connection hands back tuples.
+            conn.row_factory = sqlite3.Row
+            reading = push.stranded_notices(conn)
+        finally:
+            conn.close()
+    except Exception as exc:  # pragma: no cover - a probe must report, never raise
+        return Check(
+            "worker_notice_backlog",
+            TIER_ADVISORY,
+            False,
+            f"could not read the push backlog: {type(exc).__name__}: {exc}",
+            {"measured": False},
+        )
+    stranded = reading["notices"]
+    detail = (
+        "no worker notice has been left behind by the push channel"
+        if not stranded
+        else (
+            f"{stranded} worker notification(s) passed the {reading['window_minutes']}-minute push "
+            f"window undelivered (oldest {reading['age']}); "
+            f"{reading['no_device']} have no live device, {reading['with_device']} have one and were "
+            "refused or failed. They are still in the workers' inboxes; the phones are not ringing"
+        )
+    )
+    return Check(
+        "worker_notice_backlog",
+        TIER_ADVISORY,
+        not stranded,
+        detail,
+        {
+            "measured": True,
+            "window_minutes": reading["window_minutes"],
+            "notices": stranded,
+            "workers": reading["workers"],
+            "oldest": reading["oldest"],
+            "age_seconds": reading["age_seconds"],
+            "no_device": reading["no_device"],
+            "with_device": reading["with_device"],
+            "attempted": reading["attempted"],
+            "kinds": reading["kinds"],
+        },
+    )
+
+
+def _check_push_endpoint_allowlist(ctx: dict) -> Check:
+    """Every host the push allowlist names must be one a subscription could actually use.
+
+    An endpoint is accepted only if its host is on ``PUSH_ENDPOINT_HOSTS``, so an entry there
+    that the policy itself refuses is **silently dead**: a worker's browser subscribes and
+    reports success, the row is stored, and nothing ever arrives - which reads as a vendor
+    outage rather than as a typo in a config file. The entries that cannot work are named here
+    at startup, where somebody can still fix them, rather than by a worker who missed an
+    overtime alert.
+
+    The check and the request path ask the *same* function (``push.validate_host``), so the two
+    cannot drift into disagreeing about what "usable" means.
+
+    Advisory, not fatal: the worker inbox records every event whether or not a phone can be
+    reached, and no deployment should refuse to serve payroll over a mistyped push host.
+    """
+    hosts = push.configured_hosts()
+    unusable: list[str] = []
+    for host in hosts:
+        try:
+            push.validate_host(host, allowed=(host,))
+        except ValueError as exc:
+            unusable.append(f"{host} ({exc})")
+    if unusable:
+        return Check(
+            "push_endpoint_allowlist",
+            TIER_ADVISORY,
+            False,
+            "these PUSH_ENDPOINT_HOSTS entries can never be used: " + "; ".join(unusable),
+            {"hosts": len(hosts), "unusable": len(unusable)},
+        )
+    return Check(
+        "push_endpoint_allowlist",
+        TIER_ADVISORY,
+        True,
+        f"{len(hosts)} push service host(s) accepted; every other host is refused",
+        {"hosts": len(hosts), "unusable": 0},
     )
 
 
@@ -461,6 +864,160 @@ def _check_admin_routes_guarded(ctx: dict) -> Check:
         ok,
         detail,
         {"guarded": guarded, "missing": missing},
+    )
+
+
+# ---------------------------------------------------------------------------
+# the whole API surface, not only /admin
+# ---------------------------------------------------------------------------
+#: Methods and paths that answer **without a session**, each beside the reason that is
+#: safe. Keyed by ``"<METHOD> <path>"`` rather than by path alone, so adding a verb to a
+#: path that is public today (``DELETE /api/v1/branding``, say) does not inherit the
+#: exemption by accident - it has to be declared and explained here, in front of whoever
+#: reviews the diff.
+PUBLIC_ROUTES: dict[str, str] = {
+    "POST /api/v1/auth/login": (
+        "sign-in: it is how a session is obtained, so it cannot require one. Rate-limited by "
+        "IP and by account, and it answers one generic refusal for both an unknown user and "
+        "a wrong password."
+    ),
+    "GET /api/v1/branding": (
+        "the company's own name, lines and mark: the sign-in screen needs them before anybody "
+        "has signed in, and the same strings are already on every printed sheet. Setting them "
+        "stays admin-only."
+    ),
+    "GET /api/v1/branding/logo": "the mark the public branding read above points at.",
+    "GET /api/v1/enroll/{token}": (
+        "self-service enrollment: the invite token in the path is the credential, so a worker "
+        "who has no account yet can open the link they were handed."
+    ),
+    "POST /api/v1/enroll/{token}": "the same invite token; submits the capture.",
+    "POST /api/v1/enroll/{token}/register": "the same invite token; claims the link.",
+    "GET /api/v1/q/{token}": (
+        "one-tap clock link: the link token in the path is the credential. Reusing one does "
+        "not authenticate anybody else."
+    ),
+    "POST /api/v1/q/{token}": "the same link token; records the punch.",
+    "GET /api/v1/readiness": (
+        "the deployment's verdict, for the load balancer and ``curl -f``: booleans and check "
+        "*names* only, never a detail string (those embed absolute paths)."
+    ),
+    "GET /api/v1/status": "the liveness probe: ``{\"status\": \"active\"}`` and nothing else.",
+}
+
+#: Routes that **refuse an anonymous caller themselves**, inside the handler, so they cannot
+#: carry a role guard. Declared separately from the list above because they make the opposite
+#: promise: ``PUBLIC_ROUTES`` says "this answers without a session", this says "this decides
+#: for itself". A test can hold each list to its own claim.
+SELF_GATED_ROUTES: dict[str, str] = {
+    "GET /api/v1/metrics": (
+        "``METRICS_TOKEN`` compared with ``compare_digest`` when configured, otherwise an "
+        "admin JWT. It cannot use a ``Depends`` role guard because a scrape token is one of "
+        "the two accepted credentials."
+    ),
+    "GET /metrics": "the same handler, mounted at the bare path a scrape config assumes.",
+}
+
+#: Routes that answer without a session **and without any data of ours**: each serves an HTML
+#: file from ``frontend/``. Kept apart from the list above so that half stays a list of
+#: endpoints that deliberately parse a request.
+PAGE_ROUTES: frozenset[str] = frozenset({"GET /", "GET /enroll/{token}", "GET /q/{token}"})
+
+
+def _check_api_routes_authorised(ctx: dict) -> Check:
+    """Every route is either guarded by a role, or declared public with a reason recorded.
+
+    ``auth_enforced_on_admin_routes`` answers "*is the admin surface guarded*"; it says
+    nothing about the other eighty-odd routes, which is where the interesting mistakes live.
+    An endpoint added under ``/api/v1/worker/`` with no ``Depends`` at all is readable by
+    anybody who can reach the port, and until now the gate would not have said a word about
+    it. This closes that: the whole surface is enumerated and each route must be
+    **accounted for** - carrying a ``require_role`` guard, or declared above (``PUBLIC_ROUTES``
+    / ``SELF_GATED_ROUTES`` / ``PAGE_ROUTES``) with the reason beside it.
+
+    Three failure modes beyond the obvious unguarded route, all of which this repository has
+    already been bitten by somewhere:
+
+    * the enumeration finding nothing - a traversal that breaks must fail the gate, not
+      report ``0 guarded, 0 missing`` and vouch for a surface it never looked at;
+    * a **stale** entry - a route renamed or removed while its exemption stayed behind, which
+      reads as "public on purpose" for a path nothing serves any more, and quietly covers for
+      the new path that is now unaccounted for;
+    * a **redundant** entry - a route that is both exempted and guarded, meaning the
+      exemption is doing nothing but misinforming the next reader.
+    """
+    app = ctx.get("app")
+    if app is None:  # pragma: no cover - only when called without an app
+        return Check("api_routes_authorised", TIER_FATAL, True, "no app supplied; skipped")
+
+    seen: set[str] = set()
+    guarded: list[str] = []
+    public: list[str] = []
+    pages: list[str] = []
+    unaccounted: list[str] = []
+    for path, route in iter_api_routes(app):
+        enforced = any(
+            getattr(dependency.call, "_auth_marker", None) == "require_role"
+            for dependency in route.dependant.dependencies
+        )
+        for method in sorted(route.methods or []):
+            key = f"{method} {path}"
+            seen.add(key)
+            if enforced:
+                guarded.append(key)
+            elif key in PAGE_ROUTES:
+                pages.append(key)
+            elif key in PUBLIC_ROUTES:
+                if PUBLIC_ROUTES[key].strip():
+                    public.append(key)
+                else:
+                    unaccounted.append(f"{key} (declared public with no reason)")
+            elif key in SELF_GATED_ROUTES:
+                if SELF_GATED_ROUTES[key].strip():
+                    public.append(key)
+                else:
+                    unaccounted.append(f"{key} (self-gated with no reason)")
+            else:
+                unaccounted.append(key)
+
+    declared = set(PUBLIC_ROUTES) | set(SELF_GATED_ROUTES) | set(PAGE_ROUTES)
+    stale = sorted(declared - seen)
+    redundant = sorted(set(guarded) & declared)
+    ok = bool(seen) and not unaccounted and not stale and not redundant
+
+    if ok:
+        detail = (
+            f"{len(guarded)} route(s) guarded by require_role, {len(public)} declared open "
+            f"with a reason, {len(pages)} page route(s)"
+        )
+    elif not seen:
+        detail = (
+            "no routes could be enumerated from the app, so this check verified nothing; the "
+            "route traversal is broken"
+        )
+    else:
+        problems = []
+        if unaccounted:
+            problems.append("routes with no guard and no exemption: " + ", ".join(unaccounted))
+        if stale:
+            problems.append("exemptions for routes that no longer exist: " + ", ".join(stale))
+        if redundant:
+            problems.append("exemptions on routes that are already guarded: " + ", ".join(redundant))
+        detail = "; ".join(problems)
+
+    return Check(
+        "api_routes_authorised",
+        TIER_FATAL,
+        ok,
+        detail,
+        {
+            "guarded": len(guarded),
+            "public": len(public),
+            "pages": len(pages),
+            "unaccounted": unaccounted,
+            "stale_exemptions": stale,
+            "redundant_exemptions": redundant,
+        },
     )
 
 
@@ -1047,6 +1604,52 @@ def _check_face_detector(ctx: dict) -> Check:
     return Check("face_detector", TIER_ADVISORY, ok, detail, worklist)
 
 
+def _check_face_match_band(ctx: dict) -> Check:
+    """Whether the pipeline that would really run has decision lines that were measured.
+
+    FATAL, and the only face check here that is. Every other face check is advisory because
+    its failure has a correct degraded mode: a missing detector model runs the previous
+    crop, which is slower and has *its own* band. This one has no degraded mode at all. The
+    lines that turn a distance into approved / review / refused are derived per pipeline
+    from measured boundaries (see ``face_detector.MatchBand``), and a build that can run a
+    crop without them can only answer in one of two wrong ways - approve against numbers
+    measured on a different crop, or refuse every punch for everybody. Refusing to open the
+    port until the lines exist is the honest version of "this build cannot verify a face".
+
+    Reported healthy with the derivation attached, because the number an operator will want
+    when a review queue moves is not the line but what the line was measured against.
+    """
+    import face_detector
+    import face_engine
+
+    pipeline = face_detector.active_pipeline()
+    try:
+        band = face_detector.band_for(pipeline)
+    except face_detector.UnknownPipelineError as exc:
+        return Check(
+            "face_match_band",
+            TIER_FATAL,
+            False,
+            f"{exc}; every punch would be refused until the lines are derived (or the detector "
+            "model is restored, which selects the previous pipeline and its own band)",
+            {"pipeline": pipeline, "model": face_engine.FACE_MODEL},
+        )
+    return Check(
+        "face_match_band",
+        TIER_FATAL,
+        True,
+        f"{pipeline} / {face_engine.FACE_MODEL}: {band.basis()}",
+        {
+            "pipeline": pipeline,
+            "model": face_engine.FACE_MODEL,
+            "approve": band.approve,
+            "review": band.review,
+            "genuine_ceiling": band.genuine_ceiling,
+            "impostor_floor": band.impostor_floor,
+        },
+    )
+
+
 def _check_clock_sanity(ctx: dict) -> Check:
     try:
         conn = _open(ctx.get("db_path"), read_only=True)
@@ -1145,13 +1748,21 @@ CHECKS = (
     _check_database_writable,
     _check_schema_version,
     _check_migrations,
+    _check_schema_version_ahead,
+    _check_startup_override_acknowledged,
     _check_schema_drift,
     _check_shift_rules,
     _check_site_windows,
+    _check_overtime_alert,
+    _check_overtime_close_deferred,
+    _check_worker_push,
+    _check_worker_notice_backlog,
+    _check_push_endpoint_allowlist,
     _check_journal_mode,
     _check_password_hashing,
     _check_jwt_roundtrip,
     _check_admin_routes_guarded,
+    _check_api_routes_authorised,
     _check_no_unprefixed_admin_routes,
     _check_static_mounts,
     _check_api_docs_disabled,
@@ -1164,6 +1775,7 @@ CHECKS = (
     _check_metrics,
     _check_face_engine,
     _check_face_detector,
+    _check_face_match_band,
     _check_liveness,
     _check_clock_sanity,
     _check_database_path,
@@ -1228,13 +1840,37 @@ def run_startup_gate(app, *, db_path: Path | None = None, log=None) -> GateRepor
                 "[startup] OVERRIDE ACTIVE: serving despite "
                 f"{[check.name for check in overridable]} - reason: {settings.startup_override_reason}"
             )
-            _record(
+            alert_id = _record(
                 notifications.KIND_STARTUP_OVERRIDE,
                 notifications.SEVERITY_CRITICAL,
                 "Startup gate overridden",
                 f"The server started with failing checks {[check.name for check in overridable]}. "
                 f"Reason given: {settings.startup_override_reason}",
-                dedupe_key="startup_override",
+                # One alert per *reason*, not one for ever. An acknowledgement accepts the
+                # override it was written about, and an operator who accepted last week's
+                # reason must not have silently accepted this week's - so a different reason
+                # reopens the question (``_check_startup_override_acknowledged``).
+                dedupe_key=f"startup_override:{settings.startup_override_reason}",
+                payload={
+                    "reason": settings.startup_override_reason,
+                    "override_until": settings.startup_override_until,
+                    "checks": [check.as_dict() for check in overridable],
+                },
+            )
+            # ...and every *start* is an audit event, whether or not the alert row already
+            # existed: the alert is one row per reason, so this is the only record of how many
+            # times the deployment was forced up.
+            _audit_system(
+                "startup_override",
+                entity="admin_notifications",
+                entity_id=alert_id,
+                after={
+                    "reason": settings.startup_override_reason,
+                    "override_until": settings.startup_override_until,
+                    "failed_checks": [check.name for check in overridable],
+                    "blocked_irrespective": [check.name for check in blocked_irrespective],
+                    "schema_expected": migrations.SCHEMA_VERSION,
+                },
             )
         else:
             names = ", ".join(f"{check.name} ({check.detail})" for check in fatal)
@@ -1265,7 +1901,21 @@ def run_startup_gate(app, *, db_path: Path | None = None, log=None) -> GateRepor
     return report
 
 
-def _record(kind: str, severity: str, title: str, body: str, *, dedupe_key: str, payload: dict | None = None) -> None:
+def _record(
+    kind: str,
+    severity: str,
+    title: str,
+    body: str,
+    *,
+    dedupe_key: str,
+    payload: dict | None = None,
+) -> int | None:
+    """Write an operator alert and return its row id, or None when it could not be written.
+
+    The id is what lets a system event be attributed to the alert that describes it: the
+    forced start appends an audit row pointing at the alert an operator is asked to answer,
+    rather than at nothing.
+    """
     try:
         with database.db(write=True) as conn:
             notifications.notify(
@@ -1276,6 +1926,35 @@ def _record(kind: str, severity: str, title: str, body: str, *, dedupe_key: str,
                 body=body,
                 dedupe_key=dedupe_key,
                 payload=payload,
+            )
+            row = conn.execute(
+                "SELECT id FROM admin_notifications WHERE dedupe_key = ?", (dedupe_key,)
+            ).fetchone()
+            return int(row[0]) if row else None
+    except sqlite3.Error:
+        return None
+
+
+def _audit_system(action: str, *, entity: str, entity_id: str | int | None, after: dict) -> None:
+    """Append a system-attributed audit event: the startup gate has no session and no actor.
+
+    ``audit_log`` is append-only in the database, so every forced start is its own row rather
+    than an update of the previous one. "How often has this deployment been started past a
+    failing self-test" is a question an incident review asks, and a single overwritten row
+    could not answer it - especially now that the alert itself is one row per *reason*.
+    """
+    try:
+        with database.db(write=True) as conn:
+            conn.execute(
+                "INSERT INTO audit_log (actor_id, actor_role, action, entity, entity_id, "
+                "after_json, created_at) VALUES (NULL, 'system', ?, ?, ?, ?, ?)",
+                (
+                    action,
+                    entity,
+                    str(entity_id) if entity_id is not None else None,
+                    json.dumps(after, default=str),
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                ),
             )
     except sqlite3.Error:
         pass

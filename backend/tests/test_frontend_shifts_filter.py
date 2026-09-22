@@ -26,12 +26,17 @@ behaviour the screen depends on:
 4. one row is one shift, with its own date, site and hours, and a shift waiting for
    an administrator is marked as such and kept out of ``approved_hours``;
 4b. the columns are the administrator's to rearrange - the default order is
-   date, employee, id, site, hours, awaiting approval, open notes - the choice is
-   remembered in ``localStorage``, and a stored order that is stale or junk cannot
-   take the table down;
+   date, employee, role, id, site, arrival, hours, awaiting approval, open notes -
+   the choice is remembered in ``localStorage``, and a stored order that is stale or
+   junk cannot take the table down;
 5. the CSV button writes exactly the rows on screen - same set, same order as the
    table, filtered or not - in the four columns ``Employee,id,site,hours`` and in
-   that order whatever the screen's own column order has been changed to.
+   that order whatever the screen's own column order has been changed to;
+5b. the same button, with the format set to PDF, prints the same report through the
+   browser's print dialog - the rows on screen, the columns the administrator
+   arranged, the period in the file name the dialog offers - and puts the console
+   back when the dialog closes. Nothing is sent to the server to make a PDF, and no
+   PDF library is involved: the dialog writes the file.
 
 The search box has its own contract (name / worker id / site / day): a day is an
 ordinary filter here, because a timesheet row *has* a date; see the ``3g`` block.
@@ -45,6 +50,8 @@ Node is optional; without it these skip rather than fail.
 """
 
 from __future__ import annotations
+
+import re
 
 import pytest
 
@@ -78,7 +85,12 @@ function shift(overrides) {
         status_code: 'approved',
         status: 'Approved by Admin',
         awaiting_approval: false,
-        open_notes: 0
+        open_notes: 0,
+        // Where the shift's clock-in fell against the site's window. The server sends the
+        // verdict and the minutes; the wording is the console's.
+        arrival_time: '2026-08-07 04:20:00',
+        arrival_verdict: 'on_time',
+        arrival_minutes: 0
     }, overrides || {});
 }
 
@@ -96,13 +108,16 @@ function totalsOf(rows) {
         break_hours: sum('break_hours'),
         workers_with_open_notes: new Set(
             rows.filter((row) => Number(row.open_notes) > 0).map((row) => row.worker_id)
-        ).size
+        ).size,
+        late_arrivals: rows.filter((row) => row.arrival_verdict === 'late').length
     };
 }
 
 // Three shifts, three workers, two sites, one of them waiting for an administrator and two
-// of the workers with something open in the notes inbox. A one-row fixture cannot tell a
-// working search - or a working total - apart from a broken one.
+// of the workers with something open in the notes inbox. One arrived late by 42 minutes, so
+// "who was late, and by how much" is a question with a wrong answer as well as a right one.
+// A one-row fixture cannot tell a working search - or a working total - apart from a broken
+// one.
 const DEFAULT_ROWS = [
     shift({
         log_id: 901, date: '2026-08-07', worker_id: '600', worker_name: 'Seed Lead',
@@ -111,13 +126,15 @@ const DEFAULT_ROWS = [
     shift({
         log_id: 902, date: '2026-08-06', timestamp: '2026-08-06 15:04:00', worker_id: '601',
         worker_name: 'Ana Torres', role: 'worker', site_name: 'Harbour Depot',
-        hours: 4, recorded_hours: 4.5, break_hours: 0.5
+        hours: 4, recorded_hours: 4.5, break_hours: 0.5,
+        arrival_time: '2026-08-06 05:10:00'
     }),
     shift({
         log_id: 903, date: '2026-08-05', timestamp: '2026-08-05 16:30:00', worker_id: '602',
         worker_name: 'Bilal Khan', role: 'worker', site_name: 'Harbour Depot',
         hours: 3, recorded_hours: 5, break_hours: 0.5,
-        status_code: 'pending_review', status: 'pending_review', awaiting_approval: true, open_notes: 2
+        status_code: 'pending_review', status: 'pending_review', awaiting_approval: true, open_notes: 2,
+        arrival_time: '2026-08-05 07:12:00', arrival_verdict: 'late', arrival_minutes: 42
     })
 ];
 
@@ -127,6 +144,7 @@ function report(start, end, rows) {
         filters: { site: null, worker_id: null },
         fields: [
             'log_id', 'date', 'timestamp', 'worker_id', 'worker_name', 'role', 'site_name',
+            'arrival_time', 'arrival_verdict', 'arrival_minutes',
             'hours', 'recorded_hours', 'approved_hours', 'break_hours', 'status_code', 'status',
             'awaiting_approval', 'open_notes'
         ],
@@ -261,6 +279,7 @@ function cardValues(html) {
         break_hours: value('break_hours'),
         shifts: value('shifts'),
         workers: value('workers'),
+        late_arrivals: value('late_arrivals'),
         money_visible: ['Gross estimate', 'Rate/hour', 'hourly_rate', 'gross_estimate'].some(
             (needle) => html.indexOf(needle) >= 0
         ),
@@ -275,6 +294,9 @@ function cardValues(html) {
         has_timesheet_note: html.indexOf('One row per shift.') >= 0,
         column_order: order ? order[1].split(',') : null,
         headers: headerLabels(html),
+        // The row action: the one cell on a row that is not a column. One per shift, and
+        // never on paper - a printable sheet has no controls on it.
+        print_buttons: (html.match(/data-print-worker=/g) || []).length,
         // One per shift: a count that goes up with the number of shifts, not with the number
         // of people - which is what makes it a timesheet rather than a roster.
         shift_rows: (html.match(/data-shift=/g) || []).length,
@@ -310,10 +332,10 @@ function adminEnv(options) {
     return env;
 }
 
-const DEFAULT_COLUMNS = 'date,employee,id,site,hours,awaiting,notes';
+const DEFAULT_COLUMNS = 'date,employee,role,id,site,arrival,hours,awaiting,notes';
 // The labels those columns are painted with, in English (the harness boots in the default
 // language). Written out here so a renamed translation cannot pass unnoticed.
-const DEFAULT_HEADERS = ['Date', 'Employee', 'User ID', 'Site', 'Hours', 'Awaiting approval', 'Open notes'];
+const DEFAULT_HEADERS = ['Date', 'Employee', 'Role', 'User ID', 'Site', 'Arrival', 'Hours', 'Awaiting approval', 'Open notes'];
 
 // The scenarios. ``results`` is printed by the epilogue in ``frontend_vm``.
 const results = {};
@@ -494,6 +516,15 @@ const results = {};
         // A day is a filter like any other: a row carries its own date, so typing one
         // narrows the list instead of standing there refusing to.
         const byDate = await search('2026-08-07');
+        // The arrival is searchable like any other column: "late" is the question the
+        // column answers, and a second term is how far off - "late 42" is the one shift that
+        // far outside its window.
+        const byLate = await search('late');
+        const lateBy = await search('late 42');
+        const byOnTime = await search('on time');
+        // The role is searchable too - "whose shifts are these" is asked by typing the
+        // column, and the column is on screen in the reader's words.
+        const byRole = await search('moallem');
         const afterSearches = env.requests.length;
         await env.evaluate("UI_MODULES.applyShiftsDay('2026-08-07')");
         const afterDay = env.requests.length;
@@ -513,6 +544,10 @@ const results = {};
             by_site: bySite,
             and_terms: andTerms,
             by_date: byDate,
+            by_late: byLate,
+            late_by: lateBy,
+            by_on_time: byOnTime,
+            by_role: byRole,
             no_match: noMatch,
             day_applied: dayApplied,
             search_requests_added: afterSearches - requestsBefore,
@@ -537,7 +572,8 @@ const results = {};
         await env.evaluate("UI.renderAdminTab('Shifts')");
         const steps = env.evaluate(`(function () {
             const seen = [];
-            for (let i = 0; i < 5; i += 1) {
+            // All the way to the front, whatever the table is made of: one press, one swap.
+            for (let i = 0; i < UI_MODULES.shiftsColumns().length - 1; i += 1) {
                 UI_MODULES.moveShiftsColumn('awaiting', -1);
                 seen.push(UI_MODULES.shiftsColumns().join(','));
             }
@@ -624,6 +660,35 @@ const results = {};
         });
     }
 
+    // 4f. a shift whose clock-in is not on file: unknown, not punctual
+    {
+        const env = adminEnv();
+        await env.evaluate("UI.renderAdminTab('Shifts')");
+        // A force-clock-out, or a shift closed with no arrival recorded: the row is real,
+        // the arrival is not. The server sends null for all three fields.
+        env.evaluate(`(function () {
+            const cached = UI_MODULES._shiftsReport;
+            cached.report.rows = [Object.assign({}, cached.report.rows[0], {
+                worker_id: '603', worker_name: 'Noor Haddad',
+                arrival_time: null, arrival_verdict: null, arrival_minutes: null
+            })];
+            cached.report.totals = UI_MODULES.sumShiftsRows(cached.report.rows);
+            UI_MODULES.repaintShiftsFromCache();
+            return true;
+        })()`);
+        const html = env.evaluate("document.getElementById('adminContent').innerHTML");
+        await env.evaluate(`(async () => {
+            document.getElementById('shiftsQuery').value = 'on time';
+            await UI_MODULES.applyShiftsSearch();
+        })()`);
+        const searched = env.evaluate("document.getElementById('adminContent').innerHTML");
+        const firstRow = allRows(html)[0] || [];
+        results.no_arrival = Object.assign(cardValues(html), {
+            cell: firstRow.length > 5 ? firstRow[5] : null,
+            search_no_match: cardValues(searched).has_no_matches
+        });
+    }
+
     // 5. the CSV button writes exactly the rows on screen
     {
         const env = adminEnv();
@@ -679,12 +744,93 @@ const results = {};
         // All the way to the front, so "the screen really was rearranged" cannot be
         // satisfied by a table that was never repainted.
         await env.evaluate(`(function () {
-            for (let i = 0; i < 6; i += 1) UI_MODULES.moveShiftsColumn('notes', -1);
+            for (let i = 0; i < UI_MODULES.shiftsColumns().length; i += 1) UI_MODULES.moveShiftsColumn('notes', -1);
         })()`);
         env.evaluate('UI_MODULES.downloadShiftsCsv()');
         results.download.reordered = {
             csv: await env.lastBlobText(),
             screen_headers: headerLabels(env.evaluate("document.getElementById('adminContent').innerHTML"))
+        };
+    }
+
+    // 5c. the PDF choice prints the same report, through the browser's own dialog
+    {
+        const env = adminEnv();
+        await env.evaluate("UI.renderAdminTab('Shifts')");
+        const before = { requests: env.requests.length, blobs: env.blobs.length };
+        env.evaluate("document.getElementById('shiftsExportFormat').value = 'pdf'");
+        env.evaluate('UI_MODULES.downloadShiftsReport()');
+        const printed = env.printed[env.printed.length - 1] || {};
+        const html = env.evaluate("document.getElementById('adminContent').innerHTML");
+        results.print = {
+            printed: env.printed.length,
+            title: printed.title || null,
+            printing: printed.printing === true,
+            sheet: printed.sheet || '',
+            screen_hours: cardValues(html).hours,
+            screen_headers: headerLabels(html),
+            files_written: env.blobs.length - before.blobs,
+            requests_added: env.requests.length - before.requests,
+            expected_range: expectedDefaultRange()
+        };
+        // The dialog closes.
+        env.fireWindowEvent('afterprint');
+        results.print.after = {
+            title: env.evaluate('document.title'),
+            printing: env.evaluate("document.body.classList.contains('is-printing-report')"),
+            sheets_left: env.evaluate(
+                "document.body.__children.filter((c) => c.className === 'print-sheet').length")
+        };
+
+        // The same button, with a search on: the sheet has to hold the rows on screen.
+        await env.evaluate(`(async () => {
+            document.getElementById('shiftsQuery').value = 'harbour';
+            await UI_MODULES.applyShiftsSearch();
+        })()`);
+        env.evaluate('UI_MODULES.downloadShiftsReport()');
+        const narrowed = env.printed[env.printed.length - 1] || {};
+        results.print.filtered = { sheet: narrowed.sheet || '', title: narrowed.title || null };
+        env.fireWindowEvent('afterprint');
+
+        // Nothing on screen for the period: no sheet may be printed, and no request to
+        // invent one.
+        const stale = adminEnv();
+        await stale.evaluate("UI.renderAdminTab('Shifts')");
+        stale.evaluate('UI_MODULES._shiftsReport = null');
+        stale.evaluate("document.getElementById('shiftsExportFormat').value = 'pdf'");
+        stale.evaluate('UI_MODULES.downloadShiftsReport()');
+        results.print.nothing_to_export = { printed: stale.printed.length, toasts: toasts(stale) };
+
+        // A period that *is* on screen and has nothing in it: there is a report to print,
+        // so the dialog opens - and what it prints is the sentence, not an empty table. The
+        // two are different states, and a sheet that rendered the second as the first would
+        // hand somebody a blank page under a heading.
+        const quiet = adminEnv();
+        await quiet.evaluate("UI_MODULES.setShiftsRange('2000-01-01', '2000-01-31')");
+        await quiet.evaluate("UI.renderAdminTab('Shifts')");
+        quiet.evaluate("document.getElementById('shiftsExportFormat').value = 'pdf'");
+        quiet.evaluate('UI_MODULES.downloadShiftsReport()');
+        const quietSheet = (quiet.printed[quiet.printed.length - 1] || {}).sheet || '';
+        results.print.quiet = {
+            printed: quiet.printed.length,
+            sheet: quietSheet,
+            has_empty_note: quietSheet.indexOf('print-sheet-empty') >= 0,
+            has_table: quietSheet.indexOf('print-sheet-table') >= 0
+        };
+
+        // No choice made - and a value this build does not know - is still the spreadsheet:
+        // the download exists longest, and a print dialog nobody asked for is the worse
+        // failure of the two.
+        const plain = adminEnv();
+        await plain.evaluate("UI.renderAdminTab('Shifts')");
+        plain.evaluate('UI_MODULES.downloadShiftsReport()');
+        plain.evaluate("document.getElementById('shiftsExportFormat').value = 'xlsx'");
+        plain.evaluate('UI_MODULES.downloadShiftsReport()');
+        const anchor = plain.lastAnchor();
+        results.print.default_format = {
+            printed: plain.printed.length,
+            files: plain.blobs.length,
+            filename: anchor ? anchor.download : null
         };
     }
 
@@ -772,6 +918,21 @@ def test_the_shifts_tab_is_hours_and_approval_and_never_money(results):
     assert initial["has_timesheet_note"] is True, "an admin must be told what a row is"
 
 
+def test_every_shift_offers_its_worker_s_month_and_no_sheet_carries_a_control(results):
+    """The row action is on every row, on both layouts, and never on paper.
+
+    One tap per shift, because the shift is what an administrator is looking at when the
+    question "what did this person work this month?" comes up. The printed sheet is the
+    other half of the rule: a control inside a printed table is an instruction to somebody
+    holding a sheet of paper.
+    """
+    assert results["initial"]["print_buttons"] == 3, "one action per shift row"
+    assert results["mobile"]["print_buttons"] == 3, "and the phone cards carry it too"
+    assert "data-print-worker" not in results["print"]["sheet"], (
+        "a printable sheet must not carry the row's print button"
+    )
+
+
 def test_a_shift_waiting_for_an_administrator_is_marked_and_not_counted_as_approved(results):
     """The 8.1 h gate only means anything if unapproved hours stay out of the signed-off figure."""
     initial = results["initial"]
@@ -779,40 +940,51 @@ def test_a_shift_waiting_for_an_administrator_is_marked_and_not_counted_as_appro
     assert initial["approved_hours"] != initial["hours"], "waiting hours are not counted hours"
     # The third fixture row is the pending one (3 h of the period's 15) and its awaiting cell
     # says so, where an approved row names the decision that was made instead.
-    assert initial["first_row"][5] == "Approved by Admin", initial["first_row"]
-    assert initial["rows"][2][5] == "Awaiting approval", initial["rows"][2]
+    assert initial["first_row"][7] == "Approved by Admin", initial["first_row"]
+    assert initial["rows"][2][7] == "Awaiting approval", initial["rows"][2]
 
 
 def test_the_default_column_order_is_the_one_the_tab_was_asked_for(results):
     default = results["columns_default"]
-    assert default["columns"] == "date,employee,id,site,hours,awaiting,notes"
-    assert default["column_order"] == ["date", "employee", "id", "site", "hours", "awaiting", "notes"]
-    assert default["headers"] == ["Date", "Employee", "User ID", "Site", "Hours", "Awaiting approval", "Open notes"]
+    assert default["columns"] == "date,employee,role,id,site,arrival,hours,awaiting,notes"
+    assert default["column_order"] == [
+        "date", "employee", "role", "id", "site", "arrival", "hours", "awaiting", "notes"
+    ]
+    assert default["headers"] == [
+        "Date", "Employee", "Role", "User ID", "Site", "Arrival", "Hours", "Awaiting approval",
+        "Open notes", PRINT_ACTION_HEADER
+    ], "the data columns, then the row action - which is not one of them"
     assert default["has_columns_panel"] is True, "the admin needs a way to change it"
     assert default["stored"] is None, "a default order is not a choice anybody made"
 
 
 def test_the_first_row_carries_the_column_values_in_that_order(results):
-    """Date, name, id, site, hours, approval - the row has to line up with its header."""
+    """Date, name, role, id, site, arrival, hours, approval - the row lines up with its header."""
     cells = results["columns_default"]["first_row"]
-    assert cells is not None and len(cells) == 7, cells
+    # Ten cells: the nine data columns and the action, which carries no text of its own -
+    # its label is its ``aria-label``, and what is inside it is an icon.
+    assert cells is not None and len(cells) == 10, cells
+    assert cells[9] == "", cells
     assert cells[0] == "2026-08-07"
     assert cells[1] == "Seed Lead"
-    assert cells[2] == "600"
-    assert cells[3] == "Downtown Tower A"
-    assert cells[4] == "8"
-    assert cells[5] == "Approved by Admin"
-    assert cells[6] == "1", "this worker has one note open"
+    # The role, in the reader's words: the wire says "moallem", the table says "Moallem".
+    assert cells[2] == "Moallem"
+    assert cells[3] == "600"
+    assert cells[4] == "Downtown Tower A"
+    assert cells[5] == "On time"
+    assert cells[6] == "8"
+    assert cells[7] == "Approved by Admin"
+    assert cells[8] == "1", "this worker has one note open"
 
 
 def test_moving_a_column_moves_it_in_the_header_the_panel_and_every_row(results):
     moved = results["columns_moved"]
-    # Five steps to the left, one per button press, ending at the front of the table. One
-    # step swaps a column with its neighbour and nothing else - no reshuffle, no jump.
-    assert len(moved["steps"]) == 5
-    assert moved["steps"][0] == "date,employee,id,site,awaiting,hours,notes"
-    assert moved["steps"][1] == "date,employee,id,awaiting,site,hours,notes"
-    assert moved["steps"][-1] == "awaiting,date,employee,id,site,hours,notes"
+    # One step per button press, all the way to the front of the table. One step swaps a
+    # column with its neighbour and nothing else - no reshuffle, no jump.
+    assert len(moved["steps"]) == 8
+    assert moved["steps"][0] == "date,employee,role,id,site,arrival,awaiting,hours,notes"
+    assert moved["steps"][1] == "date,employee,role,id,site,awaiting,arrival,hours,notes"
+    assert moved["steps"][-1] == "awaiting,date,employee,role,id,site,arrival,hours,notes"
     assert moved["column_order"][0] == "awaiting"
     assert moved["headers"][0] == "Awaiting approval"
     # The cells follow the header: the newest shift is signed off, the one below it is not.
@@ -820,21 +992,21 @@ def test_moving_a_column_moves_it_in_the_header_the_panel_and_every_row(results)
     assert moved["rows"][2][0] == "Awaiting approval", moved["rows"][2]
     assert moved["first_row"][1] == "2026-08-07"
     assert moved["first_row"][2] == "Seed Lead"
-    assert sorted(moved["column_order"]) == sorted(["date", "employee", "id", "site", "hours", "awaiting", "notes"]), (
-        "reordering must never lose or add a column"
-    )
+    assert sorted(moved["column_order"]) == sorted([
+        "date", "employee", "role", "id", "site", "arrival", "hours", "awaiting", "notes"
+    ]), "reordering must never lose or add a column"
     assert moved["hours"] == "15", "and the figures survive the repaint"
 
 
 def test_the_chosen_order_is_remembered_in_the_browser(results):
     moved = results["columns_moved"]
-    assert moved["stored"] == '["awaiting","date","employee","id","site","hours","notes"]', (
-        "the order has to outlive the repaint that follows the click"
-    )
+    assert moved["stored"] == (
+        '["awaiting","date","employee","role","id","site","arrival","hours","notes"]'
+    ), "the order has to outlive the repaint that follows the click"
     persist = results["columns_persist"]
-    assert persist["before"] == "date,employee,id,site,notes,hours,awaiting"
+    assert persist["before"] == "date,employee,role,id,site,arrival,notes,hours,awaiting"
     assert persist["column_order"] == persist["before"].split(","), "a re-render keeps it"
-    assert persist["headers"][4] == "Open notes", "and the header follows the stored order"
+    assert persist["headers"][6] == "Open notes", "and the header follows the stored order"
 
 
 def test_a_stale_or_junk_stored_order_cannot_break_the_table(results):
@@ -842,14 +1014,17 @@ def test_a_stale_or_junk_stored_order_cannot_break_the_table(results):
     repair = results["columns_repair"]
     # Unknown keys are dropped, duplicates collapse, and a column the stored order forgets is
     # appended - so a release that adds a column shows it instead of hiding it for ever.
-    assert repair["stale"]["order"] == "notes,date,employee,id,site,hours,awaiting"
+    assert repair["stale"]["order"] == "notes,date,employee,role,id,site,arrival,hours,awaiting"
     assert repair["stale"]["headers"][0] == "Open notes"
     assert repair["stale"]["has_table"] is True
-    assert repair["junk"]["order"] == "date,employee,id,site,hours,awaiting,notes", (
+    assert repair["junk"]["order"] == "date,employee,role,id,site,arrival,hours,awaiting,notes", (
         "junk under the key falls back to the default order, it does not empty the table"
     )
-    assert repair["junk"]["headers"] == ["Date", "Employee", "User ID", "Site", "Hours", "Awaiting approval", "Open notes"]
-    assert repair["wrong_type"] == "date,employee,id,site,hours,awaiting,notes", (
+    assert repair["junk"]["headers"] == [
+        "Date", "Employee", "Role", "User ID", "Site", "Arrival", "Hours", "Awaiting approval",
+        "Open notes", PRINT_ACTION_HEADER
+    ]
+    assert repair["wrong_type"] == "date,employee,role,id,site,arrival,hours,awaiting,notes", (
         "a stored value that is not a list is not an order"
     )
 
@@ -859,10 +1034,12 @@ def test_the_ends_of_the_column_list_are_ends_and_reset_puts_the_default_back(re
     assert reset["at_start"] == "no-move", "the first column cannot move further left"
     assert reset["edges"]["first_cannot_go_earlier"] is True, "and the button says so"
     assert reset["edges"]["last_cannot_go_later"] is True
-    assert reset["before_reset"] == "date,employee,id,site,hours,notes,awaiting", (
+    assert reset["before_reset"] == "date,employee,role,id,site,arrival,hours,notes,awaiting", (
         "one step left puts Open notes beside the hours it explains"
     )
-    assert reset["column_order"] == ["date", "employee", "id", "site", "hours", "awaiting", "notes"]
+    assert reset["column_order"] == [
+        "date", "employee", "role", "id", "site", "arrival", "hours", "awaiting", "notes"
+    ]
     assert reset["stored_after_reset"] is None, "reset forgets the choice, it does not store the default"
 
 
@@ -977,6 +1154,17 @@ def test_a_link_pasted_into_the_open_tab_applies_without_a_reload(results):
     assert change["hours"] == "40"
 
 
+def test_the_search_box_finds_a_role_in_the_words_the_column_shows(results):
+    """A column nobody can filter by is a column somebody has to scan by eye."""
+    search = results["search"]
+    # The one moallem in the fixture, and only their shift: the role is in the haystack as
+    # the code that arrives and as the label the table paints, which is what makes
+    # "whose shifts are these" a question this box answers.
+    assert search["by_role"]["shift_rows"] == 1
+    assert search["by_role"]["hours"] == "8"
+    assert search["by_role"]["query"] == "moallem"
+
+
 def test_the_search_box_finds_a_name_a_worker_id_and_a_site(results):
     search = results["search"]
     assert search["by_name"]["shift_rows"] == 1, "'torres' is one shift"
@@ -1055,6 +1243,68 @@ def csv_rows(csv):
 
 CSV_HEADER = "Employee,id,site,hours"
 
+#: The header of the row action - the screen's own last cell, and no part of the stored
+#: column order, because a control is not a column. One word, and deliberately without an
+#: apostrophe: the suite reads headers off the markup with the tags stripped and does not
+#: decode entities, so a label with one in it would be compared as ``&#39;``.
+PRINT_ACTION_HEADER = "Print"
+
+
+# ---------------------------------------------------------------------------
+# 4f. the arrival: on time, or late by how much - and searchable
+# ---------------------------------------------------------------------------
+def test_the_timesheet_says_who_arrived_late_and_by_how_much(results):
+    """One row's arrival is the shift's own clock-in against the window its site applies."""
+    initial = results["initial"]
+    assert initial["late_arrivals"] == "1", "one of the three shifts walked in late"
+    # Column order: date, employee, role, id, site, arrival, hours, awaiting, notes.
+    assert initial["rows"][0][5] == "On time", initial["rows"][0]
+    assert initial["rows"][2][5] == "Late 42 min", initial["rows"][2]
+
+
+def test_a_search_for_late_arrivals_finds_them_and_their_minutes(results):
+    """The question an administrator actually asks: who was late, and by how much."""
+    search = results["search"]
+    assert search["by_late"]["shift_rows"] == 1, "one shift arrived late"
+    assert search["by_late"]["late_arrivals"] == "1", "and the figure above it says so"
+    assert search["late_by"]["shift_rows"] == 1, "a second term is how far off: 'late 42'"
+    assert search["late_by"]["hours"] == "3", "the narrowed view totals only that shift"
+    assert search["by_on_time"]["shift_rows"] == 2, "the two that were inside the window"
+    assert search["by_on_time"]["late_arrivals"] == "0", "nothing late is left in the list"
+    assert search["by_late"]["has_no_matches"] is False
+
+
+def test_a_shift_with_no_arrival_on_file_is_not_called_punctual(results):
+    """The unknown state matters: 'no clock-in' is not 'on time'."""
+    missing = results["no_arrival"]
+    assert missing["cell"] == "No clock-in", missing["cell"]
+    assert missing["late_arrivals"] == "0"
+    assert missing["search_no_match"] is True, (
+        "and it is not found by a search for the punctual ones either"
+    )
+
+
+def test_the_printed_sheet_carries_the_arrival_but_the_csv_does_not(results):
+    """The screen gained a column; the file did not, and paper follows the screen.
+
+    The CSV is the four fixed columns on purpose: two months of sheets have to line up
+    column for column, and a column that appears in one month's file and not the other's is
+    a spreadsheet nobody can compare. The printed sheet is the table on screen, which is
+    what the person holding it has been reading.
+    """
+    download = results["download"]
+    header, rows = csv_rows(download["csv"])
+    assert header == CSV_HEADER, "still who, their id, where and how long"
+    assert len(header.split(",")) == 4
+    assert len(rows) == 3, "the file is the whole period, arrival column or not"
+    assert "late" not in download["csv"].lower()
+    assert "on time" not in download["csv"].lower()
+    # ...and the column really is on screen, so this is about the file rather than about a
+    # column that was never added.
+    assert "Arrival" in results["columns_default"]["headers"]
+    assert "Arrival" in results["print"]["screen_headers"]
+    assert "Late 42 min" in results["print"]["sheet"], "paper keeps the arrival column"
+
 
 def test_the_csv_holds_only_who_their_id_where_and_how_long(results):
     """Four columns, and the four the API's own export writes: a sheet with no money in it."""
@@ -1104,6 +1354,101 @@ def test_the_file_columns_do_not_follow_the_screen_order(results):
     assert rows[0] == "Seed Lead,600,Downtown Tower A,8"
 
 
+# ---------------------------------------------------------------------------
+# 5b. the PDF choice: the same report, printed by the browser
+# ---------------------------------------------------------------------------
+def test_the_report_is_downloaded_as_a_spreadsheet_or_printed_as_a_pdf(results):
+    """One button, two files, and the page's own rows either way."""
+    printed = results["print"]
+    assert printed["printed"] == 1, "the PDF choice has to reach the browser's print dialog"
+    assert printed["printing"] is True, (
+        "the console has to be out of the paper before the dialog opens"
+    )
+    assert printed["files_written"] == 0, "the page writes no PDF - the dialog does"
+    assert printed["requests_added"] == 0, "the sheet is built from the rows already in hand"
+
+
+def test_the_printed_sheet_holds_the_rows_on_screen_and_the_period_in_its_name(results):
+    """The sheet names its period, holds the three shifts, and totals what they add to.
+
+    The name matters as much as the rows: "Save as PDF" offers the *document title*, so a
+    sheet called "Al-Jehad - Site Attendance" is a folder of files nobody can tell apart.
+    """
+    printed = results["print"]
+    expected = printed["expected_range"]
+    assert printed["title"] == f"shifts_{expected['start']}_{expected['end']}", (
+        "the period has to be in the name the dialog offers"
+    )
+    sheet = printed["sheet"]
+    for name in ("Seed Lead", "Ana Torres", "Bilal Khan"):
+        assert name in sheet, f"{name}'s shift is on screen but not on the sheet"
+    assert "Downtown Tower A" in sheet and "Harbour Depot" in sheet
+    assert sheet.count("<tr>") == 4, "one header row and the three shifts"
+    assert printed["screen_hours"] in sheet, "the total printed is the total on screen"
+
+
+def test_the_printed_sheet_keeps_the_columns_the_administrator_arranged(results):
+    """Paper is read by whoever set the table up, so the sheet follows their order.
+
+    The CSV deliberately does not - fixed columns so two months can be compared - and this
+    is the difference between the two files, asserted rather than assumed.
+    """
+    printed = results["print"]
+    headers = re.findall(r"<th>(.*?)</th>", printed["sheet"])
+    assert printed["screen_headers"][-1] == PRINT_ACTION_HEADER, (
+        "the row action is the screen's last column"
+    )
+    assert headers == printed["screen_headers"][:-1], (
+        "the sheet's columns are the screen's, minus the row action - a button is not paper"
+    )
+    assert headers[0] == "Date", "the default order, not the file's fixed four"
+
+
+def test_the_printed_sheet_is_the_search_the_administrator_ran(results):
+    filtered = results["print"]["filtered"]
+    assert "Ana Torres" in filtered["sheet"] and "Bilal Khan" in filtered["sheet"]
+    assert "Seed Lead" not in filtered["sheet"], "the shift the search excluded was printed"
+    assert filtered["title"].endswith("_harbour"), "two prints of one period must not clash"
+
+
+def test_closing_the_dialog_puts_the_console_back(results):
+    """A print that left the page muted would leave the next one printing a stale sheet."""
+    after = results["print"]["after"]
+    assert after["printing"] is False, "the body still claims a report is being printed"
+    assert after["title"] == "Al-Jehad - Site Attendance", "the tab's own title comes back"
+    assert after["sheets_left"] == 0, (
+        "a sheet left in the page is a second one printed behind the next report"
+    )
+
+
+def test_a_print_with_nothing_on_screen_prints_nothing(results):
+    nothing = results["print"]["nothing_to_export"]
+    assert nothing["printed"] == 0, "a failed request leaves nothing to print"
+    assert nothing["toasts"] == ["There is nothing on screen to download for this period."]
+
+
+def test_a_period_with_no_shifts_prints_the_sentence_not_an_empty_table(results):
+    """Two states that must not look alike: no report, and a report with no rows.
+
+    The frame around a sheet is shared with the worker's own timesheet, so this is where
+    "a sheet for an empty period says so" is pinned: a print that produced a titled table
+    with no rows would read as a month of no work rather than a month with nothing filed.
+    """
+    quiet = results["print"]["quiet"]
+    assert quiet["printed"] == 1, "there *is* a report, so the dialog opens"
+    assert quiet["has_empty_note"] is True
+    assert quiet["has_table"] is False, "no table at all, rather than a table with no rows"
+    assert "No shifts in this period." in quiet["sheet"]
+
+
+def test_the_untouched_format_field_still_writes_the_spreadsheet(results):
+    """The safe failure is the file the button used to write, not a print dialog."""
+    default = results["print"]["default_format"]
+    assert default["printed"] == 0, "an unknown or missing format must never print"
+    assert default["files"] == 2
+    assert default["filename"].endswith(".csv")
+
+
 def test_nothing_is_downloaded_when_the_screen_holds_no_report(results):
     """A failed request leaves no figures to export, so no file may be written."""
     nothing = results["download"]["nothing_to_export"]
@@ -1125,9 +1470,10 @@ def test_the_phone_layout_shows_one_card_per_shift_with_the_same_columns(results
     assert mobile["shift_rows"] == 3
     assert mobile["has_table"] is False
     assert mobile["hours"] == "15"
-    # The same seven columns, in the same order - a card is a row that had to fold.
-    assert mobile["labels"][:7] == [
-        "Date", "Employee", "User ID", "Site", "Hours", "Awaiting approval", "Open notes"
+    # The same columns, in the same order - a card is a row that had to fold.
+    assert mobile["labels"][:9] == [
+        "Date", "Employee", "Role", "User ID", "Site", "Arrival", "Hours", "Awaiting approval",
+        "Open notes"
     ]
     assert mobile["site_names"] == ["Downtown Tower A", "Harbour Depot", "Harbour Depot"], (
         "a phone card names the same site the desktop row does"
@@ -1139,7 +1485,7 @@ def test_a_shift_with_no_site_on_file_still_gets_a_row(results):
     table = results["sites"]["no_site"]
     assert table["shift_rows"] == 1
     assert table["site_names"] == []
-    assert table["first_row"][3] == table["em_dash"], "an em dash, not an empty cell"
+    assert table["first_row"][4] == table["em_dash"], "an em dash, not an empty cell"
     assert table["hours"] == "6"
 
 

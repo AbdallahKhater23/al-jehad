@@ -46,6 +46,7 @@ from harness import (
 
 import harness
 import quick_links
+import shift_hours
 
 #: The reference the harness writes for every seeded user, captured at import.
 #:
@@ -113,10 +114,25 @@ def issue(client, worker_id: str = WORKER, headers=None, **overrides):
     )
 
 
-def punch(client, token, *, coordinates: str = INSIDE_DOWNTOWN, image: bytes | None = None, accuracy=None):
+def punch(
+    client,
+    token,
+    *,
+    coordinates: str = INSIDE_DOWNTOWN,
+    image: bytes | None = None,
+    accuracy=None,
+    confirm: bool = True,
+):
     data = {"lat": coordinates.split(",")[0], "lon": coordinates.split(",")[1]}
     if accuracy is not None:
         data["accuracy"] = str(accuracy)
+    # ``confirm`` is on by default in this file because nearly every punch here is taken
+    # seconds after the shift opened - which is exactly the tap the early clock-out question
+    # exists for. These tests are about the *link*: who may use it, how often, what it
+    # records. The question itself is proved in ``test_early_checkout_and_rounding.py``, and
+    # one test here turns the flag off to show the refusal rather than assume it.
+    if confirm:
+        data["confirm_early_checkout"] = "1"
     return client.post(
         f"/api/v1/q/{token}",
         data=data,
@@ -276,6 +292,42 @@ def test_both_link_pages_carry_every_element_the_shared_module_reaches_for():
         assert ".hidden" in body, f"{page} uses the module's show/hide contract but never styles it"
 
 
+def test_the_early_clock_out_question_is_wired_on_the_punch_page():
+    """The question needs its elements bound and its sentences in all three tables.
+
+    The link page is the one surface with no session and no app behind it, so a button the
+    page never binds, or a sentence missing from one of the three tables, is a blank amber
+    card at a gate - the silent failure this file already exists to catch. The app's own
+    table has a parity test (``test_frontend_payload.py``); this page keeps its own, so it
+    gets its own.
+    """
+    page = (harness.PROJECT_ROOT / "frontend" / "quick.html").read_text(encoding="utf-8")
+    for element in ("early-confirm", "early-body", "btn-early-confirm", "btn-early-cancel"):
+        assert f'id="{element}"' in page, f"quick.html has no #{element} for the flow to bind"
+
+    module = (harness.PROJECT_ROOT / "frontend" / "capture.js").read_text(encoding="utf-8")
+    # The number of tables is read off the page's own language list rather than written here,
+    # so a language added to the picker is covered by this test without editing it - and a
+    # sentence that reaches only some of the tables fails rather than passing quietly.
+    languages = sorted(set(re.findall(r'code: "([a-z]{2})"', module)))
+    assert len(languages) >= 3, f"capture.js offers only {languages}"
+    for key in ("quick.earlyTitle", "quick.earlyBody", "quick.earlyConfirm", "quick.earlyCancel"):
+        found = module.count(f'"{key}"')
+        assert found == len(languages), (
+            f"{key} is in {found} of the {len(languages)} language tables ({languages}) in capture.js"
+        )
+
+    # The link pages mirror themselves from their own list, the way the app does: Urdu is
+    # right to left, and a page that renders it left to right reads as broken to the reader.
+    assert re.search(r'var RTL = \["ar", "ur"\]', module), (
+        "capture.js must name both right-to-left languages, and only those"
+    )
+
+    flow = (harness.PROJECT_ROOT / "frontend" / "quick.js").read_text(encoding="utf-8")
+    assert "confirm_early_checkout" in flow, "the page never sends the flag the server asks for"
+    assert "quick.earlyBody" in flow, "the page never writes the question it just defined"
+
+
 def test_issue_returns_a_usable_link_once(client):
     response = issue(client)
     assert response.status_code == 200, response.text
@@ -407,6 +459,45 @@ def test_a_tap_clocks_in_then_out_with_no_password(client):
     assert all("not matched" in (row[3] or "") for row in rows)
 
     assert db_scalar("SELECT uses FROM quick_links WHERE id = ?", (link["link_id"],)) == 2
+
+
+def test_a_short_tap_is_questioned_before_anything_is_recorded(client):
+    """The link asks the same question the app does, and moves nothing until it is answered.
+
+    A link punch taken seconds after the clock-in is the clearest case of a short shift
+    there is - and the one an impatient double tap produces. The refusal has to leave the
+    shift open, the link's uses untouched and no clock-out row, or cancelling would cost
+    the worker a shift.
+    """
+    clear_sessions()
+    link = issue(client).json()
+    assert punch(client, link["token"]).status_code == 200, "the first tap is the clock-in"
+    # The seed data leaves clock-out rows of its own behind, so what this pins is that
+    # the refusal adds none - not that the table is empty.
+    before = db_scalar(
+        "SELECT COUNT(*) FROM attendance_logs WHERE worker_id = ? AND action = 'Clock Out'",
+        (WORKER,),
+    )
+
+    refused = punch(client, link["token"], confirm=False)
+    assert refused.status_code == 409, refused.text
+    detail = refused.json()["detail"]
+    assert detail["error_code"] == "confirm_early_checkout"
+    assert detail["regular_hours"] == 8.0
+
+    assert active_session() is not None, "a question must not close the shift"
+    assert db_scalar(
+        "SELECT COUNT(*) FROM attendance_logs WHERE worker_id = ? AND action = 'Clock Out'",
+        (WORKER,),
+    ) == before, "nothing may be recorded before the worker answers"
+    assert db_scalar("SELECT uses FROM quick_links WHERE id = ?", (link["link_id"],)) == 1, (
+        "a refused tap is not a use of the link"
+    )
+
+    confirmed = punch(client, link["token"])
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["action"] == "Clock Out"
+    assert active_session() is None
 
 
 def test_the_worker_is_the_links_worker_and_not_the_callers_choice(client):
@@ -734,6 +825,44 @@ def test_a_standard_admin_may_issue_and_revoke(client):
         ).status_code
         == 200
     )
+
+
+def test_a_quick_link_clock_out_is_routed_by_the_shared_resolver(client):
+    """The link path reaches the same overtime verdict as the punch path.
+
+    It used to resolve ``overtime_notify_hours`` for itself and compare the *recorded*
+    hours against it, so the same shift could be held for approval from a link and approved
+    on the phone. The margins are seconds rather than milliseconds because the clock-in is
+    planted just before the request, and the request's own clock is a little later - ten
+    seconds either side of the line is far outside that skew and still "on the same second"
+    as far as any shift of a working day is concerned.
+    """
+    rules = client.get("/api/v1/admin/shift_rules", headers=bearer(HEAD_ADMIN)).json()
+    line = shift_hours.overtime_rule(rules)
+    break_seconds = int(round(shift_hours.break_hours(rules) * shift_hours.SECONDS_PER_HOUR))
+    at_the_line = line["threshold_seconds"] + break_seconds
+    link = issue(client).json()
+
+    where = "worker_id = ? AND action = 'Clock Out' ORDER BY id DESC LIMIT 1"
+    seed_open_shift(WORKER, hours_ago=(at_the_line - 10) / 3600)
+    assert punch(client, link["token"]).status_code == 200
+    assert db_scalar(f"SELECT status_code FROM attendance_logs WHERE {where}", (WORKER,)) == "approved", (
+        "a shift short of the line is an ordinary day"
+    )
+    assert db_scalar(f"SELECT overtime_hours FROM attendance_logs WHERE {where}", (WORKER,)) is None
+
+    seed_open_shift(WORKER, hours_ago=at_the_line / 3600)
+    assert punch(client, link["token"], confirm=True).status_code == 200
+    assert db_scalar(f"SELECT status_code FROM attendance_logs WHERE {where}", (WORKER,)) == "pending_overtime"
+    stored = db_scalar(f"SELECT overtime_hours FROM attendance_logs WHERE {where}", (WORKER,))
+    expected = shift_hours.overtime_assessment(at_the_line, rules)["overtime_hours"]
+    assert stored == pytest.approx(expected, abs=1e-3), (
+        "the link path and the resolver must hold back the same hours"
+    )
+
+    # ... and the reason on the row is the shared sentence, not a second wording.
+    reason = db_scalar(f"SELECT flag_reason FROM attendance_logs WHERE {where}", (WORKER,)) or ""
+    assert "overtime line" in reason and "paid day" in reason, reason
 
 
 def test_the_audit_log_names_the_link_and_the_worker(client):

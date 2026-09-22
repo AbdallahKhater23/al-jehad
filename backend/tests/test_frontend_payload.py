@@ -60,7 +60,7 @@ SHIPPED = [
 
 #: Fetched by the session that needs them, from the same directory - ``UI.loadConsoleModule``
 #: for the console, ``I18n.load`` for a language nobody has read yet.
-DEFERRED = ["admin_modules.js", "i18n.ar.js", "i18n.hi.js"]
+DEFERRED = ["admin_modules.js", "i18n.ar.js", "i18n.hi.js", "i18n.ur.js"]
 
 #: A worker's phone: the document's list, which is what the harness is given for the
 #: sessions below that must not have the console module in them.
@@ -309,6 +309,27 @@ def tables() -> dict:
 # What the document asks for
 # ---------------------------------------------------------------------------
 @pytest.mark.regression
+def test_no_string_is_declared_twice_in_a_table():
+    """A duplicated key is a string silently replaced, and the tables cannot show it.
+
+    An object literal with the same key twice is valid JavaScript: the *last* one wins, no
+    warning is printed, and everything that reads the first one keeps its old value - which is
+    how a new screen's wording once replaced a different screen's. ``Object.keys`` cannot see
+    it after the fact (the duplicate is gone by then), so this reads the source: every
+    ``"key":`` line, per table, with the key named in the failure.
+    """
+    key = re.compile(r'^\s*"([A-Za-z0-9_]+)":', re.MULTILINE)
+    for name in ("i18n.js", "i18n.ar.js", "i18n.hi.js", "i18n.ur.js"):
+        source = (FRONTEND / name).read_text(encoding="utf-8")
+        found = key.findall(source)
+        duplicates = sorted({entry for entry in found if found.count(entry) > 1})
+        assert duplicates == [], (
+            f"{name} declares {duplicates} more than once. The last declaration wins and the "
+            f"first one's screen silently changes - give one of them its own key, in all four "
+            f"tables"
+        )
+
+
 def test_the_document_ships_only_the_files_every_session_uses():
     """Six names, and the next eager tag is a phone paying for an office again."""
     shipped = [src for src in SCRIPT_SRC.findall(INDEX) if "://" not in src]
@@ -337,7 +358,7 @@ def test_the_deferred_files_are_named_where_the_app_asks_for_them():
     console = (FRONTEND / "frontendjavascript.js").read_text(encoding="utf-8")
     i18n = (FRONTEND / "i18n.js").read_text(encoding="utf-8")
     assert "script.src = 'admin_modules.js'" in console
-    assert "CHUNKS: ['ar', 'hi']" in i18n
+    assert "CHUNKS: ['ar', 'hi', 'ur']" in i18n
     assert "script.src = 'i18n.' + code + '.js'" in i18n
 
 
@@ -466,15 +487,22 @@ def test_a_language_that_cannot_be_fetched_leaves_the_reader_where_they_were(ses
 @pytest.mark.regression
 def test_the_three_tables_are_one_vocabulary(tables):
     """The chunks are the tables that were in ``i18n.js``, not a paraphrase of them."""
-    assert tables["languages"] == ["en", "ar", "hi"], (
-        "the loader builds TRANSLATIONS from three files; a session that ends up with "
-        "three languages is what proves they all merged"
+    assert tables["languages"] == ["en", "ar", "hi", "ur"], (
+        "the loader builds TRANSLATIONS from four files; a session that ends up with "
+        "four languages is what proves they all merged"
     )
     counts = tables["counts"]
     assert counts["en"] >= 508, f"the English table lost strings: {counts}"
     assert counts["ar"] == counts["hi"], f"the two translations drifted apart: {counts}"
+    # Urdu was written after the split, straight from the English table, so it carries every
+    # key. The eighteen-string gap below is Arabic's and Hindi's; it stays theirs rather than
+    # being inherited by a table that had no reason to arrive short.
+    assert counts["ur"] == counts["en"], (
+        f"the Urdu table is incomplete ({counts['ur']} of {counts['en']} keys): a reader who "
+        "chooses Urdu must not fall back to English anywhere, least of all offline"
+    )
 
-    for lang in ("ar", "hi"):
+    for lang in ("ar", "hi", "ur"):
         assert tables["unknown"][lang] == [], (
             f"{lang} has keys English does not: {tables['unknown'][lang]}. A key nobody "
             "asks for in English is a string the app can never show."
@@ -492,7 +520,46 @@ def test_the_three_tables_are_one_vocabulary(tables):
         )
 
 
+DIRECTION_HARNESS = r"""
+const results = {};
+const env = boot();
+// ``applyDirection`` is what every repaint and every language switch goes through, so it
+// is the one place the layout's direction is decided.
+const directionFor = (code) => env.evaluate(
+    "(function () { I18n.lang = '" + code + "'; I18n.applyDirection();" +
+    " return document.documentElement.__attrs.dir + '/' + document.documentElement.__attrs.lang; })()");
+results.direction = { en: directionFor('en'), ar: directionFor('ar'), hi: directionFor('hi'), ur: directionFor('ur') };
+results.rtl_list = env.evaluate('I18n.RTL.join(",")');
+results.is_rtl = {
+    ar: env.evaluate("I18n.isRtl('ar')"), ur: env.evaluate("I18n.isRtl('ur')"),
+    hi: env.evaluate("I18n.isRtl('hi')"), en: env.evaluate("I18n.isRtl('en')")
+};
+"""
+
+
+@pytest.fixture(scope="module")
+def direction() -> dict:
+    return frontend_vm.run(DIRECTION_HARNESS)
+
+
 @pytest.mark.regression
+def test_urdu_mirrors_the_layout_like_arabic(direction):
+    """Urdu reads right to left, and the app decides that from one list, not a branch.
+
+    A second RTL language is the one thing about adding Urdu that no string test can see:
+    get it wrong and every screen renders left to right in a right-to-left script, which
+    looks broken to the reader and correct to the suite.
+    """
+    assert direction["rtl_list"] == "ar,ur", (
+        f"the right-to-left languages are {direction['rtl_list']!r}: Urdu belongs in this "
+        "list, and nothing else does"
+    )
+    assert direction["is_rtl"] == {"ar": True, "ur": True, "hi": False, "en": False}
+    assert direction["direction"] == {
+        "en": "ltr/en", "ar": "rtl/ar", "hi": "ltr/hi", "ur": "rtl/ur"
+    }, direction["direction"]
+
+
 def test_the_english_table_really_is_all_that_i18n_js_carries():
     """The move, stated as a property: no other language's table is in the shipped file.
 
@@ -501,7 +568,11 @@ def test_the_english_table_really_is_all_that_i18n_js_carries():
     except this one, which is about the file every session downloads.
     """
     shipped = (FRONTEND / "i18n.js").read_text(encoding="utf-8") + (FRONTEND / "frontendjavascript.js").read_text(encoding="utf-8")
-    for lang, marker in (("ar", '"title": "نظام حضور الموقع"'), ("hi", '"title": "साइट उपस्थिति"')):
+    for lang, marker in (
+        ("ar", '"title": "نظام حضور الموقع"'),
+        ("hi", '"title": "साइट उपस्थिति"'),
+        ("ur", '"title": "حاضری الموقع"'),
+    ):
         assert marker not in shipped, (
             f"the {lang} table is back in a file every session downloads. It belongs in "
             f"frontend/i18n.{lang}.js"

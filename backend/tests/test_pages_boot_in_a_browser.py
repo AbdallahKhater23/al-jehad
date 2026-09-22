@@ -134,6 +134,50 @@ def test_the_width_reaches_the_applications_own_layout_switch(browser, site, lin
     )
 
 
+@pytest.mark.parametrize("path", ("/q/this-token-was-never-issued", "/enroll/this-token-was-never-issued"))
+def test_a_refusal_is_read_in_the_readers_language(browser, site, path):
+    """A dead link answers in the reader's language, and goes on doing so after a switch.
+
+    The server writes its refusal in English - for an administrator reading a log or a
+    ``curl`` - and both pages used to render that sentence verbatim, so a worker holding
+    Arabic, Hindi or Urdu was handed English. The reason is in the ``error_code``
+    (``link_unknown``, ``invite_unknown``) and the page has its own sentence for it; this
+    drives the real page to prove the sentence the worker reads is the page's.
+
+    ``innerText`` is what the reader sees, and it is read back after the language has been
+    switched *back*, because the message box is not a ``data-t`` node: repainting it on a
+    language switch is a separate line of code, and the one a later edit drops first.
+    """
+    context = browser.new_context(locale="en-US")
+    try:
+        tab = context.new_page()
+        tab.goto(site(path), wait_until="load")
+        tab.wait_for_function("() => document.getElementById('message').textContent.length > 0", timeout=8000)
+        english = tab.evaluate("document.getElementById('message').textContent")
+        assert "not valid" in english, f"this is not the refusal this test is about: {english!r}"
+
+        # Urdu, chosen the way a worker chooses it - before the page is loaded, which is
+        # what the picker writes to storage.
+        tab.evaluate("localStorage.setItem('lang', 'ur')")
+        tab.reload(wait_until="load")
+        tab.wait_for_function("() => document.getElementById('message').textContent.length > 0", timeout=8000)
+        urdu = tab.evaluate("document.getElementById('message').textContent")
+        assert "not valid" not in urdu, (
+            f"the refusal came back in the server's English with Urdu chosen: {urdu!r}"
+        )
+        assert urdu != english, f"the refusal did not change with the language: {urdu!r}"
+        assert tab.evaluate("document.documentElement.getAttribute('dir')") == "rtl"
+
+        # And back again: the box is rewritten from the reason the server sent, not frozen
+        # in the language the answer happened to arrive in.
+        tab.click('[data-lang="en"]')
+        assert tab.evaluate("document.getElementById('message').textContent") == english
+        tab.click('[data-lang="ur"]')
+        assert tab.evaluate("document.getElementById('message').textContent") == urdu
+    finally:
+        context.close()
+
+
 def test_the_paths_under_test_are_the_paths_the_product_sends(link_paths):
     """The pages are opened at the *token* URLs the console issues, not at the files.
 

@@ -36,7 +36,6 @@ certifi==2026.7.22
 charset-normalizer==3.5.1
 click==8.5.0
 colorama==0.4.6
-deepface==0.0.100
 Deprecated==1.3.1
 fastapi==0.141.1
 filelock==3.32.4
@@ -57,7 +56,6 @@ importlib==1.0.4
 itsdangerous==2.2.0
 Jinja2==3.1.6
 joblib==1.5.3
-keras==3.15.1
 libclang==18.1.1
 lightdsa==0.0.3
 lightecc==0.0.7
@@ -73,7 +71,12 @@ mtcnn==1.0.0
 namex==0.1.0
 narwhals==2.25.0
 numpy==2.5.2
-#opencv-python==5.0.0.93
+# The embedding engine (``backend/face_onnx.py``, FaceNet-128) runs on ONNX Runtime, and it is a
+# **runtime** dependency rather than the optional extra it used to be: with no onnxruntime there
+# is no embedding, so no punch can be verified at all. It is no longer listed in
+# ``backend/requirements-optional.txt``, because a feature that cannot degrade is not optional.
+# Same build as the measurement in ``face_onnx``'s docstring (~13 ms per embedding).
+onnxruntime==1.30.0
 opt_einsum==3.4.0
 optree==0.20.0
 packaging==26.3
@@ -101,9 +104,7 @@ slowapi==0.1.10
 soupsieve==2.9.2
 starlette==1.6.0
 sympy==1.14.0
-tensorflow==2.21.0
 termcolor==3.3.0
-tf_keras==2.21.0
 threadpoolctl==3.6.0
 tqdm==4.70.0
 truststore==0.10.4
@@ -115,4 +116,16 @@ uvicorn==0.52.4
 Werkzeug==3.1.8
 wheel==0.48.0
 wrapt==2.4.0
-opencv-python-headless
+# The face detector (``backend/face_detector.py``) runs on cv2's FaceDetectorYN and the engine's
+# crop is resized with cv2, so OpenCV is a runtime dependency, not an incidental one: an
+# unpinned line here is a host that installs a different OpenCV than the one YuNet was measured
+# on. Pinned to the release this environment was frozen from.
+opencv-python==5.0.0.93
+#
+# NOTE ON THE REMOVED FRAMEWORKS. ``deepface``, ``tensorflow``, ``tf_keras`` and ``keras`` were
+# removed here when the embedding path moved to ONNX Runtime: nothing in the application imports
+# them any more, and a host that installs a 550 MiB training framework to run a 13 ms inference
+# is paying for a dependency it does not use. Their *transitive* pins remain in the freeze below
+# and above - hand-pruning somebody else's dependency tree is how a manifest stops being the
+# freeze it claims to be - and will drop out on the next full re-freeze. The runtime imports
+# that matter are re-checked by ``backend/tests/test_deployment_manifest.py``.

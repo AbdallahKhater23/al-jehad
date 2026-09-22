@@ -57,12 +57,35 @@ Operators who want a tighter bound lower that setting (24 h is a reasonable site
 A rejection is **stored, never dropped** (``status='rejected'`` + ``rejection_code``), so
 a punch that really happened stays visible at
 ``GET /api/v1/admin/punch_queue?status=rejected`` for a human to resolve, instead of
-vanishing because a phone clock was wrong.
-
-A punch that verifies but lands outside every geofence is accepted as
+vanishing because a phone clock was wrong.A punch that verifies but lands outside every geofence is accepted as
 ``status='flagged'``, materialised with ``flag_reason``, and notified: on an offline
-capture the GPS fix is the least trustworthy part, so the worker stays on record and an
-administrator decides.
+capture the GPS fix is the least trustworthy part, so the worker stays on record
+and an administrator decides.
+
+NOTHING ARRIVES APPROVED
+------------------------
+Materialising a queued punch is not the same as confirming it. A punch taken with no
+signal was never checked - not the face, not the frame, not even the site - and the only
+evidence for it is a photo on the worker's own phone. So the clock-out - the row that
+carries the hours - is written as ``pending_review``, or ``pending_overtime`` when the
+shift crossed the overtime line (that hold is a fact about the hours and wins over the
+generic one), and ``reports.PAYABLE_CODES`` contains neither: the hours sit in the
+awaiting-approval column until an administrator approves them. The reason is recorded on
+the row, because a queue entry nobody can explain is a queue entry nobody acts on.
+
+The arrival is recorded as ``unverified_offline`` rather than held for review, and the
+difference is deliberate. It carries no hours, so there is no money for a reviewer to
+decide; and a ``pending_review`` row stops this worker closing their shift at all, because
+both the online clock-out and the quick links refuse while one exists. Holding the arrival
+would mean somebody who came in during a dead spot could not clock out - the app punishing
+them for the dead spot, and the day's hours never recorded. Unverified is what the row is;
+the departure's hold is what an administrator acts on.
+
+The selfie the phone kept is uploaded next door (``POST /attendance/sync/photo``), where
+the server runs the **same** liveness evaluation and face comparison an online punch runs
+and writes the verdict onto that review row. It is evidence, not a verdict: a score
+cannot approve a punch nobody was there to watch, and it cannot refuse one either - both
+of those are the administrator's, in the review queue.
 
 CLIENT CONTRACT
 ---------------
@@ -77,19 +100,29 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import sqlite3
 import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+import numpy as np
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field, field_validator
 
+import biometrics
+import face_detector
+import face_engine
+import liveness
 import migrations
 import notifications
+import overtime
+import punch_frames
 import shift_hours
 import shift_windows
+import telemetry
 import textguard
+import uploads
 from config import settings
 from database import db
 from rate_limit import limiter
@@ -114,16 +147,55 @@ STATUS_REJECTED = "rejected"
 #: site name that payroll could mistake for the truth.
 SITE_UNASSIGNED = "Unassigned (offline)"
 
-#: ``attendance_logs.score`` is NOT NULL. An offline punch has no face-match score
-#: because matching happened (if at all) on the client, so it is written as 0.0 with
-#: the reason recorded - never as a passing score.
+#: ``attendance_logs.score`` is NOT NULL. An offline punch has no face-match score at
+#: materialisation time, so it is written as 0.0 with the reason recorded - never as a
+#: passing score. ``POST /attendance/sync/photo`` replaces it with the real distance once
+#: the queued selfie arrives (see ``score_queued_selfie``).
 OFFLINE_SCORE = 0.0
 
 LIVENESS_OFFLINE = "unverified_offline"
 
+#: The attendance status of a materialised punch that no human has signed off. The label
+#: is the code, because that is the predicate ``GET /admin/pending_reviews`` matches on -
+#: ``main.STATUS_PENDING_REVIEW`` is the same string, and it lives here as well because
+#: this module may not import ``main`` at module scope (``main`` imports this one).
+STATUS_CODE_PENDING_REVIEW = "pending_review"
+STATUS_LABEL_PENDING_REVIEW = "pending_review"
+#: The arrival's own status: recorded, never checked, and deliberately *not* in the review
+#: queue. The clock-out half is the row an administrator has to decide - it carries the hours -
+#: and it is also the row whose hold is meaningful, because the shift is already closed. Holding
+#: the arrival too would put a money-less row in front of a reviewer and, far worse, stop the
+#: worker closing their own shift: both the online clock-out and the quick links refuse to
+#: proceed while any ``pending_review`` row exists. See ``migrations``
+#: ``STATUS_CODE_UNVERIFIED_OFFLINE`` for the same reasoning written down where the vocabulary
+#: lives.
+STATUS_CODE_UNVERIFIED_OFFLINE = migrations.STATUS_CODE_UNVERIFIED_OFFLINE
+STATUS_LABEL_UNVERIFIED_OFFLINE = migrations.STATUS_LABEL_UNVERIFIED_OFFLINE
+#: The overtime hold's label and code, spelled the way ``migrations.STATUS_CODE_MAP``
+#: translates them (the map is the authority, and it is the table the migration of an old
+#: database reads).
+STATUS_LABEL_PENDING_OVERTIME = "Pending Overtime Approval"
+STATUS_CODE_PENDING_OVERTIME = "pending_overtime"
+
+#: Why every materialised punch is in the queue, recorded as its ``flag_reason``. It is
+#: the *provenance* reason and not a finding about the shift: a worker who syncs a genuine
+#: day reads the same sentence as one who does not, and what separates them is the review
+#: - which is the point. One sentence for both ends of the shift (see ``materialize_worker``).
+OFFLINE_REVIEW_REASON = (
+    "offline punch: captured with no signal, so nothing about the face, the frame or the "
+    "site was checked when it was taken; the queued selfie is scored when it reaches the "
+    "server, and the hours are held for review until an administrator approves them"
+)
+
 # ---- rejection codes -------------------------------------------------------
 ERR_DEVICE_UNKNOWN = "device_unknown"
 ERR_DEVICE_REVOKED = "device_revoked"
+# ---- rejection codes for the queued selfie ---------------------------------
+ERR_PUNCH_UNKNOWN = "punch_unknown"
+ERR_PUNCH_NOT_ACCEPTED = "punch_not_accepted"
+ERR_PUNCH_NO_SELFIE = "punch_has_no_selfie"
+ERR_PUNCH_NOT_MATERIALIZED = "punch_not_materialized"
+ERR_PHOTO_MISMATCH = "selfie_does_not_match_the_signed_punch"
 ERR_BAD_SIGNATURE = "bad_signature"
 ERR_MISSING_SIGNATURE = "missing_signature"
 ERR_BAD_ANCHOR = "bad_anchor"
@@ -371,6 +443,18 @@ def _number(values: dict, key: str, default: float) -> float:
         return float(values[key])
     except (KeyError, TypeError, ValueError):
         return default
+
+
+def _reason(*parts: str | None) -> str | None:
+    """Join recorded reasons with the separator the rest of the app uses.
+
+    ``main.py`` composes ``flag_reason`` with ``" | ".join(...)`` at every one of its own
+    write sites, and a reader of the column cannot tell which module wrote a row. Empty and
+    ``None`` parts are dropped rather than joined, so a row with nothing to say about itself
+    records ``NULL`` instead of a bare separator.
+    """
+    text = " | ".join(str(part).strip() for part in parts if part and str(part).strip())
+    return text or None
 
 
 def _within_clock_in_window(window: object, moment: datetime) -> bool:
@@ -682,12 +766,17 @@ def materialize_worker(conn: sqlite3.Connection, worker_id: str) -> dict:
     against the wrong session.
     """
     rules = _rules(conn)
-    regular = _number(rules, "regular_hours", 8.0)
-    threshold = _number(rules, "overtime_notify_hours", 8.1)
+    # The overtime line is not resolved here: ``shift_hours.overtime_assessment`` decides
+    # what it counts, where it sits and how much of the shift it holds back, for this path
+    # exactly as for the online ones.
     cutoff = _number(rules, "hard_cutoff_hours", 11.0)
     now_str = datetime.now().strftime(_TS)
 
     applied: list[dict] = []
+    #: The worker's crossing notices, one per long shift in this batch. Returned rather than
+    #: pushed here: a push is a third-party call and this runs inside the caller's write
+    #: transaction - and the row is invisible to the dispatcher until that commits.
+    crossings: list[dict] = []
     rows = conn.execute(_PENDING_SQL.format(effective=_effective_sql()), (worker_id,)).fetchall()
     for row in rows:
         effective = parse_ts(row["effective_time"])
@@ -711,11 +800,19 @@ def materialize_worker(conn: sqlite3.Connection, worker_id: str) -> dict:
                 applied.append({"id": row["id"], "action": row["action"], "status": "rejected", "code": ERR_ALREADY_IN})
                 continue
             site = row["site_name"] or SITE_UNASSIGNED
+            reason = _reason(row["flag_reason"], OFFLINE_REVIEW_REASON)
             conn.execute(
                 "INSERT INTO active_sessions (worker_id, site_name, clock_in_time, start_source, late_flag, liveness_class) "
                 "VALUES (?, ?, ?, 'offline', ?, ?)",
                 (worker_id, site, row["effective_time"], row["flag_reason"], LIVENESS_OFFLINE),
             )
+            # The arrival is not approved either - but it is not put in the review queue, and
+            # that is a deliberate difference. It carries no hours, so there is no money for a
+            # reviewer to decide; and a ``pending_review`` row blocks this worker's next
+            # clock-out, online or through a quick link. An arrival held that way would leave
+            # somebody who came in during a dead spot unable to close their shift at all, which
+            # is the exact opposite of what the hold is for. So it records the same provenance
+            # and says what it is: unverified.
             log_id = _insert_log(
                 conn,
                 worker_id=worker_id,
@@ -723,12 +820,12 @@ def materialize_worker(conn: sqlite3.Connection, worker_id: str) -> dict:
                 action=ACTION_CLOCK_IN,
                 timestamp=row["effective_time"],
                 hours=0.0,
-                status="Approved",
-                status_code="approved",
+                status=STATUS_LABEL_UNVERIFIED_OFFLINE,
+                status_code=STATUS_CODE_UNVERIFIED_OFFLINE,
                 lat=row["lat"],
                 lon=row["lon"],
                 accuracy=row["accuracy"],
-                flag_reason=row["flag_reason"],
+                flag_reason=reason,
                 client_timestamp=row["client_timestamp"],
                 device_id=row["device_id"],
                 request_id=row["client_punch_id"],
@@ -743,13 +840,23 @@ def materialize_worker(conn: sqlite3.Connection, worker_id: str) -> dict:
                 continue
 
             clock_in = parse_ts(session["clock_in_time"]) or effective
-            elapsed = round(max(0.0, (effective - clock_in).total_seconds() / 3600.0), 4)
+            seconds_on_site = shift_hours.elapsed_seconds(clock_in, effective)
+            elapsed = round(seconds_on_site / 3600.0, 4)
             # A punch that arrives hours later still describes the same shift, so it is
-            # paid by the same rule as a shift closed online - including the unpaid
-            # break. Anything else would make the money depend on whether the phone had
-            # a signal, which is not something the worker controls.
-            hours, break_taken = shift_hours.paid_hours(elapsed, rules)
-            flag_reason = row["flag_reason"]
+            # paid by the same rule as a shift closed online - the unpaid break and the
+            # last-few-minutes rounding included. Anything else would make the money
+            # depend on whether the phone had a signal, which is not something the worker
+            # controls. There is no confirmation here: this punch was taken before anyone
+            # could be asked, and the alternative is losing it entirely.
+            record = shift_hours.recorded_shift(elapsed, rules)
+            hours = record["paid_hours"]
+            break_taken = record["break_hours"]
+            # Provenance first, then whatever the shift itself turned out to be: a reader of
+            # the queue learns what the row is before why it is a problem. The punch's own
+            # reason (a geofence miss, say) is kept beside them rather than overwritten - it
+            # used to be replaced by the long-shift sentence below, which is one finding
+            # silently deleting another.
+            flag_reason = _reason(OFFLINE_REVIEW_REASON, row["flag_reason"])
             # Deliberately NOT capped at ``hard_cutoff_hours``.
             #
             # This used to rewrite anything past 11 h as 11 h. The online path force-closed
@@ -760,38 +867,76 @@ def materialize_worker(conn: sqlite3.Connection, worker_id: str) -> dict:
             # routed to ``pending_overtime`` below, which is where an admin decides, and an
             # offline punch is exactly the case where that check earns its keep.
             if elapsed > cutoff:
-                flag_reason = (
+                flag_reason = _reason(
+                    flag_reason,
                     f"offline clock-out claims {elapsed:.2f}h on site, past the {cutoff:g}h review "
-                    "mark; hours recorded as punched, verify before approving"
+                    "mark; hours recorded as punched, verify before approving",
                 )
             conn.execute("DELETE FROM active_sessions WHERE worker_id = ?", (worker_id,))
 
-            overtime = None
-            status_code = "approved"
-            status_val = "Approved"
-            if hours > threshold:
-                overtime = round(hours - regular, 4)
-                status_code = "pending_overtime"
-                status_val = "Pending Overtime Approval"
-                flag_reason = flag_reason or f"{hours:.2f}h exceeds the {threshold:g}h threshold"
+            #: Named in full rather than ``overtime``: the module of that name announces the
+            #: crossing below, and a local shadowing it breaks the call that matters.
+            overtime_hours = None
+            # Nothing over the line, and no overtime to hold: still a review, because this
+            # punch was materialised rather than confirmed.
+            status_code = STATUS_CODE_PENDING_REVIEW
+            status_val = STATUS_LABEL_PENDING_REVIEW
+            # The two questions are separate, so they are answered separately: the *punch* is
+            # still unverified and needs a human whatever the money says, while the *hours*
+            # settle at the ceiling a mid-shift decision stated. A punch that reaches the
+            # server hours late is the one case where nobody is watching the crossing queue
+            # any more, so asking the same question a second time is how an answer gets lost.
+            # No decision returns the assessment unchanged.
+            assessment = overtime.apply_authorisation(
+                conn,
+                worker_id,
+                session["clock_in_time"],
+                shift_hours.overtime_assessment(seconds_on_site, rules),
+                rules,
+            )
+            if assessment["needs_approval"]:
+                overtime_hours = assessment["overtime_hours"]
+                status_code = STATUS_CODE_PENDING_OVERTIME
+                status_val = STATUS_LABEL_PENDING_OVERTIME
+                flag_reason = _reason(flag_reason, assessment["flag_sentence"])
                 notifications.notify(
                     conn,
                     kind=notifications.KIND_REVIEW_PENDING,
                     severity=notifications.SEVERITY_WARNING,
                     title="Offline clock-out needs overtime approval",
                     body=(
-                        f"Worker {worker_id} logged {hours:.2f}h from an offline punch at "
-                        f"'{session['site_name']}'. Approve or adjust the extra hours before payroll."
+                        f"Worker {worker_id} logged {assessment['paid_hours']:.2f}h paid from an "
+                        f"offline punch at '{session['site_name']}', past the "
+                        f"{assessment['threshold_hours']:g}h overtime line with "
+                        f"{overtime_hours:.2f}h past the paid day. Approve or adjust the extra hours "
+                        "before payroll."
                     ),
                     worker_id=worker_id,
                     site_name=session["site_name"],
                     payload={
                         "hours": hours,
                         "break_hours": break_taken,
-                        "overtime_hours": overtime,
+                        "overtime_hours": overtime_hours,
+                        "basis": assessment["basis"],
+                        "paid_hours": assessment["paid_hours"],
+                        "threshold_hours": assessment["threshold_hours"],
                         "source": "offline",
                     },
                     dedupe_key=f"offline_overtime:{worker_id}:{row['client_punch_id']}",
+                )
+                # ... and the worker is told, exactly as if they had been online when the
+                # shift ended: the announcement is a function of the shift, not of whether
+                # the phone had a signal at the time. ``moment`` is the punch's own effective
+                # time, so the crossing the worker reads is the one they lived.
+                crossings.append(
+                    overtime.announce_crossing(
+                        conn,
+                        worker_id=worker_id,
+                        site_name=session["site_name"],
+                        clock_in_time=session["clock_in_time"],
+                        values=rules,
+                        moment=effective,
+                    )
                 )
             log_id = _insert_log(
                 conn,
@@ -806,12 +951,45 @@ def materialize_worker(conn: sqlite3.Connection, worker_id: str) -> dict:
                 lon=row["lon"],
                 accuracy=row["accuracy"],
                 flag_reason=flag_reason,
-                overtime_hours=overtime,
+                overtime_hours=overtime_hours,
                 break_hours=break_taken or None,
                 client_timestamp=row["client_timestamp"],
                 device_id=row["device_id"],
                 request_id=row["client_punch_id"],
             )
+            # Settled, so the decision behind it is spent by the row that settled it: the same
+            # closing, hours later, must not leave a live answer for the next shift. A clock-in
+            # has nothing to spend - only an ending settles a decision.
+            overtime.consume_authorisation(conn, worker_id, session["clock_in_time"], log_id)
+            if status_code == STATUS_CODE_PENDING_REVIEW:
+                # One notification per offline shift, and it is sent for exactly the shift
+                # whose hold has no other call to action: the overtime branch above already
+                # told an administrator what to do about this one. Two notices for one shift
+                # is how a review queue stops being read. The clock-in half sends none - the
+                # queue lists both ends of the shift, and one row is the shift's.
+                notifications.notify(
+                    conn,
+                    kind=notifications.KIND_REVIEW_PENDING,
+                    severity=notifications.SEVERITY_WARNING,
+                    title="Offline clock-out needs review",
+                    body=(
+                        f"Worker {worker_id} recorded {hours:.2f}h paid at "
+                        f"'{session['site_name']}' from a punch taken with no signal. Nothing "
+                        "about that punch was checked when it was taken - the selfie it kept is "
+                        "scored here when it arrives - so the hours are held until an "
+                        "administrator approves or adjusts them."
+                    ),
+                    worker_id=worker_id,
+                    site_name=session["site_name"],
+                    log_id=log_id,
+                    payload={
+                        "hours": hours,
+                        "break_hours": break_taken,
+                        "source": "offline",
+                        "client_punch_id": row["client_punch_id"],
+                    },
+                    dedupe_key=f"offline_review:{worker_id}:{row['client_punch_id']}",
+                )
 
         conn.execute(
             "UPDATE punch_queue SET materialized_log_id = ?, processed_at = ?, location_trusted = ? WHERE id = ?",
@@ -828,12 +1006,370 @@ def materialize_worker(conn: sqlite3.Connection, worker_id: str) -> dict:
                 "flagged": bool(row["flag_reason"]),
             }
         )
-    return {"applied": applied, "count": len(applied)}
+    return {"applied": applied, "count": len(applied), "crossings": crossings}
+
+
+# ---------------------------------------------------------------------------
+# the queued selfie, scored when it reaches the server
+# ---------------------------------------------------------------------------
+#: ``face_detector``'s verdicts, as the sentence a reviewer reads on the review row. The
+#: three names are the band's own vocabulary - this maps them to words, it does not decide
+#: anything about them.
+_MATCH_PHRASES = {
+    face_detector.MATCH_APPROVED: "inside the approval band",
+    face_detector.MATCH_REVIEW: "inside the review band",
+    face_detector.MATCH_REFUSED: "outside the approval band",
+}
+
+
+def _frame_arrays(blob: bytes) -> tuple[np.ndarray, np.ndarray]:
+    """``(rgb, bgr)`` for one selfie: the same ceiling and channel order as a live punch.
+
+    ``main.py`` thumbnails to 640 px before either model sees the frame, and hands the
+    liveness model RGB while DeepFace expects BGR. A scoring path that skipped either would
+    print a number beside the online one that was measured on different pixels.
+    """
+    image = uploads.decode_photo(blob, field="selfie")
+    image.thumbnail((640, 640))
+    rgb = np.array(image)
+    return rgb, rgb[:, :, ::-1]
+
+
+def _selfie_sentence(decision, distance: float | None, verdict: str | None, error: str | None) -> str:
+    """One clause per check, in the order they run, for the row's ``flag_reason``."""
+    result = decision.result
+    probability = result.genuine_prob if result.is_live else result.confidence
+    detail = f" - {result.detail}" if result.detail and not result.is_live else ""
+    liveness_part = f"liveness '{result.verdict}'"
+    if probability is not None:
+        liveness_part += f" ({probability:.2f})"
+    liveness_part += detail
+
+    if distance is not None:
+        match_part = f"face match {distance:.2f}"
+        if verdict is not None:
+            match_part += f" ({_MATCH_PHRASES[verdict]})"
+    elif error:
+        match_part = f"no face match made ({error.rstrip('.')})"
+    else:
+        match_part = "no face match was attempted"
+    return f"sync selfie: {liveness_part}, {match_part}"
+
+
+def _selfie_attention(scored: dict) -> dict | None:
+    """What the evidence did *not* confirm, or ``None`` when both checks came back clean.
+
+    Returns the notification kind and severity, the telemetry label, and the phrase the
+    sentence reads. The labels are the ones the online punch already observes, so one
+    dashboard counts a spoof whatever path it arrived by.
+    """
+    result = scored["liveness"].result
+    if result.verdict in {liveness.VERDICT_SPOOF, liveness.VERDICT_LOW_CONFIDENCE}:
+        return {
+            "kind": notifications.KIND_LIVENESS_SPOOF,
+            "severity": notifications.SEVERITY_CRITICAL,
+            "telemetry": "liveness_spoof",
+            "phrase": f"the liveness check called this frame '{result.verdict}'",
+        }
+    if result.verdict == liveness.VERDICT_LIVE and scored["match_verdict"] == face_detector.MATCH_APPROVED:
+        return None
+    if scored["match_verdict"] is None:
+        # No distance came back: the comparison could not run at all (no face in the frame, a
+        # stale template, no template). "Could not be made" and "was made and refused" are
+        # different findings, which is why they are different labels here too.
+        return {
+            "kind": notifications.KIND_LIVENESS_DEGRADED,
+            "severity": notifications.SEVERITY_WARNING,
+            "telemetry": "frame_refused",
+            "phrase": f"the face could not be compared ({scored['match_error'] or 'unknown reason'})",
+        }
+    if scored["match_verdict"] == face_detector.MATCH_REFUSED:
+        return {
+            "kind": notifications.KIND_LIVENESS_DEGRADED,
+            "severity": notifications.SEVERITY_WARNING,
+            "telemetry": "rejected",
+            "phrase": (
+                f"the face matched at distance {scored['distance']:.2f}, "
+                f"{_MATCH_PHRASES[face_detector.MATCH_REFUSED]}"
+            ),
+        }
+    # The match landed inside an acceptable band and the frame still was not confirmed, so
+    # liveness is the finding - it is the only condition left. (The first branch took the two
+    # verdicts that mean an attack; this is everything else that is not ``live``.)
+    return {
+        "kind": notifications.KIND_LIVENESS_DEGRADED,
+        "severity": notifications.SEVERITY_WARNING,
+        "telemetry": "flagged_review",
+        "phrase": f"the liveness check reported '{result.verdict}'",
+    }
+
+
+async def score_queued_selfie(worker_id: str, blob: bytes) -> dict:
+    """Run the online punch's two checks over a queued selfie, and report what they said.
+
+    The comparison itself is ``main.compare_faces_sync`` - imported late, because ``main``
+    imports this module - so there is one implementation of the match, its multi-face guard
+    and its template refusals. What is *not* shared is the policy, and it cannot be: an
+    online punch may refuse the worker, who is standing there and can take another photo,
+    while an offline one has already happened. So a finding here is recorded for the reviewer
+    and never turned into a rejection - this function returns evidence and writes nothing.
+
+    Raises ``face_engine.FaceEngineBusy`` when the engine has no capacity. That is the server
+    being unable to answer rather than an answer, so the caller passes it on and the phone
+    keeps its copy: the same distinction the online punch makes, and the reason no verdict is
+    recorded in that case.
+    """
+    from main import compare_faces_sync
+
+    rgb, bgr = _frame_arrays(blob)
+    decision = await face_engine.ENGINE.run_async(liveness.inspect, rgb)
+    liveness_class, liveness_score = decision.log_fields()
+
+    distance: float | None = None
+    match_verdict: str | None = None
+    match_error: str | None = None
+    if not decision.allowed:
+        # A frame the liveness check refused is not embedded: a presentation attack must not
+        # be able to make the server spend half a second of VGG-Face, which is what the
+        # online path avoids too.
+        match_error = "the liveness check refused this frame, so it was not compared"
+    else:
+        with db() as conn:
+            user = conn.execute(
+                "SELECT id, biometric_id FROM users WHERE id = ?", (worker_id,)
+            ).fetchone()
+        reference = biometrics.resolve_reference(worker_id, biometrics.id_from(user)) if user else ""
+        if user is None or not os.path.exists(reference):
+            match_error = "no facial reference is enrolled for this account"
+        else:
+            face_data = await face_engine.ENGINE.run_async(compare_faces_sync, reference, bgr)
+            match_error = face_data.get("error") or None
+            if not match_error:
+                distance = float(face_data["distance"])
+                try:
+                    # Re-derived from the live pipeline rather than read off ``face_data``, for
+                    # the reason the online punch re-derives it: a caller may stub the
+                    # comparison itself, and a verdict path that only works when a particular
+                    # payload shape came back is a verdict path that stops being tested.
+                    match_verdict = face_detector.band_for(biometrics.current_pipeline()).classify(distance)
+                except face_detector.UnknownPipelineError:
+                    match_verdict = None
+
+    return {
+        "liveness": decision,
+        "liveness_class": liveness_class,
+        "liveness_score": liveness_score,
+        "distance": distance,
+        "match_verdict": match_verdict,
+        "match_error": match_error,
+        "sentence": _selfie_sentence(decision, distance, match_verdict, match_error),
+    }
 
 
 # ---------------------------------------------------------------------------
 # worker endpoints
 # ---------------------------------------------------------------------------
+@router.post("/sync/photo")
+@limiter.limit(settings.attendance_rate_limit)
+async def upload_sync_photo(
+    request: Request,
+    client_punch_id: str = Form(...),
+    photo: UploadFile = File(...),
+    current: CurrentUser = Depends(any_authenticated),
+):
+    """Score the selfie a queued punch kept on the phone, onto that punch's review row.
+
+    WHY THIS IS ITS OWN REQUEST, NOT A FIELD IN THE BATCH
+    -----------------------------------------------------
+    The photo could have ridden inside ``POST /attendance/sync`` as base64. It deliberately
+    does not: a JSON body is parsed *before* any handler runs, so a batch of fifty selfies
+    would be held in memory in full before one byte of it could be measured - the exact
+    failure ``uploads.read_photo`` exists to prevent ("a limit checked after the body has
+    been read is not a limit"). Here the frame goes through that one upload policy, one
+    request per photo, and the punch batch stays the small signed document it was.
+
+    WHAT BINDS THE PHOTO TO THE PUNCH
+    ---------------------------------
+    ``photo_sha256`` sits inside the HMAC the device signed, and this row was written from
+    that verified payload. So the bytes uploaded here must hash to it or they are not the
+    frame this punch was signed against - checked before anything is decoded.
+
+    WHAT IT DOES NOT DO
+    -------------------
+    It does not approve, refuse, re-price or re-materialise anything. The punch is already in
+    the review queue; this writes the score, the liveness verdict and the sentence the
+    reviewer reads onto that row. Scoring can therefore change what is *known* about a shift,
+    never what it is worth.
+    """
+    blob = await uploads.read_photo(photo, field="selfie")
+
+    with db() as conn:
+        punch = conn.execute(
+            "SELECT id, worker_id, action, site_name, status, materialized_log_id, photo_sha256, "
+            "photo_scored_at FROM punch_queue WHERE client_punch_id = ? AND worker_id = ?",
+            (client_punch_id, current.id),
+        ).fetchone()
+    if punch is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error_code": ERR_PUNCH_UNKNOWN,
+                "message": "No queued punch with that id belongs to you.",
+            },
+        )
+    if str(punch["status"]) not in (STATUS_ACCEPTED, STATUS_FLAGGED):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error_code": ERR_PUNCH_NOT_ACCEPTED,
+                "message": f"Punch {client_punch_id} was '{punch['status']}' and has no review row to score.",
+            },
+        )
+    if not punch["photo_sha256"]:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error_code": ERR_PUNCH_NO_SELFIE,
+                "message": "This punch was signed without a selfie, so there is nothing to score.",
+            },
+        )
+    if punch["materialized_log_id"] is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error_code": ERR_PUNCH_NOT_MATERIALIZED,
+                "message": "This punch has not been materialised yet; sync it first.",
+            },
+        )
+    if hashlib.sha256(blob).hexdigest() != str(punch["photo_sha256"]).strip().lower():
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error_code": ERR_PHOTO_MISMATCH,
+                "message": (
+                    "This photo is not the one this punch was signed against, so it cannot be "
+                    "used as evidence for it."
+                ),
+            },
+        )
+
+    if punch["photo_scored_at"]:
+        # Idempotent on purpose. A phone whose connection drops after a scoring that succeeded
+        # re-uploads the same photo, and it has to be able to stop: re-running the models would
+        # rewrite the same evidence and re-notify an administrator who has already been told.
+        with db() as conn:
+            row = conn.execute(
+                "SELECT score, liveness_class, liveness_score, flag_reason FROM attendance_logs "
+                "WHERE id = ?",
+                (punch["materialized_log_id"],),
+            ).fetchone()
+        return {
+            "status": "already_scored",
+            "client_punch_id": client_punch_id,
+            "score": row["score"] if row is not None else None,
+            "liveness_class": row["liveness_class"] if row is not None else None,
+            "liveness_score": row["liveness_score"] if row is not None else None,
+            "materialized_log_id": punch["materialized_log_id"],
+        }
+
+    try:
+        scored = await score_queued_selfie(current.id, blob)
+    except face_engine.FaceEngineBusy as exc:
+        # Nothing has been written and nothing is recorded as scored, so the retry is a first
+        # attempt rather than a second one.
+        raise face_engine.busy_http_exception(exc) from None
+
+    attention = _selfie_attention(scored)
+    now_str = datetime.now().strftime(_TS)
+    # The frame the score was measured from, kept as the log row's evidence - the same copy
+    # the online punch keeps (see ``punch_frames``), stored before the write transaction so a
+    # decode or disk problem here cannot abort a scoring that already ran. Best-effort like
+    # the online path: evidence lost to a full disk is not hours lost.
+    frame_name: str | None = None
+    try:
+        frame_name = punch_frames.store_frame(uploads.decode_photo(blob, field="selfie"))
+    except (OSError, ValueError) as exc:  # decode failure cannot be far: the models just read these bytes
+        log.warning("could not store the offline punch frame for worker %s", current.id, exc_info=True)
+    with db(write=True) as conn:
+        row = conn.execute(
+            "SELECT flag_reason FROM attendance_logs WHERE id = ?", (punch["materialized_log_id"],)
+        ).fetchone()
+        conn.execute(
+            "UPDATE attendance_logs SET score = ?, liveness_class = ?, liveness_score = ?, "
+            "flag_reason = ?, punch_frame = ? WHERE id = ?",
+            (
+                # ``score`` is NOT NULL and 0.0 is this module's "no score" sentinel, for the
+                # same reason materialisation writes it: a row may never carry a number that
+                # looks like a match it never had.
+                scored["distance"] if scored["distance"] is not None else OFFLINE_SCORE,
+                scored["liveness_class"],
+                scored["liveness_score"],
+                _reason(row["flag_reason"] if row is not None else None, scored["sentence"]),
+                frame_name,
+                punch["materialized_log_id"],
+            ),
+        )
+        conn.execute(
+            "UPDATE punch_queue SET photo_scored_at = ? WHERE id = ?", (now_str, punch["id"])
+        )
+        if attention is not None:
+            notifications.notify(
+                conn,
+                kind=attention["kind"],
+                severity=attention["severity"],
+                title="Offline selfie did not confirm the punch",
+                body=(
+                    f"The selfie queued with a {str(punch['action']).lower()} by worker "
+                    f"{current.id} at '{punch['site_name'] or SITE_UNASSIGNED}' was scored on "
+                    f"arrival: {attention['phrase']}. The punch was already held for review - "
+                    "its hours stay unpayable until an administrator decides."
+                ),
+                worker_id=current.id,
+                site_name=punch["site_name"],
+                log_id=punch["materialized_log_id"],
+                payload={
+                    "liveness": scored["liveness"].as_payload(),
+                    "score": scored["distance"],
+                    "match": scored["match_verdict"],
+                    "client_punch_id": client_punch_id,
+                },
+                dedupe_key=f"offline_selfie:{client_punch_id}",
+            )
+        _audit(
+            conn,
+            action="offline_selfie_scored",
+            actor=current,
+            entity="punch_queue",
+            entity_id=punch["id"],
+            before={"photo_scored_at": None},
+            after={
+                "score": scored["distance"],
+                "liveness_class": scored["liveness_class"],
+                "match": scored["match_verdict"],
+                "attention": attention["telemetry"] if attention else None,
+            },
+            request=request,
+        )
+
+    # The same vocabulary the online punch observes, so a spoof is counted once however it
+    # arrived; ``approved`` here means the evidence confirmed the frame, never that the punch
+    # was approved - that is still a human's, in the review queue.
+    telemetry.observe_verification(attention["telemetry"] if attention else "approved")
+
+    return {
+        "status": "success",
+        "client_punch_id": client_punch_id,
+        "score": scored["distance"],
+        "liveness_class": scored["liveness_class"],
+        "liveness_score": scored["liveness_score"],
+        "liveness": scored["liveness"].as_payload(),
+        "match": scored["match_verdict"],
+        "match_error": scored["match_error"],
+        "sentence": scored["sentence"],
+        "materialized_log_id": punch["materialized_log_id"],
+    }
+
+
 @router.post("/devices/register")
 @limiter.limit(settings.attendance_rate_limit)
 async def register_device(
@@ -1082,6 +1618,9 @@ async def sync_punches(request: Request, payload: SyncRequest, current: CurrentU
         # should refresh its authority, and one round trip beats two.
         next_anchor = _new_anchor(conn, device, current.id, now)
 
+    # Committed above: a materialized long shift owes the same notice the online paths give.
+    overtime.deliver_worker_notices(applied["crossings"])
+
     return {
         "status": "success",
         "server_time": now.strftime(_TS),
@@ -1213,6 +1752,8 @@ async def resolve_punch(
             after={"decision": "approve", "note": payload.note, "applied": applied["applied"]},
             request=request,
         )
+    # Approving a punch can materialize a long shift, which is a crossing like any other.
+    overtime.deliver_worker_notices(applied["crossings"])
     return {"status": "success", "decision": "approve", "applied": applied["applied"]}
 
 

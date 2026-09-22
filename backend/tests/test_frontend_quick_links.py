@@ -234,7 +234,9 @@ const results = {};
     const env = await linksEnv({ roster: false });
     const markup = render(env);
     results.no_roster = {
-        free_text: markup.indexOf('id="linkWorker" class="p-2') >= 0 && markup.indexOf('<select id="linkWorker"') < 0,
+        // A failed roster must leave a typed-id input, not a broken select. Asserted on the
+        // element, not its class: the class is styling and has to be free to change.
+        free_text: markup.indexOf('<input id="linkWorker"') >= 0 && markup.indexOf('<select id="linkWorker"') < 0,
         note_shown: markup.indexOf(env.evaluate("I18n.__('linksRosterUnavailable')")) >= 0,
         // The list is the reason the screen exists, so a failed roster must not take it.
         list_still_there: markup.indexOf('data-link="12"') >= 0

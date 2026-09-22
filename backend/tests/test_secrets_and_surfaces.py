@@ -165,6 +165,11 @@ def test_clock_in_then_clock_out_works_when_authenticated(client, jpeg):
 
     A moallem (id 600) starts with no open session -- worker 1 is seeded as
     already clocked in, so 600 keeps this test independent of that.
+
+    The clock-out is confirmed because it happens a moment after the clock-in, which is
+    a shift of no hours at all - the early clock-out question, whose refusal is proved in
+    ``test_early_checkout_and_rounding.py``. This test is about the journey, not the
+    question, so it answers it.
     """
     headers = bearer(MOALLEM)
 
@@ -174,7 +179,7 @@ def test_clock_in_then_clock_out_works_when_authenticated(client, jpeg):
     assert db_scalar("SELECT COUNT(*) FROM active_sessions WHERE worker_id = ?", (MOALLEM,)) == 1
 
     clocked_out = clock_in(
-        client, MOALLEM, action="Clock Out", image=jpeg, headers=headers
+        client, MOALLEM, action="Clock Out", image=jpeg, headers=headers, confirmed=True
     )
     assert clocked_out.status_code == 200, f"clock-out failed: {clocked_out.status_code} {clocked_out.text[:200]}"
     assert db_scalar("SELECT COUNT(*) FROM active_sessions WHERE worker_id = ?", (MOALLEM,)) == 0
@@ -283,7 +288,12 @@ def test_a_broken_face_check_is_ours_and_says_so(client, jpeg, face, monkeypatch
 
 @pytest.mark.regression
 def test_a_borderline_match_is_flagged_for_review(client, jpeg, face):
-    """The 0.41-0.60 band must route to pending_review without blocking the worker."""
+    """A score inside the review band must route to pending_review without blocking the worker.
+
+    The band is derived per pipeline (``face_detector.MatchBand``), so this drives a distance
+    into its middle rather than naming its two edges - the edges have their own tests, at both
+    boundaries, in ``test_face_match_bands``.
+    """
     face.FACE_MODE = "review"
     response = clock_in(client, MOALLEM, image=jpeg, headers=bearer(MOALLEM))
     assert response.status_code == 200, f"a borderline match must not hard-fail: {response.status_code}"

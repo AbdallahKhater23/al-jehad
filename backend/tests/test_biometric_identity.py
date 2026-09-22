@@ -471,7 +471,11 @@ def _plant_stale_template(user_id: str, *, pipeline=None, dimensions=None) -> Pa
     """
     vector = harness._reference_embedding()
     if dimensions is not None:
-        vector = vector[:dimensions]
+        # Any requested width, so a test can plant a template from another model's space: repeat
+        # the live vector and cut it down. Truncation alone stopped working when the live width
+        # fell from 4096 to 128, because ``[:512]`` of a 128-float vector is still 128 - and the
+        # "wrong size" case silently became a right-sized one with the wrong model name.
+        vector = (vector * (dimensions // len(vector) + 1))[:dimensions]
     if pipeline is None:
         text = json.dumps(vector)
     else:
@@ -519,20 +523,21 @@ def test_a_template_of_the_wrong_size_is_refused_rather_than_500(client):
 
     The *pipeline* matches here on purpose, so this reaches the dimension guard rather than
     the provenance one - which is the case a model swap leaves behind, half-written: a 512-float
-    ArcFace template beside a 4096-float VGG-Face one. The live embedding the stub reports is
-    the seeded worker's full-width vector, so the two really are different sizes and the
-    comparison really would raise.
+    ArcFace template beside a 128-float FaceNet one. The live embedding the stub reports is the
+    seeded worker's full-width vector, so the two really are different sizes and the comparison
+    really would raise.
 
     Same refusal as a stale template, because it is the same fix: a photograph. What must not
     happen is ``Internal processing error: shapes not aligned`` - a 500 that blames the server
     for a template change and tells the worker nothing.
     """
     import face_detector
+    import face_onnx
 
     assert create_account(client, STALE_WORKER).status_code == 200
     planted = _plant_stale_template(STALE_WORKER, pipeline=face_detector.PIPELINE, dimensions=512)
     try:
-        health = biometrics.reference_health(STALE_WORKER, expected_dimensions=4096)
+        health = biometrics.reference_health(STALE_WORKER, expected_dimensions=face_onnx.DIMENSIONS)
         assert health == (False, biometrics.STALE_UNREADABLE), health
 
         response = harness.clock_in(client, STALE_WORKER, headers=bearer(STALE_WORKER))
@@ -628,26 +633,55 @@ def test_read_reference_accepts_both_shapes(tmp_path):
             biometrics.read_reference(str(broken))
 
 
-def test_the_stale_reason_separates_the_three_cases(tmp_path):
-    """Three different causes, because an administrator has to know which one they are in."""
+def test_the_stale_reason_separates_the_four_cases(tmp_path):
+    """Four different causes, because an administrator has to know which one they are in.
+
+    The vectors are live-width on purpose: a dimension is checked *before* provenance, so a
+    short vector would be answered ``unreadable`` and the three provenance cases could never be
+    reached - the test would pass while measuring the wrong branch.
+    """
+    import face_engine
+    import face_onnx
+
     current = biometrics.current_pipeline()
-    live = biometrics.Reference(embedding=[0.1, 0.2], pipeline=current)
+    live_vector = [0.1, 0.2] + [0.0] * (face_onnx.DIMENSIONS - 2)
+    live = biometrics.Reference(
+        embedding=live_vector, pipeline=current, model=face_engine.FACE_MODEL
+    )
     assert biometrics.stale_reason(live) is None
 
-    assert biometrics.stale_reason(biometrics.Reference(embedding=[0.1], pipeline=None)) == (
+    assert biometrics.stale_reason(biometrics.Reference(embedding=live_vector, pipeline=None)) == (
         biometrics.STALE_NO_PROVENANCE
     )
-    assert biometrics.stale_reason(biometrics.Reference(embedding=[0.1], pipeline="mtcnn")) == (
-        biometrics.STALE_OTHER_PIPELINE
-    )
+    assert biometrics.stale_reason(
+        biometrics.Reference(embedding=live_vector, pipeline="mtcnn", model=face_engine.FACE_MODEL)
+    ) == biometrics.STALE_OTHER_PIPELINE
     assert biometrics.stale_reason(live, expected_dimensions=512) == biometrics.STALE_UNREADABLE
-    assert biometrics.stale_reason(live, expected_dimensions=2) is None
+    assert biometrics.stale_reason(live, expected_dimensions=face_onnx.DIMENSIONS) is None
+
+    # The migration case, and the reason the width is checked at all: a real VGG-Face template
+    # left on disk is 4096 floats, which no FaceNet comparison can score. It is refused here
+    # rather than reaching numpy as a shape error.
+    assert biometrics.stale_reason(
+        biometrics.Reference(embedding=[0.0] * 4096, pipeline=current, model="VGG-Face")
+    ) == biometrics.STALE_UNREADABLE
+
+    # The second half of the provenance. The crop can be the current one and the template still
+    # unscoreable: the decision lines were measured in the vector space of a *different* model,
+    # and ``face_detector.band_for`` is keyed by the pair precisely so this cannot slip past.
+    assert biometrics.stale_reason(
+        biometrics.Reference(embedding=live_vector, pipeline=current, model="ArcFace")
+    ) == biometrics.STALE_OTHER_MODEL
+    # A template that records no model at all is left alone: it is not a claim about a model
+    # this build does not have, and the bare lists it joins are refused by provenance anyway.
+    assert biometrics.stale_reason(biometrics.Reference(embedding=live_vector, pipeline=current)) is None
 
     # Every reason has something to say to the person who has to clear it.
     assert set(biometrics.STALE_EXPLANATIONS) == {
         biometrics.STALE_UNREADABLE,
         biometrics.STALE_NO_PROVENANCE,
         biometrics.STALE_OTHER_PIPELINE,
+        biometrics.STALE_OTHER_MODEL,
     }
 
 

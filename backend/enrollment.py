@@ -161,8 +161,8 @@ def _decode_image(file_bytes: bytes):
 def face_array(image):
     """The BGR array the face models expect for an already-decoded photo.
 
-    A PIL image is RGB; DeepFace's detectors and the VGG-Face model work in BGR, the
-    order ``cv2`` hands them over. The channels are therefore reversed exactly once -
+    A PIL image is RGB; the face detector and the embedding contract both work in BGR (see
+    ``face_onnx``), the order ``cv2`` hands them over. The channels are reversed exactly once -
     here - rather than at each call site, because a template embedded from RGB and a
     live frame embedded from BGR would look like two different people to the distance
     check. ``main.compare_faces_sync`` builds the same array for the attendance path.
@@ -171,7 +171,7 @@ def face_array(image):
 
 
 def _embed_image(image) -> list[float]:
-    """VGG-Face embedding for an already-decoded photo. Raises ``ValueError`` on failure.
+    """FaceNet-128 embedding for an already-decoded photo. Raises ``ValueError`` on failure.
 
     The image is handed to the model **in memory**. It used to be saved as a JPEG first -
     ``local_references/.enroll_tmp_<random>.jpg``, or a ``tempfile.mkstemp`` in the system
@@ -326,6 +326,21 @@ def _invite_kind(row: sqlite3.Row) -> str:
     except (IndexError, KeyError):
         return KIND_ENROLL
     return value if value in (KIND_ENROLL, KIND_REGISTER) else KIND_ENROLL
+
+
+def _invite_missing() -> HTTPException:
+    """The refusal for a token that matches no invite at all.
+
+    It carries an ``error_code`` for the same reason every other refusal on this route
+    does: ``enroll.html`` renders the sentence a worker reads from the code, in the
+    worker's own language, and the English ``message`` is what an administrator reading
+    a log or a ``curl`` sees. A bare string left the page with nothing to key on, so a
+    worker reading Arabic, Hindi or Urdu was shown this English sentence.
+    """
+    return HTTPException(
+        status_code=404,
+        detail={"error_code": "invite_unknown", "message": "This enrollment link is not valid."},
+    )
 
 
 def _qr_data_uri(url: str) -> str | None:
@@ -625,7 +640,7 @@ async def invite_info(request: Request, token: str):
             (_hash_token(token),),
         ).fetchone()
     if row is None:
-        raise HTTPException(status_code=404, detail="This enrollment link is not valid.")
+        raise _invite_missing() from None
     usable, state = _invite_status(row, now)
     kind = _invite_kind(row)
     reserved_name = row["pending_name"] if kind == KIND_REGISTER else row["worker_name"]
@@ -685,7 +700,7 @@ async def submit_registration(
     with db() as conn:
         row = conn.execute("SELECT * FROM enrollment_invites WHERE token_hash = ?", (_hash_token(token),)).fetchone()
     if row is None:
-        raise HTTPException(status_code=404, detail="This enrollment link is not valid.")
+        raise _invite_missing() from None
     usable, state = _invite_status(row, now)
     if not usable:
         raise HTTPException(
@@ -856,7 +871,7 @@ async def submit_enrollment(
     with db() as conn:
         row = conn.execute("SELECT * FROM enrollment_invites WHERE token_hash = ?", (_hash_token(token),)).fetchone()
     if row is None:
-        raise HTTPException(status_code=404, detail="This enrollment link is not valid.")
+        raise _invite_missing() from None
     usable, state = _invite_status(row, now)
     if not usable:
         raise HTTPException(

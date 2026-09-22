@@ -84,6 +84,25 @@ def _restore_reference_files():
         enroll_reference(user_id)
 
 
+def enroll_face(client, user_id: str, *, as_user: str = HEAD_ADMIN, image: bytes):
+    """The console's write-a-face path: ``POST /admin/enroll``, a file from disk.
+
+    The same endpoint the Credentials tab's edit panel posts to, and the same one the bulk
+    roster import uses - which is why the rule it enforces is asserted here rather than in
+    a suite of its own: this is the endpoint that decides what a punch is checked against.
+    """
+    return client.post(
+        "/api/v1/admin/enroll",
+        headers=bearer(as_user),
+        data={"worker_id": user_id},
+        files={"photo": ("reference.jpg", image, "image/jpeg")},
+    )
+
+
+def template_version(user_id: str) -> int:
+    return int(db_scalar("SELECT template_version FROM users WHERE id = ?", (user_id,)) or 0)
+
+
 def new_account(client, user_id: str = "321", name: str = "Nguyen Van A", role: str = "worker", image: bytes = b""):
     """A real account, created the way the console creates one, with a face."""
     files = {"photo": ("photo.jpg", image, "image/jpeg")} if image else None
@@ -254,8 +273,20 @@ def test_the_detail_read_carries_what_the_roster_contract_does_not(client):
 # ---------------------------------------------------------------------------
 # 2. Who may touch whose account
 # ---------------------------------------------------------------------------
-def test_a_standard_admin_cannot_touch_an_administrators_account(client):
-    """The rule the password endpoint already had, applied to the whole account."""
+def test_a_standard_admin_cannot_touch_an_administrators_account(client, jpeg):
+    """The rule the password endpoint already had, applied to the whole account.
+
+    Including the account's *face*, which is the one of the four that is not a field: a name
+    or a rate is an identity on a screen, and the reference photo is the identity the gate
+    checks. An administrator whose face a standard admin may write is an administrator whose
+    punches that standard admin can make, so writing one is the same escalation as rewriting
+    the account - and it is refused by the same function.
+    """
+    # A template that cannot be mistaken for the stub's embedding, so "the file is unchanged"
+    # is evidence rather than a coincidence of the model being deterministic.
+    harness.seed_reference(HEAD_ADMIN, "the-seeded-template-must-survive")
+    seeded_face = harness.reference_path(HEAD_ADMIN).read_text()
+    versions = {user_id: template_version(user_id) for user_id in (HEAD_ADMIN, ADMIN)}
     assert_denied(
         client.post(
             "/api/v1/admin/users/edit",
@@ -281,15 +312,55 @@ def test_a_standard_admin_cannot_touch_an_administrators_account(client):
         endpoint="POST /api/v1/admin/users/status",
         detail="role escalation: a standard admin deactivating the head admin",
     )
+    assert_denied(
+        enroll_face(client, HEAD_ADMIN, as_user=ADMIN, image=jpeg),
+        endpoint="POST /api/v1/admin/enroll",
+        detail="role escalation: a standard admin writing the head admin's face",
+    )
     assert db_scalar("SELECT name FROM users WHERE id = ?", (HEAD_ADMIN,)) == "Seed Head Admin"
     assert db_scalar("SELECT COUNT(*) FROM users WHERE id = ?", (HEAD_ADMIN,)) == 1, (
-        "an administrator's account survived all three attempts"
+        "an administrator's account survived all four attempts"
+    )
+    assert harness.reference_path(HEAD_ADMIN).read_text() == seeded_face, (
+        "the photo every punch is verified against was not rewritten"
+    )
+    assert {user_id: template_version(user_id) for user_id in versions} == versions, (
+        "and no account was marked as re-enrolled"
     )
 
 
 def test_a_standard_admin_still_edits_the_workers_that_are_the_job(client):
     assert edit(client, headers=bearer(ADMIN)).status_code == 200
     assert db_scalar("SELECT name FROM users WHERE id = ?", (MOALLEM,)) == "Ana Torres"
+
+
+def test_a_standard_admin_still_enrolls_the_workers_that_are_the_job(client, jpeg):
+    """The other half of the boundary, and the reason it is a boundary and not a lock.
+
+    A worker's photo is the ordinary case the endpoint exists for - it is the answer on the
+    day somebody's capture stops matching - and the administrator who works that site is the
+    one who has to be able to give it, without a head admin being called to the gate.
+    """
+    before = template_version(MOALLEM)
+    response = enroll_face(client, MOALLEM, as_user=ADMIN, image=jpeg)
+    assert response.status_code == 200, response.text[:300]
+    assert template_version(MOALLEM) == before + 1
+    assert harness.template_exists(MOALLEM)
+
+
+def test_a_head_admin_replaces_an_administrators_face(client, jpeg):
+    """Which is what the console offers: Credentials, the row's edit panel, a photo.
+
+    An administrator's template goes stale exactly like a worker's (the detector changed and
+    every template written before it has to be taken again - see ``needs_reenrollment``), so
+    the account that *cannot* be photographed again by itself is the one that needs this
+    most: a head admin is the only other person who may write it.
+    """
+    before = template_version(ADMIN)
+    response = enroll_face(client, ADMIN, as_user=HEAD_ADMIN, image=jpeg)
+    assert response.status_code == 200, response.text[:300]
+    assert template_version(ADMIN) == before + 1
+    assert harness.template_exists(ADMIN)
 
 
 # ---------------------------------------------------------------------------

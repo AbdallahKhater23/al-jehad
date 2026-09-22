@@ -35,7 +35,7 @@ from security import hash_password
 #: ``MIGRATIONS``. ``readiness`` refuses to start a deployment whose database is older, so a
 #: migration added without bumping this is a server that will not boot; the invariant is
 #: asserted in ``tests/test_site_shift_windows.py`` rather than left to memory.
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 21
 
 #: Magic number stamped into the SQLite header so we can recognise "this is our
 #: database" - cheap protection against pointing DATABASE_PATH at some other file.
@@ -115,6 +115,16 @@ STATUS_CODE_MAP = {
     "Auto-Closed (8h Limit)": "auto_closed_8h",
     "pending_review": "pending_review",
     "Pending Overtime Approval": "pending_overtime",
+    # The two outcomes of a refusal (migration-free: they are new *values* in an existing
+    # column, not new columns). They are different codes because they mean opposite things
+    # about the hours, and one code cannot carry both. Spelled out here rather than
+    # referring to the constants below, which are defined after this table - the same way
+    # the 8 h close above is spelled out.
+    "Overtime Rejected": "overtime_rejected",
+    "Rejected": "rejected",
+    # An offline punch that was *materialised* rather than confirmed. It is neither approved nor
+    # awaiting a decision of its own - see ``STATUS_CODE_UNVERIFIED_OFFLINE``.
+    "Unverified (offline)": "unverified_offline",
 }
 
 #: The status row written when the system closes a shift because its paid hours have
@@ -124,6 +134,39 @@ STATUS_CODE_MAP = {
 STATUS_AUTO_CLOSED_LABEL = "Auto-Closed (8h Limit)"
 STATUS_CODE_AUTO_CLOSED_8H = "auto_closed_8h"
 
+#: The status written when an administrator **refuses the hours past the regular day**.
+#:
+#: The work happened and the standard day is owed, so this code is *payable* (see
+#: ``reports.PAYABLE_CODES``) at the regular hours the administrator left in
+#: ``approved_hours`` - the overtime is not credited. It is a code of its own rather than
+#: ``approved`` for the reason ``auto_closed_8h`` is: a reader of the timesheet has to be
+#: able to tell a refused-overtime day from an ordinary one without reading the audit log,
+#: and a settled row must not be silently rewritten into a plain approval.
+STATUS_OVERTIME_REJECTED_LABEL = "Overtime Rejected"
+STATUS_CODE_OVERTIME_REJECTED = "overtime_rejected"
+
+#: The status written when an administrator decides an **unconfirmed punch was not work at
+#: all** - the location was outside every site's radius, or the face did not match. It
+#: counts for nothing: ``reports._shift_hours`` returns zero for any code that is neither
+#: payable nor awaiting a decision, which is the arithmetic "not worked" has to have. The
+#: attendance report already knew this code by name (``flagged``) before anything wrote it.
+STATUS_REJECTED_LABEL = "Rejected"
+STATUS_CODE_REJECTED = "rejected"
+
+#: The status of an offline punch that has been recorded but never checked: a signed queue row
+#: materialised into attendance, whose frame nobody looked at when it was taken.
+#:
+#: It is a code of its own because **both** of the alternatives are wrong. ``approved`` would
+#: claim a check that never happened; ``pending_review`` - correct for the clock-out that decides
+#: the pay - puts a row with no hours and no decision in front of an administrator, and worse,
+#: the clock-out and quick-link paths refuse to close a shift while *any* ``pending_review`` row
+#: exists (see ``main.py``). A worker who arrived with no signal would then be unable to clock
+#: out at all until somebody approved their arrival - the app would punish them for the dead spot,
+#: and the day's hours would never be recorded. Nor is it payable: ``reports.PAYABLE_CODES`` does
+#: not contain it, so an arrival contributes nothing to a total either way.
+STATUS_LABEL_UNVERIFIED_OFFLINE = "Unverified (offline)"
+STATUS_CODE_UNVERIFIED_OFFLINE = "unverified_offline"
+
 DEFAULT_SHIFT_RULES = {
     "clock_in_window_start": "04:00",
     "clock_in_window_end": "06:30",
@@ -131,7 +174,7 @@ DEFAULT_SHIFT_RULES = {
     "overtime_notify_hours": 8.1,
     "hard_cutoff_hours": 11.0,
     "working_days": "6,0,1,2,3,4",
-    "site_timezone": "Africa/Cairo",
+    "site_timezone": "Asia/Kuwait",
     # -- the unpaid break and the end of the day (migration 9) -----------------
     # A full day is 8 h paid plus a 30-minute break that is not paid, so a full day
     # runs 8.5 h from clock-in to clock-out. The break is deducted only from a shift
@@ -240,7 +283,7 @@ def migration_1_audit_notifications_shift_rules(conn: sqlite3.Connection) -> Non
             overtime_notify_hours REAL NOT NULL DEFAULT 8.1,
             hard_cutoff_hours REAL NOT NULL DEFAULT 11.0,
             working_days TEXT NOT NULL DEFAULT '6,0,1,2,3,4',
-            site_timezone TEXT NOT NULL DEFAULT 'Africa/Cairo',
+            site_timezone TEXT NOT NULL DEFAULT 'Asia/Kuwait',
             updated_at DATETIME NOT NULL,
             updated_by TEXT
         )
@@ -813,9 +856,8 @@ def migration_12_site_clock_in_windows(conn: sqlite3.Connection) -> None:
     ``shift_rules`` - so a night site can set only the hours and keep the company timezone,
     and the global rule stays the default it has always been.
 
-    **Why NULL and not ``DEFAULT 'Africa/Cairo'``.** Stamping a default on this column would
-    write a value into every existing site, and a value *overrides* the global
-    ``shift_rules.site_timezone`` - so an installation whose global zone is not Cairo would
+    **Why NULL and not a stamped default.** Stamping ``DEFAULT 'Asia/Kuwait'`` on this column would
+    write a value into every existing site, and a value *overrides* the global    ``shift_rules.site_timezone``- so an installation whose global zone is not Kuwait would
     have every site silently moved to Cairo by an upgrade, changing who is late at 04:00 with
     nobody having configured anything. NULL is the honest encoding of "a site that has not
     chosen", and it is what makes the fallback in ``shift_windows`` possible at all. The
@@ -876,6 +918,370 @@ def migration_13_retention_runs(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_retention_runs_started ON retention_runs(started_at DESC)")
 
 
+def migration_14_worker_notifications_and_push(conn: sqlite3.Connection) -> None:
+    """The worker's own notification channel: a record per worker, and where to reach them.
+
+    WHY A SECOND TABLE AND NOT A COLUMN ON ``admin_notifications``
+    -------------------------------------------------------------
+    ``admin_notifications`` is *about* workers but it is **for** administrators - it is the
+    triage queue, it carries the audit-facing payloads, and its read state is an operator's.
+    A worker's inbox is the other side of the same events: "your shift passed the overtime
+    line", read by the person it happened to, pruned on its own schedule, and never carrying
+    an administrative payload. Folding them together would mean every admin alert needed an
+    audience column, one read-state meaning two different things, and a bug in the filter
+    handing a worker somebody else's queue. Two tables cost one insert per event, in the same
+    transaction, which is what ``notifications.notify_worker`` does.
+
+    ``delivered_at`` / ``delivery_attempts`` / ``last_error`` are the delivery state of the
+    *push* channel, not of the inbox. A notification whose push failed is still a
+    notification the worker will see when they next open the app, so delivery failure never
+    withholds the record - it only stops the server retrying for ever.
+
+    ``worker_push_subscriptions`` stores what a browser hands us when a worker allows
+    notifications. ``endpoint`` is UNIQUE because re-subscribing the same browser must update
+    the row rather than add one: a phone that reinstalls the app is the same phone.
+    ``revoked_at`` is how a subscription a push service has told us is gone is retired - kept
+    rather than deleted, so "why did my alerts stop" has an answer on the row.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS worker_notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            worker_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            payload TEXT,
+            dedupe_key TEXT UNIQUE,
+            created_at DATETIME NOT NULL,
+            read_at DATETIME,
+            delivered_at DATETIME,
+            delivery_attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_worker_notifications_inbox "
+        "ON worker_notifications(worker_id, created_at DESC)"
+    )
+    # The delivery scan's index: undelivered rows, oldest first. Without it every dispatch
+    # walks the whole inbox, which is the one table that only ever grows.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_worker_notifications_undelivered "
+        "ON worker_notifications(delivered_at, created_at)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS worker_push_subscriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            worker_id TEXT NOT NULL,
+            endpoint TEXT NOT NULL UNIQUE,
+            p256dh TEXT NOT NULL,
+            auth TEXT NOT NULL,
+            user_agent TEXT,
+            created_at DATETIME NOT NULL,
+            last_ok_at DATETIME,
+            last_error TEXT,
+            revoked_at DATETIME
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_worker_push_subscriptions_worker "
+        "ON worker_push_subscriptions(worker_id, revoked_at)"
+    )
+
+
+def migration_16_company_branding(conn: sqlite3.Connection) -> None:
+    """The company's own name and mark, so a screen can say whose app this is.
+
+    WHY A TABLE AND NOT A CONSTANT
+    ------------------------------
+    The wordmark, the legal suffix, the founding year and the tagline were a JavaScript
+    object in ``frontendjavascript.js``, and the mark was a file beside it. That is the
+    right place for the *artwork* and the wrong place for the *name*: every screen that
+    says whose payroll this is - the login panel, the handset header, the console rail,
+    the printed timesheet - read that constant, so a company that renamed itself, or
+    wanted its own logo on the sheet it hands to payroll, needed a code change and a
+    redeploy. A settings row is the same idea as ``shift_rules`` next door: the company's
+    own numbers and words, editable where the company is administered.
+
+    NULL AND THE EMPTY STRING MEAN DIFFERENT THINGS, ON PURPOSE
+    -------------------------------------------------------------
+    ``NULL`` is "nobody has touched this column", and the shipped lockup is used - which
+    is what every deployment that never opens the panel keeps, byte for byte. An **empty
+    string** is a decision: the line is not printed. A company with no legal suffix and no
+    founding year has to be able to *remove* those lines, and a rule of "blank means the
+    shipped value" (which is what ``shift_rules`` does, because a blank clock-in window
+    would be a real hours bug) would put them straight back. So the four text columns are
+    nullable with no default, and the reader distinguishes the two states.
+
+    The mark is stored as bytes rather than as a path for the same reason the rest of this
+    row is stored: it travels with the backup, there is no file to lose when a deployment
+    moves, and nothing on disk has to be writable for a company to have a logo. It is
+    always an image this application re-encoded itself (see ``branding.encode_logo``), so
+    the stored type is one of two it chose, never one a browser guessed at.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS company_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            company_name TEXT,
+            company_legal TEXT,
+            company_est TEXT,
+            company_tagline TEXT,
+            logo_bytes BLOB,
+            logo_mime TEXT,
+            logo_width INTEGER,
+            logo_height INTEGER,
+            logo_version INTEGER NOT NULL DEFAULT 0,
+            updated_at DATETIME,
+            updated_by TEXT
+        )
+        """
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO company_settings (id, updated_at) VALUES (1, ?)",
+        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),),
+    )
+
+
+def migration_15_worker_report_columns(conn: sqlite3.Connection) -> None:
+    """Which columns this account's *own* timesheet files carry.
+
+    A preference, and an account's rather than a browser's. The file a worker hands in is
+    theirs and is handed in from wherever they happen to be: keeping the choice in the
+    browser's storage would lose it with the phone, and would give the same account two
+    different files depending on which device it downloaded from. The value is the
+    comma-joined column ids, in the order ``reports.REPORT_COLUMNS`` declares, and NULL
+    means "never chose" - which is served as the default rather than as an empty file.
+
+    No CHECK constraint on the contents, for the reason ``construction_sites`` has none on
+    its window either: the vocabulary belongs to the application that fills the cells (see
+    ``reports.REPORT_COLUMNS``), and a schema that hardcoded today's column ids would have
+    to be migrated by every release that adds one. The reader normalises regardless of what
+    is stored, so junk on this column can never reach a file - it degrades to the default.
+    """
+    add_column(conn, "users", "report_columns", "TEXT")
+
+
+def migration_17_punch_queue_photo_scored_at(conn: sqlite3.Connection) -> None:
+    """When the queued selfie for this punch was scored at sync.
+
+    A punch taken with no signal carries a selfie the *phone* decides to keep, and the
+    server only ever sees it if the phone uploads it after the queue arrives. This column
+    is when that happened - ``NULL`` means the punch is still waiting for its frame to be
+    scored, which is what makes a retried upload harmless: the first scoring owns the row
+    and a second attempt is answered from it instead of re-running the models and
+    re-writing the evidence.
+
+    It is a timestamp rather than a boolean because "this was scored, and when" is the
+    question an operator asks of a review queue, and a stamp answers both. Additive and
+    nullable, so the rows already in the table - punches whose photos were never
+    uploaded, which is every punch from before this column existed - keep the meaning they
+    had.
+    """
+    add_column(conn, "punch_queue", "photo_scored_at", "DATETIME")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_punch_photo_pending "
+        "ON punch_queue(status, photo_scored_at, received_at)"
+    )
+
+
+def migration_18_punch_frame(conn: sqlite3.Connection) -> None:
+    """The downscaled frame stored with every punch, as the review card's evidence.
+
+    A pending review used to arrive as numbers only - a distance, a liveness verdict, a flag
+    sentence - with the frame those numbers were measured from decoded, used and dropped.
+    This column is the name of the stored copy, filed under a random name in ``punch_frames/``
+    and served by log id to an administrator (see ``punch_frames`` and
+    ``/admin/pending_review_frame``).
+
+    It is evidence, not a verdict, and it is optional in both directions: rows written before
+    this column existed keep their numbers without a picture, and a row that could not keep
+    its frame (a full disk) keeps its numbers without one too - the score is the record, the
+    frame is the picture beside it. Retention sweeps the file and clears the column on the
+    same window (``retention._sweep_punch_frames``), and serving the frame never widens past
+    ``admin_only``.
+    """
+    add_column(conn, "attendance_logs", "punch_frame", "TEXT")
+
+
+def migration_19_notification_acknowledgement(conn: sqlite3.Connection) -> None:
+    """What an operator decided about an alert, and why - not merely that they saw it.
+
+    ``read_at``/``read_by`` answered "has anybody looked at this", which is the wrong question
+    for the alerts that are *decisions*: a forced start past a failing self-test, a push channel
+    that has stopped delivering. Those stay on the record until a human accepts them and says
+    why, and the acceptance has to be attributable - "somebody read it" cannot be reviewed, and
+    it cannot be shown to have been the right call.
+
+    The note is the point rather than a nicety. A forced start carries a reason from the
+    environment (``STARTUP_OVERRIDE_REASON``); the acknowledgement carries the operator's own,
+    written after the fact, and the two answers are different people answering different
+    questions. The note is vetted as prose (``textguard``) at the endpoint, like every other
+    free text this application stores, so a reader that forgets to escape is not a way in.
+
+    Nullable in both directions, which is what makes the state readable: an alert written
+    before this migration has no acknowledgement, and neither has one nobody has answered.
+    """
+    add_column(conn, "admin_notifications", "acknowledged_at", "DATETIME")
+    add_column(conn, "admin_notifications", "acknowledged_by", "TEXT")
+    add_column(conn, "admin_notifications", "acknowledgement_note", "TEXT")
+
+
+def migration_20_developer_operations(conn: sqlite3.Connection) -> None:
+    """The root tier's own storage: runtime configuration, and the private alert hub.
+
+    Two tables, and the split between them is a security decision rather than a normalising
+    one.
+
+    ``developer_config`` is *shared state*: a key, its value, who changed it and when, and a
+    single-row version counter beside it. Every worker reads through it (``developer.runtime``),
+    so a flag flipped from the developer surface takes effect on all of them without a restart.
+    That is the distributed-configuration requirement, met with the storage this deployment
+    actually has: the version counter is what makes an in-process cache safe to keep, because a
+    cached read is only trusted while the version it was taken at is still the version on
+    disk. Adding Redis to a single-file SQLite application would buy a second source of truth
+    and a new failure mode at 04:00, not a faster read.
+
+    ``developer_alerts`` is the private hub, and it is a table of its own rather than a
+    visibility column on ``admin_notifications`` for exactly one reason: **concealment by
+    construction**. A column is a filter somebody can forget in a query written next year; a
+    table that no administrator-facing route, service or report names cannot be read by
+    accident. The administrator's own alerts stay where they were, with the acknowledgement
+    flow migration 19 gave them, and neither table can leak into the other's answers.
+
+    ``dedupe_key`` is uniquely indexed, and the key is expected to carry its own window
+    (``pool_saturation:2026-09-22T15``): one row per window by construction of the index, which
+    is what stops a saturated pool writing an alert every tick.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS developer_config (
+            key TEXT PRIMARY KEY,
+            value_json TEXT NOT NULL,
+            value_type TEXT NOT NULL,
+            updated_at DATETIME NOT NULL,
+            updated_by TEXT,
+            note TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS developer_config_version (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            version INTEGER NOT NULL DEFAULT 0,
+            changed_at DATETIME
+        )
+        """
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO developer_config_version (id, version, changed_at) VALUES (1, 0, NULL)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS developer_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            source TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            detail_json TEXT,
+            trace_id TEXT,
+            dedupe_key TEXT,
+            created_at DATETIME NOT NULL,
+            read_at DATETIME,
+            read_by TEXT
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_developer_alerts_created ON developer_alerts(created_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_developer_alerts_unread ON developer_alerts(read_at, created_at)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_developer_alerts_dedupe "
+        "ON developer_alerts(dedupe_key) WHERE dedupe_key IS NOT NULL"
+    )
+
+
+def migration_21_overtime_authorisations(conn: sqlite3.Connection) -> None:
+    """The mid-shift overtime decision: a question answered while the shift is still open.
+
+    WHY THIS IS A TABLE AND NOT A NOTIFICATION
+    ------------------------------------------
+    The crossing used to be an ``admin_notifications`` row (``overtime_exceeded``), which put a
+    live *question* in the tab built for *notices*. The two differ in exactly the way that
+    matters: a notice is read and stops existing, and a question is answered and stops being
+    asked. Reading the crossing row did nothing to the shift, and the shift - still open, still
+    accumulating - stayed open whether or not anybody looked.
+
+    So the crossing is derived (see ``overtime.open_crossings``, which reads the open shifts)
+    and the *answer* is stored here. Derived, because an open shift's crossing state is already
+    computable from the shift and the rules, so a stored copy would be a second answer that can
+    disagree with the first; and because a queue item that disappears the moment the shift ends
+    needs no dismissal, no expiry and no sweeper.
+
+    WHY THE CEILING AND NOT A FLAG
+    ------------------------------
+    ``authorised_hours`` is a **number**: the paid hours this shift may run to. An approval that
+    said only "yes" would authorise an amount nobody could state, and the clock-out would either
+    ignore it or guess. The decision is recorded as an amount so that the settled row is
+    arithmetic (``max(0, paid - ceiling)``) rather than a special case, and so that "how much did
+    they authorise, and how much had been worked when they said it" is answerable from the row.
+
+    ``recorded_hours_at_decision`` is that second half, and it is not redundant with the
+    decision: without it nobody can tell a generous 12 h ceiling given at 8.5 h from a
+    rubber-stamp given at 11.9 h, and the review that reads this row is a review of a judgement.
+
+    A refusal is a ceiling too - the regular paid day - so the clock-out reads one column for
+    both answers instead of branching on the decision; ``decision`` carries the *why*.
+
+    Append-only per shift, with a partial unique index for the live one: a later decision
+    supersedes rather than overwrites, because a shift that runs past the ceiling needs a second
+    answer and the first one is what the second is measured against. Same rule the forced-start
+    acknowledgement already follows.
+
+    ``consumed_by_log_id`` is set by the clock-out that settles under this decision, which is
+    what makes "was this ever cashed in?" answerable, and what stops a decision taken for one
+    shift being read as authorisation for the next one the same worker starts.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS overtime_authorisations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            worker_id TEXT NOT NULL,
+            clock_in_time DATETIME NOT NULL,
+            decision TEXT NOT NULL,
+            authorised_hours REAL NOT NULL,
+            recorded_hours_at_decision REAL NOT NULL,
+            decided_by TEXT NOT NULL,
+            decided_at DATETIME NOT NULL,
+            note TEXT,
+            consumed_by_log_id INTEGER,
+            superseded_by INTEGER
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_overtime_authorisations_shift "
+        "ON overtime_authorisations(worker_id, clock_in_time, id DESC)"
+    )
+    # One live decision per shift. Two rows for the same open shift would be two answers to one
+    # question, and the clock-out would have to pick - which is how the arithmetic and the queue
+    # come to disagree about the same shift.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_overtime_authorisations_live "
+        "ON overtime_authorisations(worker_id, clock_in_time) "
+        "WHERE consumed_by_log_id IS NULL AND superseded_by IS NULL"
+    )
+
+
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "audit_notifications_shift_rules", migration_1_audit_notifications_shift_rules),
     (2, "provenance_columns_status_code", migration_2_provenance_columns),
@@ -890,6 +1296,14 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (11, "biometric_ids", migration_11_biometric_ids),
     (12, "site_clock_in_windows", migration_12_site_clock_in_windows),
     (13, "retention_runs", migration_13_retention_runs),
+    (14, "worker_notifications_and_push", migration_14_worker_notifications_and_push),
+    (15, "worker_report_columns", migration_15_worker_report_columns),
+    (16, "company_branding", migration_16_company_branding),
+    (17, "punch_queue_photo_scored_at", migration_17_punch_queue_photo_scored_at),
+    (18, "punch_frame", migration_18_punch_frame),
+    (19, "notification_acknowledgement", migration_19_notification_acknowledgement),
+    (20, "developer_operations", migration_20_developer_operations),
+    (21, "overtime_authorisations", migration_21_overtime_authorisations),
 ]
 
 

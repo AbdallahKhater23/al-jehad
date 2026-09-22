@@ -1,6 +1,6 @@
 """Fixtures for the security-baseline suite.
 
-The heavy lifting (database isolation, the DeepFace stub, the outbound-network
+The heavy lifting (database isolation, the face-engine and detector stubs, the outbound-network
 guard) lives in ``harness.py`` and runs at import time. See that module for the
 safety rules this suite depends on.
 """
@@ -11,12 +11,21 @@ import pytest
 
 import browser as browser_support
 import harness
-from harness import FAKE_FACE, PHOTOS_DIR, REFS_DIR, jpeg_bytes as _jpeg_bytes
+from harness import FAKE_ENGINE, jpeg_bytes as _jpeg_bytes
 
 
 @pytest.fixture(scope="session", autouse=True)
 def _outbound_network_guard():
-    """No test may reach the internet (today's alert path has hardcoded creds)."""
+    """No test may reach the internet (today's alert path has hardcoded creds).
+
+    Session-scoped and autouse, so this is also where the throwaway working directory is
+    entered - before the first test body, and before ``app_module`` imports the app. It is
+    entered here and not at ``harness`` import because pytest-xdist has each worker collect
+    its nodeids relative to its working directory: a ``chdir`` during import left every
+    worker collecting nothing and the suite reporting "no tests ran". See safety rule 1 and
+    ``harness.enter_temp_root``.
+    """
+    harness.enter_temp_root()
     harness.install_outbound_guard()
     return harness.OUTBOUND
 
@@ -27,9 +36,14 @@ def outbound():
     return harness.OUTBOUND
 
 
+
 @pytest.fixture(scope="session")
 def app_module():
     """The application under test, imported once per session."""
+    # The temp working directory before the app is imported, whatever order pytest sets the
+    # session fixtures up in. See ``harness.enter_temp_root``.
+    harness.enter_temp_root()
+
     import main
 
     # Refuse to proceed if the app is somehow pointed at the live database. This runs
@@ -37,10 +51,12 @@ def app_module():
     # loss in the real payroll database.
     harness.assert_database_isolation()
 
-    # Redirect biometric writes/reads into the temp directory: the module reads
-    # these globals at call time, so patching them here is enough.
-    main.LOCAL_REFS_DIR = str(REFS_DIR)
-    main.WORKER_PHOTOS_DIR = str(PHOTOS_DIR)
+    # Redirect every file tree the application writes into - biometric templates, reference
+    # selfies, punch frames, quick-link photos - into the temp directory. Each module reads its
+    # global at call time, so setting them here is enough, and they are set to stable paths
+    # inside the ``current`` junction so the per-test reset rotates them along with the
+    # database. See ``harness.FILE_TREES``.
+    harness.redirect_file_directories()
     return main
 
 
@@ -56,8 +72,8 @@ def client(app_module):
 
 @pytest.fixture(scope="session")
 def face():
-    """The DeepFace stub, so a test can set FACE_MODE / FACE_COUNT."""
-    return FAKE_FACE
+    """The face-engine stub, so a test can set FACE_MODE / FACE_COUNT."""
+    return FAKE_ENGINE
 
 
 @pytest.fixture(scope="session")
@@ -78,13 +94,26 @@ def deterministic_state(app_module):
 # See ``browser.py`` for why these exist and what they will not do. The short version:
 # the only assertion that catches "this page's script never executed, and the screen looks
 # like a slow connection" is a browser saying so.
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def browser():
     """A Chromium, or a skip naming the command that installs one.
 
     Probed before it is opened, and skipped rather than raised: a checkout with no browser
     is not a checkout with a broken application, and a fixture that errors would fail the
     build for the wrong reason. ``frontend_vm.NODE`` is the same shape for the node suites.
+
+    Scoped to the *module* rather than the session, and that is load-bearing. Playwright's
+    sync API keeps the main thread's event loop marked running for as long as its session is
+    open - it needs that mark to reach its own dispatcher, and a cleared mark makes the next
+    ``page.goto`` fail with "no running event loop". ``asyncio.run`` needs the opposite: the
+    mark must be clear or it refuses to start. A single pytest process serves both browser
+    modules and the suites that call ``asyncio.run`` (face engine, network hardening, the
+    JSON payload walk), so a browser session that lives for the whole run leaves those
+    suites failing from a fixture they never used. Ending the session at the module boundary
+    is the smallest lifetime that satisfies both: inside a browser module the mark is set and
+    Playwright works; between modules ``open_browser`` has closed the loop and released the
+    mark, so ``asyncio.run`` works again. Moving this back to ``session`` re-introduces the
+    bug, which ``test_browser_event_loop`` now pins.
     """
     ok, why = browser_support.available()
     if not ok:

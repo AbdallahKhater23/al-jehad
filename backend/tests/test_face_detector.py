@@ -229,7 +229,7 @@ def test_a_box_outside_the_frame_still_returns_a_usable_crop(real_detector):
 # ---------------------------------------------------------------------------
 # 3. the shape every caller reads
 # ---------------------------------------------------------------------------
-def test_detect_and_align_answers_the_shape_deepface_answers(real_detector, monkeypatch):
+def test_detect_and_align_answers_the_shape_every_caller_reads(real_detector, monkeypatch):
     """``face_engine`` and ``quick_links`` read ``confidence`` and count the entries."""
     monkeypatch.setattr(
         face_detector,
@@ -276,8 +276,9 @@ def test_the_five_landmarks_are_read_as_five_points(real_detector, monkeypatch):
 def test_float_pixels_are_not_read_as_bytes(real_detector):
     """A 0..1 image read as 0..255 pixels is a black frame, and \"no face\" is the wrong answer.
 
-    DeepFace hands round floats around, so this is not hypothetical: it is how a detector
-    ends up finding nothing in a perfectly good photo.
+    Callers hand round floats around - a normalised crop, a frame from a float pipeline - so
+    this is not hypothetical: it is how a detector ends up finding nothing in a perfectly good
+    photo.
     """
     frame = np.full((32, 32, 3), 0.5, dtype=np.float32)
     converted = real_detector._to_bgr(frame)

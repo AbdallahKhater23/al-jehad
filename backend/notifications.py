@@ -1,12 +1,22 @@
-"""Internal admin notification queue.
+"""Notification queues: one for administrators, one for the worker it happened to.
 
 This replaces the removed Twilio/WhatsApp integration: alerts are rows, they are
-visible on the admin dashboard, they cannot be lost to a third-party outage, and
-they cost nothing to send.
+visible on the dashboard (administrators) or in the worker's own inbox, they cannot
+be lost to a third-party outage, and they cost nothing to send.
 
 ``dedupe_key`` is the important column: a UNIQUE constraint plus ``INSERT OR
 IGNORE`` gives exactly-once semantics, which is what lets the overtime watcher
 run on a timer in several worker processes without spamming the administrator.
+
+WHY TWO TABLES
+--------------
+``admin_notifications`` is *about* workers but it is **for** administrators - the
+triage queue, carrying audit-facing payloads, with a read state that means "an
+operator has dealt with this". ``worker_notifications`` is the other side of the
+same events, addressed to the person they happened to, on its own retention clock
+(see ``retention._sweep_worker_notifications``). They are written in the same
+transaction by the caller, which is what keeps them from disagreeing: every worker
+notification for an event is written where the admin alert for that event is.
 """
 
 from __future__ import annotations
@@ -33,6 +43,29 @@ KIND_SHIFT_AUTO_CLOSED = "shift_auto_closed"
 #: it needs to know the link reached a working phone, and a tap after that is an ordinary
 #: punch whose record is the link's own list of uses.
 KIND_QUICK_LINK = "quick_link"
+#: The worker's own alert: their shift has passed the overtime line. Kind for
+#: ``worker_notifications`` - there is no admin equivalent, because the administrator gets
+#: ``KIND_OVERTIME_EXCEEDED`` for the same event.
+KIND_WORKER_OVERTIME_CROSSED = "overtime_crossed"
+#: The worker's own notice that the system ended their shift at the paid-day limit, the
+#: twin of ``KIND_SHIFT_AUTO_CLOSED`` above. Deliberately *not*
+#: ``KIND_WORKER_OVERTIME_CROSSED``: a close records exactly the paid day, so there are no
+#: overtime hours for a crossing notice to be about - the two events carry different
+#: figures and would contradict each other if one kind said both. Without this one the only
+#: way the worker learned the day was over was the next clock-out refusing them.
+KIND_WORKER_SHIFT_AUTO_CLOSED = "shift_auto_closed"
+#: The worker's half of an administrator *answering* their crossing while the shift is still
+#: running: the ceiling that was authorised for it, who authorised it, and what is left
+#: unauthorised. Without this the worker only ever heard that a line had been crossed, and the
+#: one thing they cannot find out on their own - how far the rest of their night is paid - was
+#: the only thing the decision actually said.
+KIND_WORKER_OVERTIME_AUTHORISED = "overtime_authorised"
+#: ... and the refusal, deliberately a *different* kind rather than the same one carrying
+#: different words. "Your extra time is authorised up to 10.5 h" and "no extra time is
+#: authorised for this shift" are opposite statements, and a kind that said both could be
+#: neither counted nor translated as either - the same reason the auto-close's notice is not the
+#: crossing's.
+KIND_WORKER_OVERTIME_DECLINED = "overtime_declined"
 KIND_STARTUP_DEGRADED = "startup_degraded"
 KIND_STARTUP_OVERRIDE = "startup_override"
 KIND_SCHEMA_REPAIR = "schema_repair"
@@ -41,6 +74,12 @@ KIND_SCHEMA_REPAIR = "schema_repair"
 #: is deliberately no pruning helper here, so that every deletion in this application has
 #: exactly one implementation, in the module that writes the compliance event describing it.
 KIND_RETENTION_SWEEP = "retention_sweep"
+#: The channel itself has gone quiet: worker notices have passed the push age window without
+#: being delivered. Not a fault of any one punch - it is the *absence* of the rows that would
+#: otherwise be the evidence, which is why it is written from a reading of the backlog rather
+#: than from an event. Severity warning, not critical: attendance keeps working, every notice
+#: is still in the worker's own inbox, and what an operator has lost is the phone ringing.
+KIND_WORKER_PUSH_UNDELIVERED = "push_undelivered"
 
 SEVERITY_INFO = "info"
 SEVERITY_WARNING = "warning"
@@ -92,9 +131,128 @@ def notify(
         return False
 
 
+def notify_worker(
+    conn: sqlite3.Connection,
+    *,
+    worker_id: str,
+    kind: str,
+    title: str,
+    body: str,
+    severity: str = SEVERITY_INFO,
+    payload: dict | None = None,
+    dedupe_key: str | None = None,
+) -> bool:
+    """Write one row into the worker's own inbox. Returns True when it was new.
+
+    Never raises, for the same reason ``notify`` does not: this runs inside the attendance or
+    watcher transaction that produced the event, and a notification that cannot be written
+    must not fail the punch, the clock-out or the scan that was doing its job.
+
+    Delivery is deliberately *not* attempted here. A push is a network call to a third
+    party, and the caller is holding a write transaction and (for a punch) a worker standing
+    at a gate. ``push.dispatch_async`` is called after the transaction commits.
+    """
+    try:
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO worker_notifications
+                (worker_id, kind, title, body, payload, dedupe_key, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(worker_id),
+                kind,
+                title,
+                body,
+                json.dumps(payload) if payload is not None else None,
+                dedupe_key,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            ),
+        )
+        return cursor.rowcount > 0
+    except sqlite3.Error:
+        return False
+
+
 def unread_count(conn: sqlite3.Connection) -> int:
     try:
         return int(conn.execute("SELECT COUNT(*) FROM admin_notifications WHERE read_at IS NULL").fetchone()[0])
+    except sqlite3.Error:
+        return 0
+
+
+def acknowledge(
+    conn: sqlite3.Connection,
+    notification_id: int,
+    *,
+    by: str,
+    note: str,
+    now: datetime | None = None,
+) -> bool:
+    """Accept an alert, with the reason. Returns whether **this** call is the one that did it.
+
+    One conditional statement rather than read-then-write, and the condition is the whole
+    design: ``WHERE acknowledged_at IS NULL`` means two administrators acknowledging the same
+    alert at the same moment cannot overwrite each other's reason with the later one. The
+    second call sets nothing and returns False, and the endpoint answers it as the conflict it
+    is - the audit trail keeps the first acceptance, which is the one that was actually made.
+
+    Acknowledging also *reads* the row (``COALESCE``, so an earlier reader is not rewritten).
+    An alert somebody has accepted has by definition been seen, and leaving it in the unread
+    count would badge a decision that has already been made.
+    """
+    stamp = (now or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
+    cursor = conn.execute(
+        "UPDATE admin_notifications SET acknowledged_at = ?, acknowledged_by = ?, "
+        "acknowledgement_note = ?, read_at = COALESCE(read_at, ?), read_by = COALESCE(read_by, ?) "
+        "WHERE id = ? AND acknowledged_at IS NULL",
+        (stamp, str(by), note, stamp, str(by), int(notification_id)),
+    )
+    return cursor.rowcount > 0
+
+
+def unacknowledged_count(conn: sqlite3.Connection) -> int:
+    """How many alerts on this deployment are still waiting for a human to answer."""
+    try:
+        return int(
+            conn.execute(
+                "SELECT COUNT(*) FROM admin_notifications WHERE acknowledged_at IS NULL"
+            ).fetchone()[0]
+        )
+    except sqlite3.Error:
+        return 0
+
+
+def newest_of_kind(conn: sqlite3.Connection, kind: str) -> sqlite3.Row | None:
+    """The most recent alert of one kind, acknowledgement and all.
+
+    What readiness reads: an alert kind whose newest row has not been accepted is an open
+    question about this deployment, and the newest row is the one that describes the state it
+    is in now. An older, acknowledged row must not answer for it.
+    """
+    try:
+        return conn.execute(
+            "SELECT * FROM admin_notifications WHERE kind = ? ORDER BY id DESC LIMIT 1",
+            (str(kind),),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+
+
+def worker_unread_count(conn: sqlite3.Connection, worker_id: str) -> int:
+    """Unread rows in one worker's inbox - the number the app badges.
+
+    Scoped by ``worker_id`` here rather than at the call site: this is the one query that
+    decides what a worker is told is waiting for them, and a caller that forgot the clause
+    would count somebody else's. The route is tested for the same property.
+    """
+    try:
+        return int(
+            conn.execute(
+                "SELECT COUNT(*) FROM worker_notifications WHERE worker_id = ? AND read_at IS NULL",
+                (str(worker_id),),
+            ).fetchone()[0]
+        )
     except sqlite3.Error:
         return 0
 

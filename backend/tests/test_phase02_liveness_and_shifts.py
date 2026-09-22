@@ -2,7 +2,7 @@
 
 Two properties are load-bearing here and both are easy to lose in a refactor:
 
-* a presentation attack must be refused **before** ``DeepFace.represent`` runs - the
+* a presentation attack must be refused **before** the face embedding runs - the
   cheap check has to come first, or the expensive path stays available to an attacker;
 * a shift must survive past 8 hours. Anything that closes a session at 8 h (or at
   8.1 h) destroys real work, and nothing at all closes a forgotten shift on a timer:
@@ -19,11 +19,13 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pytest
+import harness
 from harness import (
     ADMIN,
     DB_PATH,
     MOALLEM,
     PASSWORDS,
+    SEEDED_PENDING_LOG_ID,
     bearer,
     clock_in,
     db_scalar,
@@ -125,7 +127,7 @@ def test_genuine_frame_passes_and_reaches_face_matching(monkeypatch, app_module,
 def test_presentation_attack_is_refused_before_face_matching(
     monkeypatch, app_module, client, jpeg, probabilities, expected_class
 ):
-    """The whole point of the integration: reject *before* paying for VGG-Face."""
+    """The whole point of the integration: reject *before* paying for the embedding."""
     _install_session(monkeypatch, probabilities)
     calls = _spy_on_face_matching(monkeypatch, app_module)
     monkeypatch.setattr(settings, "liveness_mode", "enforce")
@@ -270,7 +272,7 @@ def test_default_shift_rules_are_the_documented_ones():
         "clock_in_window_end": "06:30",
         "regular_hours": 8.0,
         "overtime_notify_hours": 8.1,
-        "site_timezone": "Africa/Cairo",
+        "site_timezone": "Asia/Kuwait",
         # A full day is 8 h paid plus a 30-minute unpaid break, so it runs 8.5 h on
         # site; the break is charged only to a shift long enough to have contained one.
         "break_minutes": 30.0,
@@ -359,10 +361,14 @@ def test_overtime_alert_fires_once_at_the_crossing(monkeypatch):
     # Counted for this worker, not globally: the live database this suite clones may
     # already contain alerts of its own, and a shared count would make this test about
     # somebody else's shift.
+    # Counted for this worker, and expected at zero: the crossing is no longer an administrator
+    # notification at all - it is an item in the Approvals queue for the open shift, which
+    # ``test_overtime_crossing_queue`` pins. What this test is about is the *watcher* firing
+    # once, which the stamp and the audit row below still say.
     assert db_scalar(
         "SELECT COUNT(*) FROM admin_notifications WHERE kind = 'overtime_exceeded' AND worker_id = ?",
         (MOALLEM,),
-    ) == 1
+    ) == 0
     assert db_scalar("SELECT overtime_notified_at FROM active_sessions WHERE worker_id = ?", (MOALLEM,)), (
         "the crossing must be stamped so the watcher does not re-alert every tick"
     )
@@ -377,7 +383,7 @@ def test_overtime_alert_fires_once_at_the_crossing(monkeypatch):
     assert db_scalar(
         "SELECT COUNT(*) FROM admin_notifications WHERE kind = 'overtime_exceeded' AND worker_id = ?",
         (MOALLEM,),
-    ) == 1
+    ) == 0, "a second pass raised an alert the first pass already raised"
 
 
 def test_no_alert_before_the_threshold():
@@ -423,8 +429,16 @@ def test_clock_out_past_the_threshold_requires_admin_approval(client):
     assert waiting["awaiting_approval"] is True
     assert waiting["hours"] == pytest.approx(9.0, abs=0.05), "the shift holds what was worked"
     assert waiting["break_hours"] == pytest.approx(0.5, abs=0.01)
-    assert before["totals"]["approved_hours"] == 0, "nothing here is signed off yet"
-    assert before["totals"]["awaiting_approval_hours"] == pytest.approx(9.0, abs=0.05)
+    # 9.0 h paid is the standard 8 h day plus an hour of overtime. Nobody is reviewing
+    # whether the worker turned up - only whether the extra hour was authorised - so the
+    # day is credited as soon as the shift is filed and only the hour past it waits. The
+    # worker "works 8 h normally"; that part is not in question.
+    assert waiting["approved_hours"] == pytest.approx(8.0, abs=0.05), waiting
+    assert waiting["awaiting_approval_hours"] == pytest.approx(1.0, abs=0.05), waiting
+    assert before["totals"]["approved_hours"] == pytest.approx(8.0, abs=0.05), (
+        "the standard day is earned, not conditional on the overtime decision"
+    )
+    assert before["totals"]["awaiting_approval_hours"] == pytest.approx(1.0, abs=0.05)
 
     approved = client.post(
         "/api/v1/admin/approve_review",
@@ -457,7 +471,13 @@ def test_a_forgotten_shift_ends_at_the_paid_limit_and_is_reported(app_module, cl
     ceiling but the paid-day rule: the shift ends where the policy says a day ends
     (8 h paid, 8.5 h on site), it is marked ``auto_closed_8h``, it is payable, and the
     alert names the time that was still on the clock when the watcher got there.
+
+    The close only ends the day in the arrangement where the crossing is observable before
+    it does: the alert line is put *below* the paid day (see ``harness.use_auto_close``),
+    so the pair cooperates - the alert first, the close after. Under the shipped numbers
+    the close stands down instead, which is ``test_day_end_precedence.py``'s subject.
     """
+    harness.use_auto_close(client)
     _plant_open_session(MOALLEM, 12.0)
 
     assert not hasattr(app_module, "enforce_11h_cutoff"), (
@@ -513,3 +533,196 @@ def test_a_force_clock_out_is_priced_by_the_same_policy(client):
         "SELECT break_hours FROM attendance_logs WHERE worker_id = ? AND status = ?",
         (MOALLEM, "Force Clocked Out by Admin"),
     ) == pytest.approx(0.5, abs=0.01)
+
+
+# ---------------------------------------------------------------------------
+# refusing a shift: the other half of the approval gate
+# ---------------------------------------------------------------------------
+#  Until this endpoint existed the console's Reject button posted to
+#  ``/admin/approve_review`` and threw its ``action`` argument away, so pressing Reject
+#  *approved* the shift at its full recorded hours. A worker was paid overtime their
+#  manager had just refused, and the only trace of the refusal was that the card vanished.
+#  These tests are written against the money, not against the button: what the timesheet
+#  pays afterwards is the thing that was wrong.
+def _waiting_overtime_shift(client, hours_on_site: float = 9.5) -> int:
+    """A clock-out past the threshold, sitting in the review queue. Returns its log id."""
+    _plant_open_session(MOALLEM, hours_on_site)
+    response = clock_in(client, MOALLEM, action="Clock Out", headers=bearer(MOALLEM))
+    assert response.status_code == 200, response.text[:300]
+    log_id = db_scalar("SELECT MAX(id) FROM attendance_logs WHERE worker_id = ?", (MOALLEM,))
+    assert db_scalar("SELECT status_code FROM attendance_logs WHERE id = ?", (log_id,)) == "pending_overtime"
+    return int(log_id)
+
+
+def _timesheet_row(client, log_id: int) -> dict:
+    body = client.get(
+        f"/api/v1/admin/reports/shifts?worker_id={MOALLEM}", headers=bearer(ADMIN)
+    ).json()
+    matching = [row for row in body["rows"] if row["log_id"] == log_id]
+    assert matching, f"the shift must still be a row in the timesheet: {body['rows']}"
+    return matching[0]
+
+
+def test_rejecting_overtime_keeps_the_standard_day_and_credits_none(client):
+    """The decision a manager makes most often, and the one that used to pay the overtime."""
+    log_id = _waiting_overtime_shift(client)
+
+    refused = client.post(
+        "/api/v1/admin/reject_review",
+        headers=bearer(ADMIN),
+        json={"log_id": log_id, "note": "no overtime was authorised for this shift"},
+    )
+    assert refused.status_code == 200, refused.text[:300]
+    body = refused.json()
+    assert body["overtime_hours"] == 0, "a refusal must not credit the hours it refused"
+    assert body["approved_hours"] == pytest.approx(8.0, abs=0.01), (
+        "the standard paid day is still owed - the refusal is of the extra hours, not the work"
+    )
+
+    # The row agrees with the response.
+    assert db_scalar("SELECT status_code FROM attendance_logs WHERE id = ?", (log_id,)) == "overtime_rejected"
+    assert db_scalar("SELECT approved_hours FROM attendance_logs WHERE id = ?", (log_id,)) == pytest.approx(8.0, abs=0.01)
+    assert db_scalar("SELECT overtime_hours FROM attendance_logs WHERE id = ?", (log_id,)) == 0
+    assert db_scalar("SELECT reviewed_by FROM attendance_logs WHERE id = ?", (log_id,)) == ADMIN
+
+    # ... and so does the money. This is the assertion the old Reject button failed:
+    # it would have left 9.0 h payable and 1.0 h of overtime standing.
+    row = _timesheet_row(client, log_id)
+    assert row["awaiting_approval"] is False, "the refusal is a decision, so it leaves the queue"
+    assert row["hours"] == pytest.approx(8.0, abs=0.01), row
+    assert row["recorded_hours"] == pytest.approx(9.0, abs=0.01), (
+        "the clock is kept beside the decision: 8 h paid out of 9 h worked"
+    )
+
+
+def test_the_reason_for_a_refusal_is_recorded(client):
+    """"Why was my overtime refused" has to be answerable next month."""
+    log_id = _waiting_overtime_shift(client)
+    reason = "the foreman confirmed the site closed at 16:00"
+
+    assert client.post(
+        "/api/v1/admin/reject_review",
+        headers=bearer(ADMIN),
+        json={"log_id": log_id, "note": reason},
+    ).status_code == 200
+
+    assert db_scalar("SELECT flag_reason FROM attendance_logs WHERE id = ?", (log_id,)) == reason
+    # The audit row is append-only, and carries the actor and the before-image the update
+    # overwrote - so the arrival or liveness flag that was in ``flag_reason`` is still
+    # readable, and so is who made the decision and when.
+    assert db_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE action = 'review_reject' AND entity_id = ?",
+        (str(log_id),),
+    ) == 1
+    audit = client.get("/api/v1/admin/audit_log", headers=bearer(ADMIN)).json()
+    entries = [row for row in audit if row["action"] == "review_reject" and str(row["entity_id"]) == str(log_id)]
+    assert entries, "the audit log is where the decision is kept"
+    assert entries[0]["actor_id"] == ADMIN
+    assert reason in str(entries[0]["after_json"]), entries[0]["after_json"]
+
+
+def test_a_refusal_without_a_reason_is_refused(client):
+    """A refusal that reduces somebody's pay and explains nothing is not a decision."""
+    log_id = _waiting_overtime_shift(client)
+
+    for payload in ({"log_id": log_id}, {"log_id": log_id, "note": ""}):
+        response = client.post("/api/v1/admin/reject_review", headers=bearer(ADMIN), json=payload)
+        assert response.status_code == 422, response.text[:200]
+
+    # ... and nothing was decided by the attempts.
+    assert db_scalar("SELECT status_code FROM attendance_logs WHERE id = ?", (log_id,)) == "pending_overtime"
+    assert db_scalar("SELECT approved_hours FROM attendance_logs WHERE id = ?", (log_id,)) is None
+
+
+def test_rejecting_an_unconfirmed_punch_records_it_as_not_worked(client):
+    """The other kind of review: a clock-in nobody could confirm was work at all.
+
+    Rejecting that one is the opposite of rejecting overtime - nothing is payable, because
+    the decision is that the work did not happen. Two meanings, two codes; the console
+    shows one button for both, which is exactly why they must not share an outcome.
+    """
+    assert db_scalar("SELECT status_code FROM attendance_logs WHERE id = ?", (SEEDED_PENDING_LOG_ID,)) == "pending_review"
+
+    response = client.post(
+        "/api/v1/admin/reject_review",
+        headers=bearer(ADMIN),
+        json={"log_id": SEEDED_PENDING_LOG_ID, "note": "outside every site, and the photo was unclear"},
+    )
+    assert response.status_code == 200, response.text[:300]
+    assert response.json()["approved_hours"] == 0
+    assert response.json()["status_code"] == "rejected"
+    assert db_scalar("SELECT approved_hours FROM attendance_logs WHERE id = ?", (SEEDED_PENDING_LOG_ID,)) == 0
+
+    # It leaves the queue rather than sitting there forever.
+    pending = client.get("/api/v1/admin/pending_reviews", headers=bearer(ADMIN)).json()
+    assert all(row["id"] != SEEDED_PENDING_LOG_ID for row in pending)
+
+
+def test_a_settled_shift_cannot_be_refused_afterwards(client):
+    """Idempotence: a second answer to a question already answered is not a decision."""
+    log_id = _waiting_overtime_shift(client)
+    first = client.post(
+        "/api/v1/admin/reject_review",
+        headers=bearer(ADMIN),
+        json={"log_id": log_id, "note": "refused"},
+    )
+    assert first.status_code == 200, first.text[:200]
+
+    again = client.post(
+        "/api/v1/admin/reject_review",
+        headers=bearer(ADMIN),
+        json={"log_id": log_id, "note": "refused twice"},
+    )
+    assert again.status_code == 400, again.text[:200]
+    assert db_scalar("SELECT flag_reason FROM attendance_logs WHERE id = ?", (log_id,)) == "refused", (
+        "the second attempt must not rewrite the recorded reason"
+    )
+
+
+def test_approving_part_of_a_shift_credits_only_the_authorised_overtime(client):
+    """The same arithmetic as a refusal, read the other way: what is recorded is what was
+
+    authorised. A row carrying 8.25 approved hours beside the 1.0 h the clock recorded used
+    to contradict itself, and the timesheet repeated the contradiction.
+    """
+    log_id = _waiting_overtime_shift(client)
+
+    approved = client.post(
+        "/api/v1/admin/approve_review",
+        headers=bearer(ADMIN),
+        json={"log_id": log_id, "approved_hours": 8.25, "note": "authorised 15 min"},
+    )
+    assert approved.status_code == 200, approved.text[:200]
+    assert db_scalar("SELECT approved_hours FROM attendance_logs WHERE id = ?", (log_id,)) == pytest.approx(8.25, abs=0.01)
+    assert db_scalar("SELECT overtime_hours FROM attendance_logs WHERE id = ?", (log_id,)) == pytest.approx(0.25, abs=0.01), (
+        "15 minutes authorised out of the 1 h worked - not the hour the clock recorded"
+    )
+
+
+def test_the_whole_overtime_hour_can_still_be_approved(client):
+    """The refusal exists so that approving is a choice - and approving everything still works."""
+    log_id = _waiting_overtime_shift(client)
+
+    approved = client.post(
+        "/api/v1/admin/approve_review",
+        headers=bearer(ADMIN),
+        json={"log_id": log_id, "approved_hours": 9.0, "note": "the extra hour was authorised"},
+    )
+    assert approved.status_code == 200, approved.text[:200]
+    assert db_scalar("SELECT overtime_hours FROM attendance_logs WHERE id = ?", (log_id,)) == pytest.approx(1.0, abs=0.01)
+    row = _timesheet_row(client, log_id)
+    assert row["hours"] == pytest.approx(9.0, abs=0.01)
+
+
+def test_an_anonymous_caller_cannot_refuse_a_shift(client):
+    """The new route is an admin decision like the one beside it, and is guarded the same way."""
+    log_id = _waiting_overtime_shift(client)
+    assert client.post(
+        "/api/v1/admin/reject_review", json={"log_id": log_id, "note": "not me"}
+    ).status_code == 401
+    assert client.post(
+        "/api/v1/admin/reject_review",
+        headers=bearer(MOALLEM),
+        json={"log_id": log_id, "note": "not me"},
+    ).status_code == 403
+    assert db_scalar("SELECT status_code FROM attendance_logs WHERE id = ?", (log_id,)) == "pending_overtime"

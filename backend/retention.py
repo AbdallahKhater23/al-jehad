@@ -171,6 +171,9 @@ class Policy:
     #: Raw punch selfies (quick clock links). The single largest accumulation of faces here:
     #: one photograph per tap, for people who may never have been enrolled at all.
     punch_photo_days: int = 30
+    #: Downscaled punch frames, the review-card evidence (``punch_frames.py``). Same window
+    #: as the selfies: evidence does not outlive the photograph it was derived from.
+    punch_frame_days: int = 30
     #: Biometric residue: files with no live owning account, plus half-written templates.
     #: Note that *deactivation deletes a face immediately* (``main.deactivate_user``) and this
     #: window is the safety net for the cases where that could not finish — a file that was
@@ -207,6 +210,7 @@ class Policy:
     def as_dict(self) -> dict[str, int]:
         return {
             "punch_photo_days": int(self.punch_photo_days),
+            "punch_frame_days": int(self.punch_frame_days),
             "biometric_days": int(self.biometric_days),
             "audit_days": int(self.audit_days),
             "notification_days": int(self.notification_days),
@@ -238,6 +242,7 @@ def policy() -> Policy:
     """
     return Policy(
         punch_photo_days=settings.retention_punch_photo_days,
+        punch_frame_days=settings.retention_punch_frame_days,
         biometric_days=settings.retention_biometric_days,
         audit_days=settings.retention_audit_days,
         notification_days=settings.notification_retention_days,
@@ -487,6 +492,77 @@ def _sweep_punch_photos(conn: sqlite3.Connection, *, dry_run: bool) -> dict[str,
 
 
 # ---------------------------------------------------------------------------
+# target: downscaled punch frames (review-card evidence)
+# ---------------------------------------------------------------------------
+def _sweep_punch_frames(conn: sqlite3.Connection, *, dry_run: bool) -> dict[str, Any]:
+    """Wipe punch frames past the window, and clear the log rows that pointed at them.
+
+    The same two passes as :func:`_sweep_punch_photos`, for the same reason: the first is the
+    policy (rows older than the cutoff whose ``punch_frame`` is set), the second is the
+    residue (files no row claims, older than the window) - a punch whose transaction was
+    rolled back after its frame was written leaves a file behind, and ``punch_frames``'
+    discard-on-refusal is best-effort, not a guarantee.
+
+    Clearing the row matters more here than for a selfie: a review card whose evidence answers
+    404 must say so, not show a picture that was silently swept while the review still sat in
+    the queue - the card's own empty state covers a frame that was *never* stored, and a
+    cleared row is what makes that state the honest one.
+    """
+    import punch_frames
+
+    result = _blank()
+    cutoff = policy().cutoff(policy().punch_frame_days)
+    directory = str(punch_frames.FRAMES_DIR)
+    if cutoff is None:
+        result["skipped"] = "punch frame retention is 0 (keep every frame)"
+        return result
+
+    rows = conn.execute(
+        "SELECT id, punch_frame FROM attendance_logs "
+        "WHERE timestamp < ? AND punch_frame IS NOT NULL AND punch_frame <> '' "
+        f"ORDER BY id{_cap_sql(policy().cap)}",
+        (cutoff,),
+    ).fetchall()
+    result["matched"] = len(rows)
+    removed: list[str] = []
+    claimed: set[str] = set()
+    for row in rows:
+        name = os.path.basename(str(row["punch_frame"]))
+        try:
+            size = secure_remove(name, directory=directory, dry_run=dry_run)
+        except OSError as exc:
+            _fail(result, name, exc)
+            continue
+        result["bytes"] += size
+        removed.append(name)
+        claimed.add(name)
+        if not dry_run:
+            conn.execute("UPDATE attendance_logs SET punch_frame = NULL WHERE id = ?", (row["id"],))
+        result["references"] += 1
+
+    # Residue: files no row points at, older than the same window.
+    referenced = punch_frames.referenced_names(conn)
+    epoch_cutoff = policy().cutoff_epoch(policy().punch_frame_days)
+    for name in _directory_files(directory, (".jpg", ".jpeg")):
+        if name in referenced or name in claimed:
+            continue
+        if epoch_cutoff is not None and _mtime(os.path.join(directory, name)) >= epoch_cutoff:
+            continue
+        try:
+            size = secure_remove(name, directory=directory, dry_run=dry_run)
+        except OSError as exc:
+            _fail(result, name, exc)
+            continue
+        result["bytes"] += size
+        removed.append(name)
+
+    result["digest"] = digest(removed)
+    result["listed"] = _listed(removed)
+    result["deleted"] = 0 if dry_run else len(removed)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # target: biometric templates and reference selfies
 # ---------------------------------------------------------------------------
 def _sweep_biometric_files(conn: sqlite3.Connection, *, dry_run: bool) -> dict[str, Any]:
@@ -723,6 +799,79 @@ def _sweep_notifications(conn: sqlite3.Connection, *, dry_run: bool) -> dict[str
     return result
 
 
+def _sweep_worker_notifications(conn: sqlite3.Connection, *, dry_run: bool) -> dict[str, Any]:
+    """Drop *read* worker notifications past the window, and the retired push subscriptions.
+
+    The worker's inbox is the same kind of thing as the administrator's queue and gets the
+    same policy: an unread notification is a task nobody has done, and age does not make it
+    done - what retention can do about those is report how many are sitting there. A read one
+    is a record that was delivered and dealt with; past the window it is history.
+
+    A *revoked* push subscription goes with them. It is a dead capability: the push service
+    said the endpoint is gone, or the worker turned notifications off. Keeping it past the
+    window would keep a URL that can be POSTed to by anyone who reads this database, for no
+    operational benefit - by then, "why did my alerts stop" is answered by the inbox having
+    stayed quiet, not by a row.
+    """
+    result = _blank()
+    days = int(policy().notification_days)
+    cutoff = policy().cutoff(days)
+    if cutoff is None:
+        result["skipped"] = "notification retention is 0 (keep every notification)"
+        return result
+
+    cap = policy().cap
+    eligible = "FROM worker_notifications WHERE read_at IS NOT NULL AND created_at < ? ORDER BY id"
+    rows = conn.execute(f"SELECT id {eligible}{_cap_sql(cap)}", (cutoff,)).fetchall()
+    endpoint_rows = conn.execute(
+        "SELECT id, endpoint FROM worker_push_subscriptions "
+        f"WHERE revoked_at IS NOT NULL AND revoked_at < ? ORDER BY id{_cap_sql(cap)}",
+        (cutoff,),
+    ).fetchall()
+
+    result["matched"] = len(rows) + len(endpoint_rows)
+    result["listed"] = _listed(
+        [f"worker#{row['id']}" for row in rows] + [f"push#{row['id']}" for row in endpoint_rows]
+    )
+    result["digest"] = digest(
+        [str(row["id"]) for row in rows] + [f"push#{row['id']}" for row in endpoint_rows]
+    )
+    result["stale_unread"] = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM worker_notifications WHERE read_at IS NULL AND created_at < ?",
+            (cutoff,),
+        ).fetchone()[0]
+    )
+    result["subscriptions"] = len(endpoint_rows)
+    total_eligible = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM worker_notifications WHERE read_at IS NOT NULL AND created_at < ?",
+            (cutoff,),
+        ).fetchone()[0]
+    )
+    result["deferred"] = max(0, total_eligible - len(rows))
+    if dry_run or not (rows or endpoint_rows):
+        return result
+    deleted = int(
+        conn.execute(
+            f"DELETE FROM worker_notifications WHERE id IN (SELECT id {eligible}{_cap_sql(cap)})",
+            (cutoff,),
+        ).rowcount
+        or 0
+    )
+    deleted += int(
+        conn.execute(
+            "DELETE FROM worker_push_subscriptions WHERE id IN (SELECT id FROM "
+            "worker_push_subscriptions WHERE revoked_at IS NOT NULL AND revoked_at < ? "
+            f"ORDER BY id{_cap_sql(cap)})",
+            (cutoff,),
+        ).rowcount
+        or 0
+    )
+    result["deleted"] = deleted
+    return result
+
+
 # ---------------------------------------------------------------------------
 # target: raw offline punches and replay anchors
 # ---------------------------------------------------------------------------
@@ -825,9 +974,11 @@ def _report_attendance(conn: sqlite3.Connection, *, dry_run: bool) -> dict[str, 
 
 TARGETS = (
     ("punch_photos", _sweep_punch_photos),
+    ("punch_frames", _sweep_punch_frames),
     ("biometric_files", _sweep_biometric_files),
     ("audit_log", _sweep_audit_log),
     ("notifications", _sweep_notifications),
+    ("worker_notifications", _sweep_worker_notifications),
     ("punch_queue", _sweep_punch_queue),
     ("attendance_logs", _report_attendance),
 )

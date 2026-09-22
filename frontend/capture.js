@@ -19,7 +19,7 @@
  *
  * WHAT IT OWNS
  * ------------
- *   - the strings, and the document's ``lang`` / ``dir`` (Arabic reads right to left);
+ *   - the strings, and the document's ``lang`` / ``dir`` (Arabic and Urdu read right to left);
  *   - the photo policy the server publishes: what the browser refuses before uploading;
  *   - the camera cycle, over the element ids both pages already use;
  *   - the location fix, including why there is none.
@@ -35,17 +35,23 @@
     "use strict";
 
     //: The vendor credited at the foot of every page the app serves. A wordmark, so it is
-    //: the same string in all three languages and only the words around it move.
+    //: the same string in all four languages and only the words around it move.
     var BRAND = "دوامك اسهل";
 
     var LANGUAGES = [
         { code: "en", label: "EN", name: "English" },
         { code: "ar", label: "ع", name: "العربية" },
-        { code: "hi", label: "हि", name: "हिन्दी" }
+        { code: "hi", label: "हि", name: "हिन्दी" },
+        { code: "ur", label: "UR", name: "اردو" }
     ];
 
+    //: The languages that read right to left. Arabic and Urdu both do, so the page mirrors
+    //: for either - a list, so the next one is a line here rather than a call-site branch.
+    var RTL = ["ar", "ur"];
+
     /**
-     * The subset of the app's vocabulary these two pages use, in three languages.
+     * The subset of the app's vocabulary these two pages use, in every language the app
+     * offers.
      *
      * Written here and not in ``i18n.<lang>.js`` on purpose: those files are the app's
      * four-figure table, fetched by a signed-in session, and neither of these pages has a
@@ -86,6 +92,9 @@
             "location.unknown": "Your location could not be determined. Step outside and try again.",
 
             "link.invalid": "This link is not valid.",
+            "refuse.revoked": "This link was revoked by an administrator. Ask for a new one.",
+            "refuse.expired": "This link has expired. Ask your administrator for a new one.",
+            "refuse.used_up": "This link has already been used. Ask your administrator for a new one.",
             "offline": "Could not reach the server. Check your connection.",
 
             "quick.title": "Clock in or out",
@@ -110,6 +119,10 @@
             "quick.break": " after a {min}-minute break",
             "quick.notRecorded": "The tap was not recorded.",
             "quick.notReached": "The tap did not reach the server. Check your connection and try again.",
+            "quick.earlyTitle": "Clock out early?",
+            "quick.earlyBody": "You have worked {paid}h of the {regular}h paid day. If you clock out now, this time it will be recorded as {paid}h \u2014 not the full {regular}h day.",
+            "quick.earlyConfirm": "Confirm and clock out",
+            "quick.earlyCancel": "Cancel",
 
             "enroll.title": "Register your face",
             "enroll.registerTitle": "Create your account",
@@ -130,7 +143,7 @@
             "enroll.done.register": "Done. Your account is ready - sign in with your ID and the password you chose.",
             "enroll.done.enroll": "Done. Your reference photo has been registered.",
             "enroll.failed": "Enrollment failed.",
-            "enroll.unusable": "This link is {status}. Ask your administrator for a new one.",
+            "enroll.unusable": "This link can no longer be used. Ask your administrator for a new one.",
             "enroll.passwordShort": "Your password needs at least {n} characters.",
             "enroll.passwordMismatch": "The two passwords are not the same.",
             "enroll.uploadFailed": "Upload failed. Check your connection and try again.",
@@ -167,6 +180,9 @@
             "location.unknown": "تعذّر تحديد موقعك. اخرج إلى الخارج وحاول مرة أخرى.",
 
             "link.invalid": "هذا الرابط غير صالح.",
+            "refuse.revoked": "ألغى المدير هذا الرابط. اطلب منه رابطاً جديداً.",
+            "refuse.expired": "انتهت صلاحية هذا الرابط. اطلب من مديرك رابطاً جديداً.",
+            "refuse.used_up": "هذا الرابط مستخدم من قبل. اطلب من مديرك رابطاً جديداً.",
             "offline": "تعذّر الوصول إلى الخادم. تحقّق من اتصالك.",
 
             "quick.title": "تسجيل الحضور أو الانصراف",
@@ -191,6 +207,10 @@
             "quick.break": " بعد استراحة {min} دقيقة",
             "quick.notRecorded": "لم يتم تسجيل الحضور.",
             "quick.notReached": "لم يصل التسجيل إلى الخادم. تحقّق من اتصالك وحاول مرة أخرى.",
+            "quick.earlyTitle": "تسجيل الخروج مبكراً؟",
+            "quick.earlyBody": "لقد عملت {paid} ساعة فقط من أصل {regular} ساعة مدفوعة. إذا سجّلت الخروج الآن فسيُحتسب الوقت هذه المرة كما هو: {paid} ساعة، وليس يوماً كاملاً ({regular} ساعة).",
+            "quick.earlyConfirm": "تأكيد وتسجيل الخروج",
+            "quick.earlyCancel": "إلغاء",
 
             "enroll.title": "تسجيل صورتك",
             "enroll.registerTitle": "أنشئ حسابك",
@@ -211,7 +231,7 @@
             "enroll.done.register": "تم. حسابك جاهز - سجّل الدخول برقمك وكلمة المرور التي اخترتها.",
             "enroll.done.enroll": "تم. سُجّلت صورة المرجع الخاصة بك.",
             "enroll.failed": "فشل التسجيل.",
-            "enroll.unusable": "هذا الرابط {status}. اطلب من مديرك رابطاً جديداً.",
+            "enroll.unusable": "لم يعد هذا الرابط صالحًا. اطلب من مديرك رابطاً جديداً.",
             "enroll.passwordShort": "كلمة المرور تحتاج {n} أحرف على الأقل.",
             "enroll.passwordMismatch": "كلمتا المرور غير متطابقتين.",
             "enroll.uploadFailed": "فشل الإرسال. تحقّق من اتصالك وحاول مرة أخرى.",
@@ -248,6 +268,9 @@
             "location.unknown": "आपकी लोकेशन तय नहीं हो सकी। बाहर निकलें और दोबारा कोशिश करें।",
 
             "link.invalid": "यह लिंक मान्य नहीं है।",
+            "refuse.revoked": "यह लिंक एडमिन ने रद्द कर दिया है। नया लिंक मांगें।",
+            "refuse.expired": "इस लिंक की अवधि खत्म हो गई है। अपने एडमिन से नया लिंक मांगें।",
+            "refuse.used_up": "यह लिंक पहले ही इस्तेमाल हो चुका है। अपने एडमिन से नया लिंक मांगें।",
             "offline": "सर्वर तक नहीं पहुँच सके। अपना इंटरनेट कनेक्शन देखें।",
 
             "quick.title": "क्लॉक इन या आउट",
@@ -272,6 +295,10 @@
             "quick.break": " {min} मिनट के ब्रेक के बाद",
             "quick.notRecorded": "पंच दर्ज नहीं हुआ।",
             "quick.notReached": "पंच सर्वर तक नहीं पहुँचा। कनेक्शन देखें और दोबारा कोशिश करें।",
+            "quick.earlyTitle": "जल्दी चेक आउट करें?",
+            "quick.earlyBody": "आपने {regular} घंटे के वैतनिक दिन में से केवल {paid} घंटे काम किया है। अभी चेक आउट करने पर इस बार यही दर्ज होगा \u2014 {paid} घंटे, पूरा {regular} घंटे का दिन नहीं।",
+            "quick.earlyConfirm": "पुष्टि करें और चेक आउट",
+            "quick.earlyCancel": "रद्द करें",
 
             "enroll.title": "अपना चेहरा रजिस्टर करें",
             "enroll.registerTitle": "अपना खाता बनाएँ",
@@ -292,11 +319,98 @@
             "enroll.done.register": "हो गया। आपका खाता तैयार है - अपनी आईडी और चुने हुए पासवर्ड से साइन इन करें।",
             "enroll.done.enroll": "हो गया। आपकी संदर्भ फ़ोटो रजिस्टर हो गई है।",
             "enroll.failed": "रजिस्ट्रेशन नहीं हुआ।",
-            "enroll.unusable": "यह लिंक {status} है। अपने एडमिन से नया लिंक मांगें।",
+            "enroll.unusable": "यह लिंक अब काम नहीं करता। अपने एडमिन से नया लिंक मांगें।",
             "enroll.passwordShort": "पासवर्ड में कम से कम {n} अक्षर चाहिए।",
             "enroll.passwordMismatch": "दोनों पासवर्ड एक जैसे नहीं हैं।",
             "enroll.uploadFailed": "भेजना नहीं हुआ। कनेक्शन देखें और दोबारा कोशिश करें।",
             "enroll.fallback": "कैमरा नहीं चल रहा? यहाँ दबाकर अपने फ़ोन की गैलरी इस्तेमाल करें"
+        },
+        ur: {
+            "credit": "{brand} کے تعاون سے",
+            "language": "زبان",
+
+            "photo.policy": "صرف تصاویر: {types}، {mb} MB تک۔",
+            "photo.none.selfie": "پہلے سیلفی لیں یا منتخب کریں۔",
+            "photo.none.photo": "پہلے تصویر لیں یا منتخب کریں۔",
+            "photo.empty.selfie": "یہ فائل خالی ہے۔ سیلفی دوبارہ لیں۔",
+            "photo.empty.photo": "یہ فائل خالی ہے۔ گیلری سے تصویر منتخب کریں۔",
+            "photo.big": "یہ تصویر {mb} MB ہے اور حد {max} MB ہے۔ کم ریزولوشن پر دوبارہ لیں۔",
+            "photo.type": "یہ فائل تصویر نہیں ہے۔ صرف {types} قبول ہوتے ہیں - کوئی دستاویز، PDF یا ویڈیو نہیں۔",
+            "photo.problem": "یہ تصویر استعمال نہیں ہو سکتی۔",
+
+            "camera.blocked.punch": "کیمرہ بند ہے۔ نیچے دیے بٹن سے اپنے فون کا کیمرہ ایپ کھولیں۔",
+            "camera.blocked.enroll": "کیمرہ بند ہے۔ نیچے دیے بٹن سے اپنے فون کی گیلری کھولیں۔",
+            "camera.open": "کیمرہ کھولیں",
+            "camera.shoot.selfie": "سیلفی لیں",
+            "camera.shoot.photo": "تصویر لیں",
+            "camera.retake": "دوبارہ لیں",
+            "camera.sendSelfie": "یہ سیلفی بھیجیں",
+            "camera.preview.selfie": "آپ کی سیلفی کا پیش منظر",
+            "camera.preview.photo": "آپ کی تصویر کا پیش منظر",
+
+            "location.checking": "آپ کی لوکیشن دیکھی جا رہی ہے…",
+            "location.found": "لوکیشن مل گئی (±{m} میٹر)۔",
+            "location.unsupported": "یہ براؤزر لوکیشن نہیں بتا سکتا، اس لیے پنچ درج نہیں ہو سکتا۔",
+            "location.blocked": "لوکیشن بند ہے۔ اس صفحے کے لیے لوکیشن کی اجازت دیں اور دوبارہ کوشش کریں۔",
+            "location.unknown": "آپ کی لوکیشن معلوم نہیں ہو سکی۔ باہر جا کر دوبارہ کوشش کریں۔",
+
+            "link.invalid": "یہ لنک درست نہیں۔",
+            "refuse.revoked": "یہ لنک ایڈمنسٹریٹر نے منسوخ کر دیا ہے۔ نیا لنک مانگیں۔",
+            "refuse.expired": "اس لنک کی مدت ختم ہو گئی ہے۔ اپنے ایڈمنسٹریٹر سے نیا مانگیں۔",
+            "refuse.used_up": "یہ لنک پہلے استعمال ہو چکا ہے۔ اپنے ایڈمنسٹریٹر سے نیا مانگیں۔",
+            "offline": "سرور تک رسائی نہیں۔ اپنا کنکشن دیکھیں۔",
+
+            "quick.title": "چیک اِن یا آؤٹ",
+            "quick.headTitle": "چیک اِن یا آؤٹ - حاضری الموقع",
+            "quick.sub": "یہ لنک دیکھا جا رہا ہے…",
+            "quick.state.in": "آپ چیک اِن ہیں",
+            "quick.state.out": "آپ چیک آؤٹ ہیں",
+            "quick.state.since": "{time}{site} سے۔",
+            "quick.state.site": " {site} پر",
+            "quick.state.closed": "آپ کی آخری شفٹ بند ہو چکی ہے۔",
+            "quick.state.remaining": " اس لنک کے {n} ٹیپ باقی ہیں۔",
+            "quick.for": "برائے {name} (آئی ڈی {id})",
+            "quick.expires": "میعاد {date}",
+            "quick.btn.in": "چیک اِن",
+            "quick.btn.out": "چیک آؤٹ",
+            "quick.fallback": "کیمرہ نہیں چل رہا؟ یہاں دبا کر اپنے فون کا کیمرہ ایپ استعمال کریں",
+            "quick.note": "یہ لنک آپ کے ایڈمنسٹریٹر نے آپ کے لیے بنایا ہے۔ یہ بغیر پاس ورڈ آپ کو چیک اِن اور آؤٹ کرتا ہے، اور ہر ٹیپ اپنی لی گئی سیلفی کے ساتھ درج ہوتا ہے۔",
+            "quick.recording": "آپ کا ٹیپ درج ہو رہا ہے…",
+            "quick.noFix": "لوکیشن نہیں ملی، اس لیے پنچ نہیں بھیجا گیا۔ لوکیشن کی اجازت دیں اور دوبارہ کوشش کریں۔",
+            "quick.clockedInAt": "{site} پر چیک اِن ہوا۔",
+            "quick.clockedOut": "{site} سے چیک آؤٹ ہوا۔ {hours} گھنٹے ادا شدہ",
+            "quick.break": " {min} منٹ کے وقفے کے بعد",
+            "quick.notRecorded": "ٹیپ درج نہیں ہوا۔",
+            "quick.notReached": "ٹیپ سرور تک نہیں پہنچا۔ کنکشن دیکھیں اور دوبارہ کوشش کریں۔",
+            "quick.earlyTitle": "جلدی چیک آؤٹ کریں؟",
+            "quick.earlyBody": "آپ نے {regular} گھنٹے کے ادا شدہ دن میں سے صرف {paid} گھنٹے کام کیا ہے۔ ابھی چیک آؤٹ کرنے پر اس بار یہی درج ہوگا \u2014 {paid} گھنٹے، پورا {regular} گھنٹے کا دن نہیں۔",
+            "quick.earlyConfirm": "تصدیق کریں اور چیک آؤٹ",
+            "quick.earlyCancel": "منسوخ کریں",
+
+            "enroll.title": "اپنا چہرہ رجسٹر کریں",
+            "enroll.registerTitle": "اپنا اکاؤنٹ بنائیں",
+            "enroll.headTitle": "اپنا چہرہ رجسٹر کریں - حاضری الموقع",
+            "enroll.sub": "آپ کا لنک دیکھا جا رہا ہے…",
+            "enroll.verb.enroll": "رجسٹر ہو رہا ہے",
+            "enroll.verb.register": "اکاؤنٹ بنایا جا رہا ہے برائے",
+            "enroll.intro": "اچھی روشنی میں کھڑے ہوں، فون آنکھوں کی سطح پر رکھیں، اور سیدھا کیمرے کی طرف دیکھیں۔ ٹوپی یا دھوپ کے چشمے اتار دیں۔ اس تصویر کا موازنہ آپ کی چیک اِن والی سیلفی سے ہوتا ہے، اس لیے یہ وہیں لیں جہاں آپ عام طور پر چیک اِن کرتے ہیں۔",
+            "enroll.password.hint": "کم از کم {n} حروف کا پاس ورڈ چنیں۔ آپ اپنی آئی ڈی ({id}) اور اسی پاس ورڈ سے لاگ ان کریں گے، اس لیے اسے سنبھال کر رکھیں۔",
+            "enroll.password.placeholder": "پاس ورڈ چنیں",
+            "enroll.password2.placeholder": "دوبارہ لکھیں",
+            "enroll.phone.placeholder": "فون (اختیاری)",
+            "enroll.email.placeholder": "ای میل (اختیاری)",
+            "enroll.submit": "میری تصویر بھیجیں",
+            "enroll.create": "میرا اکاؤنٹ بنائیں",
+            "enroll.uploading": "اپ لوڈ ہو رہا ہے…",
+            "enroll.liveness": "لائیو نیس: {verdict}",
+            "enroll.done.register": "مکمل۔ آپ کا اکاؤنٹ تیار ہے - اپنی آئی ڈی اور چنے ہوئے پاس ورڈ سے لاگ ان کریں۔",
+            "enroll.done.enroll": "مکمل۔ آپ کی حوالہ تصویر رجسٹر ہو گئی ہے۔",
+            "enroll.failed": "رجسٹریشن ناکام ہو گئی۔",
+            "enroll.unusable": "یہ لنک اب کام نہیں کرتا۔ اپنے ایڈمنسٹریٹر سے نیا مانگیں۔",
+            "enroll.passwordShort": "آپ کے پاس ورڈ میں کم از کم {n} حروف ہونے چاہئیں۔",
+            "enroll.passwordMismatch": "دونوں پاس ورڈ ایک جیسے نہیں ہیں۔",
+            "enroll.uploadFailed": "اپ لوڈ ناکام ہو گیا۔ کنکشن دیکھیں اور دوبارہ کوشش کریں۔",
+            "enroll.fallback": "کیمرہ نہیں چل رہا؟ یہاں دبا کر اپنے فون کی گیلری استعمال کریں"
         }
     };
 
@@ -320,6 +434,44 @@
         return text.replace(/\{(\w+)\}/g, function (whole, name) {
             return Object.prototype.hasOwnProperty.call(vars, name) ? String(vars[name]) : whole;
         });
+    }
+
+    /** Whether the chosen language, or the English every table is written from, has a key. */
+    function has(key) {
+        return !!((STRINGS[current] || {})[key] || STRINGS.en[key]);
+    }
+
+    //: The reasons a link can be refused, as *tokens* rather than sentences. The server
+    //: says the same three words two ways - as the ``error_code`` of a punch
+    //: (``link_expired``) and as the ``status`` of a peek at an invite (``expired``) - so
+    //: one list here serves both pages and neither has to invent a mapping of its own.
+    var REFUSALS = ["revoked", "expired", "used_up"];
+
+    /** The reason inside a refusal: ``link_expired`` and ``expired`` mean the same thing. */
+    function refusalToken(detail) {
+        if (!detail || typeof detail !== "object") return "";
+        return String(detail.error_code || detail.status || "").toLowerCase().replace(/^(link|invite)_/, "");
+    }
+
+    /**
+     * A refusal the server sent, in the reader's language.
+     *
+     * The server's ``message`` is English, written for an administrator reading a log or
+     * an API client; the phone rendering it belongs to a worker who may read Arabic,
+     * Hindi or Urdu. So the reason - the token - is treated as the contract, and the
+     * English sentence is demoted to the fallback for a reason this page has never heard
+     * of. The code stays in brackets: "tell your administrator: link_expired" is the one
+     * part of a dead link a worker can usefully pass on.
+     */
+    function serverMessage(detail, fallbackKey) {
+        var token = refusalToken(detail);
+        var key = REFUSALS.indexOf(token) >= 0 ? "refuse." + token
+            : (token === "unknown" ? "link.invalid" : "");
+        var code = detail && typeof detail === "object" ? detail.error_code || "" : "";
+        if (key && has(key)) return code ? t(key) + " (" + code + ")" : t(key);
+        if (detail && typeof detail === "object" && detail.message) return detail.message;
+        if (typeof detail === "string" && detail) return detail;
+        return t(fallbackKey);
     }
 
     /** Escapes a server-supplied value for the places a sentence has to be assembled. */
@@ -368,7 +520,7 @@
 
     function applyDirection() {
         document.documentElement.setAttribute("lang", current);
-        document.documentElement.setAttribute("dir", current === "ar" ? "rtl" : "ltr");
+        document.documentElement.setAttribute("dir", RTL.indexOf(current) >= 0 ? "rtl" : "ltr");
     }
 
     /**
@@ -681,6 +833,7 @@
         translate: translate,
         applyDirection: applyDirection,
         credit: credit,
+        serverMessage: serverMessage,
         languages: function () { return LANGUAGES.slice(); },
         setPolicy: setPolicy,
         policy: function () { return policy; },

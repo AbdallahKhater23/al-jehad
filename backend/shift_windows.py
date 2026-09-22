@@ -62,7 +62,9 @@ from zoneinfo import ZoneInfo
 
 #: Used when neither the site nor the global rules name a zone. It is the value
 #: ``shift_rules`` was seeded with, so an untouched installation behaves exactly as before.
-DEFAULT_TIMEZONE = "Africa/Cairo"
+#: ``Asia/Kuwait`` is the company clock: a fixed UTC+3, with no DST rule to move the
+#: clock-in window by an hour twice a year.
+DEFAULT_TIMEZONE = "Asia/Kuwait"
 
 #: 24-hour ``HH:MM``, exactly - and strict on purpose. This value decides whether a worker's
 #: arrival is flagged for review, so "4:00" or "07:5" must be rejected where an administrator
@@ -132,7 +134,7 @@ def resolve_timezone(name: Any) -> ZoneInfo:
 def is_known_timezone(name: Any) -> bool:
     """Whether ``name`` is a zone the runtime can actually resolve.
 
-    Checked at the API boundary so ``Africa/Cairo `` (a trailing space) or ``EET`` are refused
+    Checked at the API boundary so ``Asia/Kuwait `` (a trailing space) or ``EET`` are refused
     where they are typed. A timezone that silently resolves to something else would move every
     window at that site, and the symptom - the wrong people flagged late - looks like a policy
     decision rather than a typo.

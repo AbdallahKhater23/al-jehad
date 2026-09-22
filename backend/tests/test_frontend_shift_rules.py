@@ -38,8 +38,27 @@ const RULES = {
     site_timezone: 'Africa/Cairo',
     break_minutes: 30,
     break_after_hours: 4,
-    auto_close_at_regular: 1
+    auto_close_at_regular: 1,
+    // The verdict about the pair, exactly as the server computes it. The shipped 8.1/8.0
+    // is the arrangement where the close stands down so the crossing can be reported.
+    day_end: {
+        regular_hours: 8.0,
+        notify_hours: 8.1,
+        close_at_paid_hours: null,
+        close_defers: true,
+        alert_reachable: true,
+        day_ended_by: 'overtime_review',
+        detail: 'the close stands down'
+    }
 };
+
+/** A ``day_end`` block for one of the other two arrangements. */
+function dayEnd(overrides) {
+    return Object.assign({
+        regular_hours: 8.0, notify_hours: 8.1, close_at_paid_hours: null, close_defers: false,
+        alert_reachable: true, day_ended_by: 'auto_close', detail: 'the close ends the day'
+    }, overrides || {});
+}
 
 const ADMIN = {
     id: '5000', name: 'Head Admin', role: 'head_admin', phone: '', email: 'head@example.test',
@@ -50,6 +69,9 @@ const ADMIN = {
 const saveCalls = [];
 let saveStatus = 200;
 let saveReply = RULES;
+// What ``GET /admin/shift_rules`` answers with, so a case can show the panel one of the
+// other day-end verdicts without inventing a second responder.
+let rulesReply = RULES;
 
 function stats(overrides) {
     return Object.assign({
@@ -79,7 +101,7 @@ function responders(url, init) {
             }
             return { status: 200, body: { status: 'success', rules: saveReply } };
         }
-        return { status: 200, body: RULES };
+        return { status: 200, body: rulesReply };
     }
     if (url.indexOf('/admin/active_sessions') >= 0) return { status: 200, body: [] };
     if (url.indexOf('/admin/notifications') >= 0) return { status: 200, body: { unread: 0, notifications: [] } };
@@ -101,10 +123,11 @@ function valueOf(markup, id) {
     return match ? match[1] : null;
 }
 
-function adminEnv() {
+function adminEnv(rules) {
     saveCalls.length = 0;
     saveStatus = 200;
     saveReply = RULES;
+    rulesReply = rules || RULES;
     const env = boot();
     env.setResponder(responders);
     env.evaluate('State.saveUser(' + JSON.stringify({
@@ -152,8 +175,17 @@ const results = {};
         auto_close_checked: /id="rulesAutoClose"[^>]*checked/.test(markup),
         // 8 h paid + 30 min unpaid = 8.5 h on site, and the summary has to say the day
         // that produces rather than only the two inputs.
-        summary_onsite: (/<p class="text-xs[^"]*" data-rules-summary="([^"]*)"/.exec(markup) || [])[1],
-        still_creates_admins: markup.indexOf('id="addAdminForm"') >= 0,
+        // The class is styling and moves with the design; the attribute is the contract.
+        summary_onsite: (/<p [^>]*data-rules-summary="([^"]*)"/.exec(markup) || [])[1],
+        // This tab used to carry a second panel that created an administrator. It is gone:
+        // the Credentials tab's New account form takes the id, the name, the contact details,
+        // the password and the face in one step, and two places to create an account is one
+        // too many. What must survive is the *pointer* - an administrator who comes here
+        // looking for it has to be told where it went, and the note has to carry the id
+        // ranges, which are the whole permission model.
+        create_form: markup.indexOf('id="addAdminForm"') >= 0,
+        points_at_credentials: markup.indexOf('data-admin-create-moved') >= 0
+            && markup.indexOf(env.evaluate("I18n.__('adminCreateMoved')")) >= 0,
         labels: [
             env.evaluate("I18n.__('shiftRules')"),
             env.evaluate("I18n.__('shiftRulesBreak')"),
@@ -191,7 +223,7 @@ const results = {};
         authorized: call.headers['Authorization'],
         toast: toasts(env).slice(-1)[0],
         repainted_regular: valueOf(markup, 'rulesRegularHours'),
-        repainted_summary: (/<p class="text-xs[^"]*" data-rules-summary="([^"]*)"/.exec(markup) || [])[1]
+        repainted_summary: (/<p [^>]*data-rules-summary="([^"]*)"/.exec(markup) || [])[1]
     };
 }
 
@@ -215,6 +247,55 @@ const results = {};
         toast: toasts(env).slice(-1)[0],
         still_shows_the_rules: env.evaluate("document.getElementById('adminContent').innerHTML")
             .indexOf('data-rules-panel') >= 0
+    };
+}
+
+// 2d. the panel says which rule ends the day - the deferral first, because it is the one
+//     with a behavioural change behind it (the switch still reads as on)
+function notice(markup, kind) {
+    const match = new RegExp('data-rules-alert="' + kind + '"[^>]*>([^<]*)<').exec(markup);
+    return match ? match[1].trim() : null;
+}
+
+{
+    const env = adminEnv(RULES);
+    await env.evaluate("UI.renderAdminTab('Admin')");
+    const markup = env.evaluate("document.getElementById('adminContent').innerHTML");
+    results.rules_warning_deferred = {
+        deferred_notice: markup.indexOf('data-rules-alert="deferred"') >= 0,
+        unreachable_notice: markup.indexOf('data-rules-alert="unreachable"') >= 0,
+        notice_text: notice(markup, 'deferred')
+    };
+}
+
+// 2e. the one genuinely unreachable case: the line sits on the paid day
+{
+    const rules = Object.assign({}, RULES, {
+        overtime_notify_hours: 8.0,
+        day_end: dayEnd({ notify_hours: 8.0, close_at_paid_hours: 8.0, alert_reachable: false })
+    });
+    const env = adminEnv(rules);
+    await env.evaluate("UI.renderAdminTab('Admin')");
+    const markup = env.evaluate("document.getElementById('adminContent').innerHTML");
+    results.rules_warning_unreachable = {
+        deferred_notice: markup.indexOf('data-rules-alert="deferred"') >= 0,
+        unreachable_notice: markup.indexOf('data-rules-alert="unreachable"') >= 0,
+        notice_text: notice(markup, 'unreachable')
+    };
+}
+
+// 2f. and it is quiet when the two rules agree, so a warning does not become wallpaper
+{
+    const rules = Object.assign({}, RULES, {
+        overtime_notify_hours: 7.5,
+        day_end: dayEnd({ notify_hours: 7.5, close_at_paid_hours: 8.0 })
+    });
+    const env = adminEnv(rules);
+    await env.evaluate("UI.renderAdminTab('Admin')");
+    const markup = env.evaluate("document.getElementById('adminContent').innerHTML");
+    results.rules_no_warning = {
+        any_notice: markup.indexOf('data-rules-alert=') >= 0,
+        panel_present: markup.indexOf('data-rules-panel') >= 0
     };
 }
 
@@ -310,7 +391,11 @@ def test_the_admin_tab_carries_the_shift_rules_and_the_day_they_add_up_to(result
     assert panel["break_after"] == "4"
     assert panel["auto_close_checked"] is True
     assert panel["summary_onsite"] == "8.50", "8 paid hours plus the 30-minute break is an 8.5 h day"
-    assert panel["still_creates_admins"] is True, "the tab does both jobs"
+    # The tab carries one job now. The create form moved to Credentials, where the same form
+    # the console already had - id, name, contact, password and face in one step - is the only
+    # way an account is made, and this tab says so rather than leaving a visitor guessing.
+    assert panel["create_form"] is False, "the create-an-administrator form belongs to Credentials"
+    assert panel["points_at_credentials"] is True, "and the tab has to say where it went"
     assert panel["labels"][1] == "Unpaid break (minutes)"
     assert panel["requests"] == 1, "one read of the rules, no writes"
 
@@ -338,6 +423,28 @@ def test_saving_the_rules_sends_them_and_repaints_from_the_answer(results):
 def test_unchecking_the_box_turns_the_automatic_close_off(results):
     assert results["close_off"]["auto_close_at_regular"] == 0
     assert results["close_off"]["break_minutes"] == 30, "the other fields still travel"
+
+
+def test_the_panel_warns_when_the_automatic_close_has_stood_down(results):
+    """The switch still reads as *on*, so the panel is the only place the operator is told."""
+    warned = results["rules_warning_deferred"]
+    assert warned["deferred_notice"] is True
+    assert warned["unreachable_notice"] is False, "the crossing is observable; that is the point"
+    assert "standing down" in warned["notice_text"], warned["notice_text"]
+    assert "8.1" in warned["notice_text"] and "8" in warned["notice_text"]
+
+
+def test_the_panel_warns_when_the_alert_cannot_fire_at_all(results):
+    warned = results["rules_warning_unreachable"]
+    assert warned["unreachable_notice"] is True
+    assert warned["deferred_notice"] is False
+    assert "strictly" in warned["notice_text"].lower(), warned["notice_text"]
+
+
+def test_the_panel_is_quiet_when_the_two_rules_agree(results):
+    quiet = results["rules_no_warning"]
+    assert quiet["panel_present"] is True
+    assert quiet["any_notice"] is False, "with the line below the day, both rules work and there is nothing to warn about"
 
 
 def test_a_refused_save_is_the_servers_reason(results):

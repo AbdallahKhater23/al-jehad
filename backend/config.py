@@ -98,6 +98,31 @@ def _env_path(name: str, default: Path) -> Path:
     return candidate
 
 
+#: The push services a browser's own ``PushManager`` hands out endpoints for, and the only
+#: hosts this server will ever POST a notification to.
+#:
+#: An **allowlist** rather than a denylist, and that is the whole control. The endpoint in a
+#: subscription is a URL a worker supplies and the server later fetches, so a private address,
+#: a loopback port or a cloud metadata host is something a worker can simply type. Refusing
+#: private ranges alone would leave every *public* host reachable - the attacker's own server,
+#: a third party's, an open redirect on any domain - so "not internal" is not the property
+#: wanted here. The set of hosts a real browser can produce is small and known, so it is
+#: enumerated instead, and everything else is refused at the door.
+#:
+#: Add to it with ``PUSH_ENDPOINT_HOSTS`` (comma-separated); a deployment running its own
+#: push service is the reason that exists. A host matches itself or a *subdomain* of itself
+#: only - ``notify.windows.com`` matches ``xyz.notify.windows.com`` and never
+#: ``notify.windows.com.evil.test``, which is the shape a suffix check gets wrong.
+PUSH_ENDPOINT_HOSTS: tuple[str, ...] = (
+    "fcm.googleapis.com",  # Chrome, Edge, Opera (Firebase Cloud Messaging)
+    "updates.push.services.mozilla.com",  # Firefox (autopush)
+    "push.services.mozilla.com",  # older Firefox endpoints still in the wild
+    "web.push.apple.com",  # Safari, macOS and iOS 16.4+
+    "push.apple.com",  # older Safari endpoints
+    "notify.windows.com",  # Edge / WNS: <region>.notify.windows.com
+)
+
+
 class Settings(BaseModel):
     secret_key: str
     jwt_algorithm: str = "HS256"
@@ -106,6 +131,25 @@ class Settings(BaseModel):
     database_path: Path
     backup_dir: Path
     backup_max_age_hours: int = 24
+    #: The four directories the application keeps its own files in: biometric templates and
+    #: reference selfies, enrollment photos, punch evidence frames, and quick-link punch
+    #: selfies. Each is read from the environment for the same reason ``database_path`` is - a
+    #: child process inherits the environment but not this process's in-memory state, so a path
+    #: that only exists inside the running server is a path a script, a report or a second
+    #: worker gets wrong, silently, by writing somewhere nobody looks. Each defaults to the
+    #: directory inside the project the application has always used, so a deployment that sets
+    #: none of them behaves exactly as before.
+    local_refs_dir: Path
+    worker_photos_dir: Path
+    punch_frames_dir: Path
+    quick_link_photos_dir: Path
+    #: The *fifth* tree, and the only one that is not application data: the labelled calibration
+    #: corpus (see ``corpus``). It is read from the environment for the same reason the other four
+    #: are - a child inherits the environment, not this process's state - and it is deliberately its
+    #: own directory rather than a corner of ``punch_frames``: a corpus has a different retention
+    #: rule, a different reader, and a different reason to exist, and mixing the two would make
+    #: "delete the evidence" and "delete the calibration" the same command.
+    calibration_corpus_dir: Path
     #: The pre-hardening single origin list. It still works - ``netguard`` merges it into
     #: ``cors_worker_origins`` - because a deployment that had it set was allowing exactly
     #: the worker class, and renaming it out from under them would silently close their
@@ -190,10 +234,24 @@ class Settings(BaseModel):
     face_detector_model_path: Path = Path("backend/models/face_detection_yunet_2023mar.onnx")
     face_detector_model_sha256: str | None = None
 
+    # -- face embedding (FaceNet-128 ONNX, see ``face_onnx``) ----------------
+    #  The recognition half of verification, and the one that decides what a template *is*.
+    #  It was VGG-Face: 4096 floats from a 553 MiB TensorFlow graph at ~250 ms and ~2.3 GiB
+    #  per worker. The same weights compiled to ONNX measure ~13 ms and ~151 MiB, and the
+    #  session costs ~0.2 s to build instead of ~2.7 s - so this is the knob that decides
+    #  what a punch costs and how many workers fit on a host.
+    #
+    #  The path and the pin exist for the same reason the detector's do: an operator who
+    #  keeps the artifact outside the tree, or wants the server to refuse an unexpected one.
+    #  The graph is 87 MiB and gitignored (see ``backend/models/README.md``), so a host that
+    #  has not fetched it must fail loudly at the first embed rather than silently serve.
+    facenet_model_path: Path = Path("backend/models/facenet128.onnx")
+    facenet_model_sha256: str | None = None
+
     # -- face verification capacity (see ``face_engine``) -------------------
-    #  Every punch and every enrollment is a VGG-Face embedding plus an MTCNN detection,
-    #  which is the most expensive thing this app does. These bound how much of it can run
-    #  at once, and what a caller is told when there is no room.
+    #  Every punch and every enrollment is an embedding plus a detection, which together are
+    #  still the most expensive thing this app does. These bound how much of it can run at
+    #  once, and what a caller is told when there is no room.
     #
     #  ``concurrency`` is measured, not guessed. Eight verifications on a CPU-only host:
     #  1 -> 1.90/s, 2 -> 2.55/s, 4 -> 2.56/s. The third and fourth concurrent inference add
@@ -240,6 +298,22 @@ class Settings(BaseModel):
     bulk_enroll_max_rows: int = 500
     bulk_enroll_max_zip_mb: int = 64
 
+    # -- calibration corpus (see ``corpus``) ---------------------------------
+    #  Capturing faces for measurement is a separate decision from storing punch evidence, so it is
+    #  its own switch and it defaults to **off**: a deployment that turned it on without meaning to
+    #  is a biometric store nobody asked for. When it is on, every face is stored with the detector
+    #  that produced its crop, under a retention period an operator purges by hand.
+    calibration_capture_enabled: bool = False
+    #  Long edge of a stored frame. 1280 keeps a 1920x1080 gate frame's subject at two thirds of its
+    #  native size; 0 keeps the original, which is what an experiment about the small-face regime
+    #  wants - because downscaling *moves a corpus into* that regime.
+    calibration_corpus_max_px: int = 1280
+    #  The age at which a capture is presumptively past its purpose. Not enforced by a timer (the
+    #  corpus is not swept by ``retention``), so this is the number an operator passes to
+    #  ``python -m tools.corpus purge --older-than-days`` - and it is here rather than in the runbook
+    #  so that the policy and the command cannot disagree.
+    calibration_corpus_retention_days: int = 180
+
     # -- offline punch sync -------------------------------------------------
     offline_signature_required: bool = True
     offline_punch_max_age_hours: int = 72
@@ -274,7 +348,62 @@ class Settings(BaseModel):
     #: Left unset, ``/metrics`` falls back to requiring an admin JWT (see the endpoint).
     metrics_token: str | None = None
 
+    # -- worker notifications (Web Push) -------------------------------------
+    #  The worker's own channel: a row in ``worker_notifications`` per event, and a Web Push
+    #  delivery so it reaches a phone whose app is closed. Push is the one capability here
+    #  that needs something this repository cannot ship - a VAPID key pair and the optional
+    #  ``pywebpush`` encryption dependency - so it degrades the way liveness and XLSX export
+    #  do: the inbox always works, ``GET /worker/me/push`` says whether delivery is possible
+    #  and why not, and ``readiness`` raises it as an advisory. Nothing silently pretends to
+    #  have notified anybody.
+    #
+    #  Generate a pair with ``python -m push --generate-keys`` (prints both halves, one line
+    #  each). The public half is served to the browser, which is the only place it belongs;
+    #  the private half must never be in the frontend, in a log, or in the repository.
+    push_enabled: bool = True
+    vapid_public_key: str | None = None
+    vapid_private_key: str | None = None
+    #: Contact for the push service operator: a ``mailto:`` or ``https:`` URL, per RFC 8292.
+    #: Push services use it if a subscription starts misbehaving, and some refuse a request
+    #: without one.
+    vapid_subject: str = "mailto:admin@example.invalid"
+    #: How stale a notification may be and still be worth pushing. A phone that was offline
+    #: for a day must not be told it crossed the overtime line yesterday as though it were
+    #: now - the inbox is where history belongs.
+    push_max_age_minutes: int = 15
+    #: Attempts per notification before the server stops trying. A push service that answers
+    #: 500 for a device that will never accept another message must not be retried for ever.
+    push_attempt_limit: int = 3
+    #: The hosts a subscription endpoint may point at - see ``PUSH_ENDPOINT_HOSTS``. This is
+    #: the SSRF control: without it a worker registers ``https://169.254.169.254/...`` and the
+    #: server fetches it on the next notification, from inside the network, with no credential
+    #: of the worker's involved.
+    push_endpoint_hosts: tuple[str, ...] = PUSH_ENDPOINT_HOSTS
+
     # -- overtime watcher ---------------------------------------------------
+    #  One timer, two rules: the automatic close ends a day at ``regular_hours`` paid, and
+    #  the crossing alert fires at ``overtime_notify_hours``. Both run in the same pass, and
+    #  the close deletes the session it closed - so a shift it has ended can never be
+    #  observed crossing the alert line. Which rule acts therefore decides whether a crossing
+    #  is reported at all, and that decision is made in one place
+    #  (``shift_hours.day_end_rules``):
+    #
+    #    * alert below the paid day  -> the alert fires while the shift is open, then the
+    #      close ends the standard day at ``regular_hours``;
+    #    * alert above the paid day  -> the close **stands down** (the shipped 8.1/8.0 pair),
+    #      so the shift runs on, the crossing is reported at the threshold, and the hours
+    #      past the paid day are clocked out into overtime review. Nothing is auto-closed at
+    #      8 h; set the overtime line strictly below the paid day to get the close back;
+    #    * alert on the paid day     -> nothing to observe, so the close acts and the scans
+    #      report that the alert cannot fire.
+    #
+    #  The verdict is logged at startup, published to the console at
+    #  ``GET /api/v1/admin/shift_rules`` (as ``day_end``) and raised by
+    #  ``GET /api/v1/readiness`` as ``overtime_alert_reachable`` and
+    #  ``overtime_close_deferred``.
+    #
+    #  Turning this off stops *both* rules: nothing closes a forgotten shift and nothing
+    #  alerts about one.
     overtime_watcher_enabled: bool = True
     overtime_watcher_interval_seconds: int = 60
 
@@ -307,6 +436,10 @@ class Settings(BaseModel):
     #: Raw punch selfies, one per tap of a clock link. The largest accumulation of faces
     #: here, and the one belonging to people who may never have been enrolled at all.
     retention_punch_photo_days: int = 30
+    #: Downscaled punch frames, the review-card evidence stored with every punch (see
+    #: ``punch_frames.py``). Same window as the selfies they were derived from: evidence has
+    #: no reason to outlive the photograph it was cropped from.
+    retention_punch_frame_days: int = 30
     #: Biometric residue: templates and selfies for accounts that are no longer active, files
     #: with no owning account, quarantined legacy names, and half-written staging files.
     retention_biometric_days: int = 7
@@ -360,6 +493,16 @@ class Settings(BaseModel):
         return {
             "database_path": str(self.database_path),
             "backup_dir": str(self.backup_dir),
+            # The file trees, because "where did it put the photo" is the first question when
+            # an enrollment or a punch says it worked and nothing appears in the expected place.
+            "local_refs_dir": str(self.local_refs_dir),
+            "worker_photos_dir": str(self.worker_photos_dir),
+            "punch_frames_dir": str(self.punch_frames_dir),
+            "quick_link_photos_dir": str(self.quick_link_photos_dir),
+            "calibration_corpus_dir": str(self.calibration_corpus_dir),
+            "calibration_capture_enabled": self.calibration_capture_enabled,
+            "calibration_corpus_max_px": self.calibration_corpus_max_px,
+            "calibration_corpus_retention_days": self.calibration_corpus_retention_days,
             "jwt_algorithm": self.jwt_algorithm,
             "jwt_ttl_hours": self.jwt_ttl_hours,
             "enable_api_docs": self.enable_api_docs,
@@ -381,6 +524,9 @@ class Settings(BaseModel):
             "liveness_model_path": str(self.liveness_model_path),
             # Printed because it is a decision an operator made (or accepted), and the first
             # question asked of a slow gate is what this process is allowing itself to run.
+            "facenet_model_path": str(self.facenet_model_path),
+            # Printed because it is a decision an operator made (or accepted), and the first
+            # question asked of a slow gate is what this process is allowing itself to run.
             "face_inference_concurrency": self.face_inference_concurrency,
             "face_inference_queue": self.face_inference_queue,
             "face_inference_wait_seconds": self.face_inference_wait_seconds,
@@ -394,6 +540,7 @@ class Settings(BaseModel):
             "retention_dry_run": self.retention_dry_run,
             "retention_days": {
                 "punch_photo": self.retention_punch_photo_days,
+                "punch_frame": self.retention_punch_frame_days,
                 "biometric": self.retention_biometric_days,
                 "audit": self.retention_audit_days,
                 "notification": self.notification_retention_days,
@@ -462,6 +609,13 @@ def build_settings(*, env_file: Path | None = None) -> Settings:
         database_path=database_path,
         backup_dir=backup_dir,
         backup_max_age_hours=_env_int("BACKUP_MAX_AGE_HOURS", 24),
+        # Read through ``_env_path`` so a relative value is resolved against the project root
+        # rather than the cwd, the way ``DATABASE_PATH`` is.
+        local_refs_dir=_env_path("LOCAL_REFS_DIR", PROJECT_ROOT / "local_references"),
+        worker_photos_dir=_env_path("WORKER_PHOTOS_DIR", PROJECT_ROOT / "worker_photos"),
+        punch_frames_dir=_env_path("PUNCH_FRAMES_DIR", PROJECT_ROOT / "punch_frames"),
+        quick_link_photos_dir=_env_path("QUICK_LINK_PHOTOS_DIR", PROJECT_ROOT / "quick_link_photos"),
+    calibration_corpus_dir=_env_path("CALIBRATION_CORPUS_DIR", PROJECT_ROOT / "calibration_corpus"),
         allowed_origins=_env_list("ALLOWED_ORIGINS"),
         cors_worker_origins=_env_list("CORS_WORKER_ORIGINS"),
         cors_admin_origins=_env_list("CORS_ADMIN_ORIGINS"),
@@ -495,6 +649,10 @@ def build_settings(*, env_file: Path | None = None) -> Settings:
             PROJECT_ROOT / "backend/models/face_detection_yunet_2023mar.onnx",
         ),
         face_detector_model_sha256=_env_str("FACE_DETECTOR_MODEL_SHA256"),
+        facenet_model_path=_env_path(
+            "FACENET_MODEL_PATH", PROJECT_ROOT / "backend/models/facenet128.onnx"
+        ),
+        facenet_model_sha256=_env_str("FACENET_MODEL_SHA256"),
         liveness_input_size=_env_int("LIVENESS_INPUT_SIZE", 80),
         liveness_accept_threshold=_env_float("LIVENESS_ACCEPT_THRESHOLD", 0.70),
         liveness_reject_threshold=_env_float("LIVENESS_REJECT_THRESHOLD", 0.55),
@@ -524,6 +682,18 @@ def build_settings(*, env_file: Path | None = None) -> Settings:
         notes_max_body_chars=_env_int("NOTES_MAX_BODY_CHARS", 2000),
         metrics_enabled=_env_flag("METRICS_ENABLED", True),
         metrics_token=_env_str("METRICS_TOKEN"),
+        push_enabled=_env_flag("PUSH_ENABLED", True),
+    calibration_capture_enabled=_env_flag("CALIBRATION_CAPTURE_ENABLED", False),
+    calibration_corpus_max_px=_env_int("CALIBRATION_CORPUS_MAX_PX", 1280),
+    calibration_corpus_retention_days=_env_int("CALIBRATION_CORPUS_RETENTION_DAYS", 180),
+        vapid_public_key=_env_str("VAPID_PUBLIC_KEY"),
+        vapid_private_key=_env_str("VAPID_PRIVATE_KEY"),
+        vapid_subject=_env_str("VAPID_SUBJECT", "mailto:admin@example.invalid") or "mailto:admin@example.invalid",
+        push_max_age_minutes=_env_int("PUSH_MAX_AGE_MINUTES", 15),
+        push_attempt_limit=_env_int("PUSH_ATTEMPT_LIMIT", 3),
+        push_endpoint_hosts=tuple(
+            host.lower().strip(".") for host in (_env_list("PUSH_ENDPOINT_HOSTS") or PUSH_ENDPOINT_HOSTS)
+        ),
         overtime_watcher_enabled=_env_flag("OVERTIME_WATCHER_ENABLED", True),
         overtime_watcher_interval_seconds=_env_int("OVERTIME_WATCHER_INTERVAL_SECONDS", 60),
         retention_enabled=_env_flag("RETENTION_ENABLED", True),
@@ -531,6 +701,7 @@ def build_settings(*, env_file: Path | None = None) -> Settings:
         retention_initial_delay_seconds=_env_int("RETENTION_INITIAL_DELAY_SECONDS", 300),
         retention_dry_run=_env_flag("RETENTION_DRY_RUN", False),
         retention_punch_photo_days=_env_int("RETENTION_PUNCH_PHOTO_DAYS", 30),
+    retention_punch_frame_days=_env_int("RETENTION_PUNCH_FRAME_DAYS", 30),
         retention_biometric_days=_env_int("RETENTION_BIOMETRIC_DAYS", 7),
         retention_audit_days=_env_int("RETENTION_AUDIT_DAYS", 365),
         retention_punch_queue_days=_env_int("RETENTION_PUNCH_QUEUE_DAYS", 90),
@@ -563,6 +734,16 @@ def write_env_file(path: Path | None = None, *, overwrite: bool = False) -> Path
         "# Site Attendance configuration. NEVER commit this file.\n"
         f"SECRET_KEY={secrets.token_urlsafe(48)}\n"
         "DATABASE_PATH=\n"
+        "# The four directories this app writes its own files into: biometric templates and\n"
+        "# reference selfies, enrollment photos, punch evidence frames, and quick-link punch\n"
+        "# selfies. Empty means the project's own directories. Set them when something else owns\n"
+        "# the disk - a mounted volume, a different service account - and remember that they are\n"
+        "# read by *child processes too*: any script that imports this app writes where these\n"
+        "# point, not where the server's copy happens to be:\n"
+        "LOCAL_REFS_DIR=\n"
+        "WORKER_PHOTOS_DIR=\n"
+        "PUNCH_FRAMES_DIR=\n"
+        "QUICK_LINK_PHOTOS_DIR=\n"
         "# Origins allowed to call this API from a browser. Two classes, because they are two\n"
         "# trust levels: a worker origin may read everything except /admin/*, an admin origin\n"
         "# may read all of it. Comma-separated; 'https://*.example.com' matches subdomains.\n"
@@ -578,9 +759,22 @@ def write_env_file(path: Path | None = None, *, overwrite: bool = False) -> Path
         "JWT_TTL_HOURS=12\n"
         "SCHEMA_GUARD_MODE=enforce_repair\n"
         "BACKUP_MAX_AGE_HOURS=24\n"
-        "# Emergency only - both lines are required, and the reason is audited:\n"
+        "# Emergency only - both lines are required, and the reason is audited. Which faults\n"
+        "# this may cover, and how to get back to a healthy deployment, is\n"
+        "# docs/RUNBOOK_STARTUP_OVERRIDE.md; a start with no reason is refused, and two\n"
+        "# checks (secret_key_configured, database_reachable) can never be overridden:\n"
         "# STARTUP_OVERRIDE_REASON=\n"
         "# STARTUP_OVERRIDE_UNTIL=2026-01-01T06:00:00+02:00\n"
+        "# Web Push: the notice that reaches a worker whose app is closed. Generate a pair with\n"
+        "# `cd backend && python -m push --generate-keys` (needs the optional pywebpush) and\n"
+        "# read docs/RUNBOOK_WORKER_PUSH.md. The private half is a secret: never commit it.\n"
+        "# Without a pair the worker's inbox still records every event; only the buzz is missing.\n"
+        "# VAPID_PUBLIC_KEY=\n"
+        "# VAPID_PRIVATE_KEY=\n"
+        "# The contact address a push service can reach you at (a mailto: or https: URL):\n"
+        "# VAPID_SUBJECT=mailto:admin@example.invalid\n"
+        "# Set PUSH_ENABLED=0 to stop all ringing without touching the stored subscriptions:\n"
+        "# PUSH_ENABLED=1\n"
         "# Data retention, in days. 0 means keep forever. Read the README before raising these:\n"
         "RETENTION_PUNCH_PHOTO_DAYS=30\n"
         "RETENTION_BIOMETRIC_DAYS=7\n"

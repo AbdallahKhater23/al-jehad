@@ -43,12 +43,11 @@ from datetime import datetime, timedelta
 from typing import Any, Mapping
 
 import numpy as np
-from deepface import DeepFace
 from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 from scipy.spatial.distance import cosine
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -73,8 +72,12 @@ if _BACKEND_DIR not in sys.path:
 log = logging.getLogger("attendance.api")
 
 import biometrics
+import branding
+import corpus
 import database
+import developer
 import enrollment
+import face_detector
 import face_engine
 import liveness
 import migrations
@@ -83,6 +86,8 @@ import notes
 import notifications
 import offline_sync
 import overtime
+import punch_frames
+import push
 import quick_links
 import readiness
 import reports
@@ -168,14 +173,21 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 netguard.install(app)
 
 FRONTEND_DIR = str(PROJECT_ROOT / "frontend")
-LOCAL_REFS_DIR = str(PROJECT_ROOT / "local_references")
-WORKER_PHOTOS_DIR = str(PROJECT_ROOT / "worker_photos")
+#: The two biometric trees, named from the settings rather than from a literal path. The point
+#: is the *child process*: a script or a second worker inherits ``LOCAL_REFS_DIR`` /
+#: ``WORKER_PHOTOS_DIR`` from the environment and gets the same answer the server has, where a
+#: path baked into this file would have sent it to the checkout - writing faces nobody looks at.
+#: A test repoints these attributes (see ``harness.FILE_TREES``) and every reader asks for them
+#: at call time, which is what lets one repoint carry the rotation to all of them.
+LOCAL_REFS_DIR = str(settings.local_refs_dir)
+WORKER_PHOTOS_DIR = str(settings.worker_photos_dir)
 
-#: Cosine distance bands. Below the first value the match is auto-approved, the
-#: middle band is logged and routed to a human, and above the second the
-#: attendance action is refused.
-FACE_APPROVE_THRESHOLD = 0.40
-FACE_REVIEW_THRESHOLD = 0.60
+# The cosine distance bands are **not** here. They belong to the pipeline that produced the
+# embedding - a distance means nothing without the crop it was measured on - so they live in
+# ``face_detector.MatchBand``, one band per ``(pipeline, model)``, each derived from measured
+# genuine/impostor boundaries and none of them inherited from the previous crop. Read one with
+# ``face_detector.band_for(pipeline)`` and decide with ``band.classify(distance)``; the two
+# numbers used to sit here as 0.40/0.60 with no record of what they were measured against.
 
 DEFAULT_SHIFT_RULES: dict[str, Any] = {
     "clock_in_window_start": "04:00",
@@ -184,11 +196,11 @@ DEFAULT_SHIFT_RULES: dict[str, Any] = {
     "overtime_notify_hours": 8.1,
     # A zone the runtime can actually resolve. This used to say "KUWAIT", which is not an
     # IANA key: ``ZoneInfo`` raises for it, so ``shift_windows.resolve_timezone`` fell back to
-    # ``DEFAULT_TIMEZONE`` (Africa/Cairo, below in ``shift_windows``) on every punch while the
+    # ``DEFAULT_TIMEZONE`` (Asia/Kuwait, below in ``shift_windows``) on every punch while the
     # console displayed the word KUWAIT as if it were the site's clock. The two agreed by
     # accident and only because the fallback happened to be the zone we meant - a silent
     # substitution is indistinguishable from a real setting until someone edits the other one.
-    "site_timezone": "Africa/Cairo",
+    "site_timezone": "Asia/Kuwait",
     # The unpaid break and the end of the paid day. A full day is 8 h paid plus a
     # 30-minute unpaid break (8.5 h on site); ``shift_hours.py`` is the only module that
     # turns those numbers into money, and every path that closes a shift asks it.
@@ -208,6 +220,11 @@ STATUS_PENDING_OVERTIME = "Pending Overtime Approval"
 #: system recorded, unlike the 11 h-era ``auto_closed`` rows, which still need a decision.
 STATUS_AUTO_CLOSED = migrations.STATUS_AUTO_CLOSED_LABEL
 STATUS_CODE_AUTO_CLOSED = migrations.STATUS_CODE_AUTO_CLOSED_8H
+#: Written by ``reject_review`` when the hours past the regular day are refused. The
+#: standard day stays payable and the overtime is recorded as zero - see
+#: ``migrations.STATUS_OVERTIME_REJECTED_LABEL`` for why it is not simply ``approved``.
+STATUS_OVERTIME_REJECTED = migrations.STATUS_OVERTIME_REJECTED_LABEL
+STATUS_TYPE_REJECTED = migrations.STATUS_REJECTED_LABEL
 STATUS_FORCED_IN = "Force Clocked In by Admin"
 STATUS_FORCED_OUT = "Force Clocked Out by Admin"
 
@@ -350,19 +367,20 @@ def _insert_log(
     approved_hours: float | None = None,
     overtime_hours: float | None = None,
     break_hours: float | None = None,
+    punch_frame: str | None = None,
 ) -> int:
     cursor = conn.execute(
         """
         INSERT INTO attendance_logs
             (worker_id, site_name, action, timestamp, hours, score, status, status_code,
              lat, lon, accuracy, source, liveness_class, liveness_score, flag_reason,
-             approved_hours, overtime_hours, break_hours)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             approved_hours, overtime_hours, break_hours, punch_frame)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             worker_id, site_name, action, timestamp, hours, score, status, status_code,
             lat, lon, accuracy, source, liveness_class, liveness_score, flag_reason,
-            approved_hours, overtime_hours, break_hours,
+            approved_hours, overtime_hours, break_hours, punch_frame,
         ),
     )
     return int(cursor.lastrowid or 0)
@@ -474,7 +492,7 @@ def _plain_timezone(value: str | None) -> str | None:
     if not shift_windows.is_known_timezone(candidate):
         raise ValueError(
             f"'{value}' is not a timezone this server knows. Use an IANA name such as "
-            "Africa/Cairo or Asia/Riyadh."
+            "Asia/Kuwait or Asia/Riyadh."
         )
     return candidate
 
@@ -559,6 +577,25 @@ class ReviewApprovalRequest(BaseModel):
         return textguard.prose(value, field="Note", max_length=textguard.MAX_NOTE, allow_empty=True)
 
 
+class ReviewRejectionRequest(BaseModel):
+    """A refusal, and the reason for it.
+
+    ``note`` is **required** here, unlike an approval's: this is the one decision in the
+    application that takes hours away from somebody, and a refusal with no reason written
+    down is unanswerable for as long as the row exists. The reason survives in three
+    places - the log row's ``flag_reason``, the append-only ``audit_log`` before/after
+    pair, and the response - so "why was my overtime refused" has an answer next month.
+    """
+
+    log_id: int
+    note: str
+
+    @field_validator("note")
+    @classmethod
+    def _plain_note(cls, value: str) -> str:
+        return textguard.prose(value, field="Rejection reason", max_length=textguard.MAX_NOTE)
+
+
 class PasswordEditRequest(BaseModel):
     worker_id: str
     new_password: str
@@ -641,7 +678,12 @@ class ShiftRulesUpdate(BaseModel):
 
     clock_in_window_start: str | None = None
     clock_in_window_end: str | None = None
+    #: The paid length of a day.
     regular_hours: float | None = None
+    #: The overtime line, in **paid** hours - the same hours ``regular_hours`` counts, i.e.
+    #: time on site less the unpaid break, never time on site. Resolved once, in seconds, by
+    #: ``shift_hours.overtime_rule`` / ``overtime_assessment``, which every clock-out path
+    #: and the watcher read instead of reading this column themselves.
     overtime_notify_hours: float | None = None
     site_timezone: str | None = None
     #: Unpaid break, in minutes, deducted from a shift that ran long enough to have
@@ -853,6 +895,21 @@ def compare_faces_sync(reference_json_path: str, live_image_data) -> dict:
         return {"verified": False, "distance": 99.9, "error": FACE_REFERENCE_STALE}
 
     try:
+        # The decision lines, from the pipeline that produced this embedding rather than from
+        # a constant. The staleness check above has already required that pipeline to be the
+        # live one, so this cannot read another crop's band - but it is read from the
+        # template on purpose: if a build ever ships a crop without deriving its lines, the
+        # refusal names the pipeline instead of scoring against numbers nobody measured.
+        band = face_detector.band_for(reference.pipeline or "")
+    except face_detector.UnknownPipelineError as exc:
+        log.error("face verification refused: %s", exc)
+        return {
+            "verified": False,
+            "distance": 99.9,
+            "error": "Face match thresholds are not derived for this pipeline.",
+        }
+
+    try:
         # ``represent_direct``, not a submission: the endpoint submits *this whole
         # function* to the face engine, so the model call here is the body of an engine
         # job. A job that submitted to its own pool would wait for the worker running it
@@ -884,14 +941,15 @@ def compare_faces_sync(reference_json_path: str, live_image_data) -> dict:
         telemetry.observe_cosine(time.perf_counter() - started)
 
         # The score on the way past, because it is the only early warning that the model, the
-        # camera fleet or the enrollment photos changed: the thresholds are fixed at 0.40 and
-        # 0.60, so a shift in *this* distribution is what moves the review queue. Observed for
-        # real distances only - the 99.9 sentinel on the refusal paths below is not a score, and
-        # putting it in the histogram would make every no-face frame look like a near miss.
+        # camera fleet or the enrollment photos changed: the bands are derived from this
+        # deployment's own material and then frozen, so a shift in *this* distribution is what
+        # moves the review queue. Observed for real distances only - the 99.9 sentinel on the
+        # refusal paths below is not a score, and putting it in the histogram would make every
+        # no-face frame look like a near miss.
         telemetry.observe_match_score(distance)
 
         return {
-            "verified": bool(distance <= FACE_APPROVE_THRESHOLD),
+            "verified": band.classify(distance) == face_detector.MATCH_APPROVED,
             "distance": round(distance, 4),
             "error": None,
         }
@@ -922,25 +980,19 @@ def send_whatsapp_alert(worker_id: str, worker_name: str, site_name: str, score:
 
 
 def _validate_id_and_role(user_id: str, role: str) -> None:
+    # One rule, one implementation. ``security`` owns the id bands and the list of roles no
+    # API may create; the range chain below used to be a second copy of those bands, and two
+    # copies is how the console and a registration link come to disagree about what an id may
+    # be. The refusal is explicit and by name, not an accident of a range that happens not to
+    # include the root band - an administrator who could create one could promote themselves
+    # into the tier that reads the audit trail.
+    security.refuse_developer_role(role)
+    security.validate_user_id_for_role(user_id, role)
     try:
         uid_int = int(user_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="User ID must be a numeric integer.")
-
-    if role == "worker":
-        if not (1 <= uid_int <= 499):
-            raise HTTPException(status_code=400, detail="Worker ID must be in range 1-499 for role 'worker'.")
-    elif role == "moallem":
-        if not (500 <= uid_int <= 999):
-            raise HTTPException(status_code=400, detail="Lead Worker (Moallem) ID must be in range 500-999.")
-    elif role == "admin":
-        if not (1000 <= uid_int <= 4999):
-            raise HTTPException(status_code=400, detail="Admin ID must be in range 1000-4999.")
-    elif role == "head_admin":
-        if uid_int < 5000:
-            raise HTTPException(status_code=400, detail="Head Admin ID must be 5000 or greater.")
-    else:
-        raise HTTPException(status_code=400, detail="Invalid user role specified.")
+    except ValueError:  # pragma: no cover - ``validate_user_id_for_role`` already refused it
+        raise HTTPException(status_code=400, detail="User ID must be a numeric integer.") from None
+    del uid_int, role  # kept for the signature's sake; the rules live in ``security``
 
 
 # ---------------------------------------------------------------------------
@@ -1284,6 +1336,449 @@ async def get_my_logs(limit: int = 50, current: CurrentUser = Depends(any_authen
     ]
 
 
+@router.get("/worker/me/report")
+async def get_my_report(
+    start: str | None = None,
+    end: str | None = None,
+    current: CurrentUser = Depends(any_authenticated),
+):
+    """Your own timesheet for a period - how long, and where.
+
+    The self-scoped twin of ``/admin/reports/shifts``. An administrator who works at a
+    site as well as running it has the same question about their own hours that every
+    worker has, and until now the only way to answer it was to read the company-wide
+    report and pick their own rows out of it. The subject is the token (``current.id``),
+    never a request field, so there is no id to tamper with and no way to read somebody
+    else's timesheet through it.
+
+    The rows are the timesheet's own, from the same function the console reads, so the
+    figures here cannot disagree with the ones an administrator sees on the Shifts tab -
+    including the rule that matters most: hours nobody has signed off are reported in
+    ``awaiting_approval_hours`` and never added to ``approved_hours``.
+
+    ``by_site`` is what makes this a report about *where*: the same hours bucketed per
+    site, which is the breakdown somebody asks for when they were sent to more than one
+    place in the period.
+
+    ``columns`` is the shape of the two files this account downloads (see
+    ``/worker/me/report/columns``). It travels here rather than in a second request because
+    the files are built from *this* payload on the client - a column list fetched separately
+    could arrive after the rows it describes.
+    """
+    first, second, start_date, end_date = reports._range_bounds(start, end)
+    result = reports.shift_timesheet_rows(start=first, end=second, worker_id=current.id)
+    rows = result["rows"]
+
+    # Bucketed here rather than in SQL: the rows are already in hand and the arithmetic
+    # has to match theirs exactly, which it does by summing the same field.
+    by_site: dict[str, dict] = {}
+    for row in rows:
+        bucket = by_site.setdefault(
+            row["site_name"],
+            {"site_name": row["site_name"], "shifts": 0, "hours": 0.0, "approved_hours": 0.0},
+        )
+        bucket["shifts"] += 1
+        bucket["hours"] += float(row["hours"] or 0.0)
+        bucket["approved_hours"] += float(row["approved_hours"] or 0.0)
+
+    sites = []
+    for bucket in by_site.values():
+        hours = round(bucket["hours"], 4)
+        approved = round(bucket["approved_hours"], 4)
+        sites.append(
+            {
+                "site_name": bucket["site_name"],
+                "shifts": bucket["shifts"],
+                "hours": hours,
+                "approved_hours": approved,
+                # ``hours == approved_hours + awaiting_approval_hours`` holds by
+                # construction here, exactly as it does in the totals below.
+                "awaiting_approval_hours": round(hours - approved, 4),
+            }
+        )
+    # Busiest site first, then by name so two sites with equal hours keep a stable order.
+    sites.sort(key=lambda item: (-item["hours"], item["site_name"]))
+
+    # Overtime is its own figure on the log row rather than part of ``hours``, so it is
+    # summed over the same rows the timesheet counts and is never added into a total: it
+    # is the hours that needed a decision, not hours worked twice.
+    with db() as conn:
+        overtime = conn.execute(
+            "SELECT COALESCE(SUM(COALESCE(overtime_hours, 0)), 0.0) AS overtime_hours "
+            "FROM attendance_logs "
+            "WHERE worker_id = ? AND action = 'Clock Out' AND timestamp >= ? AND timestamp < ?",
+            (current.id, first, second),
+        ).fetchone()
+        # The account's own column choice, read beside the same connection as the figures:
+        # an account that was deleted mid-session has no row to prefer anything, and the
+        # default file is the right answer for a session that outlived its account.
+        preference = conn.execute(
+            "SELECT report_columns FROM users WHERE id = ?", (current.id,)
+        ).fetchone()
+    totals = result["totals"]
+
+    return _json(
+        {
+            "worker_id": current.id,
+            "worker_name": current.name,
+            "period": {"start": str(start_date), "end": str(end_date)},
+            "rows": rows,
+            "by_site": sites,
+            "columns": list(
+                reports.report_columns(preference["report_columns"] if preference else None)
+            ),
+            "totals": {
+                "shifts": totals["shifts"],
+                "sites": len(sites),
+                "hours": totals["hours"],
+                "approved_hours": totals["approved_hours"],
+                "awaiting_approval_hours": totals["awaiting_approval_hours"],
+                "awaiting_approval": totals["awaiting_approval"],
+                "break_hours": totals["break_hours"],
+                "late_arrivals": totals["late_arrivals"],
+                "overtime_hours": round(float(overtime["overtime_hours"] or 0.0), 4),
+            },
+        }
+    )
+
+
+class ReportColumnsRequest(BaseModel):
+    """The columns this account's own timesheet files should carry.
+
+    A plain list of ids rather than a flag per column: the vocabulary lives in one place
+    (``reports.REPORT_COLUMNS``), the file's order is that vocabulary's order whatever this
+    list says, and a list cannot express a column left in an ambiguous state. An empty list
+    is not a choice - a file with no columns is not a report - and is refused below.
+    """
+
+    columns: list[str] = []
+
+
+@router.post("/worker/me/report/columns")
+async def set_my_report_columns(
+    req: ReportColumnsRequest, current: CurrentUser = Depends(any_authenticated)
+):
+    """Remember which columns **your own** timesheet files carry.
+
+    A preference, and deliberately the account's rather than the browser's: a timesheet is
+    handed in from wherever the worker happens to be, so a choice kept in one device's
+    storage would give the same account two different files - and would be lost with the
+    phone. The subject is the token, like every other ``/worker/me`` route, so there is no
+    id in this request that could write a preference onto somebody else's account.
+
+    No audit entry, and that is a decision rather than an oversight: the log answers "who
+    changed this person's *record*", and this changes only the shape of a document its own
+    account holder reads. It touches nobody's hours, grants nothing, and hides nothing -
+    every column it can name is a field of a row the same worker already reads in full on
+    the History screen.
+
+    The reply carries the list the server actually stored rather than the one it was sent:
+    ids this build does not know are dropped, so a client asking for a column this server
+    cannot fill is told by the answer what it will really get.
+    """
+    chosen = reports.report_columns_choice(req.columns)
+    if not chosen:
+        raise HTTPException(status_code=400, detail="A timesheet needs at least one column.")
+    stored = reports.stored_report_columns(chosen)
+    with db(write=True) as conn:
+        conn.execute("UPDATE users SET report_columns = ? WHERE id = ?", (stored, current.id))
+    return {
+        "status": "success",
+        "columns": list(reports.report_columns(stored)),
+        "message": "Report columns saved.",
+    }
+
+
+#: The roles that may put their *own* face on the clock, and why it is not every role.
+#:
+#: A reference template is a credential, not a preference: every punch by the account is
+#: judged against it, so whoever holds a session could mint the face that session punches
+#: with - take over a worker's account and the account's clock-ins become yours, and the
+#: hours land on that worker's timesheet. Enrolling somebody is therefore an administrator's
+#: act (``/admin/enroll``), and this list is only about the one account a session may
+#: re-credential without anybody else: its own.
+#:
+#: It names ``admin`` alone because that is the role that runs the console *and* works a
+#: shift of its own - the same list the console keeps for who may step from the console onto
+#: the handset (``UI.handsetRoles``) - so the button and this endpoint agree, and neither is
+#: a superset of the other. A ``head_admin`` owns the deployment rather than a rota (no
+#: punch card, so no template to need), and a worker's reference is issued by the company
+#: through an enrollment link.
+SELF_ENROLL_ROLES = ("admin",)
+
+
+@router.post("/worker/me/enroll")
+@limiter.limit(settings.enrollment_rate_limit)
+async def enroll_my_face(
+    request: Request,
+    photo: UploadFile = File(...),
+    current: CurrentUser = Depends(require_role(*SELF_ENROLL_ROLES)),
+):
+    """Register **your own** reference photo, so you can clock in.
+
+    The head-administrator-shaped hole this fills: an administrator who works a site reaches
+    the clock (``POST /attendance/verify`` takes any authenticated role) but a punch needs a
+    stored template, and every existing way to get one put somebody else in the middle -
+    ``/admin/enroll``, an enrollment link sent to a phone, the console's create-user form,
+    which only runs while the account is being made. An administrator with no template could
+    therefore see the punch card and never use it, and the only fix was to ask the head
+    administrator to enroll them.
+
+    The subject is the token. There is no worker id in the request to tamper with, so "enroll
+    my face" cannot be aimed at somebody else - and unlike ``/admin/enroll``, which any
+    administrator may point at any account, this one can only ever write the caller's.
+
+    The photo is a **live capture** from the console's camera, which is why the enrollment
+    liveness policy runs here (``enrollment.embed_reference``, the same call the self-service
+    link makes): a frame off a camera is exactly what passive anti-spoofing is built to
+    judge, and a printed photo must not become a permanent template. The path that accepts a
+    file from disk - the console's create-user form, the roster import - deliberately does
+    not pretend a file can be proven live.
+    """
+    file_bytes = await uploads.read_photo(photo, field="enrollment photo")
+    try:
+        image = uploads.decode_photo(file_bytes, field="enrollment photo")
+        # 800 px is what the console's other enrollment path embeds and stores; the detector
+        # gains nothing from more, and the reference selfie beside the template is a
+        # thumbnail.
+        image.thumbnail((800, 800))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Image processing failed.")
+
+    worker_id = str(current.id)
+    with db() as conn:
+        row = conn.execute(
+            "SELECT enrolled_at, biometric_id FROM users WHERE id = ?", (worker_id,)
+        ).fetchone()
+    # Read before the write, so the audit event can say whether this *replaced* a template or
+    # created the first one. "Somebody enrolled a face for this account" and "somebody
+    # replaced the face this account was using" are different events to whoever reads the log
+    # afterwards, and the second is the one worth looking at.
+    replaced = biometrics.is_enrolled(worker_id, biometrics.id_from(row))
+
+    try:
+        # Liveness and the embedding as one unit of pool work, as the self-service link does:
+        # both are model calls and the engine is the one place that bounds how many run at
+        # once, so a console enrolling itself cannot stall the punches behind it.
+        decision, embedding = await face_engine.ENGINE.run_async(
+            enrollment.embed_reference, image, stage="console_self_enroll"
+        )
+    except face_engine.FaceEngineBusy as exc:
+        raise face_engine.busy_http_exception(exc) from None
+    except HTTPException:
+        # A liveness refusal is a 422 written for the person in front of the camera; it is
+        # not ours to rewrite into something vaguer.
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Enrollment failed: {exc}") from exc
+
+    biometrics.write_reference(worker_id, image, embedding)
+
+    with db(write=True) as conn:
+        conn.execute(
+            "UPDATE users SET enrolled_at = ?, template_version = COALESCE(template_version, 0) + 1 "
+            "WHERE id = ?",
+            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), worker_id),
+        )
+        _audit(
+            conn,
+            action="biometric_self_enroll",
+            actor=current,
+            entity="users",
+            entity_id=worker_id,
+            # The before-image stays even though the write is the account's own: this is the
+            # event that decides which face the account's clock-ins will match from now on.
+            before={
+                "enrolled_at": row["enrolled_at"] if row is not None else None,
+                "template_replaced": replaced,
+            },
+            after={"source": "console", "liveness": decision.as_payload()},
+            request=request,
+        )
+        notifications.notify(
+            conn,
+            kind=notifications.KIND_ENROLLMENT_COMPLETED,
+            severity=notifications.SEVERITY_INFO,
+            title="An administrator registered their own face",
+            body=(
+                f"{current.name} (id {worker_id}) captured their reference photo from the "
+                f"console, {('replacing the template on file' if replaced else 'for the first time')}. "
+                "Their clock-ins will be matched against it from now on."
+            ),
+            worker_id=worker_id,
+            payload={"source": "console_self_enroll", "liveness": decision.as_payload()},
+            # One per enrollment, not one per attempt: the timestamp is the event, so a
+            # liveness refusal followed by a good capture is one enrollment, not two
+            # notifications about the same person.
+            dedupe_key=f"self_enroll:{worker_id}:{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        )
+
+    return {
+        "status": "success",
+        "worker_id": worker_id,
+        "template_replaced": replaced,
+        "message": "Your photo is registered. You can clock in now.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# the worker's own notification channel
+# ---------------------------------------------------------------------------
+class PushSubscriptionRequest(BaseModel):
+    """What a browser hands over when a worker allows notifications on this device.
+
+    ``endpoint`` is a URL from the browser's push service and the two keys are the
+    encryption material for that endpoint - they are the capability to send to it, which is
+    why the endpoint is not trusted: it must be an ``https`` URL on a host a push service
+    actually hands out (``push.validate_endpoint``), because the server is the party that
+    will later POST to it. A worker-supplied URL the server fetches is the definition of an
+    SSRF, so the control is an allowlist of push services rather than a shape check.
+    """
+
+    endpoint: str = Field(..., max_length=push.MAX_ENDPOINT_CHARS)
+    p256dh: str = Field(..., max_length=push.MAX_KEY_CHARS)
+    auth: str = Field(..., max_length=push.MAX_KEY_CHARS)
+
+
+class PushUnsubscribeRequest(BaseModel):
+    endpoint: str = Field(..., max_length=push.MAX_ENDPOINT_CHARS)
+
+
+def _worker_notification(row) -> dict:
+    return {
+        "id": row["id"],
+        "kind": row["kind"],
+        "title": row["title"],
+        "body": row["body"],
+        "created_at": row["created_at"],
+        "read": row["read_at"] is not None,
+        "delivered": row["delivered_at"] is not None,
+    }
+
+
+@router.get("/worker/me/notifications")
+async def get_my_notifications(
+    limit: int = 50,
+    unread_only: bool = False,
+    current: CurrentUser = Depends(any_authenticated),
+):
+    """Your own inbox: what this application has told you, newest first.
+
+    The worker-facing twin of ``/admin/notifications``, and the *record* half of the push
+    channel: a phone that was off, a permission that was never granted or a push that
+    failed all leave the event here. ``unread`` is what the app badges and what makes a
+    foreground poll able to behave like a notification without a service worker.
+
+    The subject is the token (``current.id``), never a request field - so there is no id to
+    tamper with and no way to read somebody else's inbox through it.
+    """
+    limit = max(1, min(int(limit), 200))
+    where = "worker_id = ?" + (" AND read_at IS NULL" if unread_only else "")
+    with db() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM worker_notifications WHERE {where} "
+            "ORDER BY created_at DESC, id DESC LIMIT ?",
+            (current.id, limit),
+        ).fetchall()
+        unread = notifications.worker_unread_count(conn, current.id)
+    return {
+        "worker_id": current.id,
+        "unread": unread,
+        "notifications": [_worker_notification(row) for row in rows],
+        "push": push.browser_config(),
+    }
+
+
+@router.post("/worker/me/notifications/read")
+async def mark_my_notifications_read(
+    notification_id: int | None = None, current: CurrentUser = Depends(any_authenticated)
+):
+    """Mark one notification read, or the whole inbox when no id is given.
+
+    A body-less POST rather than PATCH, because this app's whole API is POST-for-writes and
+    a worker's phone is the least forgiving client to introduce a new verb to. The
+    ``worker_id`` clause is not decoration: it is what makes "mark read" unable to touch
+    somebody else's row, and the route is tested for exactly that.
+    """
+    with db(write=True) as conn:
+        if notification_id is None:
+            changed = conn.execute(
+                "UPDATE worker_notifications SET read_at = ? WHERE worker_id = ? AND read_at IS NULL",
+                (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), current.id),
+            ).rowcount
+            return {"status": "success", "marked": int(changed or 0)}
+        changed = conn.execute(
+            "UPDATE worker_notifications SET read_at = ? "
+            "WHERE id = ? AND worker_id = ? AND read_at IS NULL",
+            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), int(notification_id), current.id),
+        ).rowcount
+        if not changed:
+            # Either it is already read or it is not this worker's. Both answers are the same
+            # one, deliberately: telling a caller that an id exists but belongs to somebody
+            # else is an enumeration oracle.
+            raise HTTPException(status_code=404, detail="No unread notification with that id.")
+    return {"status": "success", "marked": 1}
+
+
+@router.get("/worker/me/push")
+async def get_my_push_config(current: CurrentUser = Depends(any_authenticated)):
+    """Whether this deployment can push, and what the browser needs to subscribe.
+
+    The app asks for the browser's notification permission *because of this answer*: a
+    deployment with no VAPID keys must not prompt a worker for a permission nothing can use.
+    """
+    with db() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM worker_push_subscriptions WHERE worker_id = ? AND revoked_at IS NULL",
+            (current.id,),
+        ).fetchone()[0]
+    return {**push.browser_config(), "subscriptions": int(count)}
+
+
+@router.post("/worker/me/push/subscribe")
+async def subscribe_my_push(
+    request: Request,
+    payload: PushSubscriptionRequest,
+    current: CurrentUser = Depends(any_authenticated),
+):
+    """Register this browser so a notification can reach it with the app closed.
+
+    Refused (409, with the reason) when the deployment cannot push at all: storing a
+    subscription nothing will ever send to would make the app promise alerts it cannot keep.
+    """
+    usable, reason = push.transport_available()
+    if not usable:
+        raise HTTPException(status_code=409, detail=f"Push notifications are unavailable: {reason}")
+    user_agent = request.headers.get("user-agent")
+    try:
+        with db(write=True) as conn:
+            created = push.subscribe(
+                conn,
+                worker_id=current.id,
+                endpoint=payload.endpoint,
+                p256dh=payload.p256dh,
+                auth=payload.auth,
+                user_agent=user_agent,
+            )
+    except ValueError as exc:
+        # The endpoint is a URL this server will later POST to, so a malformed one is refused
+        # where it is typed rather than stored and discovered by a failing push.
+        raise HTTPException(status_code=422, detail=str(exc))
+    return {"status": "success", "created": bool(created)}
+
+
+@router.post("/worker/me/push/unsubscribe")
+async def unsubscribe_my_push(
+    payload: PushUnsubscribeRequest, current: CurrentUser = Depends(any_authenticated)
+):
+    """Turn notifications off for this device. Idempotent: a second call is not an error."""
+    with db(write=True) as conn:
+        retired = push.unsubscribe(conn, worker_id=current.id, endpoint=payload.endpoint)
+    return {"status": "success", "retired": bool(retired)}
+
+
 # ---------------------------------------------------------------------------
 # attendance
 # ---------------------------------------------------------------------------
@@ -1295,6 +1790,10 @@ async def verify_worker(
     action: str = Form(...),
     location_input: str = Form(...),
     selfie: UploadFile = File(...),
+    #: Sent back by the phone after it has shown the early clock-out warning and the
+    #: worker chose to go ahead. Absent on the first attempt, which is what makes the
+    #: warning happen: the server, not the phone, decides whether a shift is short.
+    confirm_early_checkout: str | None = Form(default=None),
     current: CurrentUser = Depends(any_authenticated),
 ):
     """Clock in or out: session + geofence + face, in that order.
@@ -1306,7 +1805,7 @@ async def verify_worker(
     answered 401, which signed the worker out mid-punch and lost them the tap. What
     actually guards the record is what follows it - a token that dies when the password
     is rotated or the account is deactivated, the geofence, and a live face that has to
-    match the enrolled template (``liveness.py`` then DeepFace).
+    match the enrolled template (``liveness.py``, then the check in ``face_engine``).
 
     The subject is ``current.id`` - the ``worker_id`` form field is accepted only
     so the existing client keeps working, and is rejected if it names anybody
@@ -1318,6 +1817,8 @@ async def verify_worker(
         )
     if action not in (ACTION_CLOCK_IN, ACTION_CLOCK_OUT):
         raise HTTPException(status_code=400, detail="Action must be 'Clock In' or 'Clock Out'.")
+    # The worker has already seen the warning and chosen to clock out anyway.
+    confirmed_early = _form_flag(confirm_early_checkout)
 
     # The account is read for the name that the alert, the audit row and the response
     # carry - never for a credential. ``any_authenticated`` has already checked the one
@@ -1359,7 +1860,8 @@ async def verify_worker(
     image = uploads.decode_photo(file_bytes, field="selfie")
     image.thumbnail((640, 640))
     # ``rgb_array`` feeds the liveness model, which was trained on RGB crops;
-    # ``img_array`` is the BGR view DeepFace expects. Computing both here keeps
+    # ``img_array`` is the BGR view the detector and the embedding contract expect - see
+    # ``face_onnx``, which does not convert channels anywhere. Computing both here keeps
     # the two consumers from silently swapping channel order.
     rgb_array = np.array(image)
     img_array = rgb_array[:, :, ::-1]
@@ -1437,9 +1939,19 @@ async def verify_worker(
 
     reference_filepath = biometrics.resolve_reference(current.id, biometrics.id_from(user_row))
     if not os.path.exists(reference_filepath):
+        # One wall, two audiences. A worker cannot register a template for themselves - that
+        # is the company's act, through an enrollment link or an administrator - so they are
+        # told to ask. An administrator can, from the console (``/worker/me/enroll``), and
+        # telling them to contact their administrator when they are one is a dead end with a
+        # phone number in it.
         raise HTTPException(
             status_code=404,
-            detail="Facial reference not registered. Please contact your administrator to enroll.",
+            detail=(
+                "Facial reference not registered. Register your own photo from the console, "
+                "then clock in again."
+                if current.role in SELF_ENROLL_ROLES
+                else "Facial reference not registered. Please contact your administrator to enroll."
+            ),
         )
 
     try:
@@ -1469,13 +1981,39 @@ async def verify_worker(
         raise HTTPException(status_code=400, detail={"error_code": error_code, "message": message})
 
     similarity_score = face_data["distance"]
-    if similarity_score <= FACE_APPROVE_THRESHOLD:
+    # The band, resolved here rather than read off ``face_data`` above: a caller is free to
+    # stub ``compare_faces_sync`` (the suite does), and a verdict path that only works when a
+    # particular payload shape came back is a verdict path that silently stops being tested.
+    # ``biometrics.current_pipeline()`` is the same name the staleness check just compared the
+    # template against, so the lines read here are the ones that crop was measured for.
+    band = face_detector.band_for(biometrics.current_pipeline())
+    verdict = band.classify(similarity_score)
+    # The frame the score was measured from, kept as the punch's evidence: a pending review
+    # is a decision about money, and "matched at 0.52" without the picture is a claim without
+    # anything to check it against (see ``punch_frames``). Stored *after* the verdict so a
+    # refused punch - 422, the worker still standing there - writes no file at all, and
+    # discarded on the domain refusals below, which leave no log row to claim it.
+    punch_frame = None
+    try:
+        punch_frame = punch_frames.store_frame(image)
+    except OSError:
+        # A punch that cannot keep its evidence is still a punch: refusing it would lose an
+        # honest worker's hours over a disk. The row carries its numbers without a picture,
+        # exactly like the rows written before frames existed.
+        log.warning("could not store the punch frame for worker %s", current.id, exc_info=True)
+    # The same frame again, when an operator has asked for calibration captures: the corpus keeps
+    # the *worker* (that is the label) and nothing about their hours - see ``corpus`` for why it is a
+    # separate store with a separate switch rather than a column on this punch. Off by default,
+    # never raises, and it re-runs the detector on its own downscaled copy so the crop it stores
+    # reproduces exactly for whoever measures it later.
+    corpus.maybe_capture_punch(image, worker_id=str(current.id), verdict=verdict)
+    if verdict == face_detector.MATCH_APPROVED:
         status_val = "success"
         status_msg = "Auto-Approved"
         log_status = STATUS_APPROVED
         status_code = "approved"
         telemetry.observe_verification("approved")
-    elif similarity_score <= FACE_REVIEW_THRESHOLD:
+    elif verdict == face_detector.MATCH_REVIEW:
         status_val = "flagged"
         status_msg = "Attendance logged - Pending HR Review"
         log_status = STATUS_PENDING_REVIEW
@@ -1492,6 +2030,7 @@ async def verify_worker(
         # thrown away. The liveness refusal above already answers 422 with this same
         # {error_code, message} shape, which the client renders as a readable message.
         telemetry.observe_verification("rejected")
+        punch_frames.discard_frame(punch_frame)
         raise HTTPException(
             status_code=422,
             detail={
@@ -1508,14 +2047,21 @@ async def verify_worker(
             },
         )
 
+    # The rules travel as they are: which hours the overtime line counts, where it sits and
+    # how much of the shift it holds back are all decided by ``overtime_assessment`` below,
+    # not by reading columns here.
     rules = get_shift_rules()
-    regular_hours = float(rules["regular_hours"])
-    overtime_hours = float(rules["overtime_notify_hours"])
     now = datetime.now()
     now_str = now.strftime("%Y-%m-%d %H:%M:%S")
     hours_worked = 0.0
     break_taken = 0.0
-    overtime = 0.0
+    #: The hours past the paid day that this clock-out is holding back. Named in full, not
+    #: ``overtime``: the module of that name is what announces the crossing below, and a
+    #: local variable shadowing it is a bug waiting for the next reader.
+    overtime_hours = 0.0
+    #: The worker's crossing notice, when this clock-out made one (``overtime.announce_crossing``).
+    #: Delivered after the transaction below, because a push cannot see an uncommitted row.
+    crossing = None
     flag_reason = liveness_flag
 
     with db(write=True) as conn:
@@ -1524,6 +2070,9 @@ async def verify_worker(
                 "SELECT worker_id FROM active_sessions WHERE worker_id = ?", (current.id,)
             ).fetchone()
             if existing:
+                # The frame goes with the refusal: this rollback writes no row, so the file
+                # would otherwise sit unclaimed until retention's residue pass found it.
+                punch_frames.discard_frame(punch_frame)
                 raise HTTPException(status_code=400, detail="Already clocked in!")
 
             # The window is the *detected site's*, not the global one: a night site and a day
@@ -1565,6 +2114,12 @@ async def verify_worker(
                 (current.id, STATUS_PENDING_REVIEW),
             ).fetchone()
             if flagged:
+                # Raising rolls the transaction back, so the log row this punch was about to
+                # write never lands - which means the frame would be left on disk with nothing
+                # claiming it. Discarded here rather than left for retention's residue pass,
+                # for the same reason the face-mismatch refusal discards: these are the two
+                # refusals that happen *after* the frame was stored, and both leave no row.
+                punch_frames.discard_frame(punch_frame)
                 raise HTTPException(
                     status_code=403, detail="Your account is flagged for manual review. Please contact HR."
                 )
@@ -1573,6 +2128,7 @@ async def verify_worker(
                 "SELECT clock_in_time, site_name FROM active_sessions WHERE worker_id = ?", (current.id,)
             ).fetchone()
             if session is None:
+                punch_frames.discard_frame(punch_frame)
                 raise HTTPException(status_code=400, detail=_no_open_shift_message(conn, current.id))
 
             clock_in_time = _parse_ts(session["clock_in_time"])
@@ -1583,25 +2139,48 @@ async def verify_worker(
             # the shift (and is stored on it), not to the person closing it, so the
             # worker's own clock-out, an administrator's force-clock-out and the
             # auto-close all arrive at the same number through ``shift_hours``.
-            elapsed_hours = round(max(0.0, (now - clock_in_time).total_seconds() / 3600.0), 4)
-            hours_worked, break_taken = shift_hours.paid_hours(elapsed_hours, rules)
-            hours_note = shift_hours.describe(elapsed_hours, hours_worked, break_taken)
+            #
+            # Measured in whole seconds between the two stored timestamps, and that is the
+            # figure the overtime decision is made on too - see ``overtime_assessment``.
+            seconds_on_site = shift_hours.elapsed_seconds(clock_in_time, now)
+            record = shift_hours.recorded_shift(seconds_on_site / 3600.0, rules)
+            if record["needs_confirmation"] and not confirmed_early:
+                # Refused *before* anything is written and before the session is deleted,
+                # so a cancel leaves the shift exactly as it was and the confirmed request
+                # that follows records the very same hours. Raising from inside the
+                # transaction is the rollback the "flagged for review" refusal has always
+                # used, and the phone renders the sentence itself from the numbers below -
+                # the English here is the API's own, for anything that is not the app.
+                # No row is written here either, so the frame goes with the refusal.
+                punch_frames.discard_frame(punch_frame)
+                raise HTTPException(status_code=409, detail=_early_checkout_refusal(record))
+            hours_worked = record["paid_hours"]
+            break_taken = record["break_hours"]
+            hours_note = record["description"]
             conn.execute("DELETE FROM active_sessions WHERE worker_id = ?", (current.id,))
 
-            # Overtime is tracked, not silently approved: any shift past the
-            # notification threshold is routed to a human before it can be paid.
-            if hours_worked > overtime_hours:
-                overtime = round(hours_worked - regular_hours, 4)
+            # Overtime is tracked, not silently approved: the one resolver decides whether
+            # this shift has reached the line, and how much of it is held back.
+            #
+            # ``apply_authorisation`` is where a crossing answered mid-shift is cashed in: the
+            # ceiling somebody stated for this shift decides what is held, so the clock-out does
+            # not ask again for hours that were already decided about. With no answer it returns
+            # the assessment unchanged - the ceiling defaults to the regular paid day, which is
+            # the arithmetic this line always did.
+            assessment = overtime.apply_authorisation(
+                conn,
+                current.id,
+                clock_in_time,
+                shift_hours.overtime_assessment(seconds_on_site, rules),
+                rules,
+            )
+            if assessment["needs_approval"]:
+                overtime_hours = assessment["overtime_hours"]
                 log_status = STATUS_PENDING_OVERTIME
                 status_code = "pending_overtime"
                 status_val = "flagged"
                 flag_reason = " | ".join(
-                    part
-                    for part in (
-                        flag_reason,
-                        f"{hours_worked:.2f}h exceeds the {overtime_hours:g}h regular threshold",
-                    )
-                    if part
+                    part for part in (flag_reason, assessment["flag_sentence"]) if part
                 )
                 status_msg = (
                     f"Clocked Out of {session['site_name']}. {hours_note} - "
@@ -1613,14 +2192,34 @@ async def verify_worker(
                     severity=notifications.SEVERITY_WARNING,
                     title="Overtime requires approval",
                     body=(
-                        f"{user_row['name']} (id {current.id}) worked {hours_worked:.2f}h at "
-                        f"'{session['site_name']}', past the {overtime_hours:g}h threshold. "
-                        "Approve or adjust the extra hours before payroll."
+                        f"{user_row['name']} (id {current.id}) worked "
+                        f"{assessment['paid_hours']:.2f}h paid at '{session['site_name']}', "
+                        f"past the {assessment['threshold_hours']:g}h overtime line with "
+                        f"{overtime_hours:.2f}h past the paid day. Approve or adjust the extra "
+                        "hours before payroll."
                     ),
                     worker_id=current.id,
                     site_name=session["site_name"],
                     dedupe_key=f"overtime:{current.id}:{now_str}",
-                    payload={"hours": hours_worked, "overtime_hours": overtime},
+                    payload={
+                        "hours": hours_worked,
+                        "overtime_hours": overtime_hours,
+                        "basis": assessment["basis"],
+                        "paid_hours": assessment["paid_hours"],
+                        "threshold_hours": assessment["threshold_hours"],
+                    },
+                )
+                # ... and the worker is told, in their own inbox, in the same transaction.
+                # The watcher cannot do this for them: it only sees shifts that are still
+                # open, and this one has just ended. ``announce_crossing`` is the one writer
+                # of that sentence, shared with the watcher and the other three paths.
+                crossing = overtime.announce_crossing(
+                    conn,
+                    worker_id=current.id,
+                    site_name=session["site_name"],
+                    clock_in_time=session["clock_in_time"],
+                    values=rules,
+                    moment=now,
                 )
             else:
                 status_msg += f" (Clocked Out of {session['site_name']}. {hours_note})"
@@ -1641,9 +2240,18 @@ async def verify_worker(
             liveness_class=liveness_class,
             liveness_score=liveness_score,
             flag_reason=flag_reason,
-            overtime_hours=overtime or None,
+            overtime_hours=overtime_hours or None,
             break_hours=break_taken or None,
+            punch_frame=punch_frame,
         )
+        if action == ACTION_CLOCK_OUT:
+            # The shift has settled, so the decision it was settled by is cashed in against
+            # this very row: an answer cannot authorise a second shift, and the record says
+            # which clock-out spent it. Guarded on the action because an *arrival* settles no
+            # shift and has no clock-in of its own to pair a decision with - and one row is
+            # written for both, so asking unconditionally is an unbound name at the top of
+            # every working day.
+            overtime.consume_authorisation(conn, current.id, clock_in_time, log_id)
         if status_code == "pending_review":
             notifications.notify(
                 conn,
@@ -1684,6 +2292,10 @@ async def verify_worker(
             request=request,
         )
 
+    # Committed, so the notice is visible to the dispatcher - and on its own thread, so a
+    # worker standing at a gate is not waiting on somebody else's push service.
+    overtime.deliver_worker_notices(crossing)
+
     return {
         "status": status_val,
         "message": status_msg,
@@ -1694,7 +2306,7 @@ async def verify_worker(
         "break_hours": break_taken,
         "paid_hours": hours_worked,
         "site": detected_site,
-        "overtime_hours": overtime,
+        "overtime_hours": overtime_hours,
         "liveness": liveness_decision.as_payload(),
     }
 
@@ -1735,12 +2347,18 @@ async def list_users(current: CurrentUser = Depends(admin_only)):
     crack against every password in the company. The plaintext is not returned either,
     because it does not exist anywhere: the hash is one-way by design.
     """
+    # The root account is concealed from every administrator, so the roster is narrowed *in
+    # the query* rather than after it: a list filtered in Python still hands back the count of
+    # what it removed, and a count is an enumeration. A developer session sees itself, which is
+    # how the account is edited at all.
+    hide_sql, hide_params = developer.visibility_clause(current, column="id")
     with db() as conn:
         rows = conn.execute(
             "SELECT id, name, email, phone, role, status, enrolled_at, biometric_id, "
             "COALESCE(token_version, 0) AS token_version, "
             "(password_hash IS NOT NULL AND password_hash <> '') AS password_set "
-            "FROM users ORDER BY CAST(id AS INTEGER) ASC"
+            "FROM users WHERE 1 = 1" + hide_sql + " ORDER BY CAST(id AS INTEGER) ASC",
+            hide_params,
         ).fetchall()
         # "When was the password last set?" is already recorded - append-only, in the
         # audit log - so it is read from there rather than duplicated into the users
@@ -2031,6 +2649,11 @@ async def read_user(user_id: str, current: CurrentUser = Depends(admin_only)):
     is pinned by a test - so the editable detail that is *not* on it (the hourly rate, the
     contact fields) is read here instead of being bolted onto every row of the list.
     """
+    # A concealed account reads as a missing one: the same 404, in the same words, as an id
+    # that was never issued. A 403 here would confirm the account exists, which is the whole
+    # thing the concealment is for.
+    if developer.hides(current, user_id):
+        raise HTTPException(status_code=404, detail="User ID not found.")
     with db() as conn:
         row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
     if row is None:
@@ -2322,13 +2945,30 @@ async def list_audit_log(
 ):
     """Administrative history: manual edits, overrides, reviews, actor and IP."""
     limit = max(1, min(int(limit), 1000))
+    # Concealment is part of the query, not a filter after it: an audit row that names the root
+    # account as its actor *or* as its subject is exactly the row an administrator must not
+    # read, and a post-filter would still return the length of the shortened list.
+    #
+    # ``COALESCE`` because ``NOT IN`` is NULL-tainted: a bare ``entity_id NOT IN (...)`` is
+    # never true for a NULL subject, so it would silently drop every row that has no subject -
+    # which is most of the table.
+    by_actor, actor_params = developer.visibility_clause(current, column="actor_id")
+    by_subject, subject_params = developer.visibility_clause(
+        current, column="COALESCE(entity_id, '')"
+    )
+    hide_sql = by_actor + by_subject
+    hide_params = actor_params + subject_params
     with db() as conn:
         if action:
             rows = conn.execute(
-                "SELECT * FROM audit_log WHERE action = ? ORDER BY id DESC LIMIT ?", (action, limit)
+                f"SELECT * FROM audit_log WHERE action = ?{hide_sql} ORDER BY id DESC LIMIT ?",
+                (action, *hide_params, limit),
             ).fetchall()
         else:
-            rows = conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            rows = conn.execute(
+                f"SELECT * FROM audit_log WHERE 1 = 1{hide_sql} ORDER BY id DESC LIMIT ?",
+                (*hide_params, limit),
+            ).fetchall()
     return _json([dict(row) for row in rows])
 
 
@@ -2565,13 +3205,152 @@ async def get_workers_live(site_name: str, current: CurrentUser = Depends(admin_
     ]
 
 
+# ---------------------------------------------------------------------------
+# admin: the live crossing, as an approval rather than an alert
+#
+# A shift that is *still open* and past the overtime line is a question, not a notice: it is
+# answered by a person, the answer changes what the shift is paid for, and until somebody
+# answers it the shift keeps running. That is the shape of the Approvals queue, not of
+# ``admin_notifications`` - which is why the crossing was moved here, and why reading it is no
+# longer a way to make it go away. The item disappears when the shift ends and not before.
+# ---------------------------------------------------------------------------
+class CrossingDecisionRequest(BaseModel):
+    """The answer to an open-shift crossing.
+
+    ``authorised_hours`` is the ceiling being authorised: the paid hours this shift may run to.
+    Omitted means "the hours already worked" - approving what there is evidence for - and stated
+    means the rest of the shift is covered deliberately, with a figure on it. Hours past the
+    ceiling come back as a second question rather than being paid quietly.
+    """
+
+    authorised_hours: float | None = Field(
+        None,
+        ge=0,
+        description="Paid hours this shift may run to; defaults to the hours worked so far.",
+    )
+    note: str | None = None
+
+    @field_validator("note")
+    @classmethod
+    def _plain_note(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        # The same prose profile every note in this application goes through: apostrophes and
+        # ampersands survive, markup does not. This text is read by an auditor and may reach the
+        # worker, and neither reader escapes it.
+        return textguard.prose(value, field="Note", max_length=textguard.MAX_NOTE, allow_empty=True)
+
+
+@router.get("/admin/overtime/crossings")
+async def list_overtime_crossings(current: CurrentUser = Depends(admin_only)):
+    """Open shifts past the overtime line: the decisions the Approvals queue is holding.
+
+    Read from the shifts themselves (``overtime.open_crossings``) rather than from stored
+    notification rows, so an item cannot outlive the shift it describes, and a crossing nobody
+    answers stays on the list instead of looking like something somebody already dealt with.
+    """
+    return _json(overtime.open_crossings())
+
+
+async def _answer_crossing(
+    request: Request, worker_id: str, req: CrossingDecisionRequest, current: CurrentUser, *, accept: bool
+):
+    """Both answers in one place, because both write the same decision row.
+
+    The audit event is written only when the answer is new: a second tap on a crossing somebody
+    already answered returns the standing decision without pretending a second decision was made
+    (``overtime.decide_crossing``, same rule as the forced-start acknowledgement). An answer that
+    supersedes one the shift has outgrown *is* new, and its event says which decision it replaced -
+    the row carries the chain, but "why is this 12 h now" is a question about the trail.
+    """
+    try:
+        with db(write=True) as conn:
+            result = overtime.decide_crossing(
+                conn,
+                worker_id=worker_id,
+                accept=accept,
+                authorised_hours=req.authorised_hours,
+                note=req.note,
+                actor_id=current.id,
+            )
+            if not result["already_decided"]:
+                _audit(
+                    conn,
+                    action="overtime_authorise" if accept else "overtime_decline",
+                    actor=current,
+                    entity="overtime_authorisations",
+                    entity_id=result["worker_id"],
+                    before={
+                        "open_shift_clock_in": result["clock_in_time"],
+                        # ``None`` on a first decision. Present, rather than omitted, because an
+                        # audit reader has to be able to tell "extended a ceiling somebody had
+                        # authorised" from "authorised for the first time" in this row alone.
+                        "superseded": result.get("superseded"),
+                    },
+                    after={
+                        "decision": result["decision"],
+                        "authorised_hours": result["authorised_hours"],
+                        "recorded_hours_at_decision": result["recorded_hours_at_decision"],
+                        "note": req.note,
+                    },
+                    request=request,
+                )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    # Committed first, because ``push`` selects notices that are not yet delivered and cannot see
+    # the row this request just wrote. A repeat of an answer already on the record wrote no notice,
+    # and the helper reads that flag itself - so this is the same call on both paths.
+    overtime.deliver_worker_notices(result)
+    return _json(result)
+
+
+@router.post("/admin/overtime/crossings/{worker_id}/accept")
+async def accept_overtime_crossing(
+    request: Request,
+    worker_id: str,
+    req: CrossingDecisionRequest,
+    current: CurrentUser = Depends(admin_only),
+):
+    """Authorise this shift up to a ceiling; its clock-out settles there rather than at the day."""
+    return await _answer_crossing(request, worker_id, req, current, accept=True)
+
+
+@router.post("/admin/overtime/crossings/{worker_id}/decline")
+async def decline_overtime_crossing(
+    request: Request,
+    worker_id: str,
+    req: CrossingDecisionRequest,
+    current: CurrentUser = Depends(admin_only),
+):
+    """Refuse the extra time: nothing past the regular paid day is authorised for this shift."""
+    return await _answer_crossing(request, worker_id, req, current, accept=False)
+
+
 @router.get("/admin/pending_reviews")
 async def list_pending_reviews(current: CurrentUser = Depends(admin_only)):
+    """The review queue: every shift a human has to decide about, with the evidence beside it.
+
+    The evidence is the point of this route. Each row now carries the three things a decision
+    actually rests on - the match score (``score``, a face *distance*: lower is a better match,
+    and the band lines that grade it are on ``GET /admin/shift_rules``), the reason the shift
+    was flagged (``flag_reason``, the liveness verdict, the window miss or the overtime
+    sentence the shift earned), and whether a frame is waiting (``frame_url``, served by
+    :func:`admin_pending_review_frame`). The frame itself is deliberately *not* inlined here:
+    a queue of ten reviews would carry ten pictures whether or not anybody opened them, on the
+    connection this console is usually opened over.
+
+    An offline punch's score can still be the 0.0 "not scored yet" sentinel: the queued selfie
+    is scored when it reaches the server (``POST /attendance/sync/photo``), and until then the
+    row says so rather than showing a number that looks like a match.
+    """
     with db() as conn:
         rows = conn.execute(
             """
-            SELECT l.id, l.worker_id, u.name, l.site_name, l.action, l.timestamp,
-                   l.hours, l.score, l.status, l.status_code, l.flag_reason, l.overtime_hours
+            SELECT l.id, l.worker_id, u.name, u.role, l.site_name, l.action, l.timestamp,
+                   l.hours, l.score, l.status, l.status_code, l.flag_reason, l.overtime_hours,
+                   l.source, l.liveness_class, l.liveness_score, l.punch_frame
             FROM attendance_logs l
             JOIN users u ON l.worker_id = u.id
             WHERE l.status = ? OR l.status_code = 'pending_overtime'
@@ -2579,7 +3358,56 @@ async def list_pending_reviews(current: CurrentUser = Depends(admin_only)):
             """,
             (STATUS_PENDING_REVIEW,),
         ).fetchall()
-    return _json([dict(row) for row in rows])
+    return _json([_pending_review_row(row) for row in rows])
+
+
+def _pending_review_row(row) -> dict:
+    """One review row for the wire, with the URL for its frame and not the file name.
+
+    ``punch_frame`` is server-side plumbing the client never sees - the same treatment the
+    quick-link use list gives ``photo_path`` - because a filename is not an identifier this
+    app exposes, and the browser has no business depending on one.
+    """
+    item = dict(row)
+    frame = item.pop("punch_frame", None)
+    item["frame_url"] = f"/api/v1/admin/pending_review_frame/{item['id']}" if frame else None
+    # The verdict, not a distance alone: the number means different things under different
+    # pipelines, and the browser recomputing it would mean shipping the bands to the client -
+    # thresholds stated once in ``face_detector``, restated in JavaScript. ``1.0`` is the
+    # "no comparison was made" sentinel (admin override, quick link); ``0.0`` is the offline
+    # "not scored yet" sentinel. A comparison *made and refused* still classifies - that is
+    # exactly the verdict the reviewer needs to see.
+    item["match_verdict"] = None
+    score = item.get("score")
+    if score is not None and float(score) not in (0.0, 1.0):
+        try:
+            item["match_verdict"] = face_detector.band_for(biometrics.current_pipeline()).classify(float(score))
+        except face_detector.UnknownPipelineError:
+            item["match_verdict"] = None
+    return item
+
+
+@router.get("/admin/pending_review_frame/{log_id}")
+async def admin_pending_review_frame(log_id: int, current: CurrentUser = Depends(admin_only)):
+    """The downscaled frame one pending review was measured from. Administrator-only.
+
+    The same shape as ``/admin/quick_link_photo``: the stored name is resolved against the
+    frame directory and checked to be *inside* it before it is served, so a row whose path was
+    edited cannot turn this route into a file-read primitive. A row with no frame - written
+    before frames existed, or whose frame retention wiped, or whose disk was full at punch
+    time - answers 404 rather than pretending to have a picture; the review is decided on its
+    numbers in that case, exactly as it always was.
+    """
+    with db() as conn:
+        row = conn.execute(
+            "SELECT punch_frame FROM attendance_logs WHERE id = ?", (log_id,)
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="This punch has no record.")
+    path = punch_frames.resolve_stored(row["punch_frame"])
+    if path is None:
+        raise HTTPException(status_code=404, detail="No frame was stored for this punch.")
+    return FileResponse(path, media_type="image/jpeg")
 
 
 @router.post("/admin/approve_review")
@@ -2606,13 +3434,18 @@ async def approve_review(
                 detail=f"Approved hours ({approved}) cannot exceed the recorded hours ({row['hours']}).",
             )
 
+        # Overtime is what the administrator *authorised* past the regular day, not what the
+        # clock happened to record. Approving 8.25 h of a 9.5 h shift settles the shift at 15
+        # minutes of overtime; a row carrying 8.25 approved hours beside 1.5 h of overtime
+        # contradicts itself, and the timesheet would repeat the contradiction.
+        regular_hours = float(get_shift_rules()["regular_hours"])
         conn.execute(
             "UPDATE attendance_logs SET status = ?, status_code = 'approved', approved_hours = ?, "
             "overtime_hours = ?, reviewed_by = ?, reviewed_at = ?, flag_reason = ? WHERE id = ?",
             (
                 "Approved by Admin",
                 approved,
-                round(max(0.0, row["hours"] - float(get_shift_rules()["regular_hours"])), 4),
+                round(max(0.0, approved - regular_hours), 4),
                 current.id,
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 req.note,
@@ -2634,6 +3467,110 @@ async def approve_review(
             request=request,
         )
     return {"status": "success", "message": "Attendance record approved by Admin."}
+
+
+@router.post("/admin/reject_review")
+async def reject_review(
+    request: Request, req: ReviewRejectionRequest, current: CurrentUser = Depends(admin_only)
+):
+    """Refuse a shift that was routed to review, and record why.
+
+    What "reject" means depends on what is being reviewed, and the two are opposites, so
+    they are two codes and not one:
+
+    * **A shift past the overtime threshold** (``pending_overtime``) still happened. The
+      worker keeps the standard paid day, the hours past it are refused, and ``overtime_hours``
+      is recorded as zero - the refusal is of the *extra* hours, not of the work. The row
+      becomes ``overtime_rejected``, which is payable at the standard day, so the day is paid
+      and the timesheet cannot credit a minute the administrator refused.
+    * **An unconfirmed punch** (``pending_review`` - the location was outside every site's
+      radius, or the face did not match) is a shift nobody could confirm was work. Rejecting
+      it records it as not worked: nothing is payable, and ``rejected`` counts for zero hours
+      wherever hours are summed.
+
+    Either way the row leaves the review queue, the notification it came from is marked
+    read, and the reason is written to the row and to the append-only audit trail.
+
+    This endpoint exists because the console's Reject button used to POST to
+    ``/admin/approve_review``: it took an ``action`` argument and never read it, so pressing
+    Reject *approved* the shift at its full recorded hours - a worker was paid overtime their
+    manager had just refused.
+    """
+    with db(write=True) as conn:
+        row = conn.execute(
+            "SELECT worker_id, hours, status, status_code, overtime_hours, approved_hours, flag_reason "
+            "FROM attendance_logs WHERE id = ?",
+            (req.log_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Attendance log record not found.")
+        code = str(row["status_code"] or "")
+        if row["status"] != STATUS_PENDING_REVIEW and code != "pending_overtime":
+            raise HTTPException(status_code=400, detail="This log is not marked as pending review.")
+
+        recorded = float(row["hours"] or 0.0)
+        if code == "pending_overtime":
+            # The standard day is owed, so it is approved at the policy figure rather than
+            # at the clock - capped by the recorded hours for a shift that never reached a
+            # full day, which cannot happen through the threshold but is free to guard.
+            regular_hours = float(get_shift_rules()["regular_hours"])
+            approved = round(min(regular_hours, recorded), 4)
+            overtime = 0.0
+            status_label = STATUS_OVERTIME_REJECTED
+            new_code = migrations.STATUS_CODE_OVERTIME_REJECTED
+            message = (
+                f"Overtime refused. The shift is recorded at {approved:g} h and no overtime "
+                f"is credited."
+            )
+        else:
+            approved = 0.0
+            overtime = 0.0
+            status_label = STATUS_TYPE_REJECTED
+            new_code = migrations.STATUS_CODE_REJECTED
+            message = "Attendance record rejected: the shift is recorded as not worked."
+
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute(
+            "UPDATE attendance_logs SET status = ?, status_code = ?, approved_hours = ?, "
+            "overtime_hours = ?, reviewed_by = ?, reviewed_at = ?, flag_reason = ? WHERE id = ?",
+            (status_label, new_code, approved, overtime, current.id, now_str, req.note, req.log_id),
+        )
+        conn.execute(
+            "UPDATE admin_notifications SET read_at = ?, read_by = ? WHERE log_id = ? AND read_at IS NULL",
+            (now_str, current.id, req.log_id),
+        )
+        _audit(
+            conn,
+            action="review_reject",
+            actor=current,
+            entity="attendance_logs",
+            entity_id=req.log_id,
+            # The before-image carries the arrival/liveness flag this write replaces in
+            # ``flag_reason``, so the reason for the refusal is added to the record rather
+            # than swapped for the reason the shift was flagged in the first place.
+            before={
+                "hours": recorded,
+                "status": row["status"],
+                "status_code": code,
+                "approved_hours": row["approved_hours"],
+                "overtime_hours": row["overtime_hours"],
+                "flag_reason": row["flag_reason"],
+            },
+            after={
+                "status_code": new_code,
+                "approved_hours": approved,
+                "overtime_hours": overtime,
+                "reason": req.note,
+            },
+            request=request,
+        )
+    return {
+        "status": "success",
+        "message": message,
+        "status_code": new_code,
+        "approved_hours": approved,
+        "overtime_hours": overtime,
+    }
 
 
 @router.post("/admin/force_clock_in")
@@ -2700,12 +3637,31 @@ async def force_clock_out(
             raise HTTPException(status_code=404, detail="Worker is not currently clocked in.")
 
         clock_in_time = _parse_ts(session["clock_in_time"]) or now
-        elapsed_hours = round(max(0.0, (now - clock_in_time).total_seconds() / 3600.0), 4)
+        seconds_on_site = shift_hours.elapsed_seconds(clock_in_time, now)
         # The same policy the worker's own clock-out applies, so the same shift pays the
         # same whichever way it is closed. Deducting the break only on one of those two
         # paths would mean the answer to "what is this day worth?" depended on whether
         # the worker remembered to tap the button, which is not a payroll rule.
-        hours_worked, break_taken = shift_hours.paid_hours(elapsed_hours, get_shift_rules())
+        rules = get_shift_rules()
+        record = shift_hours.recorded_shift(seconds_on_site / 3600.0, rules)
+        hours_worked = record["paid_hours"]
+        break_taken = record["break_hours"]
+        # ... and the overtime figure comes from the same resolver as the approval gate.
+        # This path records the row as *approved* rather than routing it for review, which
+        # is the point of an override: the administrator closing the shift is the person
+        # the review would be handed to. What it must not do is settle the shift as if
+        # nobody had answered: ``apply_authorisation`` reads the standing decision for this
+        # shift and reports what is *still* held past it, so closing this way cannot
+        # contradict an answer given in the Approvals queue - which would be an approval
+        # silently reversing itself hours later. With no answer it returns the assessment
+        # unchanged, and the arithmetic is exactly what this line always did.
+        assessment = overtime.apply_authorisation(
+            conn,
+            req.worker_id,
+            session["clock_in_time"],
+            shift_hours.overtime_assessment(seconds_on_site, rules),
+            rules,
+        )
         now_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
         conn.execute("DELETE FROM active_sessions WHERE worker_id = ?", (req.worker_id,))
@@ -2720,31 +3676,79 @@ async def force_clock_out(
             status=STATUS_FORCED_OUT,
             status_code="approved",
             source="admin_override",
-            overtime_hours=_overtime_hours(hours_worked),
+            overtime_hours=assessment["overtime_hours"] or None,
             break_hours=break_taken or None,
+        )
+        # ... and the answer that settled it is spent by this row, so it cannot be read as
+        # authorisation for the worker's next shift.
+        overtime.consume_authorisation(conn, req.worker_id, session["clock_in_time"], log_id)
+        # The worker is told their shift crossed the line, even though this override records
+        # the hours as authorised: the notice states the event and the rule (time past the
+        # paid day needs approval before it is paid), not the outcome, which is what makes one
+        # sentence honest on all four paths. Their card and their history both show the day.
+        crossing = overtime.announce_crossing(
+            conn,
+            worker_id=req.worker_id,
+            site_name=session["site_name"],
+            clock_in_time=session["clock_in_time"],
+            values=rules,
+            moment=now,
         )
         _audit(
             conn,
             action="force_clock_out",
             actor=current,
             entity="active_sessions",
-            entity_id=req.worker_id,
-            after={
-                "hours": hours_worked,
-                "break_hours": break_taken,
-                "elapsed_hours": elapsed_hours,
-                "log_id": log_id,
-            },
+            entity_id=req.worker_id,                after={
+                    "hours": hours_worked,
+                    "break_hours": break_taken,
+                    "elapsed_hours": assessment["elapsed_hours"],
+                    "log_id": log_id,
+                },
             request=request,
         )
+    overtime.deliver_worker_notices(crossing)
     return {
         "status": "success",
         "message": (
-            f"Worker {req.worker_id} successfully Force Clocked Out. "
-            f"{shift_hours.describe(elapsed_hours, hours_worked, break_taken)}."
+            f"Worker {req.worker_id} successfully Force Clocked Out. {record['description']}."
         ),
         "hours": hours_worked,
         "break_hours": break_taken,
+    }
+
+
+def _form_flag(value: str | None) -> bool:
+    """A checkbox-style form field: anything that reads as a yes is one.
+
+    Mirrors ``shift_hours.auto_close_enabled`` on purpose - an unreadable value must not
+    quietly turn a flag *on*, and the phone sends a plain ``1``.
+    """
+    if value is None:
+        return False
+    return str(value).strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _early_checkout_refusal(record: Mapping[str, Any]) -> dict[str, Any]:
+    """The early clock-out question, with the numbers the phone needs to spell it out.
+
+    ``message`` is English because the API has one language; the app does not use it -
+    it builds the same sentence from these figures in the reader's own language, so the
+    warning a worker sees on a site in Cairo is not written in English.
+    """
+    return {
+        "error_code": "confirm_early_checkout",
+        "message": (
+            f"You have worked {record['paid_hours']:.2f}h of the "
+            f"{record['regular_hours']:.2f}h paid day. Clocking out now records "
+            f"{record['paid_hours']:.2f}h, not the full day. Repeat the punch with "
+            "confirm_early_checkout=1 to record it, or stay clocked in."
+        ),
+        "paid_hours": record["paid_hours"],
+        "regular_hours": record["regular_hours"],
+        "elapsed_hours": record["elapsed_hours"],
+        "break_hours": record["break_hours"],
+        "short_hours": record["short_hours"],
     }
 
 
@@ -2774,15 +3778,6 @@ def _no_open_shift_message(conn: sqlite3.Connection, worker_id: str) -> str:
         f"Your shift was closed automatically at {row['timestamp']}: {paid:.2f}h paid{break_note}. "
         "Nothing more is recorded for it - ask your administrator if you kept working."
     )
-
-
-def _overtime_hours(hours: float) -> float | None:
-    try:
-        regular = float(get_shift_rules()["regular_hours"])
-    except (KeyError, TypeError, ValueError):
-        regular = 8.0
-    excess = round(hours - regular, 4)
-    return excess if excess > 0 else None
 
 
 @router.get("/admin/logs")
@@ -2843,7 +3838,111 @@ async def list_notifications(
         else:
             rows = conn.execute("SELECT * FROM admin_notifications ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         unread = notifications.unread_count(conn)
-    return _json({"unread": unread, "notifications": [dict(row) for row in rows]})
+        unacknowledged = notifications.unacknowledged_count(conn)
+    return _json(
+        {
+            "unread": unread,
+            "unacknowledged": unacknowledged,
+            "notifications": [dict(row) for row in rows],
+        }
+    )
+
+
+class NotificationAcknowledgement(BaseModel):
+    """The reason an operator accepted an alert.
+
+    ``note`` is **required**, and that is the whole difference between this endpoint and
+    ``/read``. An alert that records a decision - a forced start past a failing self-test, a
+    channel that has stopped delivering - is not answered by having been looked at: it is
+    answered by somebody saying, in their own words, why it is acceptable. A bare click leaves
+    the next person to read the same row with the same question, and leaves an investigation
+    with no account of who decided what.
+
+    Free text, so it goes through the prose profile like every note in this application:
+    apostrophes and ampersands survive, markup and script URLs do not.
+    """
+
+    note: str
+
+    @field_validator("note")
+    @classmethod
+    def _plain_note(cls, value: str) -> str:
+        return textguard.prose(value, field="Acknowledgement reason", max_length=textguard.MAX_NOTE)
+
+
+@router.post("/admin/notifications/{notification_id}/acknowledge")
+async def acknowledge_notification(
+    notification_id: int,
+    payload: NotificationAcknowledgement,
+    request: Request,
+    current: CurrentUser = Depends(admin_only),
+):
+    """Accept an alert with a reason, and put both on the record.
+
+    Three writes, in one transaction, each doing a different job: the row gains the
+    acknowledgement (``notifications.acknowledge``), the append-only ``audit_log`` gains the
+    event with the actor, the note and the request's own provenance, and the alert is marked
+    read - an alert somebody has accepted has by definition been seen, and leaving it in the
+    unread count would badge a decision that has already been made.
+
+    Acknowledging twice is refused rather than overwritten. The first acceptance is the one
+    that was actually made, and rewriting it would leave the audit trail describing a decision
+    nobody took; the second caller is told who accepted it and when, which is the answer they
+    needed anyway.
+    """
+    with db(write=True) as conn:
+        row = conn.execute(
+            "SELECT * FROM admin_notifications WHERE id = ?", (int(notification_id),)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Notification not found.")
+        if row["acknowledged_at"]:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Notification {notification_id} was already acknowledged by "
+                    f"{row['acknowledged_by']} on {row['acknowledged_at']}. The first "
+                    "acknowledgement is the one on the record; a second would rewrite whose "
+                    "decision it was."
+                ),
+            )
+        wrote = notifications.acknowledge(
+            conn, int(notification_id), by=current.id, note=payload.note
+        )
+        if not wrote:
+            # Reachable only if the row was acknowledged between the read above and this
+            # statement - which the write lock makes impossible here, so this is the second
+            # layer of the same rule rather than a second rule.
+            raise HTTPException(
+                status_code=409,
+                detail=f"Notification {notification_id} was acknowledged concurrently.",
+            )
+        _audit(
+            conn,
+            action="notification_acknowledge",
+            actor=current,
+            entity="admin_notifications",
+            entity_id=notification_id,
+            before={"acknowledged": False},
+            after={
+                "note": payload.note,
+                "kind": row["kind"],
+                "severity": row["severity"],
+                "title": row["title"],
+                "alerted_at": row["created_at"],
+            },
+            request=request,
+        )
+        acknowledged = conn.execute(
+            "SELECT * FROM admin_notifications WHERE id = ?", (int(notification_id),)
+        ).fetchone()
+    return _json(
+        {
+            "status": "success",
+            "message": f"Notification {notification_id} acknowledged.",
+            "notification": dict(acknowledged),
+        }
+    )
 
 
 @router.post("/admin/notifications/{notification_id}/read")
@@ -2894,6 +3993,22 @@ async def enroll_worker(
     photo: UploadFile = File(...),
     current: CurrentUser = Depends(admin_only),
 ):
+    """Write a reference photo as an *existing* account's template.
+
+    This is the console's replacement for a face that was never taken or has gone stale
+    (``/admin/enroll/needs_reenrollment`` names the second case): the administrator picks a
+    file from the machine in front of them, and everything a punch is checked against --
+    the template and the selfie beside it -- is rewritten under the account's immutable
+    biometric id. A file from disk, so no liveness claim is made for it: the paths that
+    judge a live capture are ``/worker/me/enroll`` and the person's own registration link.
+
+    Any administrator may do this for a **worker**, and that is deliberate: it is the same
+    authority as changing their name or their rate, and it is the answer on the day a
+    worker's photo will not match. Over an **administrator's** face it is a standard admin's
+    escalation - a template is what a punch is verified against, so writing one is choosing
+    who that account will clock in as - and ``_guard_standard_admin`` refuses it, exactly as
+    it does for the account's name, its password and its status.
+    """
     try:
         int(worker_id)
     except ValueError:
@@ -2903,6 +4018,7 @@ async def enroll_worker(
         user = conn.execute("SELECT name, role FROM users WHERE id = ?", (worker_id,)).fetchone()
     if user is None:
         raise HTTPException(status_code=404, detail="Worker ID not found in database. Create the user first.")
+    _guard_standard_admin(current, user, "enroll a face for")
 
     file_bytes = await uploads.read_photo(photo, field="enrollment photo")
     try:
@@ -2954,9 +4070,185 @@ async def enroll_worker(
         raise HTTPException(status_code=500, detail=f"Enrollment failed: {exc}")
 
 
+# ---------------------------------------------------------------------------
+# company identity - whose app this is, on the login screen and on every sheet
+# ---------------------------------------------------------------------------
+#
+# The company's name, its lockup lines and its mark used to be a constant in
+# ``frontendjavascript.js`` and a file beside it, which meant every screen that says whose
+# payroll this is - and the sheet an administrator hands to payroll - needed a code change
+# and a redeploy to carry a different name. They are a settings row now (see ``branding``),
+# editable on the console's Admin tab like the shift rules next door.
+#
+# The read is deliberately public. The screen that most needs the company's name is the
+# login panel, which by definition has no session, and the alternative - a hardcoded wordmark
+# on the one screen whose whole job is to answer "is this the app my administrator told me
+# about?" - is the thing being removed here. What this exposes is the name the company put
+# on its own front door and the mark it prints on its own documents: no account details, no
+# configuration, nothing an unauthenticated visitor could not read off a payslip.
+
+
+@router.get("/branding")
+async def read_branding():
+    """The company's own name and mark, as configured. Public: the login screen needs it.
+
+    A field is ``null`` when nobody has configured it - the caller keeps the lockup it
+    shipped with - and an empty string when the company decided that line is not printed.
+    Those are different answers and they stay different all the way to the paper, which is
+    why this returns both rather than flattening them into one "empty".
+
+    ``logo_url`` is a path, not an absolute URL: this page is served from a LAN address, a
+    chosen port or an HTTPS tunnel depending on the deployment, and only the client knows
+    which origin it is talking to. The ``?v=`` in it is the stored version of the bytes, so
+    a replaced mark is a different URL and no cache can serve the old one to a fresh page.
+    """
+    with db() as conn:
+        return _json(branding.payload_for_api(conn))
+
+
+@router.get("/branding/logo")
+async def read_branding_logo():
+    """The company's mark, as bytes. Public, like the name beside it, and for the same reason.
+
+    Cached hard (a year, immutable) because the URL carries the version of the bytes it
+    names: a replacement is a *different* URL, so there is nothing here to revalidate and a
+    phone stops fetching a logo it already has. The type is one of two this server chose
+    when it re-encoded the upload, and ``nosniff`` says so - the browser is not invited to
+    decide for itself what these bytes are.
+    """
+    with db() as conn:
+        stored = branding.logo_bytes(conn)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="No logo is configured.")
+    data, mime, _version = stored
+    return Response(
+        content=data,
+        media_type=mime,
+        headers={
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Length": str(len(data)),
+        },
+    )
+
+
+class BrandingUpdate(BaseModel):
+    """The company's own lines. Every one of them is optional *and* nullable.
+
+    Absent means "leave this alone"; ``null`` means "back to the shipped lockup"; a string -
+    including the empty one - means the company decided what that line says, so an empty box
+    is a line that is not printed rather than a silent reset.
+    """
+
+    name: str | None = None
+    legal: str | None = None
+    est: str | None = None
+    tagline: str | None = None
+
+
+@router.post("/admin/branding")
+async def update_branding(
+    request: Request, payload: BrandingUpdate, current: CurrentUser = Depends(admin_only)
+):
+    """Save the company's name and lockup lines.
+
+    ``admin_only``, the same authority the shift rules beside it take: this is the company's
+    own identity, not one account's, and it is the \"who runs this deployment\" role rather
+    than something a page can reach without a session (see the read endpoints above for why
+    reading is public and writing is not).
+    """
+    supplied = {key: getattr(payload, key) for key in payload.model_fields_set}
+    if not supplied:
+        raise HTTPException(status_code=400, detail="Nothing to save.")
+    with db(write=True) as conn:
+        result = branding.write(conn, supplied, actor_id=current.id)
+        _audit(
+            conn,
+            action="branding_update",
+            actor=current,
+            entity="company_settings",
+            entity_id=1,
+            before=result["before"],
+            after=result["after"],
+            request=request,
+        )
+        state = branding.payload_for_api(conn)
+    return {"status": "success", "branding": state}
+
+
+@router.post("/admin/branding/logo")
+async def upload_branding_logo(
+    request: Request,
+    logo: UploadFile = File(...),
+    current: CurrentUser = Depends(admin_only),
+):
+    """Set the company's mark from an uploaded image.
+
+    The bytes are validated by ``uploads`` (size while reading, type by signature, pixel
+    ceiling before decoding) and then *re-encoded* into the stored form - PNG when the image
+    has transparency to keep, JPEG otherwise. The file the browser can fetch afterwards is
+    therefore one this server wrote, never the one it was sent: an upload cannot become a
+    document this origin serves, whatever it claimed to be.
+
+    The audit records the mark's *shape* - type, dimensions, size - and never its bytes: the
+    question the log answers is "who put this logo on our payslips, and when", and a few
+    hundred kilobytes of base64 in every audit row would make the log unreadable.
+    """
+    data = await uploads.read_photo(logo, field="logo")
+    with db(write=True) as conn:
+        before = branding.read(conn)["logo"]
+        state = branding.set_logo(conn, data, actor_id=current.id)
+        _audit(
+            conn,
+            action="branding_logo_set",
+            actor=current,
+            entity="company_settings",
+            entity_id=1,
+            before=before,
+            after=state["logo"],
+            request=request,
+        )
+        payload = branding.payload_for_api(conn)
+    return {"status": "success", "branding": payload}
+
+
+@router.delete("/admin/branding/logo")
+async def remove_branding_logo(request: Request, current: CurrentUser = Depends(admin_only)):
+    """Remove the company's mark, so the one this application ships with is used again.
+
+    A named act rather than "upload an empty file": "put our old mark back" is a thing an
+    administrator wants to do, and it is the undo for the upload above. The row's version
+    is bumped either way, so a screen still holding the removed mark's URL is holding a URL
+    that now answers 404 rather than a cached image of a logo the company just took down.
+    """
+    with db(write=True) as conn:
+        had = branding.clear_logo(conn, actor_id=current.id)
+        if had:
+            _audit(
+                conn,
+                action="branding_logo_removed",
+                actor=current,
+                entity="company_settings",
+                entity_id=1,
+                request=request,
+            )
+        payload = branding.payload_for_api(conn)
+    return {"status": "success", "removed": had, "branding": payload}
+
+
 @router.get("/admin/shift_rules")
 async def read_shift_rules(current: CurrentUser = Depends(admin_only)):
-    return get_shift_rules()
+    """The company's shift rules, and what this application makes of them.
+
+    ``day_end`` is not a setting; it is the consequence of the settings beside it - the two
+    watchers' thresholds, whether the auto-close is on, whether the crossing alert can
+    therefore ever fire, and which rule ends a day. It travels with the rules so the console
+    can say "with these numbers, nothing will ever be flagged as overtime" on the screen
+    where the numbers are typed, instead of only in a startup log nobody reads. The
+    precedence itself is stated once, in ``shift_hours.day_end_rules``.
+    """
+    rules = get_shift_rules()
+    return {**rules, "day_end": shift_hours.day_end_rules(rules)}
 
 
 @router.post("/admin/shift_rules")
@@ -3013,6 +4305,16 @@ async def update_shift_rules(
         raise HTTPException(status_code=400, detail="break_after_hours must be between 0 and 24.")
     if changes.get("regular_hours") is not None and not (0 < float(changes["regular_hours"]) <= 24):
         raise HTTPException(status_code=400, detail="regular_hours must be between 0 and 24.")
+    # The overtime line is a *paid-hours* figure, and it is compared against one, so it gets
+    # the same range check the paid day does. It went unvalidated: a zero (or a negative, or
+    # 900) was stored, and a line at 0 holds every shift of every length for approval while a
+    # line at 900 silently means "nobody is ever on overtime". Neither is a preference.
+    if changes.get("overtime_notify_hours") is not None and not (
+        0 < float(changes["overtime_notify_hours"]) <= 24
+    ):
+        raise HTTPException(
+            status_code=400, detail="overtime_notify_hours must be between 0 and 24."
+        )
     if changes.get("auto_close_at_regular") is not None:
         changes["auto_close_at_regular"] = 1 if int(changes["auto_close_at_regular"]) else 0
 
@@ -3039,7 +4341,11 @@ async def update_shift_rules(
             after=changes,
             request=request,
         )
-    return {"status": "success", "rules": get_shift_rules()}
+    # The same ``day_end`` block the read returns, so saving a change shows its verdict on
+    # the spot: an operator who sets the alert back above the regular day sees immediately
+    # that nothing will be flagged.
+    rules = get_shift_rules()
+    return {"status": "success", "rules": {**rules, "day_end": shift_hours.day_end_rules(rules)}}
 
 
 # ---------------------------------------------------------------------------
@@ -3204,6 +4510,15 @@ app.include_router(notes.admin_router, prefix="/api/v1")
 # public one-tap punch the link itself authenticates. Additive, like the routers above.
 app.include_router(quick_links.admin_router, prefix="/api/v1")
 app.include_router(quick_links.public_router, prefix="/api/v1")
+# The root tier's own surface: runtime configuration, the private alert hub, diagnostics and
+# the raw audit stream. Additive, like every router above - nothing already served moved, and
+# every route on it is built from ``require_developer``, so an administrator cannot reach one
+# by any name they can present.
+app.include_router(developer.router, prefix="/api/v1")
+# Every statement the slow-query view reports carries the trace id of the request that ran it,
+# and the id is owned by ``developer``. Bound here rather than inside ``database`` because the
+# layer below must not import the tier above it - the dependency points one way.
+database.set_trace_provider(developer.current_trace_id)
 
 
 @app.get("/enroll/{token}", include_in_schema=False)
@@ -3306,8 +4621,72 @@ async def revalidate_frontend_assets(request: Request, call_next):
     return response
 
 
+# 7. Tag every request with a trace id, and let the failures an operator needs to hear about
+#    reach the root tier's alert hub.
+#
+# The id is set before the route runs so that a diagnostics statement, an audit row and an
+# alert written by the same request can be joined by somebody holding only one of them. A
+# ContextVar, so two concurrent requests never share one, and cleared afterwards so a pooled
+# task cannot inherit the last request's id.
+#
+# The alert is raised on the *response* status as well as on an exception that got past every
+# handler: a 500 that a handler turned into a response and one that propagated are the same
+# event to an operator. A 429 is the rate-limit signal for the same reason - it is observable
+# at the edge, so nothing has to reach into the limiter to notice a client being refused.
+@app.middleware("http")
+async def developer_trace_and_alerts(request: Request, call_next):
+    developer.set_trace_id(developer.new_trace_id())
+    try:
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            developer.raise_alert(
+                kind="unhandled_exception",
+                summary=f"{request.method} {request.url.path} raised {type(exc).__name__}",
+                severity="critical",
+                source="http",
+                detail={"method": request.method, "path": request.url.path},
+            )
+            raise
+        if request.url.path.startswith("/api/"):
+            if response.status_code >= 500:
+                developer.raise_alert(
+                    kind="unhandled_exception",
+                    summary=f"{request.method} {request.url.path} answered {response.status_code}",
+                    severity="error",
+                    source="http",
+                    detail={
+                        "method": request.method,
+                        "path": request.url.path,
+                        "status": response.status_code,
+                    },
+                )
+            elif response.status_code == 429:
+                # Deduplicated over five minutes: a scan trips this hundreds of times, and an
+                # alert hub that fills with one client's noise is one nobody reads.
+                developer.raise_alert(
+                    kind="rate_limit_spike",
+                    summary=f"{request.url.path} refused a client for rate",
+                    severity="warning",
+                    source="http",
+                    detail={"method": request.method, "path": request.url.path},
+                    dedupe_window_seconds=300,
+                )
+        # The id travels back to the caller so a worker's screenshot and an operator's log line
+        # can be joined without either of them reading a database.
+        response.headers["X-Trace-Id"] = developer.current_trace_id() or ""
+        return response
+    finally:
+        developer.set_trace_id(None)
+
+
 if settings.face_model_preload:  # pragma: no cover - heavy, skipped when disabled
     try:
-        DeepFace.build_model("VGG-Face")
-    except Exception as exc:  # pragma: no cover - the model can be fetched lazily
-        print(f"[startup] DeepFace model preload skipped: {exc}")
+        # The ONNX session, not a Keras graph: ~0.2 s and ~150 MiB against ~2.7 s and a
+        # 553 MiB framework. Preloading it means a worker's first punch does not pay for
+        # the load, and a missing graph is reported here rather than at the gate.
+        import face_onnx
+
+        face_onnx.load_now()
+    except Exception as exc:  # pragma: no cover - the model can also be fetched lazily
+        print(f"[startup] face model preload skipped: {exc}")

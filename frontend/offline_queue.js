@@ -20,6 +20,10 @@
  *                    canonical field string, stored in IndexedDB.
  *  4. replay         POST /attendance/sync -> a per-punch verdict; the response
  *                    carries a fresh anchor for the next offline window.
+ *  5. selfie         POST /attendance/sync/photo -> the frame this punch was signed
+ *                    against, scored server-side (liveness + the face match) onto the
+ *                    review row the punch was materialised on. Kept on the phone until
+ *                    the server confirms it, then dropped.
  *
  *  WHAT IS SIGNED (and why it must match exactly)
  *  ----------------------------------------------
@@ -53,8 +57,17 @@
  *  -------------
  *  A queued punch is authorised by the session token that replays it, not by the
  *  password typed at capture time (the server cannot check a password with no
- *  network). The selfie is hashed and kept on the phone - there is no upload
- *  endpoint for it yet - so photo_sha256 binds the punch to that image.
+ *  network). The selfie is hashed and kept on the phone until the queue lands, and
+ *  then uploaded so the server can check the frame it never saw; photo_sha256 is
+ *  inside the signature, which is what binds the uploaded image to the punch. Until
+ *  that upload, the hash is the only thing tying the punch to the photo.
+ *
+ *  NOTHING HERE IS APPROVED
+ *  ------------------------
+ *  A punch replayed from this queue arrives as attendance that has to be reviewed -
+ *  the hours are recorded but not payable until an administrator approves them, and
+ *  the endpoint above is what gives that reviewer something to read. The phone is not
+ *  the authority on whether the frame was genuine; it is the only witness.
  * ===================================================================== */
 'use strict';
 
@@ -62,7 +75,13 @@ const OFFLINE_DB_NAME = 'site_attendance_offline';
 const OFFLINE_DB_VERSION = 1;
 /** Server default is OFFLINE_BATCH_MAX=50; stay under it and halve on a 413. */
 const OFFLINE_BATCH_CHUNK = 25;
-/** Keep local photos as long as the punch itself can still be replayed. */
+/** How long a photo the server has not confirmed is worth keeping.
+ *
+ *  Long enough to outlast the offline window itself: a frame the upload could not
+ *  deliver is evidence still owed to a reviewer, so it is held for as long as the punch
+ *  can be replayed. Once the server has it, the copy here goes immediately - see
+ *  ``prune`` - because a face does not belong on a worker's phone any longer than the
+ *  queue needs it. */
 const OFFLINE_PHOTO_RETENTION_HOURS = 72;
 /** Local history of settled punches; the server keeps the authoritative copy. */
 const OFFLINE_HISTORY_RETENTION_DAYS = 7;
@@ -313,6 +332,29 @@ const OfflineHttp = {
             const response = await fetch(this.baseURL() + path, {
                 method: 'POST', headers, body: JSON.stringify(body || {})
             });
+            const parsed = await response.json().catch(() => null);
+            return { ok: response.ok, status: response.status, body: parsed, offline: false };
+        } catch (error) {
+            return { ok: false, status: 0, body: null, offline: true, error };
+        }
+    },
+
+    /**
+     * POST a multipart form - one photo, no Content-Type header set by us.
+     *
+     * Leaving the header alone is the point: only ``fetch`` knows the multipart boundary it
+     * generated, and a hand-written ``Content-Type`` would replace the body's own and make
+     * the server unable to parse a single part. The same envelope the online clock-in and the
+     * enrollment screen use (see ``quick.js``/``enroll.js``).
+     */
+    async postForm(path, form, token) {
+        const headers = {};
+        if (token) headers['Authorization'] = `Bearer ${token}`;
+        if (typeof API !== 'undefined' && API.isTunnelHost && API.isTunnelHost()) {
+            headers['ngrok-skip-browser-warning'] = 'true';
+        }
+        try {
+            const response = await fetch(this.baseURL() + path, { method: 'POST', headers, body: form });
             const parsed = await response.json().catch(() => null);
             return { ok: response.ok, status: response.status, body: parsed, offline: false };
         } catch (error) {
@@ -692,6 +734,23 @@ const OFFLINE = {
         return [OFFLINE_CRYPTO.roundCoord(parts[0]), OFFLINE_CRYPTO.roundCoord(parts[1])];
     },
 
+    /**
+     * Send one queued selfie to the endpoint that scores it.
+     *
+     * Multipart, one frame per request, deliberately not a field inside the punch batch: the
+     * server reads an upload through one size-checked policy *while it is still arriving*, and
+     * a JSON body is parsed in full before any handler can measure it (see
+     * ``backend/uploads.py``). A 503 here means the server could not score it right now, which
+     * is why the caller keeps the photo rather than dropping it.
+     */
+    async uploadPhoto(record, blob, token) {
+        const form = new FormData();
+        form.append('client_punch_id', record.client_punch_id);
+        const name = String(blob && blob.type || '').includes('png') ? 'selfie.png' : 'selfie.jpg';
+        form.append('photo', blob, name);
+        return OfflineHttp.postForm('/attendance/sync/photo', form, token);
+    },
+
     /** Exactly the fields the sync endpoint models; local bookkeeping is dropped. */
     toPayload(record) {
         return {
@@ -775,7 +834,10 @@ const OFFLINE = {
     async syncNow() {
         const summary = {
             sent: 0, applied: 0, flagged: 0, rejected: 0, duplicates: 0,
-            pending: 0, offline: false, error: null, results: []
+            pending: 0, offline: false, error: null, results: [],
+            // The frames: ``uploaded`` reached the server and were scored there, ``pending``
+            // did not and are still on this phone for the next attempt.
+            photos: { uploaded: 0, pending: 0, error: null }
         };
         const worker = this.currentWorker();
         if (!worker) { summary.error = 'no_session'; return summary; }
@@ -798,7 +860,10 @@ const OFFLINE = {
         let queue = await this.queuedPunches(worker.id);
         let rounds = 0;
 
-        while (queue.length && rounds < 20) {
+        // ``summary.offline`` stops the replay too: a photo upload that found no network means
+        // the next batch POST would find none either, and a queue that is safe is worth more
+        // than a round trip that is certain to fail.
+        while (queue.length && rounds < 20 && !summary.offline) {
             rounds += 1;
             const batch = queue.slice(0, chunkSize);
             const response = await OfflineHttp.post(
@@ -867,6 +932,30 @@ const OFFLINE = {
                     code: verdict.code || null,
                     effective_time: verdict.effective_time || null
                 });
+
+                // The frame, to the endpoint that scores it. Best-effort by design: no punch
+                // depends on this, and a photo that does not make it is retried on the next
+                // sync instead of holding the queue up. A *rejected* punch has no review row
+                // to score, so its photo is not sent at all.
+                if (settled.status === 'synced' && record.photo_sha256) {
+                    const blob = await this.photo(record.client_punch_id);
+                    if (blob) {
+                        const upload = await this.uploadPhoto(record, blob, worker.token);
+                        if (upload.ok) {
+                            summary.photos.uploaded += 1;
+                            // The server has it: this phone keeps the punch and drops the face.
+                            await OFFLINE_DB.remove('photos', record.client_punch_id).catch(() => {});
+                            await OFFLINE_DB.put('punches', {
+                                ...settled,
+                                photo_uploaded_at: OFFLINE_CRYPTO.formatTs(Date.now())
+                            });
+                        } else {
+                            summary.photos.pending += 1;
+                            summary.photos.error = OfflineHttp.errorMessage(upload) || 'photo_upload_failed';
+                            if (upload.offline) { summary.offline = true; break; }
+                        }
+                    }
+                }
             }
 
             // A fresh anchor: reconnecting is exactly when authority is renewed.
@@ -940,7 +1029,14 @@ const OFFLINE = {
             if ((punch.captured_wall_ms || 0) < historyCutoff) {
                 await OFFLINE_DB.remove('punches', punch.client_punch_id);
             }
-            if ((punch.captured_wall_ms || 0) >= photoCutoff) keepPhoto.add(punch.client_punch_id);
+            // A settled punch keeps its photo only while the server has not got it. Once it
+            // has been scored there, the frame is on the record where a reviewer can see what
+            // was done about it, and the copy here is a face on somebody's phone with nothing
+            // left to do - the sync drops it immediately, and this is the backstop for the
+            // paths that could not (an upload that failed, a worker who never synced again).
+            if (!punch.photo_uploaded_at && (punch.captured_wall_ms || 0) >= photoCutoff) {
+                keepPhoto.add(punch.client_punch_id);
+            }
         }
 
         const photos = await OFFLINE_DB.all('photos').catch(() => []);

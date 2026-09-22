@@ -66,6 +66,12 @@ A bare list is still *read* - an upgraded site has thousands of them and none of
 is unreadable - but it is read as ``pipeline = None``: "made before we recorded this",
 which is exactly as stale as the recorded names say it is. The two shapes are handled
 in one place, ``read_reference``, so no caller has to ask which one it is holding.
+
+Both recorded names are checked, not just the first (see ``stale_reason``). The crop and
+the recognition model are halves of one thing - which pixels are embedded, and what the
+vector means - and each half owns a set of decision lines in ``face_detector``. A template
+whose *model* changed is refused for the same reason a template whose pipeline changed is:
+no distance measured across the two means anything, and neither does a threshold.
 """
 
 from __future__ import annotations
@@ -254,6 +260,7 @@ def is_enrolled(user_id: str, biometric_id: str | None = None) -> bool:
 STALE_UNREADABLE = "unreadable"
 STALE_NO_PROVENANCE = "no_provenance"
 STALE_OTHER_PIPELINE = "other_pipeline"
+STALE_OTHER_MODEL = "other_model"
 
 
 @dataclass(frozen=True)
@@ -296,6 +303,18 @@ def _model_name() -> str:
     return face_engine.FACE_MODEL
 
 
+def _expected_dimensions() -> int:
+    """The embedding width the live engine produces.
+
+    Read lazily from ``face_engine`` rather than stored, for the same reason the model name
+    is: a template is judged against what this build would write *now*, and a copy frozen at
+    import time would keep accepting the previous model's vectors after a swap.
+    """
+    import face_engine
+
+    return int(face_engine.FACE_DIMENSIONS)
+
+
 def read_reference(path: str) -> Reference:
     """The template at ``path``, in either shape. Raises on a file that is neither.
 
@@ -320,7 +339,9 @@ def read_reference(path: str) -> Reference:
     raise ValueError(f"template at {os.path.basename(path)} is neither a vector nor a record")
 
 
-def stale_reason(reference: Reference, *, expected_dimensions: int | None = None) -> str | None:
+def stale_reason(
+    reference: Reference, *, expected_dimensions: int | None = None
+) -> str | None:
     """Why ``reference`` cannot be scored, or ``None`` when it can.
 
     Ordered by what an administrator has to do about it, most actionable first. A wrong
@@ -328,13 +349,30 @@ def stale_reason(reference: Reference, *, expected_dimensions: int | None = None
     all, and the failure that produces is a shape error deep inside a numpy call, which
     surfaces to a worker as "Internal processing error" - a 500 that says nothing. Here it
     is the same refusal as a stale template, which names the fix.
+
+    The *model* is checked beside the pipeline because the two are the halves of one thing:
+    the crop decides which pixels are embedded and the model decides what the vector means,
+    so replacing either moves every distance and needs a band derived for the pair. Without
+    this check a model swap would keep the pipeline's name - and therefore that pipeline's
+    decision lines - and score a new embedding space against thresholds measured in the old
+    one. ``face_detector.band_for`` is keyed by both, so this is also what makes that key
+    answerable: a template whose model is not the live one never reaches the lookup.
     """
-    if expected_dimensions is not None and len(reference.embedding) != expected_dimensions:
+    if expected_dimensions is None:
+        # The live engine's own width, not "skip the check". A dimension is the one property
+        # of a template that needs no model file and no comparison to be sure about, and
+        # leaving it unverified when a caller omits the argument was the single way a
+        # 4096-float vector reached a 128-float comparison - where numpy raises a shape error
+        # deep inside ``cosine`` and the worker is told "Internal processing error".
+        expected_dimensions = _expected_dimensions()
+    if len(reference.embedding) != expected_dimensions:
         return STALE_UNREADABLE
     if reference.pipeline is None:
         return STALE_NO_PROVENANCE
     if reference.pipeline != current_pipeline():
         return STALE_OTHER_PIPELINE
+    if reference.model is not None and reference.model != _model_name():
+        return STALE_OTHER_MODEL
     return None
 
 
@@ -372,6 +410,11 @@ STALE_EXPLANATIONS: dict[str, str] = {
     ),
     STALE_OTHER_PIPELINE: (
         "the stored face template was made by a different face pipeline and has to be "
+        "re-enrolled"
+    ),
+    STALE_OTHER_MODEL: (
+        "the stored face template was made by a different recognition model, so no distance "
+        "computed from it can be compared with the thresholds in force, and it has to be "
         "re-enrolled"
     ),
 }

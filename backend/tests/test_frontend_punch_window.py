@@ -170,9 +170,10 @@ const results = {};
 
 // 6. the open card carries the line, and opening it is what asks
 //
-// The VM has no getUserMedia, so the two things the card asks of the device are stubbed;
-// what this asserts is the page's own code. ``openCamera`` is read mid-flight, the way the
-// worker sees it the moment the card appears.
+// The device is overridden rather than installed: this suite is about the window line, not
+// about capture, and installing a camera is what a suite about capture does instead (see
+// test_frontend_punch_capture). ``openCamera`` is read mid-flight, the way the worker sees it
+// the moment the card appears.
 {
     const env = workerEnv();
     env.evaluate("Object.defineProperty(Camera, 'isSupported', { value: true, configurable: true })");

@@ -2,13 +2,16 @@
 
 WHY THIS EXISTS
 ---------------
-Every punch is a VGG-Face embedding plus an MTCNN detection, and those are the most
-expensive things this application does: roughly half a second of CPU each on the deployment
-host, with TensorFlow allocating inside a graph the whole process shares. Until this module
-existed that work ran wherever the caller happened to be:
+Every punch is a face embedding plus a face detection, and those are the two most expensive
+things this application does. Neither of them runs TensorFlow any more: the detection is
+OpenCV's YuNet and the embedding is a FaceNet-128 graph executed by ONNX Runtime (see
+``face_onnx``), which between them took a verification from roughly half a second of CPU and
+~2.3 GiB of resident graph down to tens of milliseconds and ~150 MiB. What has *not* changed
+is that model work must be bounded, so this module still owns the bound. Until it existed
+that work ran wherever the caller happened to be:
 
 * on anyio's shared thread pool (40 threads) from ``/attendance/verify`` and
-  ``/q/{token}``, so forty simultaneous punches meant forty simultaneous TensorFlow calls;
+  ``/q/{token}``, so forty simultaneous punches meant forty simultaneous inferences;
 * **on the event loop** from the punch's liveness check and from three enrollment paths (the
   console's create-account, the registration link and the self-service capture), so one
   administrator uploading a photo stalled *every* request in that worker for the length of
@@ -23,19 +26,27 @@ One queue, a fixed number of worker threads, and the only functions in the codeb
 call the face models. A caller submits work and gets a result; when the queue is full it is
 told (``FaceEngineBusy``) instead of queuing behind nothing in particular.
 
-The capacity is measured, not guessed. Eight verifications on the deployment host (CPU
-only, TensorFlow using every core):
+The capacity is measured, not guessed. Eight verifications on the deployment host, when the
+embedding was VGG-Face and TensorFlow was using every core:
 
     concurrency 1 -> 4.21 s total, 0.53 s per call, 1.90 verifications/s
     concurrency 2 -> 3.13 s total, 0.78 s per call, 2.55 verifications/s
     concurrency 4 -> 3.13 s total, 1.54 s per call, 2.56 verifications/s
 
-The third and fourth concurrent inference add **no throughput at all** and double the time
-a worker waits at the gate, so the default is two. What absorbs a site arriving at 04:00 is
-the *queue*, not the concurrency: a punch costs one or two slots (its liveness check and its
-verification), and beyond the queue's depth a request is refused with 503 + ``Retry-After``
-- which the client can retry, and which the offline punch queue exists to cover - rather
-than being stacked up invisibly until the process runs out of memory.
+The third and fourth concurrent inference added **no throughput at all** and doubled the time
+a worker waited at the gate, so the default is two. That measurement belongs to the retired
+pipeline and the default is kept rather than inherited blindly - the same benchmark run
+against engineering, three models wide, showed the ONNX engine scaling where TensorFlow did
+not (86 -> 95 -> 121 embeds/s from one to four callers, against 2.9 -> 2.8 - 2.5 falling for
+the Keras path), so two is now conservative. **Raising it is a punch-level decision, not a
+benchmark-level one**: this pool also carries the liveness check and the detector, and those
+share the same cores. Measure a real site's load before changing it.
+
+What absorbs a site arriving at 04:00 is the *queue*, not the concurrency: a punch costs one
+or two slots (its liveness check and its verification), and beyond the queue's depth a request
+is refused with 503 + ``Retry-After`` - which the client can retry, and which the offline punch
+queue exists to cover - rather than being stacked up invisibly until the process runs out of
+memory.
 
 TWO RULES WORTH KNOWING
 -----------------------
@@ -44,8 +55,8 @@ TWO RULES WORTH KNOWING
    runtime rather than deadlocking, and job bodies call the ``*_direct`` helpers, which do
    the model call without going through the queue.
 2. **This does not isolate the models from the API process.** A crash inside native
-   TensorFlow (an out-of-memory kill, a corrupt image reaching a half-installed model) still
-   takes the API process with it, and a saturated queue still competes for the same CPU. Real
+   ONNX Runtime (an out-of-memory kill, a corrupt image reaching a half-installed model)
+   still takes the API process with it, and a saturated queue still competes for the same CPU. Real
    isolation means a separate model server - Triton, TorchServe - behind a network call;
    ``FaceEngine`` is the seam that makes that a second implementation rather than a rewrite.
    Until then this bounds the damage, and ``stats()`` makes it visible.
@@ -64,19 +75,25 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, NamedTuple
 
 import face_detector
+import face_onnx
 import telemetry
 from config import settings
 
 log = logging.getLogger(__name__)
 
-#: The detector and model every path in this application uses. Named once so a punch and an
+#: The recognition model every path in this application uses. Named once so a punch and an
 #: enrollment cannot drift onto different models and stop matching each other.
-FACE_MODEL = "VGG-Face"
+#:
+#: It is also written beside every stored template and compared by
+#: ``biometrics.stale_reason``, so changing this string invalidates every template on disk.
+#: That is the intent, not a side effect: two models that both return 128 floats still mean
+#: different things, and a template scored against thresholds derived in the other one's
+#: geometry is a number with no meaning.
+FACE_MODEL = face_onnx.MODEL_NAME
+#: The embedding size that model produces. Exported so a gate can validate a template's shape
+#: without opening a session - ``biometrics`` uses it as the default expectation.
+FACE_DIMENSIONS = face_onnx.DIMENSIONS
 FACE_DETECTOR = face_detector.DETECTOR_NAME
-#: What a verification falls back to when the YuNet model is not on disk. The previous
-#: detector, through DeepFace. Reported by readiness rather than swallowed: a deployment
-#: still on it pays ~30x more for detection on every punch, and that is worth seeing.
-FACE_DETECTOR_FALLBACK = "mtcnn"
 
 
 # ---------------------------------------------------------------------------
@@ -116,64 +133,65 @@ class NoFaceDetected(ValueError):
 
 
 # ---------------------------------------------------------------------------
-# the model calls: the only place DeepFace is called for verification work
+# the model calls: the only place a face model is run for verification work
 # ---------------------------------------------------------------------------
-def _represent(image, *, detector_backend: str | None = None, enforce_detection: bool = True):
-    """VGG-Face embeddings for one image, **one entry per detected face**. BGR array or path.
+def _represent(image, *, enforce_detection: bool = True):
+    """FaceNet-128 embeddings for one image, **one entry per detected face**. BGR array or path.
 
-    Detection is ``face_detector`` (YuNet) whenever its model is on disk, and the previous
-    DeepFace detector otherwise; the embedding is always ``FACE_MODEL``, run on the crop the
-    detector chose. The detector is the expensive half - measured at 308 ms for MTCNN
-    against 10 ms for YuNet at the application's working size - so which one is live decides
-    what a punch costs.
+    Two models, one crop. ``face_detector`` (YuNet, a 112x112 landmark-aligned crop) decides
+    which pixels are a face; ``face_onnx`` embeds that crop at 160x160. Both run in a process
+    that has never imported TensorFlow, which is the whole point of the swap: a worker starts
+    in ~0.4 s instead of ~6.6 s and holds ~150 MiB instead of ~2.3 GiB.
 
-    The shape of the answer is DeepFace's, deliberately: callers count the entries to answer
-    "how many faces are in this frame" (``main.compare_faces_sync`` refuses more than one),
-    and ``face_confidence`` is the key they read. Keeping that contract is what lets the
-    detector change without a caller changing.
+    The shape of the answer is DeepFace's, deliberately and unchanged: callers count the
+    entries to answer "how many faces are in this frame" (``main.compare_faces_sync`` refuses
+    more than one) and read ``face_confidence``. Keeping that contract is what let the engine
+    underneath be replaced without a single caller changing.
 
-    Imported inside the function so that importing this module does not pull TensorFlow into
-    a process that only wants the admin routes - and so the test harness's DeepFace stub is
-    what runs, exactly as it is for the rest of the suite.
+    **There is no fallback detector any more, and that is deliberate.** This used to fall
+    through to DeepFace's MTCNN when the YuNet model was missing. MTCNN lives in TensorFlow,
+    it produces a *different crop*, and an embedding of a different crop is a different
+    vector space - so the fallback would have scored templates against distances derived
+    through another pipeline's geometry while looking like it worked. A host without the
+    detector model now says so instead of answering with numbers nobody derived.
+
+    The model is still resolved lazily, so that importing this module - a CLI command, a
+    migration, the test suite - does not open an 87 MiB graph.
 
     Timed here rather than at the queue boundary because this is the number the capacity
-    decision was made from. A failure is timed too - a model that raises instantly is not
+    decision is made from. A failure is timed too - a model that raises instantly is not
     fast, it is broken, and it would otherwise look like excellent latency on a graph.
     """
-    from deepface import DeepFace
-
     started = time.perf_counter()
     error: BaseException | None = None
     try:
-        if face_detector.available()[0]:
-            faces = face_detector.detect_and_align(image)
-            if not faces:
-                if enforce_detection:
-                    # The same failure, and the same exception type, that DeepFace raises for
-                    # a frame it cannot use - so every caller's existing handling (a 4xx that
-                    # names the photo rather than the server) keeps working unchanged.
-                    raise ValueError("No face detected in the photo.")
-                faces = [{"face": image, "confidence": 1.0}]
-            embeddings = []
-            for face in faces:
-                embedded = DeepFace.represent(
-                    img_path=face.get("face", image),
-                    model_name=FACE_MODEL,
-                    detector_backend="skip",
-                    enforce_detection=False,
-                )
-                # One entry per *detected* face. The call can answer with more than one (the
-                # test stub does, and so does DeepFace), and taking them all would square the
-                # face count instead of counting the faces in the frame.
-                if embedded:
-                    embeddings.append(embedded[0])
-            return embeddings
-        return DeepFace.represent(
-            img_path=image,
-            model_name=FACE_MODEL,
-            detector_backend=detector_backend or FACE_DETECTOR_FALLBACK,
-            enforce_detection=enforce_detection,
-        )
+        ready, reason = face_detector.available()
+        if not ready:
+            raise FaceEngineUnavailable(
+                "face detection is unavailable "
+                f"({reason or 'no detector model'}), and this build has no fallback: an "
+                "embedding is only meaningful for the crop its vectors were derived from"
+            )
+        faces = face_detector.detect_and_align(image)
+        if not faces:
+            if enforce_detection:
+                # The same failure, and the same exception type, every caller's existing
+                # handling already turns into a 4xx that names the photo rather than the
+                # server.
+                raise ValueError("No face detected in the photo.")
+            faces = [{"face": image, "confidence": 1.0}]
+        # One entry per *detected* face, never one per model call: taking every embedding a
+        # call could return would square the face count instead of counting the faces in the
+        # frame, and ``compare_faces_sync`` reads that count to refuse a frame with two people
+        # in it.
+        engine = face_onnx.get_engine()
+        return [
+            {
+                "embedding": engine.embed_as_list(face.get("face", image)),
+                "face_confidence": float(face.get("confidence", 1.0)),
+            }
+            for face in faces
+        ]
     except BaseException as exc:  # noqa: BLE001 - recorded, then handed to the caller unchanged
         error = exc
         raise
@@ -182,36 +200,36 @@ def _represent(image, *, detector_backend: str | None = None, enforce_detection:
             operation="represent",
             seconds=time.perf_counter() - started,
             model=FACE_MODEL,
-            # The detector that actually ran, not the one this build prefers: on a host
-            # without the model every call is on the fallback, and a graph labelled with
+            # The detector that actually ran, read rather than assumed: a graph labelled with
             # the ideal detector is a graph an operator cannot explain the latency of.
-            detector=detector_backend or face_detector.active_detector(),
+            detector=face_detector.active_detector(),
             error=error,
         )
 
 
-def _detect(image, *, detector_backend: str | None = None, enforce_detection: bool = False):
+def _detect(image, *, enforce_detection: bool = False):
     """Faces in one image, without embedding them (the cheap half of the API).
 
     Nothing else in the application detects a face: a quick clock link asks only whether one
     is *present*, and this is that question. Separate operation label from ``represent`` on
     purpose - an operator tuning the gate needs to see the two costs apart.
-    """
-    from deepface import DeepFace
 
+    No fallback here either, for the reason ``_represent`` gives: the previous fallback was
+    DeepFace's MTCNN, and a detection path that silently changes the detector is a detection
+    path that silently changes the crop every stored template was built from.
+    """
     started = time.perf_counter()
     error: BaseException | None = None
     try:
-        if face_detector.available()[0]:
-            faces = face_detector.detect_and_align(image)
-            if not faces and enforce_detection:
-                raise ValueError("No face detected in the photo.")
-            return faces
-        return DeepFace.extract_faces(
-            img_path=image,
-            detector_backend=detector_backend or FACE_DETECTOR_FALLBACK,
-            enforce_detection=enforce_detection,
-        )
+        ready, reason = face_detector.available()
+        if not ready:
+            raise FaceEngineUnavailable(
+                f"face detection is unavailable ({reason or 'no detector model'})"
+            )
+        faces = face_detector.detect_and_align(image)
+        if not faces and enforce_detection:
+            raise ValueError("No face detected in the photo.")
+        return faces
     except BaseException as exc:  # noqa: BLE001
         error = exc
         raise
@@ -220,7 +238,7 @@ def _detect(image, *, detector_backend: str | None = None, enforce_detection: bo
             operation="detect",
             seconds=time.perf_counter() - started,
             model=face_detector.active_detector(),
-            detector=detector_backend or face_detector.active_detector(),
+            detector=face_detector.active_detector(),
             error=error,
         )
 
@@ -475,11 +493,11 @@ class FaceEngine:
 
     # -- the model operations ---------------------------------------------
     def represent(self, image, **kwargs):
-        """VGG-Face embeddings, on the pool."""
+        """FaceNet-128 embeddings, on the pool."""
         return self.run(_represent, image, **kwargs)
 
     async def represent_async(self, image, **kwargs):
-        """VGG-Face embeddings, on the pool, awaited."""
+        """FaceNet-128 embeddings, on the pool, awaited."""
         return await self.run_async(_represent, image, **kwargs)
 
     def detect(self, image, **kwargs):
@@ -496,7 +514,7 @@ class FaceEngine:
     # alias would quietly keep calling the original and a stub would look like a pass.
     @staticmethod
     def represent_direct(image, **kwargs):
-        """The VGG-Face call, without going through the queue.
+        """The embedding call, without going through the queue.
 
         For the body of a job that already holds a slot: submitting again would wait for
         the worker running it. See rule 1 in the module docstring.

@@ -42,6 +42,9 @@
     border-radius: 12px; color: #cbd5e1; cursor: pointer; margin-top: 12px;
   }
   .note { font-size: .8rem; color: #94a3b8; }
+  /* Amber, because the early clock-out question is about money and is not an error: the
+     tap has not failed, it is waiting for an answer. */
+  .card.early { border-color: #b45309; background: #2a1c08; }
   .note.warn { color: #fca5a5; }
   .msg { border-radius: 12px; padding: 12px; font-weight: 600; display: none; }
   .msg.ok { display: block; background: #052e1a; color: #86efac; border: 1px solid #166534; }
@@ -72,11 +75,32 @@
     <button type="button" data-lang="en">EN</button>
     <button type="button" data-lang="ar">ع</button>
     <button type="button" data-lang="hi">हि</button>
+    <button type="button" data-lang="ur">UR</button>
   </nav>
 </header>
 
 <main>
   <div id="message" class="msg"></div>
+
+  <!--
+    The early clock-out question. It appears only when the server refuses a tap because
+    the shift is short of the paid day - a refusal that is a question, so it is answered
+    with two buttons instead of read as an error. Cancel undoes nothing: the server
+    stopped before it wrote a row or closed the shift.
+  -->
+  <div class="card early hidden" id="early-confirm">
+    <p class="state" id="early-title" data-t="quick.earlyTitle">Clock out early?</p>
+    <!--
+      No ``data-t`` on the sentence: it carries the two figures the server sent, and a
+      translation with no values to substitute would leave the braces on screen. The
+      language switch rewrites it from the same numbers (see the picker in ``quick.js``).
+    -->
+    <p class="note" id="early-body">If you clock out now, this shift is recorded as it is.</p>
+    <div class="row" style="margin-top:12px">
+      <button id="btn-early-confirm" data-t="quick.earlyConfirm">Confirm and clock out</button>
+      <button id="btn-early-cancel" class="secondary" data-t="quick.earlyCancel">Cancel</button>
+    </div>
+  </div>
 
   <!--
     One button, not two. Whether this tap is a clock-in or a clock-out is a fact about the
