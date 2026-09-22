@@ -679,7 +679,10 @@ def test_a_dead_server_says_so(results):
 
 
 def test_the_worker_has_a_notes_tab_and_a_queue_that_says_what_is_waiting(results):
-    assert results["worker_tabs"] == ["clock", "history", "notes", "profile"]
+    # ``alerts`` joins the bar in the order it has to be in: the system's own notices, then
+    # the notes the worker writes back. The other half of this list - the inbox behind that
+    # tab - is the subject of ``test_frontend_worker_alerts.py``.
+    assert results["worker_tabs"] == ["clock", "history", "alerts", "notes", "profile"]
     worker = results["worker"]
     assert worker["tab_bar"] is True, "the tab is on the bar the worker actually taps"
     assert worker["requests"] >= 1, "the tab reads the worker's own notes"

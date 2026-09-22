@@ -70,11 +70,12 @@ from pydantic import BaseModel, field_validator
 import face_engine
 import liveness
 import notifications
+import overtime
 import shift_hours
 import shift_windows
 import textguard
 import uploads
-from config import PROJECT_ROOT, settings
+from config import settings
 from database import db
 from rate_limit import limiter
 from security import CurrentUser, admin_only
@@ -89,9 +90,11 @@ public_router = APIRouter(prefix="/q", tags=["quick links"])
 
 _TS = "%Y-%m-%d %H:%M:%S"
 
-#: Where the punch selfies are kept. Repointable from a test, which must not write faces
-#: into the repository - the same convention ``main.WORKER_PHOTOS_DIR`` uses.
-PHOTOS_DIR = str(PROJECT_ROOT / "quick_link_photos")
+#: Where the punch selfies are kept, from the settings so that a child process inherits the
+#: answer in ``QUICK_LINK_PHOTOS_DIR`` rather than writing into the checkout - the same
+#: convention ``main.WORKER_PHOTOS_DIR`` uses. Repointable from a test either way, by assigning
+#: this attribute.
+PHOTOS_DIR = str(settings.quick_link_photos_dir)
 
 
 def photos_dir() -> str:
@@ -663,6 +666,9 @@ async def submit_quick_punch(
     lat: float = Form(...),
     lon: float = Form(...),
     accuracy: float | None = Form(default=None),
+    #: Set on the second tap, after the page has shown the early clock-out warning and the
+    #: worker chose to go ahead. The link page never decides this for itself.
+    confirm_early_checkout: str | None = Form(default=None),
 ):
     """Clock the link's worker in - or out - from one tap and one photo.
 
@@ -678,6 +684,7 @@ async def submit_quick_punch(
     """
     import main
 
+    confirmed_early = main._form_flag(confirm_early_checkout)
     row, usable, state = _load_link(token)
     if not usable:
         raise _refuse_link(state)
@@ -816,9 +823,9 @@ async def submit_quick_punch(
             )
 
     # --- the punch ----------------------------------------------------------------------
+    # The rules travel as they are: the overtime line and what it counts are resolved once,
+    # by ``shift_hours.overtime_assessment`` below, exactly as the password path does it.
     rules = main.get_shift_rules()
-    regular_hours = float(rules["regular_hours"])
-    overtime_hours = float(rules["overtime_notify_hours"])
     now = datetime.now()
     now_str = now.strftime(_TS)
     photo_name = punch_photo_name()
@@ -826,6 +833,16 @@ async def submit_quick_punch(
         image.save(os.path.join(photos_dir(), photo_name), format="JPEG")
     except OSError as exc:  # pragma: no cover - disk failure
         raise HTTPException(status_code=500, detail=f"The punch photo could not be stored: {exc}")
+
+    # The review card's evidence, from the same decoded frame (see ``punch_frames``). The
+    # quick-link photo already exists, but it is retention-wiped on its own window and
+    # served from the *use* row; the log row is what a pending review is decided from, so the
+    # frame rides on it. Best-effort like the online path: a full disk takes the picture, not
+    # the punch.
+    try:
+        punch_frame = main.punch_frames.store_frame(image)
+    except OSError:
+        punch_frame = None
 
     with db(write=True) as conn:
         # Re-read the link inside the transaction. Two taps arriving together (a double tap,
@@ -844,7 +861,12 @@ async def submit_quick_punch(
         action = main.ACTION_CLOCK_OUT if session is not None else main.ACTION_CLOCK_IN
         hours_worked = 0.0
         break_taken = 0.0
-        overtime = 0.0
+        #: Named in full rather than ``overtime``: the module of that name announces the
+        #: crossing below, and a local shadowing it would silently break the call.
+        overtime_hours = 0.0
+        #: The worker's crossing notice, when this tap made one: delivered after this
+        #: transaction commits, because a push cannot see an uncommitted row.
+        crossing = None
         flag_reason = f"quick link #{row['id']} ({action.lower()}) - selfie recorded, not matched"
         if liveness_flag:
             flag_reason = " | ".join(part for part in (liveness_flag, flag_reason) if part)
@@ -874,28 +896,42 @@ async def submit_quick_punch(
             if clock_in_time is None:
                 _discard_photo(photo_name)
                 raise HTTPException(status_code=400, detail="The stored clock-in time is unreadable.")
-            elapsed_hours = round(max(0.0, (now - clock_in_time).total_seconds() / 3600.0), 4)
-            hours_worked, break_taken = shift_hours.paid_hours(elapsed_hours, rules)
-            hours_note = shift_hours.describe(elapsed_hours, hours_worked, break_taken)
+            seconds_on_site = shift_hours.elapsed_seconds(clock_in_time, now)
+            record = shift_hours.recorded_shift(seconds_on_site / 3600.0, rules)
+            if record["needs_confirmation"] and not confirmed_early:
+                # The same question, the same numbers and the same rollback as
+                # ``/attendance/verify``. The photo was written above, so it goes with the
+                # refusal: a shift nobody recorded must not leave a selfie behind.
+                _discard_photo(photo_name)
+                raise HTTPException(status_code=409, detail=main._early_checkout_refusal(record))
+            hours_worked = record["paid_hours"]
+            break_taken = record["break_hours"]
+            hours_note = record["description"]
             conn.execute("DELETE FROM active_sessions WHERE worker_id = ?", (worker["id"],))
 
             log_status = main.STATUS_APPROVED
             status_code = "approved"
             status_val = "success"
             status_msg = f"Clocked Out of {session['site_name']}. {hours_note}"
-            if hours_worked > overtime_hours:
-                # Overtime is tracked, not silently paid - identical to the password path.
-                overtime = round(hours_worked - regular_hours, 4)
+            # Overtime is tracked, not silently paid - the same resolvers, and so the same
+            # answer, as the password path. The second one is the mid-shift decision: a link
+            # clock-out must settle at the ceiling somebody stated for this shift, or an
+            # operator who answered a crossing would watch this tap hold the same hours for
+            # approval a second time. No answer returns the assessment unchanged.
+            assessment = overtime.apply_authorisation(
+                conn,
+                worker["id"],
+                session["clock_in_time"],
+                shift_hours.overtime_assessment(seconds_on_site, rules),
+                rules,
+            )
+            if assessment["needs_approval"]:
+                overtime_hours = assessment["overtime_hours"]
                 log_status = main.STATUS_PENDING_OVERTIME
                 status_code = "pending_overtime"
                 status_val = "flagged"
                 flag_reason = " | ".join(
-                    part
-                    for part in (
-                        flag_reason,
-                        f"{hours_worked:.2f}h exceeds the {overtime_hours:g}h regular threshold",
-                    )
-                    if part
+                    part for part in (flag_reason, assessment["flag_sentence"]) if part
                 )
                 status_msg = (
                     f"Clocked Out of {session['site_name']}. {hours_note} - overtime requires admin "
@@ -907,14 +943,26 @@ async def submit_quick_punch(
                     severity=notifications.SEVERITY_WARNING,
                     title="Overtime requires approval",
                     body=(
-                        f"{worker['name']} (id {worker['id']}) worked {hours_worked:.2f}h at "
-                        f"'{session['site_name']}' and clocked out with a quick link, past the "
-                        f"{overtime_hours:g}h threshold. Approve or adjust the extra hours."
+                        f"{worker['name']} (id {worker['id']}) worked "
+                        f"{assessment['paid_hours']:.2f}h paid at '{session['site_name']}' and "
+                        f"clocked out with a quick link, past the "
+                        f"{assessment['threshold_hours']:g}h overtime line with "
+                        f"{overtime_hours:.2f}h past the paid day. Approve or adjust the extra hours."
                     ),
                     worker_id=str(worker["id"]),
                     site_name=session["site_name"],
                     dedupe_key=f"overtime:{worker['id']}:{now_str}",
-                    payload={"hours": hours_worked, "overtime_hours": overtime, "link_id": row["id"]},
+                    payload={"hours": hours_worked, "overtime_hours": overtime_hours, "link_id": row["id"]},
+                )
+                # ... and the tap owes the worker the same sentence the app does. The watcher
+                # cannot supply it: it walks shifts that are still open, and this one is over.
+                crossing = overtime.announce_crossing(
+                    conn,
+                    worker_id=str(worker["id"]),
+                    site_name=session["site_name"],
+                    clock_in_time=session["clock_in_time"],
+                    values=rules,
+                    moment=now,
                 )
         else:
             # A quick link can be used at any site, so the window is the one where the phone
@@ -970,9 +1018,16 @@ async def submit_quick_punch(
             liveness_class=liveness_class,
             liveness_score=liveness_score,
             flag_reason=flag_reason,
-            overtime_hours=overtime or None,
+            overtime_hours=overtime_hours or None,
             break_hours=break_taken or None,
+            punch_frame=punch_frame,
         )
+        if action == main.ACTION_CLOCK_OUT:
+            # The answer the shift was settled at is spent by this row - a link punch is one
+            # more way of ending a shift, not a way of leaving the decision live for the next
+            # one. Guarded on the action because one row is written for both punches, and there
+            # is no session - no clock-in to pair a decision with - when the tap is an arrival.
+            overtime.consume_authorisation(conn, worker["id"], session["clock_in_time"], log_id)
 
         ip = request.client.host if request.client else None
         user_agent = request.headers.get("user-agent")
@@ -1044,6 +1099,10 @@ async def submit_quick_punch(
             request=request,
         )
 
+    # Committed, so the notice is visible to the dispatcher - and on its own thread, so the
+    # tap that produced it did not wait on anybody's push service.
+    overtime.deliver_worker_notices(crossing)
+
     return {
         "status": status_val,
         "action": action,
@@ -1053,7 +1112,7 @@ async def submit_quick_punch(
         "site": detected_site,
         "hours": hours_worked,
         "break_hours": break_taken,
-        "overtime_hours": overtime,
+        "overtime_hours": overtime_hours,
         "log_id": log_id,
         "use_id": use_id,
         "face_count": face_count,

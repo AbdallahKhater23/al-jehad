@@ -62,6 +62,7 @@ SPOOFED_IDENTITY_CALLS: list[tuple[str, str, dict, str]] = [
     ("POST", "/api/v1/admin/force_clock_in", {"json_body": {"worker_id": MOALLEM, "site_name": "Downtown Tower A", "admin_id": HEAD_ADMIN}}, "clock somebody in"),
     ("POST", "/api/v1/admin/force_clock_out", {"json_body": {"worker_id": WORKER, "site_name": "", "admin_id": HEAD_ADMIN}}, "clock somebody out"),
     ("POST", "/api/v1/admin/approve_review", {"json_body": {"log_id": SEEDED_PENDING_LOG_ID, "admin_id": HEAD_ADMIN}}, "approve a flagged attendance record"),
+    ("POST", "/api/v1/admin/reject_review", {"json_body": {"log_id": SEEDED_PENDING_LOG_ID, "note": "refused", "admin_id": HEAD_ADMIN}}, "refuse a flagged attendance record"),
 ]
 
 CONTRACT_CALLS: list[tuple[str, str, dict, str]] = [
@@ -76,6 +77,9 @@ CONTRACT_CALLS: list[tuple[str, str, dict, str]] = [
     ("POST", "/api/v1/admin/users/edit_password", {"json_body": {"worker_id": WORKER, "new_password": "Hijacked-Pass-123"}}, "reset a password without claiming an identity"),
     ("POST", "/api/v1/admin/force_clock_out", {"json_body": {"worker_id": WORKER, "site_name": ""}}, "clock somebody out without claiming an identity"),
     ("POST", "/api/v1/admin/approve_review", {"json_body": {"log_id": SEEDED_PENDING_LOG_ID}}, "approve a record without claiming an identity"),
+    # A refusal has to be as guarded as the approval beside it: it is the decision that
+    # takes hours away from somebody, so an anonymous caller reaching it is the worse gap.
+    ("POST", "/api/v1/admin/reject_review", {"json_body": {"log_id": SEEDED_PENDING_LOG_ID, "note": "refused"}}, "refuse a record without claiming an identity"),
 ]
 
 

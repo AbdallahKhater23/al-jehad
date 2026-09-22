@@ -102,8 +102,10 @@ results.translations = JSON.parse(env.evaluate(
 // Everything the page owns has to be reached *inside* the VM (``env.evaluate``): the
 // app's files declare their objects in the VM's global scope, not in this script's.
 {
-    // The VM has no getUserMedia, so the two things the card asks of the device are
-    // stubbed. What this asserts is the page's own code, not the stub.
+    // The device is overridden rather than installed: this suite drives the card only far
+    // enough to see the hint inside it, and the advice itself is asserted from numbers above.
+    // A suite about the capture path uses the camera the harness models (see
+    // test_frontend_punch_capture).
     env.evaluate("Object.defineProperty(Camera, 'isSupported', { value: true, configurable: true })");
     env.evaluate("Camera.start = async () => ({ getTracks: () => [] })");
     // The card is painted before the stream is awaited and the coach starts after it, so

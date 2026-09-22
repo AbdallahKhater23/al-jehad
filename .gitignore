@@ -20,6 +20,10 @@ worker_photos
 local_references
 # Selfies taken with a quick clock link. Biometric data, like the two above: never in git.
 quick_link_photos
+# The frame stored with each punch, for a review card. Same class again: a worker's face, and
+# the app writes one of these per punch. It was the only one of the four left unignored, so a
+# test run that stored a frame left the checkout with hundreds of untracked JPEGs.
+punch_frames
 .vscode
 Dockerfile
 test_odoo.py

@@ -715,7 +715,39 @@ def security_headers(
     return headers
 
 
-def _is_document(content_type: bytes | str | None) -> bool:
+#: Statuses that carry no body at all. A ``304`` is the one that matters: the frontend is
+#: served ``Cache-Control: no-cache, must-revalidate`` on purpose (see ``revalidate_frontend_assets``
+#: in ``main.py``), so from the second load of a page onwards the browser revalidates and the
+#: server answers ``304 Not Modified``.
+_BODILESS_STATUSES = frozenset({204, 205, 304})
+
+
+def _accepts_html(request_headers: list | None) -> bool:
+    """Whether the *request* asked for a page, which is all a bodyless response leaves."""
+    accept = _header(request_headers or [], b"accept") or b""
+    return b"text/html" in bytes(accept).lower()
+
+
+def _is_document(
+    content_type: bytes | str | None,
+    *,
+    status: int = 200,
+    request_headers: list | None = None,
+) -> bool:
+    """Whether this response is a page, for the split between the two CSPs.
+
+    The content-type is the evidence, except for a status that carries no body: the browser
+    reuses the *cached* entity and replaces the stored headers with the ones sent alongside
+    the ``304``, so a policy picked from a content-type the 304 does not have silently
+    downgrades a revalidated page to ``CSP_API`` - ``default-src 'none'`` - and every script
+    on it is refused from then on. The page then sits on its own "Checking…" placeholder and
+    reads as a slow connection, which is the failure this repository treats as its worst.
+
+    For those statuses the request is the only evidence left, so ``Accept`` decides: a
+    navigation names ``text/html``, and a ``fetch`` from a page does not.
+    """
+    if status in _BODILESS_STATUSES:
+        return _accepts_html(request_headers)
     return "text/html" in (
         content_type.decode("latin-1").lower() if isinstance(content_type, bytes) else str(content_type or "").lower()
     )
@@ -837,7 +869,11 @@ class NetworkGuardMiddleware:
                         scheme=str(scope.get("scheme") or "http"),
                         forwarded_proto=_decoded(_header(request_headers, b"x-forwarded-proto")),
                         peer_trusted=_peer_trusted(active, scope),
-                        is_document=_is_document(_header(message.get("headers") or [], b"content-type")),
+                        is_document=_is_document(
+                            _header(message.get("headers") or [], b"content-type"),
+                            status=int(message.get("status") or 200),
+                            request_headers=request_headers,
+                        ),
                     )
                 message["headers"] = _merge_headers(message.get("headers") or [], additions)
             await send(message)

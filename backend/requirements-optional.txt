@@ -1,9 +1,6 @@
 # Optional extras. Each one degrades gracefully when missing, so none of them is
 # allowed to become a hard startup requirement:
 #
-#   onnxruntime -> passive liveness (MiniFASNet). Without it the check reports
-#                  available=false; see backend/models/README.md for what LIVENESS_MODE
-#                  does with that.
 #   qrcode      -> renders the self-service enrollment QR code. Without it the invite
 #                  endpoint still returns the URL, so enrollment continues.
 #   openpyxl    -> XLSX report export. Without it /admin/reports/export answers 501 with
@@ -14,10 +11,22 @@
 #                  A deployment running uvicorn with --workers must also set
 #                  PROMETHEUS_MULTIPROC_DIR, or a scrape sees one worker's share of the
 #                  traffic and reports it as the whole.
+#   pywebpush   -> Web Push, the channel that reaches a worker whose app is closed. Without
+#                  it the server says so as its own reason (push.transport_available),
+#                  the app offers no switch, and every notice still lands in the worker's
+#                  inbox. It also brings py-vapid, which is what python -m push
+#                  --generate-keys generates the key pair with - see
+#                  docs/RUNBOOK_WORKER_PUSH.md.
 #
 # Pin these to whatever the deployment validates. Versions below are the ones the code
 # was written against.
-onnxruntime>=1.17
+#
+# ``onnxruntime`` is deliberately NOT here. It is the embedding engine (``backend/face_onnx.py``)
+# since the VGG-Face -> FaceNet-128 swap, so a host without it verifies nothing - it is pinned in
+# the runtime manifest, requirements.txt. Passive liveness (MiniFASNet) also runs on it, and that
+# check still degrades on its own (available=false; see backend/models/README.md for what
+# LIVENESS_MODE does with that), but the engine above it does not.
 qrcode>=7.4
 openpyxl>=3.1
 prometheus_client>=0.20
+pywebpush>=2.0

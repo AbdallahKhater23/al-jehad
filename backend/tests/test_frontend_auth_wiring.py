@@ -50,8 +50,8 @@ const fs = require('fs');
 const path = require('path');
 
 const frontend = process.argv[2];
-const scripts = ['i18n.js', 'i18n.ar.js', 'i18n.hi.js', 'frontendjavascript.js',
-                 'worker_modules.js'];
+const scripts = ['i18n.js', 'i18n.ar.js', 'i18n.hi.js', 'i18n.ur.js',
+                 'frontendjavascript.js', 'worker_modules.js'];
 
 // A clock the tests can move by hand. The card's timer has to be *live*: the only
 // way to observe a shift tipping past the threshold while the worker watches is to
@@ -497,16 +497,19 @@ def test_an_open_shift_makes_the_panel_offer_clock_out(results):
 
 
 def test_an_over_long_shift_shows_a_live_timer_and_the_approval_note(results):
-    """The worker, not only an admin, must see that the shift has run past 8.1h."""
+    """The worker, not only an admin, must see that the shift has run past 8.1h paid."""
     card = results["overtime_shift"]
     assert card["has_elapsed_slot"] is True, "the elapsed time needs a node to tick into"
     assert card["has_note_slot"] is True, "the overtime note needs a node to be revealed in"
     assert card["timer_running"] is True, "the timer must tick, not freeze at render time"
     assert card["shown_label"].startswith("9:0"), f"expected ~9h on the clock: {card['shown_label']}"
-    assert card["note_hidden"] is False, "past the threshold the note must be visible"
-    assert "8.1" in card["note_text"] and "overtime approval" in card["note_text"]
-    assert any("needs overtime approval" in shown for shown in card["toasts"]), (
-        "crossing the threshold is worth interrupting the worker for"
+    assert card["note_hidden"] is False, "past the line the note must be visible"
+    # The title names the line the worker has reached and the basis it is counted on - the
+    # note is the mirror of the administrator's alert, not a promise about a pay decision
+    # (that depends on the line against the paid day; see ``shift_hours.overtime_assessment``).
+    assert "8.1" in card["note_text"] and "paid" in card["note_text"], card["note_text"]
+    assert any("8.1" in shown for shown in card["toasts"]), (
+        "crossing the line is worth interrupting the worker for"
     )
 
 

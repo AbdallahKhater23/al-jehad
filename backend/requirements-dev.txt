@@ -9,6 +9,17 @@ pytest==9.1.1
 # starlette 1.6's TestClient prefers httpx2 and warns when falling back to httpx
 httpx2==2.12.0
 
+# Runs the suite across every core: `python -m pytest tests -n auto`. The whole file takes
+# about five minutes that way against half an hour in one process.
+#
+# It is not free of consequences, which is why it is named here rather than left to whoever
+# feels like installing it: the tests run in separate *processes*, so anything a test leaves in
+# the interpreter or the working directory is per worker, and two tests can no longer rely on
+# being the only thing that has run. ``tests/harness.py`` therefore enters the throwaway working
+# directory from a fixture rather than at import (an import-time ``chdir`` makes every worker
+# collect zero tests), and ``tests/test_fixture_state.py`` pins both facts.
+pytest-xdist==3.8.0
+
 # PyJWT is a RUNTIME dependency of the JWT remediation, and the test harness also
 # uses it to mint real tokens so the 401-vs-403 distinction is meaningful.
 PyJWT==2.14.0

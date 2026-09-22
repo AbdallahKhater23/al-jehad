@@ -98,8 +98,48 @@ def refusal_counter(reason: str) -> float:
     Read straight off the client library's counter rather than through a scrape: this is an
     assertion about whether the code counted something, and routing it through the exposition
     format would test the parser as well.
+
+    Two counter shapes exist, and the suite must run against both:
+
+    * **the real library** - ``labels(reason=...)`` returns a *child* object holding that
+      series' value, read from its ``_value``;
+    * **telemetry's no-op stand-in** - what the module serves when ``prometheus_client`` is
+      not installed (the optional-extra contract). ``labels()`` returns the same object for
+      every reason and ``inc()`` records nothing, so there is no per-series value to read.
+      The increment tests then assert only the *behavioural* half: a refused request, with
+      the reason the policy named. The counting half is pinned by
+      ``test_metrics.py::test_every_helper_is_silent_when_the_library_is_missing`` instead,
+      which is where the degradation contract lives.
     """
-    return float(telemetry.NETGUARD_REFUSALS.labels(reason=reason)._value.get())
+    child = telemetry.NETGUARD_REFUSALS.labels(reason=reason)
+    if telemetry.AVAILABLE:
+        return float(child._value.get())
+    return float(_STAND_IN_COUNTS.get(reason, 0))
+
+
+#: Read side of the stand-in: ``netguard.count_refusal`` records the reason here when the
+#: library is absent (see ``telemetry.count_netguard_refusal``), so the suite can still
+#: assert the *pair* "this request was refused, for this reason" - just not from the counter,
+#: because there is nothing inside it. Keyed by reason like the real counter's child objects.
+_STAND_IN_COUNTS: dict[str, int] = {}
+
+
+def _record_stand_in(**labels) -> None:
+    """The stand-in's receiver: one increment of the series these labels name."""
+    key = ",".join(f"{value}" for value in labels.values())
+    _STAND_IN_COUNTS[key] = _STAND_IN_COUNTS.get(key, 0) + 1
+
+
+@pytest.fixture(autouse=True)
+def _reset_stand_in_counts():
+    """Wire the stand-in's read side around each test, like the counter's own isolation."""
+    _STAND_IN_COUNTS.clear()
+    if hasattr(telemetry.Counter, "record"):
+        telemetry.Counter.record = _record_stand_in
+    yield
+    if hasattr(telemetry.Counter, "record"):
+        telemetry.Counter.record = None
+    _STAND_IN_COUNTS.clear()
 
 
 def check_named(name: str):
@@ -483,6 +523,34 @@ def test_a_document_response_carries_the_document_policy(client, monkeypatch):
     assert "img-src 'self' data: blob:" in policy
 
 
+def test_a_bodiless_response_is_judged_by_the_request_not_by_a_missing_content_type():
+    """A ``304`` has no content-type, and picking the CSP from that made pages script-dead.
+
+    Measured on a running server: ``curl -H 'If-None-Match: <the etag>' /quick.html`` - and
+    ``/`` - came back ``304 Not Modified`` carrying ``CSP_API``, ``default-src 'none'``. A
+    browser merges a 304's headers into the response it has stored, so the refusal replaced
+    the policy the page was cached with, every script was blocked from the second load
+    onwards, and the page sat on its own "Checking…" placeholder looking like a slow
+    connection - after a first load that had worked. Chrome reproduced it: reloading the
+    link page left ``typeof Capture === 'undefined'`` and all four CSP violations in the
+    console, while the same URL in a fresh context booted normally.
+
+    The document policy is not what is asserted here but the *decision*, because the 304 can
+    come from any caching layer in front of the app - a CDN, or the Worker in ``deploy/``
+    that proxies ``/q/*`` and ``/enroll/*`` - and any of them can strip it to a bodiless
+    response. What is left to judge by is the request, and the two halves of the split are
+    pinned together so "send the document policy on every 304" cannot pass either.
+    """
+    navigation = [(b"accept", b"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")]
+    assert netguard._is_document(None, status=304, request_headers=navigation) is True
+    assert netguard._is_document(None, status=304, request_headers=[(b"accept", b"*/*")]) is False
+    #: No header at all is not a navigation, so the stricter policy is the safe answer.
+    assert netguard._is_document(None, status=304, request_headers=[]) is False
+    #: And a body that does carry a type is still judged by the type, not by ``Accept``.
+    assert netguard._is_document(b"application/json", status=200, request_headers=navigation) is False
+    assert netguard._is_document(b"text/html; charset=utf-8", status=200) is True
+
+
 def test_the_document_policy_refuses_inline_script_elements(client, monkeypatch):
     """The stored-XSS payload needs an inline ``<script>`` *element*; that one is refused.
 
@@ -557,6 +625,11 @@ def test_headers_can_be_turned_off_for_a_deployment_that_sets_them_elsewhere(cli
 
 def test_a_route_keeps_the_headers_it_sets_itself(client, monkeypatch):
     """The metrics payload sets ``no-store``; the middleware adds, it does not overrule."""
+    if not telemetry.AVAILABLE:
+        # The assertion needs a route that serves 200, and /metrics - the one route in this
+        # suite that sets its own headers - answers 501 without the optional library. The
+        # header contract itself is pinned in ``test_metrics.py`` alongside the exposition.
+        pytest.skip("prometheus_client is not installed")
     install(monkeypatch)
     response = client.get("/metrics", headers=bearer(ADMIN))
     assert response.status_code == 200

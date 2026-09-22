@@ -19,9 +19,12 @@ part of it is a way to pay somebody the wrong amount:
    down for the afternoon must record the shift as ending at 8.5 h, not at the moment the
    watcher next ran.
 4. **Nothing is closed silently.** The alert names what was closed, when, and - when the
-   shift was still open well past its limit - how much time past it is *not* recorded.
-5. **The worker is told, not left with an error.** The commonest reason a clock-out finds
-   no open shift is now the policy itself, so it says so instead of "clock in first".
+   shift was still open well past its limit - how much time past it is *not* recorded, and
+   the worker whose day it was gets their own notice in the same transaction.
+5. **The worker is told, not left with an error.** The close announces itself in the
+   worker's own inbox the moment it ends the day (kind `shift_auto_closed`), so the refusal
+   a later clock-out gets - "no open shift, closed automatically at ..." - is a fallback for
+   a stale screen rather than the first the worker ever hears of it.
 """
 
 from __future__ import annotations
@@ -61,9 +64,9 @@ def plant_open_session(worker_id: str, hours_ago: float) -> str:
     return clock_in_time
 
 
-def clock_out(client, worker_id=MOALLEM, action="Clock Out"):
+def clock_out(client, worker_id=MOALLEM, action="Clock Out", confirmed=False):
     return harness.clock_in(
-        client, worker_id, action=action, headers=bearer(worker_id)
+        client, worker_id, action=action, headers=bearer(worker_id), confirmed=confirmed
     )
 
 
@@ -153,11 +156,23 @@ def test_a_normal_day_pays_eight_hours_and_records_the_break(client):
     assert db_scalar("SELECT break_hours FROM attendance_logs WHERE id = ?", (log_id,)) == pytest.approx(0.5, abs=0.01)
 
 
-def test_a_short_shift_is_paid_as_worked(client):
-    """40 minutes is not a day with a break in it, so nothing is deducted."""
+def test_a_short_shift_is_paid_as_worked_once_the_early_clock_out_is_confirmed(client):
+    """40 minutes is not a day with a break in it, so nothing is deducted.
+
+    It is also *short*, so the worker is asked before it is written down; confirming is
+    what this test does. The question itself is the subject of
+    ``test_early_checkout_and_rounding.py``.
+    """
     plant_open_session(MOALLEM, 0.75)
 
-    response = clock_out(client)
+    refused = clock_out(client)
+    assert refused.status_code == 409, refused.text[:300]
+    assert refused.json()["detail"]["error_code"] == "confirm_early_checkout"
+    assert db_scalar("SELECT COUNT(*) FROM active_sessions WHERE worker_id = ?", (MOALLEM,)) == 1, (
+        "a question must leave the shift exactly as it was, not close it"
+    )
+
+    response = clock_out(client, confirmed=True)
     assert response.status_code == 200, response.text[:300]
     assert response.json()["hours"] == pytest.approx(0.75, abs=0.02)
     assert response.json()["break_hours"] == 0
@@ -213,6 +228,9 @@ def test_the_worker_panel_is_told_where_the_paid_day_ends(client):
 # the automatic close
 # ---------------------------------------------------------------------------
 def test_a_forgotten_shift_is_closed_at_the_boundary(client):
+    # The arrangement this test is about: the close ends the day. Under the shipped pair the
+    # close stands down so the crossing can be reported (see ``use_auto_close``).
+    harness.use_auto_close(client)
     clock_in_time = plant_open_session(MOALLEM, 12.0)
 
     summary = overtime.scan_auto_close()
@@ -254,6 +272,7 @@ def test_a_forgotten_shift_is_closed_at_the_boundary(client):
 
 def test_the_closed_shift_is_payable(client):
     """The eight recorded hours are work; the old 11 h rows needed a decision, this one doesn't."""
+    harness.use_auto_close(client)
     plant_open_session(MOALLEM, 8.6)
     overtime.scan_auto_close()
 
@@ -271,7 +290,8 @@ def test_the_closed_shift_is_payable(client):
     assert report["totals"]["awaiting_approval_hours"] == 0
 
 
-def test_a_shift_under_the_limit_is_left_alone():
+def test_a_shift_under_the_limit_is_left_alone(client):
+    harness.use_auto_close(client)
     plant_open_session(MOALLEM, 7.0)
 
     summary = overtime.scan_auto_close()
@@ -286,6 +306,7 @@ def test_a_shift_under_the_limit_is_left_alone():
 
 
 def test_closing_twice_is_impossible(client):
+    harness.use_auto_close(client)
     plant_open_session(MOALLEM, 9.0)
     first = overtime.scan_auto_close()
     second = overtime.scan_auto_close()
@@ -298,6 +319,10 @@ def test_closing_twice_is_impossible(client):
         "SELECT COUNT(*) FROM admin_notifications WHERE kind = 'shift_auto_closed' AND worker_id = ?",
         (MOALLEM,),
     ) == 1
+    assert db_scalar(
+        "SELECT COUNT(*) FROM worker_notifications WHERE kind = 'shift_auto_closed' AND worker_id = ?",
+        (MOALLEM,),
+    ) == 1, "and the worker is told once, not once per tick"
 
 
 def test_an_operator_can_turn_the_close_off(client):
@@ -319,6 +344,7 @@ def test_an_operator_can_turn_the_close_off(client):
 
 def test_the_worker_who_comes_back_is_told_what_happened(client):
     """Not \"clock in first\" - the shift ended, and the answer says when and for how much."""
+    harness.use_auto_close(client)
     plant_open_session(MOALLEM, 8.6)
     overtime.scan_auto_close()
 
@@ -329,6 +355,62 @@ def test_the_worker_who_comes_back_is_told_what_happened(client):
     assert "8.00h paid" in detail, detail
     assert "30-minute unpaid break" in detail, detail
     assert "clocking in first" not in detail, "the old message would read as data loss"
+
+
+def test_the_worker_is_told_their_shift_was_closed_for_them(client):
+    """The close decides the day for somebody, so it says so at the moment it does.
+
+    Every other way a shift ends is a person watching their own clock-out. The auto-close is
+    the system ending the day unattended, and until this notice existed the worker's first
+    hint was their *next* clock-out being refused - which reads as data loss precisely
+    because they believed they were still on the clock.
+    """
+    harness.use_auto_close(client)
+    clock_in_time = plant_open_session(MOALLEM, 12.0)
+
+    summary = overtime.scan_auto_close()
+    assert summary["closed"] == 1 and summary["worker_notified"] == 1, summary
+    assert summary["shifts"][0]["worker_notified"] is True, summary["shifts"]
+
+    inbox = client.get("/api/v1/worker/me/notifications", headers=bearer(MOALLEM)).json()
+    closed = [row for row in inbox["notifications"] if row["kind"] == "shift_auto_closed"]
+    assert len(closed) == 1, inbox["notifications"]
+    notice = closed[0]
+    assert "8h" in notice["title"], notice["title"]
+    assert inbox["unread"] >= 1, "an unread notice is what the app badges"
+
+    # The figures are the shift's own, and they are the ones the timesheet wrote: the closing
+    # moment is the boundary, not the moment the watcher happened to run.
+    boundary = (datetime.strptime(clock_in_time, TS) + timedelta(hours=8.5)).strftime(TS)
+    assert boundary in notice["body"], notice["body"]
+    assert "8.50h on site" in notice["body"], notice["body"]
+    assert "0.50h unpaid break" in notice["body"], notice["body"]
+    assert "8.00h payable" in notice["body"], notice["body"]
+
+    # ... and the one thing the notice exists to prevent: finding out at the gate. It says so,
+    # and the late case names the time the close could not record.
+    assert "next clock-out will find no open shift" in notice["body"], notice["body"]
+    assert "3.50h past" in notice["body"] and "not recorded" in notice["body"], notice["body"]
+
+    # It is not the crossing channel: a close records exactly the paid day, so there is no
+    # overtime sentence it could honestly write (see test_day_end_precedence).
+    assert [row for row in inbox["notifications"] if row["kind"] == "overtime_crossed"] == [], (
+        inbox["notifications"]
+    )
+
+
+def test_an_ordinary_close_at_the_limit_is_a_fact_not_an_alarm(client):
+    """The boundary case: closed on time, nothing lost, and the sentence says what to do next."""
+    harness.use_auto_close(client)
+    plant_open_session(MOALLEM, 8.6)  # six minutes past the boundary, inside the tolerance
+
+    overtime.scan_auto_close()
+    body = db_scalar(
+        "SELECT body FROM worker_notifications WHERE kind = 'shift_auto_closed' AND worker_id = ?",
+        (MOALLEM,),
+    )
+    assert "Clock in again when you start your next shift" in body, body
+    assert "not recorded" not in body, "nothing was lost inside the tolerance, so it must not say so"
 
 
 def test_a_worker_with_no_shift_at_all_still_gets_the_plain_answer(client):
@@ -354,14 +436,24 @@ def test_every_row_carries_the_unpaid_break_beside_the_hours(client):
     assert oldest["break_hours"] == pytest.approx(0.5, abs=0.02)
     assert oldest["awaiting_approval"] is False, "an ordinary day is nobody's decision"
 
-    # The 9.0 h one is past the 8.1 h threshold, so it waits for approval instead - the
-    # break changes what a shift is worth, not who may sign it off.
+    # The 9.0 h one is past the 8.1 h threshold, so the *extra* hour waits for approval -
+    # the break changes what a shift is worth, not who may sign it off. The standard day it
+    # already earned is credited either way: a hold on the overtime is not a hold on the
+    # eight hours nobody is questioning.
     assert newest["recorded_hours"] == pytest.approx(9.0, abs=0.05), "9.5 h on site, less the break"
     assert newest["break_hours"] == pytest.approx(0.5, abs=0.02)
     assert newest["awaiting_approval"] is True
+    assert newest["approved_hours"] == pytest.approx(8.0, abs=0.05), newest
+    assert newest["awaiting_approval_hours"] == pytest.approx(1.0, abs=0.05), newest
 
     assert report["totals"]["break_hours"] == pytest.approx(1.0, abs=0.02), "two unpaid half hours"
-    assert report["totals"]["approved_hours"] == pytest.approx(8.0, abs=0.05)
-    assert report["totals"]["awaiting_approval_hours"] == pytest.approx(9.0, abs=0.05)
+    # 8.0 h for the ordinary day, plus the 8.0 h standard day inside the overtime one. The
+    # hour past that day is the only thing still undecided.
+    assert report["totals"]["approved_hours"] == pytest.approx(16.0, abs=0.05)
+    assert report["totals"]["awaiting_approval_hours"] == pytest.approx(1.0, abs=0.05)
+    assert report["totals"]["hours"] == pytest.approx(
+        report["totals"]["approved_hours"] + report["totals"]["awaiting_approval_hours"],
+        abs=0.001,
+    ), report["totals"]
     # 17.0 h counted plus 1.0 h break is 18.0 h of shifts that ran 8.5 h and 9.5 h.
     assert report["totals"]["hours"] + report["totals"]["break_hours"] == pytest.approx(18.0, abs=0.05)

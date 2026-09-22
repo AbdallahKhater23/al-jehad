@@ -300,6 +300,29 @@ attendance_netguard_refusals_total{reason="proxy_not_trusted"}
 | Startup aborts with `network_policy` fatal | `ADMIN_IP_ALLOWLIST` / `TRUSTED_PROXIES` contains something that is not an address or CIDR. |
 | Readiness `network_policy` failing (advisory) | `X-Forwarded-For` has arrived from an undeclared peer: the gate is checking the proxy's address. |
 
+The startup gate that produces those aborts runs the checks described under
+[Tests](#tests) and a good few besides; the fatal ones, what each one protects, which of them
+an operator may consciously serve through, and how to get back to a healthy deployment
+afterwards are [`docs/RUNBOOK_STARTUP_OVERRIDE.md`](docs/RUNBOOK_STARTUP_OVERRIDE.md), kept
+honest by `backend/tests/test_startup_override_runbook.py`. Two of those checks are not
+overridable at all - a deployment with no signing key or no database has no
+`STARTUP_OVERRIDE_REASON` that could save it.
+
+A forced start is a decision, and the application treats it as one: the *reason* is required to
+open the hatch, and an **acknowledgement** is required to settle it. `STARTUP_OVERRIDE_REASON`
+writes one `admin_notifications` row per reason - critical, unread, carrying the failing checks
+and the operator's own words - and `startup_override_acknowledged` reports it as an open
+question on the readiness surfaces until somebody answers it. Answering is
+`POST /api/v1/admin/notifications/{id}/acknowledge` with a note, from the console's **Alerts**
+tab or the API: the note is required and vetted as plain text, the actor and their reason go into
+the append-only `audit_log` (with the request's address and user agent), the alert is marked
+read with it, and a second answer is refused with a `409` naming who answered first - because
+the first acceptance is the one that was actually made. Two acts stay distinct the whole way
+through: **reading** an alert records that somebody looked, which is the right answer for a
+sweep or a note, and **acknowledging** it records that somebody decided. Every individual forced
+start is its own `audit_log` row, so "how often, and with what reason" outlives the alert row
+it belongs to.
+
 ### 3. Security headers
 
 Sent on every response, including refusals and static assets:
@@ -454,10 +477,14 @@ Key settings (all optional except `SECRET_KEY`, full list in `backend/config.py`
 | `LIVENESS_MODE` | `advisory` | `off` / `advisory` (record + notify, never block) / `enforce` (refuse a spoofed frame before face matching) |
 | `LIVENESS_MODEL_PATH` | `backend/models/minifasnet.onnx` | MiniFASNet ONNX file; see `backend/models/README.md` |
 | `ENROLLMENT_LIVENESS_MODE` | `inherit` | liveness policy used when a *new reference template* is enrolled |
-| `OVERTIME_WATCHER_ENABLED` | `1` | background timer that alerts the moment a shift passes 8.1 h |
+| `OVERTIME_WATCHER_ENABLED` | `1` | the background timer that ends a shift at the paid day and alerts past it - which of the two acts, and whether the close stands down, is decided by the thresholds below; read *Which rule ends the day* before retuning either one; `0` stops both rules |
 | `OFFLINE_PUNCH_MAX_AGE_HOURS` | `72` | how far back an offline punch may be anchored |
 | `NOTES_MAX_OPEN_PER_WORKER` | `20` | how many notes by one worker may be waiting for an answer at once |
 | `UPLOAD_MAX_PHOTO_BYTES` | `5242880` (5 MB) | ceiling for **every** photo upload in the app |
+| `LOCAL_REFS_DIR` | `local_references` | face templates. Set it with the three below when something else owns the disk, and remember that a **child process** reads it too: any script that imports this app writes where these point |
+| `WORKER_PHOTOS_DIR` | `worker_photos` | reference selfies, one per enrolled account |
+| `PUNCH_FRAMES_DIR` | `punch_frames` | the downscaled evidence frame stored with a punch |
+| `QUICK_LINK_PHOTOS_DIR` | `quick_link_photos` | the selfie a quick-link punch arrives with |
 | `MIN_PASSWORD_LENGTH` | `8` | shortest password the server will set, in the console and on a registration link |
 | `ENROLLMENT_TOKEN_TTL_HOURS` | `72` | how long an enrollment or registration link stays usable |
 | `OVERTIME_WATCHER_INTERVAL_SECONDS` | `60` | how often that timer runs |
@@ -480,8 +507,9 @@ degrades with an explicit message instead of failing.
 
 ## Face verification capacity
 
-Every punch and every enrollment is a VGG-Face embedding plus an MTCNN detection, and
-those are the most expensive things this application does. They all run in one place,
+Every punch and every enrollment is a VGG-Face embedding plus a YuNet detection (the
+previous detector, MTCNN, still runs on a host without the YuNet model), and those are the
+most expensive things this application does. They all run in one place,
 `backend/face_engine.py`, which is a small queue with a fixed number of worker threads -
 so the answer to "how much inference is running right now" is a number in the config, not
 "as much as happened to be asked for".
@@ -523,6 +551,64 @@ than a rewrite; until then this bounds the damage. `GET /api/v1/readiness` repor
 load (capacity, queued, in-flight, refusals, slowest) as an advisory check, so an operator
 can see a saturated engine without it failing the startup gate.
 
+## Where a face match is decided
+
+A distance is not a verdict, and a threshold is not a number: it is a decision measured for
+one crop and one model. Both live together in `backend/face_detector.py`, keyed by exactly
+that pair:
+
+| pipeline | model | approved at or below | review up to | refused above |
+| --- | --- | --- | --- | --- |
+| `yunet-2023mar` | VGG-Face | 0.40 | 0.50 | 0.50 |
+| `mtcnn` (when the YuNet model is absent) | VGG-Face | 0.40 | 0.55 | 0.55 |
+
+**How those lines were derived.** Two boundaries can be measured: the *genuine ceiling* (the
+highest distance between a photograph and the same person's template) and the *impostor
+floor* (the lowest distance between two different people - what a false accept has to clear).
+Measured on this deployment's own material and on a public multi-identity corpus, through this
+pipeline's own code path:
+
+| boundary | value | what it rests on |
+| --- | --- | --- |
+| genuine ceiling | **0.233** | every same-person pair this deployment has produced - 18 capture variants (0.019-0.144) and both enrolled accounts against each other (0.165-0.233) |
+| impostor floor | **0.676** | the closest of 495 different-people pairs at punch scale (240 px JPEG q60, the size a phone sends), and of 1,269 across four corpora and both pipelines (0.676-0.796) |
+
+The approve line is the geometric centre of that window (0.40: the point with the largest
+margin to both boundaries), and the refuse line sits 1.35x below the impostor floor, rounded
+to the 0.05 a decision is actually made at. `MatchBand.derived()` recomputes both lines from
+the evidence recorded beside them, and a test asserts the shipped numbers are what that rule
+produces - a line cannot be moved without moving the measurement that justifies it.
+
+**Why they are bound to the pipeline.** The pair this replaced - 0.40 and 0.60 - was
+DeepFace's published setting for *DeepFace's* crop, inherited when detection moved to YuNet,
+tied to nothing, and re-derived by nobody. It happened to sit inside the new window, so
+nothing failed and nobody looked. The table is keyed by the pipeline name and the recognition
+model, `band_for()` has no default, and `/api/v1/readiness` carries a **fatal**
+`face_match_band` check: a build that can run a crop whose lines were never derived refuses to
+open the port rather than approve against numbers measured elsewhere. A recognition-model swap
+is the same event wearing the same pipeline name, which is why `biometrics` also refuses a
+stored template whose recorded model is not the live one.
+
+**Re-measuring after a crop or model change.** Both boundaries come from one shape of
+measurement: embed a corpus in which you know *who* each photograph is (one directory per
+identity), through this application's own path (`face_engine.ENGINE.represent_direct`), then
+take every within-identity pair as genuine and every across-identity pair as impostor, and
+read off the maximum of the first and the minimum of the second. Do it in the deployment's
+own capture conditions - the phone's 240 px JPEG, not the original file - because that is
+where the floor sits lowest (0.676 at punch scale against 0.730 at full resolution, measured).
+Record both boundaries on the new band, add it to `face_detector.BANDS`, and let
+`test_face_match_bands` tell you whether the lines you typed are what the rule derives from
+the evidence you recorded.
+
+**What is still unmeasured.** The corpora are clean, frontal and evenly lit, which is the
+*easiest* end of impostors, so 0.676 is an upper bound on the real floor. On the harshest
+corpus - the same person, a decade and a camera apart - genuine pairs reach 0.885, *above*
+that floor. That overlap is why the band has a middle: a distance this deployment has never
+produced for either class goes to a human, and only a distance past the refuse line is
+answered at the gate with "take it again". `attendance_face_match_score` is the histogram that
+shows how the live distribution sits against these lines; if `flagged_review` climbs, the
+lines were measured on a deployment that no longer exists and want re-deriving.
+
 ## Per-site shifts (including overnight)
 
 Each site can run its own clock-in window. A site with no window configured uses the global
@@ -534,7 +620,7 @@ curl -X POST localhost:8000/api/v1/admin/sites/edit \
   -H "Content-Type: application/json" \
   -d '{"site_name":"New Capital Zone B","location_input":"29.98,31.75","radius":100,
        "clock_in_window_start":"21:30","clock_in_window_end":"05:30",
-       "site_timezone":"Africa/Cairo"}'
+       "site_timezone":"Asia/Kuwait"}'
 ```
 
 **From the console** (the way it is meant to be set): *Sites* → **Edit** on a site, or fill the
@@ -561,7 +647,7 @@ another machine (or another country) does not change who is late.
 * `clock_in_window_start` / `clock_in_window_end` must be strict 24-hour `HH:MM`. `7:30` is
   refused where it is typed, and the column has a database `CHECK` behind it for anything that
   arrives another way.
-* `site_timezone` must be an IANA name (`Africa/Cairo`, `Asia/Riyadh`); a typo is refused
+* `site_timezone` must be an IANA name (`Asia/Kuwait`, `Asia/Riyadh`); a typo is refused
   rather than silently falling back.
 * The company window on `POST /api/v1/admin/shift_rules` is checked by the **same** rules, at
   the same endpoint the Shift rules panel posts to. An emptied box clears it back to the
@@ -580,6 +666,236 @@ session carries a `late_flag`, and an administrator gets a notification naming t
 was actually applied. `GET /api/v1/readiness` reports any stored window the application could
 not parse - which is the only way a bad value becomes visible, because the punch path falls
 back to the global rule rather than failing a worker's arrival.
+
+## Which rule ends the day (the automatic close and the overtime alert)
+
+One timer, two rules, and only one of them can end a day. `overtime.py` runs both every
+`OVERTIME_WATCHER_INTERVAL_SECONDS`:
+
+| Rule | Acts at | What it does |
+| --- | --- | --- |
+| **Automatic close** (`auto_close_at_regular`) | `regular_hours` **paid** - 8 by default | Writes the clock-out itself *at the boundary*, marks the shift `Auto-Closed (8h Limit)` / `auto_closed_8h`, and notifies the administrator **and the worker whose day it ended**. |
+| **Overtime crossing alert** (`overtime_notify_hours`) | 8.1 **paid** by default | Alerts the administrator that a shift is **still open** past the threshold. |
+
+They run in the same pass, and the close deletes the session it closed - so a shift the close
+has ended can never be observed crossing the alert line. Whichever rule acts first therefore
+decides whether a crossing is reported at all. **Which rule wins is decided in one place**,
+`shift_hours.day_end_rules()`, read by both scans so the figures they act on cannot drift:
+
+| Settings (close on) | Who ends the day | Why |
+| --- | --- | --- |
+| alert **below** the paid day (`8.1`? no - `7.5` < `8.0`) | the **close**, at 8 h | the crossing is reported at 7.5 h while the shift is open, then the standard day still ends at 8 h. |
+| alert **above** the paid day (`8.1` > `8.0`, the shipped pair) | the **overtime workflow** | a shift closed at 8 h could never reach 8.1 h, so the close **stands down**: the shift runs on, the crossing is reported at 8.1 h, and hours past 8 h are clocked out into overtime review. **Nothing is auto-closed at 8 paid hours.** |
+| alert **on** the paid day (`8.0`) | the **close**, at 8 h | there is nothing to observe: "crossed the paid limit and is still working" is false at that figure, and the alternative is paging the manager on every ordinary full day. |
+| close **off** | a **clock-out** (or nobody) | the alert is then the only thing watching, and it always fires. |
+
+The shipped pair is the deferral row, and that is deliberate: an alert line above the paid
+day only means anything if shifts are allowed to reach it. To get the automatic close back,
+set the overtime line **strictly below** the paid day - that is also what being warned
+*before* the day ends looks like. `OVERTIME_WATCHER_ENABLED=0` stops *both* rules.
+
+A deferral is never silent, and neither is the one unreachable case (the alert on the paid
+day). The verdict travels in four places:
+
+* a **startup log line** from `overtime.start_watcher()` - `WARNING` when the close has stood
+down or the alert cannot fire, naming both numbers and the way out;
+* `GET /api/v1/admin/shift_rules` returns a `day_end` block (`regular_hours`, `notify_hours`,
+`close_at_paid_hours` - `null` when the close has stood down - `close_defers`,
+`alert_reachable`, `day_ended_by`, and the sentence explaining it); the console's **Shift
+rules** panel warns from it on the screen where the numbers are typed;
+* `GET /api/v1/readiness` reports both halves as advisory checks - `overtime_alert_reachable`
+(the alert can fire at all) and `overtime_close_deferred` (the automatic close is standing
+down, so a switch that still reads as *on* is no longer closing anything);
+* `overtime.scan_auto_close()` returns `deferred: true` with the reason instead of a quiet
+zero, and the watcher logs each pass where it stands down.
+
+**The cost of the deferral** is the same one that was already documented for switching the
+close off, and it now applies to the shipped settings: **nothing ends a forgotten shift.**
+Two consequences, and the second one is easy to miss:
+
+1. a worker who never clocks out keeps accruing hours that wait for approval, and the alert
+   fires once when the crossing happens;
+2. **an open shift refuses the next clock-in** (`Already clocked in!`), so the same worker
+   cannot start the next day until somebody ends it. The alert says so, and *Force clock
+   out* in the console is how an administrator ends it.
+
+If you want the system to end the day for you, put the overtime line below the paid day - and
+accept the alert that comes with it, because a crossing the close can see is a crossing the
+manager is told about.
+
+## The overtime line, and what it counts
+
+`overtime_notify_hours` (8.1 by default) is a **paid-hours** figure - the same hours
+`regular_hours` counts, i.e. time on site **less the unpaid break**. It is never time on
+site: a worker on site for 8.5 h has been paid for 8, so reading the line as on-site hours
+would put every ordinary full day on overtime. The basis is named once, in
+`shift_hours.OVERTIME_BASIS`, and the console says *paid* wherever the line is named.
+
+**One resolver, every path.** `shift_hours.overtime_assessment()` is what answers "has this
+shift crossed the line, and how much of it is held back?". The punch path, the quick-link
+path, the offline materialization, the clock-out an administrator forces, and **both**
+watcher scans read it - none of them resolves the column itself. That is not tidiness: the
+four paths used to resolve it their own way and disagreed. The gate was strict (`>`) where
+the watcher was inclusive (`>=`), two paths compared the *recorded* hours (which round a
+shift up to the paid day) against a line meant for real paid hours, and one of them wrote a
+sentence into `flag_reason` calling the overtime line the "regular threshold".
+
+**The rule it encodes** (`needs_approval`):
+
+| | |
+| --- | --- |
+| the comparison is on | seconds - the resolution the timestamps are stored at |
+| the operator is | `>=` - *reached*, not passed, so the worker's card, the administrator's alert and the clock-out gate fire on the same second |
+| a shift is held when | its paid time has reached the line **and** it leaves time past the regular paid day |
+| what is held | the paid time **past the regular day** (`overtime_hours`) - what the approval queue, the payroll totals and the rejection arithmetic read |
+
+Both halves of the third row matter. A line *below* the paid day is a warning set early, and
+without the second half every ordinary full day would be held for approval with a zero
+overtime figure on it - which is what the code did before this was one function. A shift that
+ends between the paid day and the line is therefore an ordinary approved day: **the line
+triggers the alert, the paid day starts the overtime.**
+
+### What a shift is worth *before* anybody decides
+
+A worker/moallem works eight hours as a matter of course, so **the standard day is earned the
+moment the shift is filed** and only the time past it waits on a manager. A 9.0 h paid shift
+that has crossed the line reads:
+
+| | pending | after approval of 8.25 h | after refusal |
+| --- | --- | --- | --- |
+| `approved_hours` | 8.00 | 8.25 | 8.00 |
+| `awaiting_approval_hours` | 1.00 | 0 | 0 |
+| `overtime_hours` | 1.00 | 0.25 | 0 |
+| status | `pending_overtime` | `approved` | `overtime_rejected` |
+
+Withholding the *whole* shift made an ordinary day conditional on somebody pressing a button,
+and it contradicted the refusal path beside it in the same queue, which has always paid the
+standard day. The two halves of that queue now agree, and the approval still overwrites the
+provisional day rather than adding to it - the decision is the decision.
+
+**The other hold is not the same thing.** `pending_review` credits nothing: it is a doubt
+about whether the work happened at all (a liveness verdict, a selfie that did not match, a
+punch with no face), so there is no standard day to credit ahead of it. Only
+`pending_overtime` - the hold that is about the *extra* hours rather than about the work -
+gets the split. A `pending_overtime` row carrying no overtime figure (or a nonsense one)
+fails closed and credits nothing, because there is then no figure to separate the day out with.
+
+`reports._shift_hours()` is the one place that decides this, and every status satisfies
+`counted == approved + awaiting` by construction - which is what makes the two columns add up
+to the hours the sheet shows. The server sends `awaiting_approval_hours` **per row** so the
+console totals a filtered view with the server's own arithmetic rather than assuming an
+awaiting shift holds all of its hours; the fallback to `row.hours` is for a payload from an
+older server, and keeps the two figures summing either way.
+
+**The worker is told, whichever way the shift ends.** The crossing alert is not the watcher's
+alone: a timer can only see a shift that is still open, so a worker who crossed the line and
+clocked out before the next pass used to learn nothing while the administrator's review alert
+arrived. `overtime.announce_crossing()` is now the one writer of that notice - the watcher
+calls it for a shift that is still running, and so does every path that can end one (the
+punch, the quick link, the offline punch materialized later, and the clock-out an
+administrator forces). One sentence, the figures taken from the shift's own clock-in, and a
+`dedupe_key` naming the *shift* rather than the caller - so a worker alerted while still on
+site and then clocking out is told once, not twice. It lands in the worker's own inbox
+(`worker_notifications`, kind `overtime_crossed`) and is pushed to their phone after the
+transaction commits (`push.dispatch_async()`; a deployment with no VAPID key pair configured
+simply has no push - the inbox row is the record, and `readiness` reports the missing key
+pair as an advisory).
+
+The crossing notice is about the *shift*, though, and it was the last word the worker had until
+their clock-out - hours of not knowing whether staying on was paid. So the **answer is its own
+notice**: `overtime.decide_crossing()` writes it in the same transaction as the decision it
+reports, stating the ceiling, who authorised it and what is left unauthorised (kind
+`overtime_authorised`; a refusal is `overtime_declined`, a different kind because "authorised up
+to 10.5 h" and "no extra time is authorised" are opposite statements that no single kind could
+carry). Its `dedupe_key` names the **decision**, not the shift: a ceiling an operator extends has
+to reach the worker twice, because the extension is the answer their clock-out settles at, while
+a repeated request cannot (same row, same key). The operator's note is deliberately *not* in it -
+it is written for the record, and the console promises a worker never sees a reviewer's note - so
+what the worker gets is the figure and who set it. `push.dispatch_async()` runs after the
+endpoint's transaction commits, through the same `deliver_worker_notices()` the crossing uses.
+
+The record is **readable on the phone**, not only pushed to it: the handset's *Alerts* tab is
+that inbox (`GET /worker/me/notifications`, the notifications the token's own account was
+sent, newest first, with a read state), and the clock panel carries the count above the clock
+button - a band naming the newest unread notice with the way in. The band is on the clock
+panel on purpose: the close writes its notice because the next clock-out refuses the worker,
+so the sentence has to be in front of them *before* they tap that button. Two details are
+deliberate and pinned by tests: the badge is one number read once, from the endpoint with
+`unread_only=true`, so the tab and the band can never disagree; and marking one read sends its
+id in the **query string**, which is where the route reads it (`notification_id`), because the
+same request with a JSON body would be answered like "no id" and mark the whole inbox read.
+Nothing about a notice the system wrote - an auto-close, a crossing - is lost on a deployment
+with no push at all: the row is what reaches the worker, and the push is only the shortcut to
+it.
+
+The **push half** closes the gap the inbox cannot: a notice reaches a worker whose app is
+closed. `push-service-worker.js` is registered at boot - before any permission is asked, and
+for every account - because a web push cannot exist without a service worker, and the first
+enable must be one tap on a site's cellular link, not a tap plus a registration wait. Nothing
+prompts at boot: a permission fired unprompted is how an app teaches people to refuse prompts.
+The profile tab's card reads `GET /worker/me/push` first and names its state honestly -
+configured with a count of devices, not configured *with the server's own reason*, or a
+browser too old to register a worker - and offers a switch only where one can work. Enabling
+asks the permission, creates the subscription against the deployment's VAPID public key, and
+POSTs it; a backend refusal releases the browser-side subscription too, so the card never says
+"on" for a subscription no server will send to. Disabling releases the browser side whatever
+the server answered - the worker asked for off, and a row the server could not retire is
+cleaned up by the next failed delivery, not by this phone. A tap on the notification focuses
+(or opens) the app and hands it the notice id; the page marks it read in the query string the
+same way the inbox does, so the badge on the lock screen and the badge on the tab agree.
+The worker file holds no token and no state - it only ever *receives* - and the settings
+card's strings ship in all four languages.
+
+The operator's side of that - generating the key pair, which variables carry it, and how to
+watch a notice travel from a shift that ran long to a phone that is in a pocket - is
+[`docs/RUNBOOK_WORKER_PUSH.md`](docs/RUNBOOK_WORKER_PUSH.md), kept honest by
+`backend/tests/test_worker_push_runbook.py`, which fails when a renamed setting, a changed
+default or a moved route makes the runbook wrong. The sender is an **optional** dependency
+(`pywebpush`, in `backend/requirements-optional.txt`): a deployment without it behaves exactly
+as one that never configured push, and says so with its own reason rather than failing.
+
+The channel's own failure mode is a **silence**, and a silence is the one thing an
+event-driven alert cannot report: a push service answering 401, a subscription retired under
+the worker's feet, a permission revoked - each leaves every setting valid and no row behind.
+So the backlog is measured instead. `push.stranded_notices()` reads the notices that passed
+`PUSH_MAX_AGE_MINUTES` still undelivered (past that window nothing is retried, so those will
+*never* be pushed), and keeps the two halves an operator has to act on differently: notices
+whose worker has no live device - nothing was sent, nothing can be until that worker allows
+notifications - and notices whose device is registered, where the push service refused or
+failed the send. The reading reaches three surfaces an operator already watches: an
+`admin_notifications` row (`push_undelivered`, warning, one per hour so a persistent backlog is
+re-said without becoming an alarm nobody reads), the `worker_notice_backlog` advisory on
+`GET /api/v1/readiness` (the one an uptime monitor can poll), and a WARNING line on the watcher
+tick. It is taken on two clocks - the watcher pass and every `push.dispatch` - because a channel
+that has gone quiet is exactly the case where nobody is punching, and the punches that would
+otherwise take the reading stop arriving with the notices they would have reported. The rule
+that keeps it trustworthy is the quiet one: a deployment that does not intend to push is never
+told about its own inbox. With no key pair, or `PUSH_ENABLED=0`, a backlog is the expected
+state, and `worker_notice_backlog` says "not measured" rather than inventing a fault - so the
+check has teeth exactly where nothing else can see the problem.
+
+The **automatic close** has its own notice, in its own kind (`shift_auto_closed`), written in
+the same transaction as the administrator's alert: it ends a shift with nobody asking it to,
+so the worker is told *that it happened* - when the day was closed, what it was paid, and
+that their next clock-out will find nothing open - rather than discovering it from the
+refusal at the gate. The kind is deliberately not `overtime_crossed`: a close records exactly
+the paid day, so there are no held-back hours for a crossing sentence to be about.
+
+The sentence states the event and the rule - you passed the line at this instant, and time
+past the paid day needs approval before it is paid - never the outcome, because on the
+*Force clock out* path the hours have already been authorised by the administrator who ended
+the shift and a notice reading "waiting for approval" would be false there. The one
+difference between an open shift and a finished one is the closing clause ("clock out when
+you finish"). A clock-out path announces only when hours are actually held: a shift that
+stops between an early line and the paid day has crossed the line and is paid in full, so
+there is nothing to tell the worker about their pay.
+
+The held hours are written to `attendance_logs` as `Pending Overtime Approval` /
+`pending_overtime`: visible on the timesheet, excluded from approved hours until an
+administrator decides them, and a rejection leaves the standard paid day intact.
+`overtime_notify_hours` is range-checked on write like `regular_hours` (0 < x ≤ 24) - a line
+at 0 held every shift of every length for approval, and a line at 900 silently meant nobody
+was ever on overtime.
 
 ## Worker enrollment
 
@@ -658,8 +974,31 @@ Details, including the residual risk of a long offline window, are in
 POST /api/v1/attendance/devices/register   -> device key (returned once)
 POST /api/v1/attendance/anchors            -> {anchor_id, server_time, anchor_signature}
 POST /api/v1/attendance/sync               -> batch of signed punches
+POST /api/v1/attendance/sync/photo         -> the selfie a queued punch kept, scored here
 GET  /api/v1/admin/punch_queue             -> triage, including refused punches
 ```
+
+**Materialising a punch is not confirming it.** A punch taken with no signal was never checked —
+not the face, not the frame, not even the site — so nothing that comes out of the queue is approved.
+The clock-out, the row that carries the hours, lands in `pending_review` (or `pending_overtime` when
+the shift crossed the overtime line, which is the same hold with a sharper reason) with the
+provenance in `flag_reason`; the hours are recorded and are not payable until an administrator
+approves them from the review queue, and the phone is told exactly that: `pending_hours` in the
+worker's own totals, not `regular_hours`.
+
+The arrival is recorded as `unverified_offline` instead, and that difference is deliberate: it
+carries no hours for anybody to decide, and a `pending_review` row blocks that worker's next
+clock-out (the online punch and the quick links both refuse while one exists) — so holding the
+arrival would leave somebody who came in during a dead spot unable to close their shift, with the
+day never recorded at all.
+
+The selfie the phone kept is uploaded afterwards, through the same size-and-type policy as every
+other photo in the app, and bound to its punch by the `photo_sha256` inside the signature — a
+different image is refused rather than scored. The server then runs the online punch's own checks
+over it (liveness, then the face comparison) and writes the verdict onto the review row: the score,
+the liveness verdict and a sentence the reviewer reads. It is evidence, never a decision — a model
+that runs hours later is not a witness, so scoring cannot approve an offline punch and cannot refuse
+one either, and a spoof it finds is recorded and notified without touching what the shift is worth.
 
 ## Reporting
 
@@ -679,7 +1018,10 @@ tests all use the new names. (`/admin/reports/export` is the export for scripts 
 `/admin/reports/shifts` is a **timesheet**, not a payroll report: one row per shift, with the
 day it ended, the worker, their id, the site, the hours it counts for, whether an
 administrator has signed it off (`awaiting_approval`), and how many notes that worker has
-open. It carries no `hourly_rate` and no `gross_estimate` - an app that pays nobody should
+open. It also carries the **arrival** the shift started with - `arrival_time` (the clock-in
+that was paired with this shift), `arrival_verdict` (`on_time` / `early` / `late`) and
+`arrival_minutes` (how far outside the window, `0` when on time) - and
+`totals.late_arrivals` beside the hour totals. It carries no `hourly_rate` and no `gross_estimate` - an app that pays nobody should
 not ship a sheet that looks like it is about to. The rate is still a field on the user
 record (the Credentials tab edits it); nothing multiplies it.
 
@@ -692,13 +1034,40 @@ rather than the raw clock - 8.25 h of a 9.5 h shift, with `recorded_hours` kept 
 In the admin console, the **Shifts** tab opens on this month and lets the admin pick a
 period - or tap *This month* / *Last month* / *This week*, the week running from Sunday to
 match `working_days`. It shows the totals (hours, approved hours, hours and shifts awaiting
-approval, unpaid break, shifts, workers) and then the shifts themselves.
+approval, unpaid break, shifts, workers, late arrivals) and then the shifts themselves.
 
 The table's columns are the administrator's to arrange. They arrive in this order -
-**Date, Employee, User ID, Site, Hours, Awaiting approval, Open notes** - and the *Columns*
-panel moves any of them earlier or later, remembering the choice in `localStorage` so it
-survives a reload without changing what any other admin sees. A stored order that is stale
-or junk is repaired rather than obeyed (unknown columns dropped, new ones appended).
+**Date, Employee, Role, User ID, Site, Arrival, Hours, Awaiting approval, Open notes** - and
+the *Columns* panel moves any of them earlier or later, remembering the choice in
+`localStorage` so it survives a reload without changing what any other admin sees. A stored
+order that is stale or junk is repaired rather than obeyed (unknown columns dropped, new
+ones appended).
+
+**Role** is the column that answers *whose shifts are these*. A normal administrator who
+also works a site clocks in like anybody else, and their row is the one a reviewer has to be
+able to pick out of a month of rows. It is written in the reader's language -
+*Administrator*, not `admin` - and the search box below matches it in both forms, so
+`administrator` finds their shifts and so does the Arabic word for the role. A row whose
+account no longer exists says the role is unknown rather than leaving the cell empty, which
+would read as "worker".
+
+**Arrival** says whether the shift's own clock-in was inside the window its site applies -
+*On time*, *Late 42 min*, *Early 5 min* - and *No clock-in* when there is no arrival on file
+for that shift (a force-clock-out, or an auto-close whose clock-in predates the pairing).
+Unknown is not the same as punctual, so it is stated rather than rendered as a tick. The
+verdict is computed by the same function the gate uses (`shift_windows`), from the site's
+own hours and timezone with the company rule as the per-field fallback, so the column cannot
+contradict the flag the worker's card showed at the time. The window applied is the one in
+force when the report is read: this application has never stored the window a punch was
+judged against, so a site that has since changed its hours is judged by the new ones.
+
+That column makes the timesheet answer the question a foreman actually asks - **who arrived
+late, and by how much**. Typing `late` in **Search** narrows the list to the late arrivals
+and the *Late arrivals* figure above it to the same set; `late 42` is the ones 42 minutes
+outside their window, and `on time` is the rest. The arrival is *not* in the CSV export: that
+file is fixed at `Employee, id, site, hours` so two months of sheets line up column for
+column, and the arrival is a judgement that changes if the window does. The printed PDF
+sheet is the table on screen, so it keeps the column.
 
 The **Download CSV** button writes a file from the rows shown, so a search downloads
 exactly what the table shows (the API export has no free-text filter and always covers the
@@ -709,6 +1078,107 @@ shows it (the API export writes that figure unrounded, so a script gets the exac
 and a reader gets the same sheet). The screen's column order deliberately does not travel
 into the file: a sheet whose columns move from day to day cannot be compared with last
 month's.
+
+The **Download** button writes either of two files, picked in the *Format* box beside it:
+the CSV sheet described above, or the same report as a **PDF**. The PDF is the browser's own
+print dialog - the console builds the sheet from the rows on screen and calls
+`window.print()`, so *Save as PDF* is what writes the file, the reader's own fonts render
+Arabic and Hindi names correctly, and the host needs nothing installed to produce it (`pip
+install reportlab` on a server whose office is in Cairo is a font problem nobody asked
+for). The sheet keeps the columns the administrator arranged rather than the CSV's fixed
+four - paper is read by whoever set the table up - and carries the period and the total;
+the dialog offers the period as the file name, the same name the CSV gets. As with the CSV,
+a search travels into the sheet, and a period with nothing on screen prints nothing. The
+paper rules themselves - the sheet, the file name the dialog offers, and putting the page
+back when it closes - live in one `PrintReport`, shared with the reader's own timesheet
+below, because they are the same three rules for either reader. The *frame* of the sheet is
+shared for the same reason and lives there too: the title, the period line, the table, the
+total and the note that says only approved hours count are built once
+(`PrintReport.sheetHtml`), and each screen supplies only what is its own - its columns, its
+rows, its total, what an empty period reads. A second hand-built frame is how one screen
+ends up printing a sheet that states the note at its foot, or the arrow between two dates,
+slightly differently from the other.
+
+**Whose timesheet this is, at the top of every sheet.** That frame also carries the
+company's own name and mark, so the paper an administrator signs says whose payroll it is -
+and neither is a constant any more. The wordmark, the legal suffix, the founding year, the
+tagline and the logo are a settings row (`company_settings`, one row, edited on the console's
+**Admin → Company** panel), and `GET /api/v1/branding` is the public read: the login panel,
+which by definition has no session, is the screen that most needs to say whose app this is,
+and a wordmark on the one screen whose job is to answer *is this the app my administrator
+told me about?* is the thing this replaced. Writing is `POST /api/v1/admin/branding` and the
+logo endpoints beside it, `admin_only` like the shift rules, and audited - the log records
+the mark's type, size and dimensions rather than its bytes. An uploaded logo is decoded,
+bounded (40 MP, 5 MB, JPEG/PNG/WebP only) and **re-encoded** by the server: PNG when it has
+transparency to keep, JPEG when it does not, scaled to 512 px on its longest edge, so what a
+browser fetches afterwards is never the file that was posted, and a 4000-pixel phone photo
+of a business card is a 40 KB mark rather than a 400 KB one. `?v=` in the served URL is the
+stored version, so a replaced mark is a different URL and no cache can keep serving the old
+one.
+
+`null` and `""` are different answers here, deliberately: a line nobody configured is the one
+this application ships with, and a line the company *emptied* is not printed - a business
+with no legal suffix must be able to take that line off its own sheet, and a rule of "blank
+means the shipped value" would put it straight back. So the four lines are nullable with no
+default, the empty string survives the round trip to paper, and the console's panel has a
+**Use the shipped lockup** button for "stop deciding" as distinct from "print nothing here".
+The frontend merges the row over the shipped lockup once, in `Brand`, and every surface that
+says whose this is reads that one record - login panel, handset header, console rail, footer
+sentence, and the header of every printed sheet. The cache is applied before the first paint
+and the network answer only corrects what changed since, so a phone at a gate never waits on
+its connection to learn the company's name; a settings read that fails leaves the last lockup
+that was known in place, which is what keeps an offline handset from naming the wrong
+company.
+
+**One worker's month, from that worker's row.** Every shift row carries a printer button -
+the one cell on the row that is not a column - and it prints **that person's calendar
+month**, which is a different document from the period sheet above in two ways that matter.
+The subject comes from the row: the request is `/admin/reports/shifts?start=…&end=…&worker_id=…`,
+so the server answers with one person's shifts rather than the period's, and a month longer
+than the period on screen is a real month rather than a filter over whatever the table
+happened to be holding. The period is the calendar month the chosen period falls in - the
+tab may be showing a week, a single day, or a shared link's odd range and the sheet is still
+the month - clipped to today while that month is still running, exactly as the presets are,
+so a sheet never describes work that has not happened. On the sheet the three identity
+columns leave the table and appear once above it (`Seed Lead · Moallem · id 600`), because a
+month of one person's shifts would otherwise repeat the same three facts on every line; the
+columns that remain keep the administrator's own order and the tab's own cells, and the file
+the dialog offers is named after the person as well as the month, so two of these in one
+folder are not told apart by opening them. A month that person did not work prints nothing
+and says so, rather than handing over a titled blank sheet that reads as a lost timesheet.
+
+**Your own month, for the person it is about.** The same figures are available to whoever
+they describe, without an administrator passing them on: the handset's **History** tab leads
+with the reader's own timesheet for a month they pick - hours worked, approved, still
+awaiting approval, overtime, and the per-site split that answers "how much did I work
+*where*" - from `GET /worker/me/report`, which is scoped by the token and takes no worker
+id, so there is nothing in the request to point at somebody else's month. **Download CSV**
+writes that list with the fixed English columns (`Date, Site, Arrival, Break hours, Hours,
+Approved hours, Status`) and **Download PDF** prints it as a sheet: the same rows and the
+same totals as the console's, because both are built from the report already on screen
+rather than re-derived on the server - and the two sheets come off the same `PrintReport`,
+so the row an administrator prints for one worker and the row that worker prints for
+themselves are the same document seen from either side. A normal administrator who also works a site reaches
+this screen by stepping onto the handset from the console (**Check In**), and a lead worker
+by signing in, so all three roles read and print their own month the same way; a month with
+nothing in it prints nothing rather than a blank sheet with a title on it.
+
+**Which columns those two files carry is the worker's own choice.** The card's *Columns in
+the file* panel is one checkbox per column - `date`, `site`, `arrival`, `break`, `hours`,
+`recorded` (time on site beside the hours it counts for), `approved`, `status` - and
+**Save columns** remembers it through `POST /worker/me/report/columns`, on the *account*
+rather than in the browser: a timesheet is handed in from wherever the worker is standing,
+so a choice kept in one device's storage would give the same account two different files and
+would be lost with the phone. `reports.REPORT_COLUMNS` is the vocabulary, and it is the only
+list either side reads - the server drops ids it does not know (so a client one release
+ahead can still save, and a column this build cannot fill never becomes a column of empty
+cells), refuses an empty choice (a file with no columns is not a report; the screen stops the
+last box from coming off and says why), and stores the *default* choice as nothing, so an
+account that has never narrowed anything gains a column in the release that adds one. A tick
+takes effect on the very next download and Save is what makes it outlive the page - the same
+rule the files already follow, that what is written cannot disagree with what is on screen -
+and the sheet prints the chosen columns under their headings in the reader's language while
+the CSV keeps its fixed English ones.
 
 The period is kept in the URL fragment (`#shifts=2026-08-01..2026-08-31`), so copying the
 address bar - or the **Copy link** button - hands a colleague the same figures. Opening
@@ -721,13 +1191,33 @@ worker's open notes (open or in progress) - four shifts by one person with a req
 one outstanding note, not four.
 
 The **Search** box narrows the rows without touching the period, matching on worker name,
-worker id, site, day or approval state - every term has to match, so `harbour khan` is the
+worker id, role, site, day, approval state or arrival - every term has to match, so `harbour khan` is the
 one shift that is both. The totals above the list then cover only the shifts shown, and the
 card block is replaced by "no shift matches" rather than a grid of zeros. A day typed into
 the box filters the rows like any other term (a timesheet row *has* a date) and still
 offers a one-tap switch that moves the whole period onto it. Searching repaints from the
 rows already in hand, so it costs no request - only a new period does.
 Hours still awaiting approval are shown beside the approved ones and never added to them.
+
+**Who is in the attendance figures.** `/admin/reports/attendance` counts the day somebody
+walked in, so an administrator who covered a shift appears in it like anyone else - the same
+`days_present` on the same `expected_days`, the same arithmetic turning it into a rate, and
+no branch in the query for a role. Each row carries **`role`** beside the name for the same
+reason the Shifts tab has the column: the figures are reviewed by role, and a row that names
+the person without saying which of them is the administrator is a row somebody has to
+reconcile by hand. The attendance export (`kind=attendance`) writes it as its third column,
+`worker_id,worker_name,role,...`, so it travels into the file. The two review queues an
+operator works through - `/admin/pending_reviews` (the console's **Approvals** tab) and
+`/admin/reports/pending` - carry `role` too, so a long shift waits for a decision under the
+name of whoever it belongs to.
+
+**Live Ops** is the other half of reading a shift: the ones that are still open. Each row
+names the person, the site, the clock-in time and how long they have been on site, and the
+role is on the row - `Administrator · 1000`, not `admin · 1000` - and on the phone cards,
+which previously showed no role at all. The board's filter matches the role in both forms as
+well. A board where an administrator's own shift reads like anybody else's is a board whose
+reader has to recognise a name before they can tell who is on site, and the role is the one
+fact that decides who reviews the hours afterwards.
 
 ## Data retention and erasure
 
@@ -844,7 +1334,15 @@ Set `METRICS_TOKEN` to a random string (`python -m config` shows whether one is 
 never the value). With no token configured the endpoint requires an admin JWT, which is
 what makes it safe to leave on by default; `METRICS_ENABLED=0` answers 404 instead, and an
 installation without `prometheus_client` answers 501 with the install command rather than
-500 - the library is an optional extra, and so is the feature.
+500 - the library is an optional extra, and so is the feature. The degraded mode is two-way
+contractual: without the library every counter still accepts the application's increments
+silently (write-path parity, pinned by
+`test_metrics.py::test_every_helper_is_silent_when_the_library_is_missing`), and the stand-in
+`Counter` can hand the label values of each increment to a receiver (`Counter.record`), which
+is how the network-policy suite keeps asserting "refused, for this reason" on an interpreter
+that has no `prometheus_client` at all. The exposition format itself is never faked:
+`render()` returns empty bytes and `/metrics` answers 501, because a plausible-looking scrape
+of nothing would be worse than an honest 501.
 
 **Why hand-rolled rather than `prometheus-fastapi-instrumentator`.** Its middleware answers
 the HTTP half of this question and nothing else: it cannot see that a punch spends half a
@@ -862,7 +1360,7 @@ application starts without the library, which a hard import would not.
 | `attendance_http_in_progress` | gauge | - | concurrency right now (unlabelled: see below) |
 | `attendance_face_model_seconds` | histogram | operation, model, detector | **inference cost** (`represent`, `detect`) |
 | `attendance_face_cosine_seconds` | histogram | - | the 4096-float comparison, on its own |
-| `attendance_face_match_score` | histogram | - | distance distribution, bucketed at 0.40/0.60 |
+| `attendance_face_match_score` | histogram | - | distance distribution, on a fixed grid bracketing both pipelines' decision lines |
 | `attendance_face_model_failures_total` | counter | operation, error | the model raised, by exception type |
 | `attendance_face_engine_job_seconds` | histogram | job, outcome | pooled job time |
 | `attendance_face_engine_queue_wait_seconds` | histogram | job | time spent waiting for a worker |
@@ -927,8 +1425,9 @@ histogram_quantile(0.99,
 #    only "database is locked"/"busy" - so this alert means what it says.
 sum(increase(attendance_sqlite_lock_errors_total[10m])) > 0
 
-# 7. The review queue is filling up: scores drifting towards the 0.60 threshold means the
-#    camera fleet, the lighting or the enrollment photos changed - not that workers changed.
+# 7. The review queue is filling up: scores drifting towards the refuse line (see "Where a
+#    face match is decided" for the lines in force) means the camera fleet, the lighting or the
+#    enrollment photos changed - not that workers changed.
 sum(rate(attendance_verifications_total{outcome="flagged_review"}[15m]))
   / sum(rate(attendance_verifications_total[15m])) > 0.10
 
@@ -974,6 +1473,163 @@ That is the point of a reset, and the panel says so before the button. A standar
 cannot change an administrator's password - the server answers 403, and the button is
 hidden for the same reason rather than shown and then refused.
 
+### How the API decides who may do what
+
+Authorization here is three layers, and the third one is checked at startup rather than
+remembered.
+
+**The credential is a signed session token, and the subject is always the token.** No
+endpoint takes an identity from a request field: `/attendance/verify` still accepts the
+`worker_id` the shipped client sends, and rejects it if it names anybody but the token's
+owner; every self-scoped read (`/worker/me/*`) has no id in it to tamper with. That is
+why the old "send `admin_id` and be believed" shape is gone - identity is not a form field.
+
+**The role guard is a dependency, not a branch.** `security.require_role("admin")` is a
+FastAPI dependency (`any_authenticated`, `admin_only`, `head_admin_only` are the pre-built
+ones), and each carries an `_auth_marker` so the guard can be *inspected* rather than
+trusted. The token's `token_version` is compared against the row on every request, so a
+password reset or a deactivated account kills existing sessions on every ASGI worker at
+once, not just the one that handled the reset.
+
+**Object-level ownership is enforced in the query.** A worker asking for a colleague's
+note gets the same 404 as a note that does not exist - "not yours" and "not there" must be
+indistinguishable, or the endpoint becomes a way to enumerate which ids are real.
+`ensure_self_or_role` does the same for a record reached by id.
+
+The third layer is the part that used to be missing. `auth_enforced_on_admin_routes`
+walks every path containing `/admin/` and fails the startup gate when one of them has no
+role guard - and it said nothing at all about the other eighty-odd routes, which were
+covered only by convention: they carried `Depends(any_authenticated)` because whoever
+wrote them was careful. An endpoint added under `/api/v1/worker/` with no `Depends` at all
+would have been readable by anybody who could reach the port, with the gate reporting a
+clean bill of health.
+
+`api_routes_authorised` (`backend/readiness.py`) closes that, and it is **fatal**: the
+process refuses to serve rather than running a surface nobody verified. Every route must
+be *accounted for* - carrying a `require_role` guard, or named in one of three explicit
+lists with the reason written beside it:
+
+| List | What it claims | Who is on it |
+| --- | --- | --- |
+| `PUBLIC_ROUTES` | answers without a session, on purpose | sign-in, the company branding the sign-in screen needs, the enrollment and quick-link token paths, readiness and status |
+| `SELF_GATED_ROUTES` | refuses you itself, inside the handler | `/metrics` and `/api/v1/metrics` - it accepts a scrape token *or* an admin JWT, so it cannot carry a role guard |
+| `PAGE_ROUTES` | serves an HTML file and no data of ours | `/`, `/enroll/{token}`, `/q/{token}` |
+
+Entries are keyed by **method and path**, so adding a verb to a path that is public today
+(a `DELETE /api/v1/branding`, say) does not inherit the exemption - it has to be declared
+and explained in the diff. As shipped: 85 routes guarded by `require_role`, 12 declared
+open with a reason, 3 pages.
+
+The check also fails on the two ways a list like this rots. A **stale** exemption is one
+for a route that no longer exists: it reads as "public on purpose" for a path nothing
+serves, and quietly covers for the rename that is now unaccounted for. A **redundant**
+exemption is one on a route that is already guarded, which does nothing but misinform the
+next reader. And a traversal that enumerates *nothing* fails rather than reporting `0
+guarded, 0 missing` - that exact vacuous pass is how the sibling check once certified a
+surface it had never looked at.
+
+`backend/tests/test_api_route_authorisation.py` holds all of it: that the gate passes on
+the app as shipped, that it bites on each failure mode above, and that the exemption lists
+are **honest** - a route declared public really does answer an anonymous caller, and one
+declared self-gated really does refuse one.
+
+That gate proves every route *has* an authorization decision. It cannot tell whether the
+decision is the **right** one: a route guarded by `any_authenticated` satisfies it
+perfectly, even when the route is an administrator's. `backend/tests/test_role_audience.py`
+closes that by stating the audience **independently of the guards** and holding the guards to
+it. `_intended_roles()` derives the audience from the shape of the API - a `/api/v1/admin/`
+path belongs to the administrator roles, everything else to every signed-in role - with a
+short list of documented exceptions (`/worker/stats/{worker_id}` and `/status/detail` are
+administrators'; `/worker/me/enroll` is one administrator's own face). Independence is the
+point: a table read back out of `_allowed_roles` would agree with itself however wrong the
+guards were.
+
+It fails in **both** directions, because both are defects. A route *broader* than its path
+implies is the one that costs money - a payroll read any worker can call. A route *narrower*
+than it implies refuses somebody it was built for, which is how a 403 nobody reads gets
+shipped. Alongside that it presents a real session from every role outside an audience and
+asserts a refusal, and one from a role inside it and asserts the opposite, so a guard that
+denied all four roles cannot look like a pass. Those probes are sent with **no body** on
+purpose: FastAPI resolves dependencies before it validates a request, so the refusal is
+decided from the credential alone and the sweep cannot write anything.
+
+The matrix answers *which roles may call a route*. It is blind to the layer underneath - a
+route any worker may call that takes an **id**, where the id decides whose record is read
+or written. "May I call this endpoint" and "may I have this record" are different
+questions, and a role guard only answers the first. `backend/tests/test_ownership_matrix.py`
+covers that layer, in both halves:
+
+* **structural** - every route whose path carries somebody's record is accounted for. Three
+  legitimate answers exist and each is declared in the file: the audience is administrators
+  only, so no cross-worker case exists; the path is a *credential* rather than an id (an
+  invite or quick-link token, hashed at rest, single-use, revocable); or it is listed with
+  the one mechanism that decides the owner - `notes._fetch_note(..., worker_id=...)` and
+  `offline_sync._device_lookup(conn, current.id, device_id)`. A new worker-reachable id route
+  cannot ship unlisted.
+* **live** - a real second session aiming at a real record owned by somebody else. The
+  refusal is asserted *and the row is asserted unmoved*, because a 404 that still wrote is
+  not a refusal; the owner's own access is asserted beside it, so an endpoint that refuses
+everybody cannot pass.
+
+The third form of the same mistake has no id in the path to find it by, so it is probed
+directly: an id smuggled in through a **query string** or a **form field**. Every self-scoped
+route (`/worker/me/*`) is asked twice - once with a colleague's `worker_id` and once without -
+and the two answers must be identical, which is asserted as an equality between responses
+rather than against a payload's shape so it cannot start passing because a field was added.
+`POST /attendance/verify` gets a *complete* form with the wrong `worker_id`, because that
+refusal lives in the handler (every role may punch, so it cannot carry a role guard) and a
+bodiless request would only prove that a missing form is a 422.
+
+Two of those live cases had no test anywhere before this file: a worker revoking a
+**colleague's signing device** (the quiet one - it bumps their key epoch, so every punch their
+phone has queued stops verifying and the worker finds out at the gate), and a colleague's
+`worker_id` appended to a self-scoped route. The notes half is covered in depth by
+`test_worker_notes.py`; this file holds the matrix-level probe so the list is complete in one
+place.
+
+### Where the server is allowed to send
+
+All three layers above decide *who may call*. One endpoint also decides *where the server
+may go*, and it is the only place in the application where a value a worker supplies becomes
+a URL the server fetches: a push subscription endpoint. The browser hands over a URL, the
+server POSTs a notification to it, and it does so again on every event that follows. That is
+a server-side request forgery primitive with a retry, and the request leaves from inside the
+network with no credential of the worker's attached.
+
+**The control is an allowlist, and that choice is the design.** Refusing private ranges is
+the obvious alternative and the wrong property: nothing about the attack needs an internal
+address. `https://collector.attacker.test/hook` is a public host, reachable from anywhere,
+and confirms to its owner that the server fetched it - and a denylist would accept it. The
+hosts a real browser can produce are few and known, so "not internal" is replaced with "is a
+push service" (`PUSH_ENDPOINT_HOSTS`). Two rules sit behind the list as a second lock, so a
+hand-added entry cannot quietly reopen the hole: an **address** is never a push service
+however public, and a **private suffix** is never one however it is spelled.
+
+| Layer | Where | What it refuses |
+| --- | --- | --- |
+| the policy | `push.validate_endpoint` | not `https`, port not 443, credentials in the URL, whitespace or control characters, over-length, an IP literal, a single-label or private-suffix host, an unknown service |
+| the door | `POST /worker/me/push/subscribe` | the same, at 422, **and the row is not stored** - a refusal that still wrote would leave the send path holding the URL |
+| the send path | `push.deliver` | the same, re-applied per subscription, so a row written before the check existed, by an older build or by an operator's script, is never fetched |
+
+The endpoint is parsed with `urlsplit`, not matched as a string, because the gap between
+those two *is* the attack: `https://fcm.googleapis.com@evil.test/` has the host `evil.test`,
+and any check that looked for an allowed name anywhere in the string accepts it. The host
+comparison matches on the **dot boundary** - a plain `endswith("notify.windows.com")` accepts
+`notify.windows.com.evil.test`, which an attacker registers for the price of a domain -
+while still accepting the `<region>.notify.windows.com` subdomains that WNS really hands out.
+
+A refusal is counted **apart from a failure** in the dispatch summary, and the inbox row's
+`last_error` names it, so an operator is not sent to the push service's logs for a request
+that never left the server. The allowlist itself is held to the same policy at startup
+(`push_endpoint_allowlist`, advisory via `validate_host`), because a dead entry there is the
+quietest failure in this area: the worker subscribes, the browser reports success, and no
+notification ever arrives - indistinguishable from the vendor being down.
+
+`backend/tests/test_push_endpoint_authorisation.py` covers all four, and the send-path half
+is asserted against `harness.OUTBOUND`, which records every outbound HTTP attempt the
+application makes and performs none of them: "the server did not send" is a claim about the
+network, so it is checked at the network seam rather than inferred from a return value.
+
 ### Starting an account
 
 The tab has two buttons, because there are two ways an account begins.
@@ -1002,6 +1658,47 @@ The console's three old account tabs are gone: **Users** (the enroll dashboard, 
 action was capturing an enrollment photo) and the never-wired **Pass** and **Enroll** tabs,
 which only ever rendered "module coming soon". `/api/v1/admin/enroll` itself is untouched
 and still documented above.
+
+### Your own face
+
+An administrator who works a site as well as running it needs a face reference like anybody
+else, and every path that produced one put somebody else in the middle: `/admin/enroll`
+takes a `worker_id` this account should not have to be given, an enrollment link has to be
+opened on a phone, and the create form above only runs while the account is being made. So
+the **Credentials** tab offers **Enroll my face** - or **Replace my photo**, when a template
+is already on file - on the reader's own row, which is the one row the tab otherwise refuses
+to manage, because a standard administrator may not touch an administrator's account. The
+control is drawn from the same list the console uses for who may step onto the clock
+(`UI.handsetRoles`), and the endpoint checks that list, so a role that cannot punch is never
+offered it and a role that is offered it never meets a 403.
+
+```
+POST /api/v1/worker/me/enroll                   photo (multipart) -> your own template
+```
+
+**The subject is the token.** There is no `worker_id` on the wire to point at somebody else,
+and a field that tries is ignored - which is the difference between this and
+`/admin/enroll`, where the id is a parameter an administrator is trusted to choose. This one
+can only ever write the caller's own face, which is why it is safe to hand to a role that is
+not a head administrator.
+
+**The photo is a live capture** from the console's camera, so the enrollment liveness policy
+runs on it (`ENROLLMENT_LIVENESS_MODE`, `inherit` by default): a frame off a camera is exactly
+what passive anti-spoofing is built to judge, and a printed photo must not become a permanent
+template - unlike the create form above, which takes a file from disk and cannot pretend to
+prove it live. A capture the policy refuses answers 422, writes nothing, and keeps the camera
+open so the reader can simply try again.
+
+**A replacement is recorded as one.** The response says `template_replaced`, and the audit
+event (`biometric_self_enroll`) carries a before-image, because "a face was enrolled" and
+"the face this account was using was replaced" are different events to whoever reads the log
+a year later - and a credential minted without anybody else in the loop is worth an
+`enrollment_completed` notification on the same board as everything else.
+
+Finally, the refusal at the gate says where *that* reader's fix is. A punch with no template
+has always answered `404 "Facial reference not registered. Please contact your administrator
+to enroll."`, which is right for a worker and a dead end for an administrator, who is one:
+they now read "Register your own photo from the console, then clock in again."
 
 ## Notes (what a worker needs to ask for)
 
@@ -1067,6 +1764,35 @@ asset host's HTML), that Cloudflare's own 403 `error code: 1010` is never report
 deployment, that the host's `x-railway-fallback` 502 is named as the host's problem, and that the
 hand-built multipart punch body is a form the API can parse.
 
+`backend/tests/test_api_route_authorisation.py` covers the startup gate described under
+*Accounts and access*: that every route on the shipped application is either guarded by a
+role or declared open with a reason, that the gate fails on an unguarded route, a stale
+exemption, a redundant exemption, a missing reason and a traversal that enumerated nothing,
+and that the public and self-gated lists mean what they say when probed with no credential.
+
+`backend/tests/test_ownership_matrix.py` goes one layer below the audience question: every
+route whose path takes a record id must be accounted for (administrator-only, a credential
+rather than an id, or declared with the ownership check that guards it), and a real second
+session is aimed at a real record owned by somebody else at every worker-reachable id route -
+asserting both the refusal and that the row did not move. It also proves an id smuggled in
+through a query string or a form field changes nothing.
+
+`backend/tests/test_role_audience.py` covers the other half of that question - not whether a
+route is guarded, but whether it is guarded **correctly**. It states each route's intended
+audience independently of its guard and fails when a route reaches too far or too little,
+then re-proves it live by presenting a session from each role outside the audience and
+expecting a refusal. Widening `/worker/stats/{worker_id}` to `any_authenticated` fails the
+live half without the startup gate noticing at all, which is exactly the gap it fills.
+
+`backend/tests/test_push_endpoint_authorisation.py` covers the one place a worker-supplied
+value becomes a URL the server fetches. It holds the policy (private and internal addresses,
+metadata services, unknown push services, and the two ways an allowlist is defeated - a
+longer name that ends with an allowed one, and a URL whose userinfo hides the real host), the
+door (the subscribe endpoint refuses at 422 *and stores nothing*), and the send path (a
+planted subscription row is refused, with `harness.OUTBOUND` proving no request was made).
+It also holds the allowlist itself to the same policy at startup, since a dead entry there is
+silent.
+
 `backend/tests/test_deployment_manifest.py` keeps the deployment files honest: runtime imports
 stay pinned in `requirements.txt` (and test-only packages stay out of it), the healthcheck path is
 a real route that answers 200 without a session, the start command in `railway.json` still parses
@@ -1077,7 +1803,13 @@ back to 8000 instead of failing the start.
 cd backend
 ./venv/Scripts/python.exe -m pytest tests -q            # Windows (Git Bash)
 ./venv/Scripts/python.exe -m pytest tests/test_site_shift_windows.py -q   # one suite
+./venv/Scripts/python.exe -m pytest tests -n auto -q    # every core (the whole file: ~5 min)
 ```
+
+The parallel run is the one to use, and it is worth knowing how the suite is arranged to make it
+safe: each worker is a separate process, so a test's environment is its own, and each worker is
+handed its tests in collection order - which is what keeps a module's tests together in one worker
+(a module-scoped fixture is therefore never torn down while another module's test is running).
 
 The suite **never touches your data.** At import it copies `times.db` into a temp directory,
 points the application at the copy, and refuses to run if the app resolves anywhere else
@@ -1112,3 +1844,35 @@ The app ships two dedicated layouts and switches automatically:
 
 Force a mode for testing with `localStorage.layoutOverride = 'mobile' | 'desktop'`,
 and point the front-end at another backend with `localStorage.apiBaseURL`.
+
+### The phone console's sticky band
+
+On a phone the console's only pinned element is the **tab strip**, and nothing else. It
+used to be a 149px band carrying the tab's title, the brand mark and the four action
+buttons as well - a sixth of an iPhone viewport, held there permanently, on a screen whose
+whole job is showing an operator a table. It was spent on things that do not need to survive
+scrolling: the title answers "what am I looking at" once, when the tab is tapped, and "which
+admin am I" is asked before a destructive button, not while scrolling payroll. The title,
+its hint and the actions now scroll away with the pane (`.admin-mobile-bar`, the first thing
+in the frame); the strip stays, because it is the one control that has to be reachable from
+anywhere in a long table. The band is strip-sized - about 57px plus the inset.
+
+Both ends of the screen are handled in the stylesheet, because `viewport-fit=cover` puts the
+status bar and the home indicator on the page rather than around it:
+
+* the top inset is **padding on the sticky element**, so the band's background fills the
+  notch while its content sits below it. As a margin it would scroll the strip up under the
+  status bar and paint the tabs across the clock;
+* the bottom inset is added to the frame's bottom padding, so the last row of a table - or
+  the credit under it - cannot be painted over by the gesture bar. Note the phone's own
+  `@media (max-width: 1023px)` override of `.admin-frame`: an inset set only on the base
+  rule is an inset that never applies where it was needed, which is exactly how it was
+  written the first time, and the browser test caught it;
+* every inset is `env(safe-area-inset-*, 0px)` through a `--safe-*` custom property, with a
+  `0px` fallback so a device without a notch is unaffected.
+
+`backend/tests/test_signed_in_sessions_in_a_browser.py` measures this in a real browser. It
+cannot emulate a notch - Playwright's device profiles report no insets - so instead it *puts*
+one there by setting the custom property and asserts the geometry moves by exactly that
+much, which is the only part the CSS is responsible for; `viewport-fit=cover` in
+`index.html` is asserted separately as what makes a real inset non-zero on a device.

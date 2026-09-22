@@ -57,6 +57,11 @@ for _path in (str(BACKEND_DIR), str(TESTS_DIR)):
         sys.path.insert(0, _path)
 
 import harness  # noqa: E402  - importing it *is* the isolation layer (see its docstring)
+
+#: The working directory is part of that isolation and is entered explicitly, because
+#: ``harness`` no longer chdir()s at import - doing so breaks pytest-xdist's collection (see
+#: safety rule 1 in its docstring). Before ``import main``, which is below.
+harness.enter_temp_root()
 from fastapi.testclient import TestClient  # noqa: E402
 
 #: Two months of a working year, wide enough to include whatever the clone holds.
@@ -329,8 +334,8 @@ def main(argv: list[str] | None = None) -> int:
     # The same guard the suite's conftest uses: refuse to measure anything that is not the
     # temp clone, because the failure mode is silently profiling (and writing to) payroll.
     harness.assert_database_isolation()
-    main.LOCAL_REFS_DIR = str(harness.REFS_DIR)
-    main.WORKER_PHOTOS_DIR = str(harness.PHOTOS_DIR)
+    # Every file tree the app writes into - see ``harness.FILE_TREES``.
+    harness.redirect_file_directories()
     harness.install_outbound_guard()
     harness.reset_database(main)
 

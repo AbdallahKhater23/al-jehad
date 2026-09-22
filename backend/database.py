@@ -13,10 +13,13 @@ may not have it.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
+from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Callable
 
 import telemetry
 from config import settings
@@ -25,6 +28,104 @@ from config import settings
 DB_PATH: Path = settings.database_path
 
 BUSY_TIMEOUT_MS = 5000
+
+# ---------------------------------------------------------------------------
+# the diagnostics view (``developer`` is the only reader)
+# ---------------------------------------------------------------------------
+#: A bounded ring of the statements that took too long, and a handful of counters.
+#:
+#: Deliberately *not* a second Prometheus metric: ``telemetry`` owns what is scraped, and a
+#: diagnostics counter that also appeared in /metrics would be one number with two owners.
+#: Deliberately no statement text either - the verb, the duration and the trace id only, for
+#: the reason ``InstrumentedConnection`` gives above: in a database layer, statement text can
+#: carry a worker id.
+SLOW_STATEMENT_MS = 250.0
+SLOW_STATEMENT_RING = 200
+
+_slow_statements: deque = deque(maxlen=SLOW_STATEMENT_RING)
+_stats: dict[str, float] = {
+    "connections_opened": 0.0,
+    "read_only_connections": 0.0,
+    "statements": 0.0,
+    "lock_waits": 0.0,
+    "lock_timeouts": 0.0,
+    "max_lock_wait_seconds": 0.0,
+    "slow_statements": 0.0,
+}
+
+#: Set by whichever module owns trace ids (``developer`` does), so a slow statement can be
+#: joined to the request that caused it without this module importing the module that reads it.
+_trace_provider: Callable[[], str | None] | None = None
+
+
+def set_trace_provider(provider: Callable[[], str | None] | None) -> None:
+    global _trace_provider
+    _trace_provider = provider
+
+
+def _trace_id() -> str | None:
+    if _trace_provider is None:
+        return None
+    try:
+        return _trace_provider()
+    except Exception:  # pragma: no cover - a provider that throws must not fail a query
+        return None
+
+
+def record_statement(operation: str, seconds: float) -> None:
+    """Count a statement, and keep the slow ones. Called on the query path, so it is tiny."""
+    _stats["statements"] += 1
+    if seconds * 1000.0 < SLOW_STATEMENT_MS:
+        return
+    _stats["slow_statements"] += 1
+    _slow_statements.append(
+        {
+            "operation": operation,
+            "seconds": round(seconds, 4),
+            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "trace_id": _trace_id(),
+        }
+    )
+
+
+def record_lock_wait(seconds: float) -> None:
+    _stats["lock_waits"] += 1
+    if seconds > _stats["max_lock_wait_seconds"]:
+        _stats["max_lock_wait_seconds"] = round(seconds, 4)
+
+
+def record_lock_timeout() -> None:
+    _stats["lock_timeouts"] += 1
+
+
+def slow_queries(limit: int = 20) -> list[dict]:
+    """The slowest statements seen, newest first. Never the SQL - see the module docstring."""
+    entries = list(_slow_statements)
+    return list(reversed(entries))[: max(1, int(limit))]
+
+
+def connection_stats() -> dict:
+    """What the diagnostics surface reports, plus the hub's own unread count."""
+    facts: dict = {key: (int(value) if key != "max_lock_wait_seconds" else value) for key, value in _stats.items()}
+    facts["busy_timeout_ms"] = BUSY_TIMEOUT_MS
+    facts["slow_statement_threshold_ms"] = SLOW_STATEMENT_MS
+    facts["unread_alerts"] = _unread_alert_count()
+    return facts
+
+
+def _unread_alert_count() -> int:
+    """Read straight from the table: this module cannot import the module that writes it."""
+    try:
+        conn = connect()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM developer_alerts WHERE read_at IS NULL"
+            ).fetchone()
+            return int(row[0]) if row else 0
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -78,12 +179,15 @@ class InstrumentedConnection(sqlite3.Connection):
         except sqlite3.OperationalError as exc:
             if telemetry.is_lock_error(exc):
                 telemetry.count_lock_error(operation=operation)
+                record_lock_timeout()
             raise
         finally:
             elapsed = time.perf_counter() - started
             telemetry.count_statement(operation)
+            record_statement(operation, elapsed)
             if _is_write_lock_acquisition(sql):
                 telemetry.observe_lock_wait(operation=operation, seconds=elapsed)
+                record_lock_wait(elapsed)
                 # The wait is over *now*; the clock for the transaction itself starts here, or
                 # the histogram would attribute a 5-second lock wait to the lock holder's own
                 # transaction length and make a slow transaction look like a slow query.
@@ -117,6 +221,24 @@ class InstrumentedConnection(sqlite3.Connection):
             telemetry.count_statement("script")
 
 
+def resolve_path(target: Path) -> Path:
+    """The concrete file a configured path names, past any directory junction or symlink.
+
+    The test harness points ``DATABASE_PATH`` at a *stable* path whose directory is a
+    junction (a symlink on POSIX) that it repoints at a fresh database before every test,
+    so that no reset ever has to touch a file another test still holds. SQLite, however,
+    identifies a database's locks - and in WAL mode its shared-memory index in particular -
+    by the path it was opened with: on Windows, two connections opened through the same
+    junction *across* a repoint contend over the old file's lock even though the junction now
+    names a different file, and the second one fails with "database is locked". Resolving here
+    means every connection is opened by the concrete generation path, which is exactly what
+    the rotation promises: a straggler keeps its own file and the next test gets its own.
+
+    It is a no-op for a normal deployment, where the configured path is already its own file.
+    """
+    return Path(os.path.realpath(str(target)))
+
+
 def connect(
     *,
     db_path: Path | None = None,
@@ -126,7 +248,7 @@ def connect(
 ) -> sqlite3.Connection:
     """Open a connection. ``isolation_level=None`` means autocommit (used by
     migrations, which manage ``BEGIN IMMEDIATE`` themselves)."""
-    target = Path(db_path or DB_PATH)
+    target = resolve_path(Path(db_path or DB_PATH))
     if read_only:
         conn = sqlite3.connect(
             f"file:{target}?mode=ro",
@@ -142,6 +264,7 @@ def connect(
     conn.row_factory = sqlite3.Row
     conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
     telemetry.count_connection(read_only=read_only)
+    _stats["read_only_connections" if read_only else "connections_opened"] += 1
     return conn
 
 

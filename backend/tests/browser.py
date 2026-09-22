@@ -42,7 +42,7 @@ import dataclasses
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 # ---------------------------------------------------------------------------
 # The browsers this can drive
@@ -118,6 +118,41 @@ def available() -> tuple[bool, str]:
     return _AVAILABILITY
 
 
+def release_event_loop() -> None:
+    """Undo the running-loop flag Playwright's sync API leaves on the main thread.
+
+    Playwright's sync API runs its own event loop from a greenlet and, on every hand-back
+    from the dispatcher fiber, re-asserts ``asyncio._set_running_loop(loop)`` (see
+    ``playwright._impl._sync_base.SyncBase._sync``). Its context manager closes that loop on
+    exit but never clears the flag, so the main thread is left believing a loop is running
+    over a loop that is now closed. Any ``asyncio.run(...)`` later in the *same* process -
+    a different suite running after the browser fixtures - then dies with "asyncio.run()
+    cannot be called from a running event loop", from a fixture it never touched.
+
+    So the browser session puts the flag back the way it found it. This is deliberately about
+    the *flag* and not the current event loop: Playwright builds its loop with
+    ``asyncio.new_event_loop()`` and never installs it, so clearing the current loop would be
+    undoing something Playwright never did.
+
+    Note that this can only run once the session is *over*: while it is open the flag has to
+    stay set, or Playwright's own next call fails with "no running event loop". That is why
+    the ``browser`` fixture is module-scoped rather than session-scoped - see the fixture's
+    docstring in ``conftest``. Clearing it earlier, in the hope of helping a suite that runs
+    next, breaks the browser session instead of fixing anything.
+    """
+    import asyncio
+
+    events = getattr(asyncio, "events", None)
+    if events is None:  # pragma: no cover - every CPython has this module
+        return
+    get_running = getattr(events, "_get_running_loop", None)
+    set_running = getattr(events, "_set_running_loop", None)
+    if get_running is None or set_running is None:  # pragma: no cover - stable private API
+        return
+    if get_running() is not None:
+        set_running(None)
+
+
 @contextlib.contextmanager
 def open_browser():
     """A browser, for the length of the session."""
@@ -126,12 +161,18 @@ def open_browser():
     except ImportError as exc:  # pragma: no cover - a checkout without the dev extra
         raise NoBrowser(f"playwright is not installed ({exc}). Add it to requirements-dev.txt.") from exc
 
-    with sync_playwright() as playwright:
-        browser = launch(playwright)
-        try:
-            yield browser
-        finally:
-            browser.close()
+    try:
+        with sync_playwright() as playwright:
+            browser = launch(playwright)
+            try:
+                yield browser
+            finally:
+                browser.close()
+    finally:
+        # After the ``with`` above, Playwright has stopped and closed its loop - and left the
+        # main thread's running-loop flag set. Clearing it here is what keeps the browser
+        # suites from poisoning ``asyncio.run`` for every test that runs after them.
+        release_event_loop()
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +511,7 @@ def sign_in(
     until: str | None = None,
     probe: dict[str, str] | None = None,
     shots: Path | None = None,
+    after: Callable[[Any], None] | None = None,
 ) -> Observation:
     """Fill in the real sign-in form and report what the role landed on.
 
@@ -480,6 +522,12 @@ def sign_in(
     ``until`` waits for a narrower effect than ``identity.landed`` when the test knows which
     width's layout it asked for; ``probe`` evaluates extra expressions once the screen is
     up. Both are read *before* the tab closes, which is the only moment they can be.
+
+    ``after`` is handed the tab once the screen is up and before anything is read, for the
+    behaviour that only exists *after* somebody touches something - a control that has to
+    be tapped for the screen to be in the state under test. It runs before ``probe`` so the
+    expressions are read against the state the interaction left behind, and inside the open
+    context so the interaction can still be made at all.
     """
     console_errors: list[str] = []
     page_errors: list[str] = []
@@ -516,6 +564,8 @@ def sign_in(
             tab.wait_for_function(f"() => ({until or identity.landed})", timeout=15000)
 
         ran = bool(tab.evaluate(f"({identity.landed})"))
+        if ran and after is not None:
+            after(tab)
         if not ran and shots is not None:
             shots.mkdir(parents=True, exist_ok=True)
             tab.screenshot(

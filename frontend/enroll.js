@@ -23,18 +23,45 @@
 
     var $ = function (id) { return document.getElementById(id); };
 
-    function say(text, kind) {
+    //: How to write the message box's current sentence again, in whatever language is
+    //: chosen now.
+    var resay = function () {};
+
+    /**
+     * Writes the message box, and keeps the way to write it again.
+     *
+     * This box is not a ``data-t`` node: its sentence is chosen when the server answers or
+     * a photo is refused, so the language switch cannot repaint it on its own. ``again`` is
+     * that way back, which is why every writer below hands one over - a worker who reads a
+     * refusal and then taps Urdu must not be left reading the English it arrived in.
+     */
+    function say(text, kind, again) {
         var box = $("message");
         box.className = "msg " + (kind || "");
         box.textContent = text;
+        resay = again || function () {};
     }
 
-    /** The server's refusal, in the server's words, which are not translated here. */
-    function detailOf(body, fallbackKey) {
-        var detail = body && body.detail;
-        var text = (detail && detail.message) || detail || Capture.t(fallbackKey);
-        var code = detail && detail.error_code ? " (" + detail.error_code + ")" : "";
-        return text + code;
+    /** Says a sentence the page can produce again - a refusal, or a photo policy line. */
+    function sayAgain(produce, kind) {
+        var again = function () { say(produce(), kind, again); };
+        again();
+    }
+
+    /** Says a sentence from the page's own table. */
+    function sayKey(key, kind, vars) {
+        sayAgain(function () { return Capture.t(key, vars); }, kind);
+    }
+
+    /**
+     * Says a refused answer, from the reason it carries rather than from its prose.
+     *
+     * ``Capture.serverMessage`` resolves the ``error_code`` - or the ``status`` of a peek at
+     * the invite - against this page's table, so the sentence is the reader's, and the
+     * re-say means switching language rewrites it rather than leaving the English behind.
+     */
+    function sayRefusal(body, fallbackKey) {
+        sayAgain(function () { return Capture.serverMessage(body, fallbackKey); }, "err");
     }
 
     /**
@@ -67,7 +94,7 @@
             .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
             .then(function (res) {
                 if (!res.ok) {
-                    say(detailOf(res.body, "link.invalid"), "err");
+                    sayRefusal(res.body && res.body.detail, "link.invalid");
                     $("btn-start").disabled = true;
                     $("btn-submit").disabled = true;
                     $("fallback-label").classList.add("hidden");
@@ -99,20 +126,24 @@
                 }
 
                 if (!res.body.usable) {
-                    say(Capture.t("enroll.unusable", { status: res.body.status }), "err");
+                    // The peek at the invite reports the same three reasons as the punch
+                    // route, as ``status`` rather than as an ``error_code``.
+                    sayRefusal(res.body, "enroll.unusable");
                     $("btn-start").disabled = true;
                     $("btn-submit").disabled = true;
                     $("password-card").classList.add("hidden");
                 }
             })
-            .catch(function () { say(Capture.t("offline"), "err"); });
+            .catch(function () { sayKey("offline", "err"); });
     }
 
     function submit() {
         var problem = camera.problem();
         if (problem) {
             camera.showProblem(problem);
-            say(problem, "err");
+            // Asked again rather than remembered: the sentence is the policy's, in the
+            // language that is chosen when it is written.
+            sayAgain(function () { return camera.problem() || problem; }, "err");
             return;
         }
         var form = new FormData();
@@ -125,11 +156,11 @@
             var password = $("password").value || "";
             var again = $("password2").value || "";
             if (password.length < minPasswordLength) {
-                say(Capture.t("enroll.passwordShort", { n: minPasswordLength }), "err");
+                sayKey("enroll.passwordShort", "err", { n: minPasswordLength });
                 return;
             }
             if (password !== again) {
-                say(Capture.t("enroll.passwordMismatch"), "err");
+                sayKey("enroll.passwordMismatch", "err");
                 return;
             }
             form.append("password", password);
@@ -143,22 +174,22 @@
             .then(function (res) {
                 if (res.ok) {
                     if (isRegister) {
-                        say(Capture.t("enroll.done.register"), "ok");
+                        sayKey("enroll.done.register", "ok");
                         $("password-card").classList.add("hidden");
                     } else {
-                        say(Capture.t("enroll.done.enroll"), "ok");
+                        sayKey("enroll.done.enroll", "ok");
                     }
                     var live = res.body.liveness || {};
                     $("status-line").textContent = Capture.t("enroll.liveness", { verdict: live.verdict || "n/a" });
                     $("btn-retake").classList.add("hidden");
                     return;
                 }
-                say(detailOf(res.body, "enroll.failed"), "err");
+                sayRefusal(res.body && res.body.detail, "enroll.failed");
                 $("btn-submit").disabled = false;
                 $("status-line").textContent = "";
             })
             .catch(function () {
-                say(Capture.t("enroll.uploadFailed"), "err");
+                sayKey("enroll.uploadFailed", "err");
                 $("btn-submit").disabled = false;
             });
     }
@@ -173,6 +204,9 @@
             $("credit").textContent = Capture.credit();
             Capture.applyPolicy();
             describeWho();
+            // The message box is not a ``data-t`` node, so it is re-said here from whatever
+            // wrote it - a refusal in the language it arrived in is the leak this closes.
+            resay();
             // The intro, the title and the submit button are read off the same state the
             // first paint read them off - the link's kind, which does not change.
             if (isRegister) {
@@ -190,7 +224,7 @@
             primary: "btn-submit",
             family: "photo",
             allow: function () { return usable; },
-            onBlocked: function () { say(Capture.t("camera.blocked.enroll"), "err"); }
+            onBlocked: function () { sayKey("camera.blocked.enroll", "err"); }
         });
 
         $("btn-start").addEventListener("click", function () { camera.start(); });

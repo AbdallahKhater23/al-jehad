@@ -74,7 +74,9 @@ const UI_MODULES = {
         camera: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8h3l1.5-2h7L17 8h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1Z"></path><circle cx="12" cy="13.5" r="3.5"></circle></svg>',
         pencil: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20h4L20 8l-4-4L4 16v4Z"></path><path d="m14 6 4 4"></path></svg>',
         power: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 4v8"></path><path d="M7.5 7.5a6.5 6.5 0 1 0 9 0"></path></svg>',
-        table: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="M3 10h18M9 10v9"></path></svg>'
+        table: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="M3 10h18M9 10v9"></path></svg>',
+        printer: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 8V4h10v4"></path><rect x="4" y="8" width="16" height="7" rx="2"></rect><path d="M7 15h10v5H7z"></path></svg>',
+        eye: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-6.5 10-6.5S22 12 22 12s-3.5 6.5-10 6.5S2 12 2 12Z"></path><circle cx="12" cy="12" r="2.5"></circle></svg>'
     },
 
     /**
@@ -133,9 +135,13 @@ const UI_MODULES = {
      * What one open shift means *right now*.
      *
      * ``state`` is the line the shift has crossed, and it is the whole point of
-     * the board: ``on`` is a normal working day, ``over`` has passed the hour
-     * the server alerts on at clock-out (overtime approval is coming), and
-     * ``closing`` has reached the paid day the system will close it at.
+     * the board: ``on`` is a normal working day, ``over`` has passed the overtime
+     * line the server alerts on (``overtime_notify_hours``, a *paid* figure - so the
+     * break is out of it before it is compared, exactly as the server does it), and
+     * ``closing`` has reached the paid day the system will close it at. Whether an
+     * ``over`` shift is then held for approval depends on the line against the paid
+     * day (``shift_hours.overtime_assessment``): past the paid day needs a decision,
+     * and a line set below the day only warns early.
      */
     liveOpsFacts(session, rules, now) {
         const policy = rules || {};
@@ -242,7 +248,12 @@ const UI_MODULES = {
         })).filter(({ session }) => {
             if (site && String(session.site_name || '') !== site) return false;
             if (!query) return true;
-            return [session.name, session.worker_id, session.site_name, session.role]
+            // The role is in the haystack twice on purpose: as the wire code, and in the
+            // words this reader sees. The board shows "Administrator" - so an operator who
+            // types what is on the screen has to find the row, and one reading the console
+            // in Arabic has to find it by the Arabic word.
+            return [session.name, session.worker_id, session.site_name, session.role,
+                this.roleLabel(session.role)]
                 .some((value) => String(value === null || value === undefined ? '' : value).toLowerCase().indexOf(query) >= 0);
         });
         const sort = this._liveOpsSort || 'longest';
@@ -382,6 +393,22 @@ const UI_MODULES = {
         return this.escapeHtml(`${paid} \u00b7 ${I18n.__('liveOpsClosingAt').replace('{time}', at)}`);
     },
 
+    /**
+     * The small line under a name: the role, in the reader's words, then the rest.
+     *
+     * The board is where an operator decides what to do about who is on site, so the one
+     * thing it must not do is make an administrator look like anybody else. They work a
+     * shift here too, their hours are reviewed like anyone else's, and a row that printed
+     * the wire code - or, on the card, nothing at all - left the reader to work out that
+     * this shift is an administrator's from a name they had to recognise.
+     *
+     * Empty parts are dropped rather than joined blindly: a session with no role on file
+     * used to read "\u00b7 1000", a separator with nothing in front of it.
+     */
+    liveOpsWhoSubHtml(parts) {
+        return this.escapeHtml(parts.filter(Boolean).join(' \u00b7 '));
+    },
+
     liveOpsRowHtml(session, facts) {
         const elapsed = facts.seconds === null ? '\u2014' : this.liveOpsDuration(facts.seconds);
         const start = this.escapeHtml(String(session.clock_in_time || ''));
@@ -393,7 +420,7 @@ const UI_MODULES = {
                         ${this.liveOpsAvatarHtml(session)}
                         <div class="ops-who">
                             <span class="ops-name">${this.escapeHtml(session.name || session.worker_id)}</span>
-                            <span class="ops-sub">${this.escapeHtml(`${session.role || ''} \u00b7 ${session.worker_id}`)}</span>
+                            <span class="ops-sub">${this.liveOpsWhoSubHtml([this.roleLabel(session.role), session.worker_id])}</span>
                         </div>
                     </div>
                 </td>
@@ -420,7 +447,10 @@ const UI_MODULES = {
                     ${this.liveOpsAvatarHtml(session)}
                     <div class="ops-who">
                         <span class="ops-name">${this.escapeHtml(session.name || session.worker_id)}</span>
-                        <span class="ops-sub">${this.escapeHtml(`${session.site_name || ''} \u00b7 ${this.liveOpsClockTime(session.clock_in_time)}`)}</span>
+                        <span class="ops-sub">${this.liveOpsWhoSubHtml([
+                            this.roleLabel(session.role), session.site_name,
+                            this.liveOpsClockTime(session.clock_in_time)
+                        ])}</span>
                     </div>
                 </div>
                 <div class="ops-card-facts">
@@ -816,6 +846,108 @@ const UI_MODULES = {
         return start ? Math.max(0, (Date.now() - start.getTime()) / 1000) : null;
     },
 
+    /**
+     * The evidence block: the frame, the match verdict, the liveness verdict, and the
+     * sentence that put this row in the queue.
+     *
+     * Deliberately not an ``<img src>`` (see ``showLinkPhoto``): the frame is a worker's face
+     * served to administrators only, so the bytes are fetched with the session credential
+     * and turned into an object URL this page alone can read. A missing frame is stated, not
+     * hidden - "no picture" and "the picture failed to load" are different facts, and a
+     * reviewer must know which one they are looking at.
+     */
+    approvalsEvidenceHtml(log) {
+        const id = this.escapeHtml(log.id);
+        const verdictKey = {
+            approved: 'approvalsVerdictApproved',
+            review: 'approvalsVerdictReview',
+            refused: 'approvalsVerdictRefused',
+        }[log.match_verdict];
+        const distance = (log.score !== null && log.score !== undefined && Number(log.score) !== 0 && Number(log.score) !== 1)
+            ? Number(log.score).toFixed(2)
+            : null;
+        const liveness = log.liveness_class && log.liveness_class !== 'unverified_offline'
+            ? this.escapeHtml(this.approvalsLivenessLabel(log.liveness_class, log.liveness_score))
+            : null;
+        const facts = [
+            distance !== null ? { label: I18n.__('approvalsMatchScore'), value: distance } : null,
+            verdictKey ? { label: I18n.__('approvalsMatchVerdict'), value: I18n.__(verdictKey) } : null,
+            liveness ? { label: I18n.__('approvalsLiveness'), value: liveness } : null,
+        ].filter(Boolean);
+        const frameButton = log.frame_url
+            ? `<button type="button" class="ui-btn ui-btn-sm" data-show-frame="${id}">${this.OPS_ICONS.eye}${this.escapeHtml(I18n.__('approvalsShowFrame'))}</button>`
+            : '';
+        const frameNote = log.frame_url
+            ? ''
+            : `<p class="ui-section-note" data-frame-missing>${this.escapeHtml(I18n.__('approvalsFrameMissing'))}</p>`;
+        return `
+            <div class="ui-evidence" data-evidence="${id}">
+                <p class="ops-stat-label">${this.escapeHtml(I18n.__('approvalsEvidence'))}</p>
+                <div class="ui-evidence-row">
+                    <div class="ui-evidence-media">
+                        <img id="reviewFrame${id}" class="hidden ui-photo" alt="${this.escapeHtml(I18n.__('approvalsFrameAlt'))}" />
+                    </div>
+                    <div class="ui-evidence-facts">
+                        ${frameButton}
+                        ${frameNote}
+                        ${facts.length ? `<div class="ui-facts">${facts.map((f) => `
+                            <div class="ui-fact">
+                                <span class="ops-stat-label">${this.escapeHtml(f.label)}</span>
+                                <span class="ui-fact-value">${f.value}</span>
+                            </div>`).join('')}</div>` : ''}
+                    </div>
+                </div>
+                ${log.flag_reason ? `<p class="ui-note is-warn" data-flag-reason>${this.OPS_ICONS.alert}${this.escapeHtml(log.flag_reason)}</p>` : ''}
+            </div>`;
+    },
+
+    /**
+     * One liveness clause: the class as words, with the model's confidence when it has one.
+     * The classes are the log codes ``liveness.log_fields`` writes - shown as words here,
+     * never as the raw code, the same rule ``codeLabel`` follows for notification kinds.
+     */
+    approvalsLivenessLabel(livenessClass, livenessScore) {
+        const key = {
+            live: 'livenessClassLive',
+            print_attack: 'livenessClassPrint',
+            replay_attack: 'livenessClassReplay',
+            unknown: 'livenessClassUnknown',
+            unavailable: 'livenessClassUnavailable',
+            error: 'livenessClassError',
+        }[livenessClass];
+        const label = key ? I18n.__(key) : String(livenessClass);
+        const confidence = (livenessScore === null || livenessScore === undefined) ? null : Number(livenessScore);
+        return confidence === null || Number.isNaN(confidence)
+            ? label
+            : `${label} (${confidence.toFixed(2)})`;
+    },
+
+    /**
+     * One frame, fetched with this admin's token. The same pattern as ``showLinkPhoto``:
+     * the endpoint answers 404 for a frame retention wiped or a punch that never had one,
+     * and the note in the card says that rather than a broken image icon.
+     */
+    async showReviewFrame(logId) {
+        const image = document.getElementById(`reviewFrame${logId}`);
+        const button = document.querySelector(`[data-show-frame="${CSS.escape(String(logId))}"]`);
+        const headers = {};
+        if (State.token) headers['Authorization'] = `Bearer ${State.token}`;
+        if (button) button.disabled = true;
+        try {
+            const response = await fetch(`${API.baseURL}/admin/pending_review_frame/${encodeURIComponent(logId)}`, { headers });
+            if (!response.ok) throw new Error(I18n.__('approvalsScoreFailed'));
+            const blob = await response.blob();
+            if (image) {
+                image.src = URL.createObjectURL(blob);
+                image.classList.remove('hidden');
+            }
+            if (button) button.remove();
+        } catch (err) {
+            Toast.error(err.message || I18n.__('approvalsScoreFailed'));
+            if (button) button.disabled = false;
+        }
+    },
+
     approvalsCardHtml(log) {
         const id = this.escapeHtml(log.id);
         const seconds = this.approvalsWaitingSeconds(log);
@@ -855,6 +987,7 @@ const UI_MODULES = {
                         <span class="ui-fact-value">${this.escapeHtml(this.liveOpsClockTime(log.timestamp))}</span>
                     </div>
                 </div>
+                ${this.approvalsEvidenceHtml(log)}
                 <label class="ui-label" for="note-${id}" style="margin-top:16px">${this.escapeHtml(I18n.__('approvalsNote'))}</label>
                 <textarea id="note-${id}" class="ui-field" rows="2"
                           placeholder="${this.escapeHtml(I18n.__('approvalsNotePlaceholder'))}"></textarea>
@@ -890,6 +1023,16 @@ const UI_MODULES = {
     async renderApprovals(content) {
         if (!content) return;
         content.innerHTML = UI.consoleSkeletonHtml(I18n.__('approvalsTitle'));
+        // Two questions, two reads, in flight *together*: a shift that is still running is a
+        // different question from a clock-out waiting for review, so the tab waits for the
+        // slower of the two rather than for their sum. They are separately fatal as well -
+        // a crossings read that fails leaves its own section empty (the queue below is still
+        // the screen's primary content), and only the queue's failure replaces the screen.
+        //
+        // The ``.catch`` is attached where the read starts, not where it is awaited: on the
+        // error path below this promise is never awaited, and an unhandled rejection is a
+        // console error nobody can act on.
+        const crossingsRead = API.request('/admin/overtime/crossings').catch(() => []);
         let logs;
         try {
             logs = await API.request('/admin/pending_reviews');
@@ -899,21 +1042,287 @@ const UI_MODULES = {
             content.innerHTML = this.uiErrorHtml(err, "UI.renderAdminTab('Approvals')");
             return;
         }
-        content.innerHTML = `<div class="ui-page" data-approvals="true">${this.approvalsHtml(Array.isArray(logs) ? logs : [])}</div>`;
+        const crossings = await crossingsRead;
+        content.innerHTML = `<div class="ui-page" data-approvals="true">${this.crossingsSectionHtml(Array.isArray(crossings) ? crossings : [])}${this.approvalsHtml(Array.isArray(logs) ? logs : [])}</div>`;
+        // One delegated pass over every "show the frame" button on the page: a repaint
+        // between paint and tap cannot orphan it, and no inline handler is added (the count
+        // ``test_frontend_xss`` pins only falls). The guards are the same ones
+        // ``bindCredentialsControls`` carries: the stub DOMs the frontend suites run under
+        // give ``content`` as a bare element without ``querySelectorAll``.
+        if (content && typeof content.querySelectorAll === 'function') {
+            // One delegated pass per control, and never an assumption about what
+            // ``querySelectorAll`` hands back. In a browser it is a ``NodeList``; in the stubbed
+            // DOM the frontend suites run under it is a plain array, and on a guard rail built
+            // for one of them the other becomes a crash on a tab that otherwise works.
+            // ``Array.from`` accepts an array, an array-like and an iterable, and answers ``[]``
+            // for anything else - so a stub with no tree, no ``querySelectorAll`` or a shape
+            // nobody has thought of yet cannot take the screen down.
+            const bindEach = (selector, handler) => {
+                let nodes = [];
+                try {
+                    nodes = Array.from(content.querySelectorAll(selector) || []);
+                } catch (err) {
+                    nodes = [];
+                }
+                nodes.forEach((node) => {
+                    if (node && typeof node.addEventListener === 'function') handler(node);
+                });
+            };
+            bindEach('[data-show-frame]', (button) => {
+                button.addEventListener('click', () => {
+                    this.showReviewFrame(button.getAttribute('data-show-frame'));
+                });
+            });
+            // The two answers to a live crossing, bound the same way and for the same reasons:
+            // a repaint between paint and tap cannot orphan a listener, and no inline handler is
+            // added - ``test_frontend_xss`` pins the count of those, and it only ever falls.
+            bindEach('[data-crossing-accept]', (button) => {
+                button.addEventListener('click', () => {
+                    this.handleCrossing(button.getAttribute('data-crossing-accept'), true);
+                });
+            });
+            bindEach('[data-crossing-decline]', (button) => {
+                button.addEventListener('click', () => {
+                    this.handleCrossing(button.getAttribute('data-crossing-decline'), false);
+                });
+            });
+        }
     },
 
+    /**
+     * The live crossings: shifts that are past the overtime line *right now*.
+     *
+     * A separate section rather than rows in the queue below, because the two are different
+     * questions with different consequences. A queue row is a shift that has ended and is
+     * waiting to be priced; a crossing is a shift that has not ended, where the answer changes
+     * what the rest of it is paid for. Reading a queue row is a step towards deciding it;
+     * reading a crossing decided nothing at all, which is why it does not live in Alerts.
+     */
+    crossingsSectionHtml(items) {
+        if (!Array.isArray(items) || items.length === 0) return '';
+        return `
+            <p class="ui-section-note" data-crossings-title="true">${this.escapeHtml(I18n.__('crossingsTitle'))}</p>
+            <p class="ui-section-note" data-crossings-hint="true">${this.escapeHtml(I18n.__('crossingsHint'))}</p>
+            <div class="ui-stack">${items.map((item) => this.crossingCardHtml(item)).join('')}</div>`;
+    },
+
+    crossingCardHtml(item) {
+        const id = this.escapeHtml(String(item.worker_id));
+        const decision = item.decision || null;
+        // Whether this row is a *question* right now, read from the server rather than re-derived
+        // here. An authorisation covers the shift only up to the ceiling somebody named (a blank
+        // acceptance covers what had been worked at that moment, and no more), a refusal stands for
+        // the whole shift however long it runs, and the rule that decides between them - with the
+        // tolerance it carries - is ``overtime.authorisation_covers``. A client comparing
+        // ``paid_hours`` against ``authorised_hours`` itself would be a second rule, and the two
+        // would disagree the moment either moved. No field at all reads as settled, so a card with
+        // an answer on it never looks like it is still asking.
+        const needsAnswer = !decision || item.needs_answer === true;
+        // Two numbers, because the decision is about the *second* one: what the shift has worked
+        // so far, and what is being held past the line. An operator who sees only "9 h" cannot
+        // tell whether anything is at stake.
+        const stats = [
+            [I18n.__('crossingsPaid'), Number(item.paid_hours || 0).toFixed(2)],
+            [I18n.__('crossingsHeld'), Number(item.overtime_hours || 0).toFixed(2)],
+            [I18n.__('approvalsClockIn'), String(item.clock_in_time || '')],
+            [I18n.__('approvalsSite'), String(item.site_name || '')],
+        ];
+        // Who answered: the name the server resolved for the id, falling back to the id itself
+        // so a decision whose account has gone still says something an operator can read.
+        const who = String(decision && (decision.decided_by_name || decision.decided_by) || '');
+        const answer = decision
+            ? `<p class="ui-section-note" data-crossing-answer="${id}">${this.escapeHtml(
+                  (decision.decision === 'declined'
+                      ? I18n.__('crossingsDeclinedBy')
+                      : I18n.__('crossingsAuthorised')
+                            .replace('{hours}', Number(decision.authorised_hours || 0).toFixed(2))
+                  ).replace('{who}', who)
+              )}</p>
+              ${
+                  decision.note
+                      ? `<p class="ui-section-note" data-crossing-answer-note="${id}">${this.escapeHtml(
+                            String(decision.note)
+                        )}</p>`
+                      : ''
+              }`
+            : '';
+        // A ceiling the shift has worked past: the answer stays on the card *and* the form comes
+        // back, with the figure the operator is being asked about. Without this the second question
+        // the server is waiting on has no way to be answered from the console - the card would show
+        // an authorisation, say nothing about the hours beyond it, and never offer the question.
+        // The evidence travels with the answer, in the same block the review cards use, so the two
+        // halves of this tab read the same way: a decision, and what it rested on.
+        const evidence = decision ? this.crossingDecisionEvidenceHtml(item, decision, who) : '';
+        const outgrown =
+            decision && needsAnswer
+                ? `<p class="ui-section-note" data-crossing-outgrown="${id}">${this.escapeHtml(
+                      I18n.__('crossingsPastCeiling').replace(
+                          '{hours}', Number(item.unauthorised_hours || 0).toFixed(2)
+                      )
+                  )}</p>`
+                : '';
+        const controls = needsAnswer
+            ? `
+                <label class="ui-label" for="crossingHours-${id}" style="margin-top:16px">${this.escapeHtml(I18n.__('crossingsCeiling'))}</label>
+                <input id="crossingHours-${id}" class="ui-field" type="number" min="0" step="0.25"
+                       data-crossing-hours="${id}" />
+                <label class="ui-label" for="crossingNote-${id}" style="margin-top:12px">${this.escapeHtml(I18n.__('approvalsNote'))}</label>
+                <textarea id="crossingNote-${id}" class="ui-field" rows="2" data-crossing-note="${id}"
+                          placeholder="${this.escapeHtml(I18n.__('approvalsNotePlaceholder'))}"></textarea>
+                <div class="ui-row" style="margin-top:12px">
+                    <button type="button" class="ui-btn ui-btn-primary" data-crossing-accept="${id}">${this.OPS_ICONS.check}${this.escapeHtml(I18n.__('crossingsAccept'))}</button>
+                    <button type="button" class="ui-btn" data-crossing-decline="${id}">${this.escapeHtml(I18n.__('crossingsDecline'))}</button>
+                </div>`
+            : '';
+        return `
+            <article class="ui-card" data-crossing="${id}">
+                <div class="ui-row ui-row-between">
+                    <strong>${this.escapeHtml(String(item.worker_name || id))}</strong>
+                    <span class="ui-badge is-warn">${this.OPS_ICONS.alert}${this.escapeHtml(I18n.__('crossingsRunning'))}</span>
+                </div>
+                <div class="ops-stat-grid" style="margin-top:12px">
+                    ${stats
+                        .map(
+                            ([label, value]) => `
+                    <div class="ops-stat">
+                        <span class="ops-stat-label">${this.escapeHtml(label)}</span>
+                        <span class="ops-stat-value">${this.escapeHtml(value)}</span>
+                    </div>`
+                        )
+                        .join('')}
+                </div>
+                ${item.close_defers ? `<p class="ui-section-note" data-crossing-holds-open="${id}">${this.escapeHtml(I18n.__('crossingsCloseDefers'))}</p>` : ''}
+                ${answer}${evidence}${outgrown}${controls}
+            </article>`;
+    },
+
+    /**
+     * The evidence behind an answer: the ceiling, the hours worked when it was given, who gave it.
+     *
+     * The other half of this tab's items already carry a block like this for a review, and for the
+     * same reason. "Authorised up to 12 h" on its own cannot tell a generous ceiling given at
+     * 8.5 h from a rubber-stamp given at 11.9 h, and that difference is what the next person to
+     * ask - an operator tempted to extend it, the worker asking why their week moved, an auditor
+     * months later - needs from the card rather than from a query.
+     *
+     * A refusal shows the same block without the ceiling: it authorised nobody, and printing the
+     * paid day it kept under a label reading "authorised" would read as an authorisation. The
+     * hours worked when it was made are its evidence, and they are the whole of it.
+     */
+    crossingDecisionEvidenceHtml(item, decision, who) {
+        const id = this.escapeHtml(String(item.worker_id));
+        const recorded = Number(decision.recorded_hours_at_decision);
+        const facts = [
+            decision.decision === 'declined'
+                ? null
+                : {
+                      label: I18n.__('crossingsDecisionCeiling'),
+                      value: Number(decision.authorised_hours || 0).toFixed(2)
+                  },
+            isFinite(recorded)
+                ? { label: I18n.__('crossingsDecisionRecorded'), value: recorded.toFixed(2) }
+                : null,
+            { label: I18n.__('crossingsDecisionBy'), value: String(who || '') }
+        ].filter(Boolean);
+        return `
+            <div class="ui-evidence" data-crossing-evidence="${id}">
+                <p class="ops-stat-label">${this.escapeHtml(I18n.__('approvalsEvidence'))}</p>
+                <div class="ui-facts">${facts
+                    .map(
+                        (fact) => `
+                    <div class="ui-fact">
+                        <span class="ops-stat-label">${this.escapeHtml(fact.label)}</span>
+                        <span class="ui-fact-value">${this.escapeHtml(fact.value)}</span>
+                    </div>`
+                    )
+                    .join('')}</div>
+            </div>`;
+    },
+
+    /**
+     * One answer to a live crossing, and the endpoint that owns it.
+     *
+     * The ceiling is optional and empty means "the hours worked so far": the same default the
+     * server applies, so the two cannot disagree about what a blank field authorises. Hours past
+     * the ceiling are not paid quietly - they come back as a second question - so a number here
+     * is a deliberate act rather than a formality.
+     */
+    async handleCrossing(workerId, accept) {
+        const id = String(workerId);
+        const hoursField = document.getElementById(`crossingHours-${id}`);
+        const noteField = document.getElementById(`crossingNote-${id}`);
+        const raw = hoursField ? String(hoursField.value || '').trim() : '';
+        const note = noteField ? String(noteField.value || '').trim() : '';
+        if (!accept && !note) {
+            // Same rule as refusing a review: a refusal is what the record keeps to answer
+            // "why was my overtime refused".
+            Toast.error(I18n.__('approvalsRejectNeedsNote'));
+            return;
+        }
+        const body = { note: note || null };
+        if (raw) {
+            const hours = Number(raw);
+            if (!isFinite(hours) || hours < 0) {
+                // Caught here so a typo is a toast rather than a round trip that answers 400.
+                Toast.error(I18n.__('crossingsCeilingInvalid'));
+                return;
+            }
+            body.authorised_hours = hours;
+        }
+        const card = typeof document.querySelector === 'function' ? document.querySelector(`[data-crossing="${id}"]`) : null;
+        const buttons = card && card.querySelectorAll ? Array.from(card.querySelectorAll('button')) : [];
+        // The answer is a round trip on a phone tether: both buttons go down while it is in
+        // flight, so one card cannot take a second answer to the same question.
+        buttons.forEach((button) => { button.disabled = true; });
+        try {
+            await API.request(
+                `/admin/overtime/crossings/${encodeURIComponent(id)}/${accept ? 'accept' : 'decline'}`,
+                { method: 'POST', body }
+            );
+        } catch (err) {
+            buttons.forEach((button) => { button.disabled = false; });
+            Toast.error(err.message);
+            return;
+        }
+        Toast.success(I18n.__(accept ? 'crossingsAccepted' : 'crossingsDeclined'));
+        UI.renderAdminTab('Approvals');
+    },
+
+    /**
+     * The two answers to a review - and the one endpoint each.
+     *
+     * ``action`` was taken and thrown away here: both buttons posted to
+     * ``/admin/approve_review``, so pressing *Reject* approved the shift at its full recorded
+     * hours. A worker was paid the overtime their manager had just refused, and the only
+     * trace of the refusal was that the card disappeared. The decision picks the endpoint
+     * now, and a refusal has to carry the reason it is recorded with - the server refuses
+     * one without it, so the check here is what saves a round trip, not what enforces it.
+     */
     async handleApproval(logId, action) {
+        const reject = action === 'reject';
         // Read defensively: a second click - or a second admin on the same review - lands
         // after the list has re-rendered, when this row's note box is already detached.
         const field = document.getElementById(`note-${logId}`);
-        const note = field ? field.value : '';
+        const note = field ? String(field.value || '').trim() : '';
+        if (reject && !note) {
+            // A reason, not a nicety: it is what the record keeps to answer "why was my
+            // overtime refused", and the server answers 422 without one.
+            Toast.error(I18n.__('approvalsRejectNeedsNote'));
+            return;
+        }
         const card = typeof document.querySelector === 'function' ? document.querySelector(`[data-review="${logId}"]`) : null;
         const buttons = card && card.querySelectorAll ? Array.from(card.querySelectorAll('button')) : [];
         // The decision is a round trip on a phone tether. Both buttons go down while it is
         // in flight, so the card cannot take a second answer to the same question.
         buttons.forEach((button) => { button.disabled = true; });
         try {
-            await API.request('/admin/approve_review', { method: 'POST', body: { log_id: logId, admin_id: State.user.id, note } });
+            if (reject) {
+                // No ``admin_id``: identity is the bearer token, and a rejection is a new call
+                // site that has no reason to repeat a field the server ignores.
+                await API.request('/admin/reject_review', { method: 'POST', body: { log_id: logId, note } });
+            } else {
+                await API.request('/admin/approve_review', { method: 'POST', body: { log_id: logId, admin_id: State.user.id, note } });
+            }
         } catch (err) {
             buttons.forEach((button) => { button.disabled = false; });
             Toast.error(err.message);
@@ -921,8 +1330,235 @@ const UI_MODULES = {
         }
         // Was an ``alert()``: a modal that stops the browser, cannot be read by the toast
         // queue, and announces nothing to a screen reader that was not already looking.
-        Toast.success(I18n.__('approvalsDecided'));
+        Toast.success(I18n.__(reject ? 'approvalsRejected' : 'approvalsDecided'));
         UI.renderAdminTab('Approvals');
+    },
+
+    // -----------------------------------------------------------------
+    //  Alerts - what the system is telling you, and the one decision it waits on
+    // -----------------------------------------------------------------
+    /**
+     * The console's read of ``admin_notifications``: the table the server writes when it has
+     * something an administrator must know - a start that bypassed a failing self-test, a push
+     * channel that has stopped delivering, a schema repair, a retention sweep.
+     *
+     * The tab exists for the *acknowledgement*, not for the list. Every one of these rows was
+     * already stored before this screen, and reachable from an API - which for the people who
+     * run the deployment is the same as not being reachable at all. What is new is that a
+     * decision can be given an answer: ``POST /admin/notifications/{id}/acknowledge`` takes a
+     * reason, records it against the administrator's own identity in the append-only
+     * ``audit_log``, and readiness stops reporting the forced start as unaccepted. Readiness is
+     * what a monitor watches; this is where a person accepts what it is reporting.
+     *
+     * Three rules the rendering follows:
+     *
+     * 1. **Unacknowledged first, then severity, then newest.** The queue leads with what is
+     *    waiting on somebody, so the row that needs an answer is never below the fold.
+     * 2. **Text from the server is escaped like any other text.** An alert body is a sentence
+     *    this backend wrote, and it can carry a worker's name or a site name; ``escapeHtml`` is
+     *    what keeps a site called ``<b>`` from turning bold in the middle of an alert about a
+     *    forced start.
+     * 3. **A reason is required before the button does anything.** The server refuses an empty
+     *    note (400, through ``textguard``), so the check here saves a round trip on a phone
+     *    tether - it is not what enforces it.
+     */
+    ALERT_SEVERITY_ORDER: { critical: 0, warning: 1, info: 2 },
+
+    alertSeverityRank(alert) {
+        const rank = this.ALERT_SEVERITY_ORDER[String((alert && alert.severity) || '')];
+        return rank === undefined ? 3 : rank;
+    },
+
+    /** ``critical`` as words, in the reader's language, with the code as the fallback.
+     *
+     * No arrow glyph here: ``test_frontend_print_sheet`` reads these two files for one to stop a
+     * second date range being drawn, and a comment is text it cannot tell from a template.
+     */
+    alertSeverityLabel(alert) {
+        return codeLabel('notifSeverity', String((alert && alert.severity) || 'info'));
+    },
+
+    /** Most urgent first: unanswered, then the tone, then the newest. */
+    alertOrder(alerts) {
+        return alerts.slice().sort((a, b) => {
+            const waiting = (a.acknowledged_at ? 1 : 0) - (b.acknowledged_at ? 1 : 0);
+            if (waiting !== 0) return waiting;
+            const severity = this.alertSeverityRank(a) - this.alertSeverityRank(b);
+            if (severity !== 0) return severity;
+            return Number(b.id || 0) - Number(a.id || 0);
+        });
+    },
+
+    alertCardHtml(alert) {
+        const id = this.liveOpsInlineString(alert.id);
+        const acknowledged = !!alert.acknowledged_at;
+        const severity = String(alert.severity || 'info');
+        const tone = severity === 'critical' ? ' is-danger' : (severity === 'warning' ? ' is-warn' : '');
+        const chip = acknowledged
+            ? `<span class="ui-badge" data-alert-acknowledged-chip="true">${this.OPS_ICONS.check}${this.escapeHtml(I18n.__('adminAlertsAcknowledged'))}</span>`
+            : `<span class="ui-badge${tone}" data-alert-waiting-chip="true">${this.OPS_ICONS.alert}${this.escapeHtml(I18n.__('adminAlertsWaiting'))}</span>`;
+        return `
+            <article class="ui-card${tone}" data-alert="${this.escapeHtml(String(alert.id))}"
+                     data-alert-kind="${this.escapeHtml(String(alert.kind || ''))}"
+                     data-alert-severity="${this.escapeHtml(severity)}"
+                     data-unacknowledged="${acknowledged ? '0' : '1'}">
+                <div class="ui-spread">
+                    <div class="ops-row-main">
+                        <span class="ui-badge${tone}" data-alert-severity-badge="true">${this.escapeHtml(this.alertSeverityLabel(alert))}</span>
+                        <div class="ops-who">
+                            <span class="ops-name">${this.escapeHtml(alert.title || '')}</span>
+                            <span class="ops-sub">${this.escapeHtml(I18n.__('adminAlertsRaised').replace('{when}', String(alert.created_at || '')))}</span>
+                        </div>
+                    </div>
+                    ${chip}
+                </div>
+                <p class="ui-note is-body" data-alert-body="true">${this.escapeHtml(alert.body || '')}</p>
+                ${acknowledged ? this.alertAcknowledgementHtml(alert) : this.alertAcknowledgeFormHtml(alert, id)}
+            </article>`;
+    },
+
+    /** What was decided before: who accepted it, when, and in their own words why. */
+    alertAcknowledgementHtml(alert) {
+        const acknowledged = I18n.__('adminAlertsAcknowledgedBy')
+            .replace('{who}', String(alert.acknowledged_by || ''))
+            .replace('{when}', String(alert.acknowledged_at || ''));
+        return `
+                <p class="ui-section-note" data-alert-acknowledged-by="true">${this.escapeHtml(acknowledged)}</p>
+                <p class="ui-note is-body" data-alert-acknowledgement-note="true">${this.escapeHtml(I18n.__('adminAlertsReason'))}: ${this.escapeHtml(alert.acknowledgement_note || '')}</p>`;
+    },
+
+    /**
+     * The answer, for an alert nobody has given one to yet.
+     *
+     * Both controls are bound by ``bindAlertControls`` rather than carrying an ``onclick``: an
+     * inline handler is the reason the document policy still allows ``script-src-attr
+     * 'unsafe-inline'``, and the alert queue - which renders text this server wrote, including
+     * from a worker's note - is the last screen that should widen it.
+     */
+    alertAcknowledgeFormHtml(alert, id) {
+        const read = alert.read_at
+            ? ''
+            : `
+                    <button type="button" class="ui-btn" data-alert-mark-read="${id}">${this.escapeHtml(I18n.__('adminAlertsMarkRead'))}</button>`;
+        return `
+                <label class="ui-label" for="alertNote${id}" style="margin-top:16px">${this.escapeHtml(I18n.__('adminAlertsAcknowledgeNote'))}</label>
+                <textarea id="alertNote${id}" class="ui-field" rows="2" data-alert-note="${id}"
+                          placeholder="${this.escapeHtml(I18n.__('adminAlertsAcknowledgePlaceholder'))}"></textarea>
+                <p class="ui-section-note" style="margin-top:6px">${this.escapeHtml(I18n.__('adminAlertsAcknowledgeKept'))}</p>
+                <div class="ui-row" style="margin-top:12px">
+                    <button type="button" class="ui-btn ui-btn-primary" data-alert-acknowledge="${id}">${this.OPS_ICONS.check}${this.escapeHtml(I18n.__('adminAlertsAcknowledge'))}</button>${read}
+                </div>`;
+    },
+
+    alertsHtml(data) {
+        const alerts = Array.isArray(data && data.notifications) ? data.notifications : [];
+        if (alerts.length === 0) {
+            return `
+                <div class="ui-empty" data-alerts-empty="true">
+                    <span class="ui-empty-icon">${this.OPS_ICONS.check}</span>
+                    <p class="ui-empty-title">${this.escapeHtml(I18n.__('adminAlertsEmpty'))}</p>
+                    <p class="ui-empty-body">${this.escapeHtml(I18n.__('adminAlertsEmptyHint'))}</p>
+                    <button type="button" class="ui-btn" data-alerts-live-ops="true">${this.OPS_ICONS.clock}${this.escapeHtml(I18n.__('activeShifts'))}</button>
+                </div>`;
+        }
+        const waiting = alerts.filter((alert) => !alert.acknowledged_at).length;
+        const count = I18n.__('adminAlertsCount')
+            .replace('{waiting}', String(waiting))
+            .replace('{count}', String(alerts.length));
+        return `
+            <p class="ui-section-note" data-alerts-count="${waiting}">${this.escapeHtml(count)}</p>
+            <p class="ui-section-note">${this.escapeHtml(I18n.__('adminAlertsHint'))}</p>
+            <div class="ui-stack">${this.alertOrder(alerts).map((alert) => this.alertCardHtml(alert)).join('')}</div>`;
+    },
+
+    async renderAlerts(content) {
+        if (!content) return;
+        content.innerHTML = UI.consoleSkeletonHtml(I18n.__('adminAlertsTitle'));
+        let data;
+        try {
+            data = await API.request('/admin/notifications?limit=100');
+        } catch (err) {
+            content.innerHTML = this.uiErrorHtml(err, "UI.renderAdminTab('Alerts')");
+            return;
+        }
+        content.innerHTML = `<div class="ui-page" data-alerts="true">${this.alertsHtml(data)}</div>`;
+        this.bindAlertControls(content);
+    },
+
+    /**
+     * Bind the queue's controls after it is painted.
+     *
+     * One pass over the card's own buttons, with the id read off the attribute the card was
+     * drawn with - so a repaint between paint and tap cannot orphan a handler, and no inline
+     * ``onclick`` joins the ones the document policy already tolerates. The guards are the same
+     * ones ``bindCredentialsControls`` and the review cards carry: a stub DOM without
+     * ``querySelectorAll`` must be able to render the tab without throwing.
+     */
+    bindAlertControls(content) {
+        if (!content || typeof content.querySelectorAll !== 'function') return;
+        const on = (selector, handler) => {
+            content.querySelectorAll(selector).forEach((button) => {
+                if (typeof button.addEventListener !== 'function') return;
+                button.addEventListener('click', () => handler(button.getAttribute(selector.slice(1, -1))));
+            });
+        };
+        on('[data-alert-acknowledge]', (id) => this.acknowledgeAlert(id));
+        on('[data-alert-mark-read]', (id) => this.markAlertRead(id));
+        content.querySelectorAll('[data-alerts-live-ops]').forEach((button) => {
+            if (typeof button.addEventListener !== 'function') return;
+            button.addEventListener('click', () => UI.renderAdminTab('Live Ops'));
+        });
+    },
+
+    /**
+     * Accept an alert, with the reason. The note is the point of the screen.
+     *
+     * Answers ``409`` by showing the server's sentence - it names the administrator who
+     * accepted it first and when, which is what a second person needs to know and is not
+     * something this screen can know by itself.
+     */
+    async acknowledgeAlert(notificationId) {
+        const field = document.getElementById(`alertNote${notificationId}`);
+        const note = field ? String(field.value || '').trim() : '';
+        if (!note) {
+            Toast.error(I18n.__('adminAlertsAcknowledgeNeedsNote'));
+            return;
+        }
+        const card = typeof document.querySelector === 'function'
+            ? document.querySelector(`[data-alert="${notificationId}"]`)
+            : null;
+        const buttons = card && card.querySelectorAll ? Array.from(card.querySelectorAll('button')) : [];
+        // The decision is a round trip on a phone tether: both buttons go down while it is in
+        // flight, so one alert cannot take two answers.
+        buttons.forEach((button) => { button.disabled = true; });
+        try {
+            await API.request(`/admin/notifications/${encodeURIComponent(notificationId)}/acknowledge`, {
+                method: 'POST',
+                body: { note }
+            });
+        } catch (err) {
+            buttons.forEach((button) => { button.disabled = false; });
+            Toast.error(err.message);
+            return;
+        }
+        Toast.success(I18n.__('adminAlertsAcknowledgedToast'));
+        UI.renderAdminTab('Alerts');
+    },
+
+    /**
+     * Seen, but not accepted. Kept as a separate act on purpose: an informational alert (a
+     * retention sweep, a note a worker wrote) needs clearing, and nothing about clearing it
+     * should look like accepting a forced start.
+     */
+    async markAlertRead(notificationId) {
+        try {
+            await API.request(`/admin/notifications/${encodeURIComponent(notificationId)}/read`, { method: 'POST' });
+        } catch (err) {
+            Toast.error(err.message);
+            return;
+        }
+        Toast.success(I18n.__('adminAlertsMarkedRead'));
+        UI.renderAdminTab('Alerts');
     },
 
     // -----------------------------------------------------------------
@@ -1078,10 +1714,10 @@ const UI_MODULES = {
             </form>`;
     },
 
-    /** The zones an administrator is most likely to want, as suggestions - not a closed list. */
+    /** The company zone, offered as a suggestion - the field is not a closed list. */
     siteTimezoneOptionsHtml() {
         return `<datalist id="siteTimezoneOptions">
-            ${['Africa/Cairo', 'Africa/Alexandria', 'Asia/Riyadh', 'Asia/Dubai', 'Asia/Kolkata', 'Europe/London', 'UTC']
+            ${['Asia/Kuwait']
                 .map((zone) => `<option value="${this.escapeHtml(zone)}"></option>`).join('')}
         </datalist>`;
     },
@@ -1800,6 +2436,55 @@ const UI_MODULES = {
                 return this.applyCredentialsSearch();
             };
         }
+        this.bindCredentialsControls(content);
+    },
+
+    /**
+     * One listener per repaint for the controls this tab renders by hand.
+     *
+     * Bound on the nodes that were just rendered, so a repaint cannot leave a second
+     * listener behind, and one per node rather than on the container, because the question
+     * each handler answers is "which account or which file" and the node already carries it.
+     * Same idiom as the handset's export buttons.
+     *
+     * All three of these are ``data-`` hooks rather than inline attributes. The document CSP
+     * has to allow ``script-src-attr 'unsafe-inline'`` for the handlers the console builds as
+     * strings, that allowance is pinned per file so it may only fall, and what it buys an
+     * injected ``<img onerror>`` is exactly this - so a control added today binds its own
+     * listener instead of widening it.
+     */
+    bindCredentialsControls(root) {
+        const scope = root || document;
+        if (typeof scope.querySelectorAll !== 'function') return;
+        const buttons = scope.querySelectorAll('[data-enroll-self]');
+        for (let i = 0; i < buttons.length; i += 1) {
+            const button = buttons[i];
+            if (typeof button.addEventListener !== 'function') continue;
+            button.addEventListener('click', (event) => {
+                event.preventDefault();
+                this.enrollSelf();
+            });
+        }
+        // The reference photo on the edit panel. A ``change`` event and the element itself as
+        // the argument, because an ``<input type="file">`` is the one control whose value
+        // cannot be re-read later: the file list is a snapshot taken when the dialog closed.
+        const pickers = scope.querySelectorAll('[data-edit-photo]');
+        for (let i = 0; i < pickers.length; i += 1) {
+            const picker = pickers[i];
+            if (typeof picker.addEventListener !== 'function') continue;
+            picker.addEventListener('change', (event) => {
+                this.pickEditPhoto(event && event.target ? event.target : picker);
+            });
+        }
+        const clears = scope.querySelectorAll('[data-clear-edit-photo]');
+        for (let i = 0; i < clears.length; i += 1) {
+            const clear = clears[i];
+            if (typeof clear.addEventListener !== 'function') continue;
+            clear.addEventListener('click', (event) => {
+                event.preventDefault();
+                this.clearEditPhoto();
+            });
+        }
     },
 
     /** Repaints the roster from the last response; only a search or a save needs this. */
@@ -2056,8 +2741,15 @@ const UI_MODULES = {
      * existed. The last two are not the same button on purpose - see ``deleteUser``.
      */
     credentialsActionHtml(user, compact) {
+        const isSelf = String(user.id) === String((State.user || {}).id);
+        // Your own reference photo is the one thing about your own row that you *may* change,
+        // and it is the whole reason an administrator who works a site can clock in at all.
+        // So it is offered on the row that reports whether a face is on file - above the
+        // protected-account branch below, which is what suppresses everything else an
+        // administrator would do to an administrator.
+        const selfEnroll = isSelf ? this.selfEnrollButtonHtml(user, compact) : '';
         if (!this.canManageAccount(user)) {
-            return `<span class="ui-badge is-quiet" data-protected="true">${this.OPS_ICONS.shield}${this.escapeHtml(I18n.__('credentialsAdminProtected'))}</span>`;
+            return `${selfEnroll}<span class="ui-badge is-quiet" data-protected="true">${this.OPS_ICONS.shield}${this.escapeHtml(I18n.__('credentialsAdminProtected'))}</span>`;
         }
         if (String(user.id) === String(this._credentialsTarget)) return '';
         const id = this.escapeHtml(user.id);
@@ -2066,7 +2758,6 @@ const UI_MODULES = {
         // account that could be the last head admin is the one asking), so offering the
         // button would be offering a request that always fails. Editing yourself is fine -
         // a name or a rate is not a lockout.
-        const isSelf = String(user.id) === String((State.user || {}).id);
         const statusKey = inactive ? 'credentialsReactivate' : 'credentialsDeactivate';
         // Two shapes of the same four actions. The roster is nine columns wide, and four
         // labelled buttons in the last one wrapped onto two lines and doubled the height of
@@ -2105,8 +2796,186 @@ const UI_MODULES = {
         const rowStyle = compact
             ? 'flex-wrap:nowrap;justify-content:flex-end;gap:6px'
             : 'justify-content:flex-end;gap:6px';
-        return `<span class="ui-row" style="${rowStyle}">${setPassword}${edit}${status}${remove}</span>`;
+        return `<span class="ui-row" style="${rowStyle}">${selfEnroll}${setPassword}${edit}${status}${remove}</span>`;
     },
+
+    /**
+     * Whether *this* account may register its own face.
+     *
+     * The server's answer is ``SELF_ENROLL_ROLES`` in ``main.py``, and the console reads the
+     * same list it uses to decide who may step from the console onto the clock: a role that
+     * cannot punch has no use for a template, and one that is not in that list would only
+     * meet a 403. A test pins the two lists equal, because a button that is drawn from a
+     * different list than the endpoint is checked against is a button that fails in the one
+     * place nobody looks.
+     */
+    canSelfEnroll() {
+        if (typeof UI === 'undefined' || typeof UI.canOpenHandset !== 'function') return false;
+        return UI.canOpenHandset();
+    },
+
+    /**
+     * Enroll or re-enroll my own face, on the row that reports what is on file.
+     *
+     * Two labels, one action: an account with no template is being told how to clock in, and
+     * an account that has one is being offered a replacement (a template can go stale when
+     * the detector changes, and the console's own readiness screen reports exactly that).
+     *
+     * A ``data-`` hook rather than an inline ``onclick``: the CSP's inline-attribute
+     * allowance is pinned per file and may not rise, and that allowance is what an injected
+     * ``<img onerror>`` needs. ``paintCredentials`` binds the listener, so a repaint cannot
+     * leave a second one behind.
+     */
+    selfEnrollButtonHtml(user, compact) {
+        if (!this.canSelfEnroll()) return '';
+        const id = this.escapeHtml(user.id);
+        const label = this.escapeHtml(I18n.__(user.face_enrolled ? 'credentialsFaceReplace' : 'credentialsFaceEnroll'));
+        const icon = this.OPS_ICONS.camera;
+        return compact
+            ? `<button type="button" data-enroll-self="${id}" class="ui-btn ui-btn-sm ui-btn-primary is-icon" title="${label}" aria-label="${label}">${icon}</button>`
+            : `<button type="button" data-enroll-self="${id}" class="ui-btn ui-btn-sm ui-btn-primary">${icon}${label}</button>`;
+    },
+
+    /**
+     * Take my own reference photo: the camera, the shutter, and one request.
+     *
+     * The same camera the punch card uses (``Camera.start``, the same front-facing stream and
+     * the same framing once the overlay is up), on the device that will be doing the
+     * punching, which is what makes the template resemble the live captures it will be
+     * compared with. The server runs the enrollment liveness policy on what comes back, so a
+     * photo of a photo cannot become a permanent template - the overlay says so, because a
+     * refusal the reader cannot predict is a refusal that looks like a bug.
+     */
+    async enrollSelf() {
+        if (!this.canSelfEnroll()) return;
+        // One overlay at a time: a second shutter over the first would post two templates for
+        // the same account, and the loser of that race is whichever one lands second. Held
+        // rather than searched for, like the print sheet: it is the node this path put in the
+        // page, so it is the node this path takes back out.
+        if (this._enrollBusy || this._enrollOverlay) return;
+        if (typeof Camera === 'undefined' || !Camera.isSupported) {
+            const info = Camera.explain({ name: 'NotAllowedError' });
+            UI.showHelpModal(info.title, info.steps);
+            return;
+        }
+        this._enrollBusy = true;
+        try {
+            const overlay = document.createElement('div');
+            overlay.className = 'camera-overlay';
+            overlay.id = 'enrollOverlay';
+            overlay.innerHTML = `
+                <div class="camera-head" style="padding-top:calc(16px + var(--safe-top))">
+                    <p class="camera-action">${this.escapeHtml(I18n.__('credentialsFaceEnrollTitle'))}</p>
+                    <button type="button" data-close-enroll="true" class="icon-button" style="background:rgba(255,255,255,.12);border-color:rgba(255,255,255,.25);color:#fff">\u2715</button>
+                </div>
+                <video id="enrollVideo" autoplay playsinline muted></video>
+                <div class="camera-controls">
+                    <div class="camera-controls-row">
+                        <div class="camera-spacer"></div>
+                        <button type="button" id="enrollShutter" class="shutter-button" aria-label="${this.escapeHtml(I18n.__('credentialsFaceEnrollTake'))}"></button>
+                        <div class="camera-spacer"></div>
+                    </div>
+                    <p class="camera-hint">${this.escapeHtml(I18n.__('credentialsFaceEnrollHint'))}</p>
+                </div>`;
+            document.body.appendChild(overlay);
+            document.body.style.overflow = 'hidden';
+            this._enrollOverlay = overlay;
+            // Scoped to the overlay that was just built, not searched for across the document:
+            // this camera is one of two the app can have on screen (a punch card is the other),
+            // and the two controls below belong to this one.
+            const close = overlay.querySelector('[data-close-enroll]');
+            if (close) close.addEventListener('click', () => this.closeEnrollCamera());
+            const shutter = overlay.querySelector('#enrollShutter');
+            if (shutter) shutter.addEventListener('click', () => this.submitSelfEnroll());
+            try {
+                const stream = await Camera.start();
+                const video = document.getElementById('enrollVideo');
+                video.srcObject = stream;
+                try { await video.play(); } catch (e) { /* autoplay policing; ignore */ }
+            } catch (err) {
+                // The handset's own explanation of a camera that will not open - permission
+                // refused, an insecure origin, no camera on a desktop - because it is the
+                // same camera and the same three reasons.
+                const info = Camera.explain(err);
+                this.closeEnrollCamera();
+                UI.showHelpModal(info.title, info.steps);
+                return;
+            }
+        } finally {
+            this._enrollBusy = false;
+        }
+    },
+
+    /**
+     * Send the frame. Success is the row saying "enrolled" a moment later.
+     *
+     * The request carries the photo and nothing else. Whose template this is, is the token -
+     * there is no account id here to be pointed at somebody else, and the endpoint refuses a
+     * role that is not allowed to enroll itself at all.
+     */
+    async submitSelfEnroll() {
+        const video = document.getElementById('enrollVideo');
+        const shutter = document.getElementById('enrollShutter');
+        if (!State.user) {
+            // The session died while the overlay was open; without this the capture throws on
+            // a user that is no longer there and the reader is left on a camera that cannot
+            // send anything.
+            this.closeEnrollCamera();
+            Toast.error(I18n.__('sessionExpiredSignInAgain'));
+            return;
+        }
+        if (!video || !video.videoWidth) {
+            Toast.error(I18n.__('cameraNotReady'));
+            return;
+        }
+        if (shutter) shutter.disabled = true;
+        let blob = null;
+        try {
+            blob = await Camera.snapshot(video);
+        } catch (err) {
+            blob = null;
+        }
+        if (!blob) {
+            if (shutter) shutter.disabled = false;
+            Toast.error(I18n.__('cameraFailedTitle'));
+            return;
+        }
+        const form = new FormData();
+        form.append('photo', blob, 'reference.jpg');
+        try {
+            await API.request('/worker/me/enroll', { method: 'POST', body: form });
+        } catch (err) {
+            // A 401 has already cleared the session and repainted the login screen; take the
+            // camera down with it. Everything else - a liveness refusal, a frame the model
+            // cannot use - is about this photo, so the overlay stays open and the shutter
+            // comes back, and the reader can simply try again.
+            if (!State.user) {
+                this.closeEnrollCamera();
+                Toast.error(I18n.__('sessionExpiredSignInAgain'));
+                return;
+            }
+            if (shutter) shutter.disabled = false;
+            Toast.error(`${I18n.__('credentialsFaceEnrollFailed')}: ${err.message}`);
+            return;
+        }
+        this.closeEnrollCamera();
+        Toast.success(I18n.__('credentialsFaceEnrollDone'));
+        // The roster is the answer to "did it work": repainting from the server is what turns
+        // the face cell into "enrolled" and the button into "replace".
+        await this.loadCredentials(document.getElementById('adminContent'));
+    },
+
+    /** Take the enrollment camera down, and the page back out of the way of nothing. */
+    closeEnrollCamera() {
+        State.stopCamera();
+        const overlay = this._enrollOverlay;
+        this._enrollOverlay = null;
+        if (overlay && typeof overlay.remove === 'function') overlay.remove();
+        document.body.style.overflow = '';
+    },
+
+    /** The enrollment camera this module has open, if any - one at a time, by construction. */
+    _enrollOverlay: null,
 
     /** The account being edited, looked up in the roster on screen. */
     credentialsTarget() {
@@ -2280,6 +3149,19 @@ const UI_MODULES = {
     _credentialsEditDraft: { name: '', email: '', phone: '', hourly_rate: '' },
 
     /**
+     * The replacement reference photo chosen on the edit panel, or ``null``.
+     *
+     * The selection is held as the file object itself rather than read back from the input
+     * when it is time to send: a repaint rebuilds the picker, and browsers do not let a file
+     * be put back into one - so the object in memory is the only thing a retry after a failed
+     * upload can still send. Cleared whenever the panel opens, closes or saves.
+     */
+    _credentialsEditPhoto: null,
+
+    /** Why the chosen photo cannot be used, or ``""``. Shown beside the picker. */
+    _credentialsEditPhotoError: '',
+
+    /**
      * Opens the edit form for one account, with the account read from the server.
      *
      * Read rather than taken from the row on screen, because the roster payload is a
@@ -2293,6 +3175,11 @@ const UI_MODULES = {
         this._credentialsTarget = null;
         this._credentialsPassword = '';
         this._credentialsRevealed = null;
+        // Whatever was chosen for the last account, dropped before this one opens: a photo
+        // left over from the previous row would be written as *this* person's template, which
+        // is the same one-account-to-another bug the password panel is arranged to prevent.
+        this._credentialsEditPhoto = null;
+        this._credentialsEditPhotoError = '';
         try {
             const user = await API.request(`/admin/users/${encodeURIComponent(userId)}`);
             this._credentialsEdit = user;
@@ -2313,6 +3200,10 @@ const UI_MODULES = {
     closeUserEdit() {
         this._credentialsEdit = null;
         this._credentialsEditDraft = { name: '', email: '', phone: '', hourly_rate: '' };
+        // The chosen file goes with the panel: it is a copy of somebody's face in memory, and
+        // closing the form is what stops holding it.
+        this._credentialsEditPhoto = null;
+        this._credentialsEditPhotoError = '';
         return this.repaintCredentialsFromCache();
     },
 
@@ -2336,6 +3227,7 @@ const UI_MODULES = {
         const user = this._credentialsEdit;
         if (!user) return '';
         const draft = this._credentialsEditDraft;
+        const photo = this._credentialsEditPhoto;
         const box = 'ui-card is-stacked is-flat';
         const field = this.credentialsFieldClass();
         const label = 'ui-label';
@@ -2361,11 +3253,85 @@ const UI_MODULES = {
                     </label>
                 </div>
                 <p class="ui-note">${I18n.__('credentialsHourlyRateHint')}</p>
+                <!-- The face, which is the one thing about this person that is not a field on
+                     their row. What is on file is stated rather than implied, because the two
+                     cases are different jobs: a first photo is what makes the account able to
+                     clock in at all, and a replacement silently stops the previous template
+                     working - see the hint under the picker, which says so. -->
+                <div class="ui-facts" style="margin-top:12px">
+                    <div class="ui-fact">
+                        <span class="ops-stat-label">${this.escapeHtml(I18n.__('credentialsPhoto'))}</span>
+                        <span data-edit-face="${user.face_enrolled ? 'enrolled' : 'missing'}">${this.credentialsFace(user)}</span>
+                    </div>
+                </div>
+                <div class="ui-row" style="margin-top:12px">
+                    <input type="file" id="userEditPhoto" accept="image/jpeg,image/png,image/webp"
+                           data-edit-photo="${this.escapeHtml(user.id)}" class="${field}">
+                    ${photo ? `<span class="ui-note" data-edit-photo-chosen>${this.escapeHtml(photo.name || '')} · ${this.photoSizeLabel(photo)}</span>
+                        <button type="button" data-clear-edit-photo="true" class="${quiet}">${I18n.__('credentialsPhotoRemove')}</button>` : ''}
+                </div>
+                <p class="ui-note">${I18n.__('credentialsPhotoEditHint')}</p>
+                ${this._credentialsEditPhotoError ? `<p class="ui-note is-danger" data-edit-photo-error>${this.escapeHtml(this._credentialsEditPhotoError)}</p>` : ''}
                 <div class="ui-row">
                     <button type="button" onclick="UI_MODULES.saveUserEdit()" class="ui-btn ui-btn-primary">${I18n.__('save')}</button>
                     <button type="button" onclick="UI_MODULES.closeUserEdit()" class="${quiet}">${I18n.__('cancel')}</button>
                 </div>
             </div>`;
+    },
+
+    /**
+     * Holds the photo chosen for the account being edited, or refuses it before upload.
+     *
+     * The same policy check the create form makes (``checkPhotoFile``), and deliberately the
+     * same one: one account's photo is not a looser kind of photo than another's. A refusal
+     * holds nothing, says why beside the picker and makes no request - the alternative is a
+     * 5 MB upload over a site's phone tether ending in a 413 the admin could have been told
+     * about instantly.
+     */
+    pickEditPhoto(input) {
+        const chosen = input && input.files && input.files[0] ? input.files[0] : null;
+        const problem = this.checkPhotoFile(chosen);
+        this.readUserEditDraft();
+        this._credentialsEditPhotoError = problem || '';
+        this._credentialsEditPhoto = problem ? null : chosen;
+        if (problem) Toast.error(problem);
+        return this.repaintCredentialsFromCache();
+    },
+
+    clearEditPhoto() {
+        this._credentialsEditPhoto = null;
+        this._credentialsEditPhotoError = '';
+        return this.repaintCredentialsFromCache();
+    },
+
+    /**
+     * Writes the chosen photo as this account's template: ``POST /admin/enroll``.
+     *
+     * The one endpoint for the job, shared with the console's own enrollment and the bulk
+     * roster import - it takes a file from disk, embeds it and overwrites both files the
+     * account's punches are checked against. Returns whether it landed, because the caller
+     * decides what a failure means: the account's *fields* are saved by then, so the panel
+     * stays open with the file still held and the reason beside the picker rather than
+     * closing on a person whose face was never written.
+     */
+    async uploadEditPhoto(user) {
+        const photo = this._credentialsEditPhoto;
+        if (!photo) return true;
+        const form = new FormData();
+        form.append('worker_id', user.id);
+        form.append('photo', photo, photo.name || 'reference.jpg');
+        try {
+            await API.request('/admin/enroll', { method: 'POST', body: form });
+        } catch (err) {
+            this._credentialsEditPhotoError = err.message;
+            Toast.error(`${I18n.__('credentialsFaceEnrollFailed')}: ${err.message}`);
+            await this.repaintCredentialsFromCache();
+            return false;
+        }
+        this._credentialsEditPhoto = null;
+        this._credentialsEditPhotoError = '';
+        Toast.success(I18n.__('credentialsPhotoSaved'));
+        return true;
     },
 
     /**
@@ -2401,12 +3367,19 @@ const UI_MODULES = {
         }
         try {
             await API.request('/admin/users/edit', { method: 'POST', body });
-            Toast.success(I18n.__('credentialsUserSaved'));
         } catch (err) {
             Toast.error(err.message);
             return;
         }
-        this._credentialsEdit = null;
+        // A chosen photo is a second request, because it is a second content type: the
+        // account's own fields travel as JSON and a file cannot. It is sent only when one was
+        // chosen, so the ordinary edit - a name, a rate - is still one round trip.
+        if (this._credentialsEditPhoto) {
+            const uploaded = await this.uploadEditPhoto(user);
+            if (!uploaded) return;
+        }
+        Toast.success(I18n.__('credentialsUserSaved'));
+        this.closeUserEdit();
         await this.loadCredentials(document.getElementById('adminContent'));
     },
 
@@ -2572,12 +3545,25 @@ const UI_MODULES = {
      * Nothing chosen is not an error: an account with no face is a legitimate account,
      * it simply cannot clock in until a photo is registered for it.
      */
-    checkPhotoFile(file) {
+    /**
+     * Why the chosen file cannot be used, or ``null`` when it can.
+     *
+     * ``wording`` is what the refusal calls the file. One policy, three subjects: a face
+     * reference, a logo, and whatever comes next all go through the same ceiling and the
+     * same type allowlist, and only the sentence changes - a company uploading its mark is
+     * not being told to "retake the photo".
+     */
+    checkPhotoFile(file, wording) {
+        const say = wording || {
+            unreadable: 'credentialsPhotoUnreadable',
+            tooLarge: 'credentialsPhotoTooLarge',
+            wrongType: 'credentialsPhotoWrongType'
+        };
         if (!file) return null;
         const size = Number(file.size || 0);
-        if (size <= 0) return I18n.__('credentialsPhotoUnreadable');
+        if (size <= 0) return I18n.__(say.unreadable);
         if (size > this.PHOTO_POLICY.maxBytes) {
-            return `${I18n.__('credentialsPhotoTooLarge')} (${this.photoSizeLabel(file)} / ${this.PHOTO_POLICY.maxMb} MB)`;
+            return `${I18n.__(say.tooLarge)} (${this.photoSizeLabel(file)} / ${this.PHOTO_POLICY.maxMb} MB)`;
         }
         const type = String(file.type || '').toLowerCase();
         if (this.PHOTO_POLICY.accepted.indexOf(type) >= 0) return null;
@@ -2586,7 +3572,7 @@ const UI_MODULES = {
         // decides from the bytes, so this cannot let a document through.
         const name = String(file.name || '').toLowerCase();
         if (!type && /\.(jpe?g|png|webp)$/.test(name)) return null;
-        return I18n.__('credentialsPhotoWrongType');
+        return I18n.__(say.wrongType);
     },
 
     pickCredentialsPhoto(input) {
@@ -2967,96 +3953,63 @@ const UI_MODULES = {
     _shiftRules: null,
 
     /**
-     * The Admin tab: the rules a shift is measured by, then the admin roster.
+     * The Admin tab: whose deployment this is, and the rules a shift is measured by.
      *
-     * The shift rules are here rather than in the API docs because they are the numbers
-     * a payroll question turns on - what a day is worth, how much of it is an unpaid
-     * break, and whether the day ends by itself - and until now the only way to change
-     * them was a ``curl``.
+     * Two panels, both about the deployment rather than about one account. The **Company**
+     * panel is the name and the mark every screen and every printed sheet carries (see
+     * ``Brand``); the **shift rules** are the numbers a payroll question turns on - what a
+     * day is worth, how much of it is an unpaid break, and whether the day ends by itself -
+     * and until the panel existed the only way to change them was a ``curl``.
+     *
+     * Creating an administrator used to be this tab's third panel, and it was a worse
+     * version of a screen that already existed: three boxes and no role choice, against a
+     * Credentials form that takes the id, the name, the contact details, the password *and*
+     * the face in one step. Two places to create an account is one place too many, so the
+     * panel is gone and the note below says where the job actually lives. What stays is the
+     * one thing that was not a duplicate: the id ranges, which are the whole permission
+     * model (1000-4999 an admin, 5000 and above a head admin).
      */
-    async renderAdminManagement(content, knownRules) {
-        // ``knownRules`` is passed back after a save, so the panel repaints from the rules
-        // the server stored instead of spending a second round trip re-reading them.
+    async renderAdminManagement(content, knownRules, knownBranding) {
+        // ``knownRules`` and ``knownBranding`` are passed back after a save, so the panel
+        // repaints from what the server stored instead of spending extra round trips
+        // re-reading it.
         let rules = knownRules || null;
         try {
             rules = rules || await API.request('/admin/shift_rules');
         } catch (err) {
             Toast.error(err.message);
         }
+        let branding = knownBranding || null;
+        try {
+            branding = branding || await API.request('/branding');
+            // Keep the lockup the rest of the app draws in step with what this panel is
+            // showing, without a reload: the rail, the handset header and the next sheet
+            // all read ``BRAND``.
+            if (branding) this.adoptBranding(branding);
+        } catch (err) {
+            // Silence, deliberately. The read is public and the console already holds a
+            // lockup (the one resolved at boot); a company name that cannot be re-read is
+            // not worth an error toast over, and the panel draws what the app is using.
+        }
         // The rules this panel was painted from. ``saveShiftRules`` reads a field back from
         // here when the box itself cannot answer (see that method for why).
         this._shiftRules = rules;
         content.innerHTML = `
             <div class="ui-page" data-admin-panel="true">
+                ${this.companyHtml(branding)}
                 ${this.shiftRulesHtml(rules)}
-                ${this.createAdminHtml()}
+                <p class="ui-note is-body" data-admin-create-moved="true">${this.escapeHtml(I18n.__('adminCreateMoved'))}</p>
             </div>`;
         const rulesForm = document.getElementById('shiftRulesForm');
         if (rulesForm) rulesForm.onsubmit = (event) => this.saveShiftRules(event);
-        const adminForm = document.getElementById('addAdminForm');
-        if (adminForm) adminForm.onsubmit = (event) => this.addAdmin(event);
-    },
-
-    /**
-     * The second job this tab has: creating another administrator.
-     *
-     * It was three unlabelled boxes under an "Admin Name / Password / Admin ID
-     * (1000+)" heading - placeholders doing a label's work, which vanish the moment
-     * somebody types in them, and nothing at all saying what the ID range means. The
-     * range is the whole permission model: 1000-4999 is an admin who cannot touch
-     * another administrator, 5000 and above is a head admin who can.
-     */
-    createAdminHtml() {
-        return `
-            <section class="ui-card is-flat" aria-labelledby="createAdminTitle">
-                <h3 class="ui-section-title" id="createAdminTitle">${this.escapeHtml(I18n.__('adminCreateTitle'))}</h3>
-                <p class="ui-section-note" style="margin-top:4px">${this.escapeHtml(I18n.__('adminCreateHint'))}</p>
-                <form id="addAdminForm" class="ui-grid three" style="margin-top:14px">
-                    <div>
-                        <label class="ui-label" for="adminId">${this.escapeHtml(I18n.__('adminId'))}</label>
-                        <input type="text" id="adminId" class="ui-field" inputmode="numeric" required
-                               placeholder="${this.escapeHtml(I18n.__('adminIdPlaceholder'))}">
-                    </div>
-                    <div>
-                        <label class="ui-label" for="adminName">${this.escapeHtml(I18n.__('adminName'))}</label>
-                        <input type="text" id="adminName" class="ui-field" autocomplete="off" required>
-                    </div>
-                    <div>
-                        <label class="ui-label" for="adminPass">${this.escapeHtml(I18n.__('adminPassword'))}</label>
-                        <input type="password" id="adminPass" class="ui-field" autocomplete="new-password" required>
-                    </div>
-                    <div style="grid-column:1/-1">
-                        <button type="submit" class="ui-btn ui-btn-primary">${this.OPS_ICONS.shield}${this.escapeHtml(I18n.__('adminCreate'))}</button>
-                    </div>
-                </form>
-            </section>`;
-    },
-
-    /** Create the account, or say why not. Same failure shape as the site form. */
-    async addAdmin(event) {
-        if (event && event.preventDefault) event.preventDefault();
-        const value = (id) => {
-            const element = document.getElementById(id);
-            return element && element.value !== undefined ? String(element.value) : '';
-        };
-        try {
-            await API.request('/admin/admins/add', { method: 'POST', body: {
-                user_id: value('adminId'),
-                name: value('adminName'),
-                password: value('adminPass'),
-                role: 'admin',
-                creator_id: State.user.id
-            }});
-        } catch (err) {
-            // Same reason as the site form: "Admin ID must be in range 1000-4999." is the
-            // only thing that tells the admin what to change, and it used to vanish.
-            Toast.error(err.message);
-            return;
-        }
-        // Was an ``alert()``, and the panel never repainted - so the account was created
-        // and the form still showed the details, which is how the same admin gets made twice.
-        Toast.success(I18n.__('adminCreated'));
-        UI.renderAdminTab('Admin');
+        const companyForm = document.getElementById('companyForm');
+        if (companyForm) companyForm.onsubmit = (event) => this.saveCompany(event);
+        const reset = document.getElementById('companyReset');
+        if (reset) reset.onclick = () => this.resetCompanyLines();
+        const logoInput = document.getElementById('companyLogoInput');
+        if (logoInput) logoInput.onchange = () => this.pickCompanyLogo(logoInput);
+        const removeLogo = document.getElementById('companyLogoRemove');
+        if (removeLogo) removeLogo.onclick = () => this.removeCompanyLogo();
     },
 
     /**
@@ -3076,6 +4029,20 @@ const UI_MODULES = {
         const overtimeAt = Number(value('overtime_notify_hours', 8.1));
         const autoClose = String(value('auto_close_at_regular', 1)) !== '0';
         const onSite = regular + (regular >= afterHours ? minutes / 60 : 0);
+        // What the two watchers add up to, from the server: with the automatic close on and
+        // the alert at or above the paid day, no shift can ever reach the alert - the day is
+        // ended first, and the watcher looks exactly like one with nothing to report. The
+        // figures this is decided from are on this screen, so the verdict belongs here too.
+        // The sentence is built from the numbers rather than taken from the server's own
+        // (English) ``detail``, because this panel ships in three languages.
+        const dayEnd = (rules && rules.day_end) || null;
+        const alertLost = !!(dayEnd && dayEnd.alert_reachable === false);
+        // The other half of the same verdict, and the one with a behavioural change behind it:
+        // with the overtime line above the paid day the automatic close stands down, so a
+        // switch that still reads as on no longer closes anything. The two are mutually
+        // exclusive (the alert is either below the line, on it, or above it), so one note is
+        // shown, never a stack.
+        const closeDeferred = !!(dayEnd && dayEnd.close_defers === true);
         return `
             <section class="ui-card is-flat" data-rules-panel="true" aria-labelledby="shiftRulesTitle">
                 <h3 class="ui-section-title" id="shiftRulesTitle">${this.escapeHtml(I18n.__('shiftRules'))}</h3>
@@ -3099,6 +4066,21 @@ const UI_MODULES = {
                         <span class="ui-fact-value" data-rules-fact="overtime">${this.escapeHtml(`${this.hoursLabel(overtimeAt)} h`)}</span>
                     </div>
                 </div>
+
+                ${alertLost
+                    ? `<p class="ui-note is-body is-warn" data-rules-alert="unreachable">${this.escapeHtml(
+                        I18n.__('shiftRulesAlertUnreachable')
+                            .replace('{regular}', String(regular))
+                            .replace('{notify}', String(overtimeAt))
+                    )}</p>`
+                    : ''}
+                ${closeDeferred
+                    ? `<p class="ui-note is-body is-warn" data-rules-alert="deferred">${this.escapeHtml(
+                        I18n.__('shiftRulesCloseDeferred')
+                            .replace('{regular}', String(regular))
+                            .replace('{notify}', String(overtimeAt))
+                    )}</p>`
+                    : ''}
 
                 <form id="shiftRulesForm" class="ui-grid three" style="margin-top:16px">
                     <div>
@@ -3226,6 +4208,173 @@ const UI_MODULES = {
     },
 
     // -----------------------------------------------------------------
+    //  Company - the name and the mark every screen and every sheet carries
+    //
+    //  Four lines and an image, next door to the shift rules because they are the same
+    //  kind of thing: the deployment's own settings, editable where the deployment is
+    //  administered. What they are *not* is decoration - the name on the login panel is
+    //  how a worker on site cellular knows this is the app their administrator told them
+    //  about, and the name at the top of a printed timesheet is whose payroll it is.
+    // -----------------------------------------------------------------
+
+    /**
+     * The four lines of the lockup, and the box each one is typed into.
+     *
+     * One list rather than a template and a saver that agree by hand: the panel draws from
+     * it, the save reads from it, and a fifth line would be one entry here. ``limit`` is the
+     * server's own ceiling (``branding.MAX_FIELD_CHARS``), carried as ``maxlength`` so a box
+     * stops before the refusal rather than after it.
+     */
+    COMPANY_LINES: [
+        { key: 'name', input: 'companyName', label: 'companyName', limit: 60 },
+        { key: 'legal', input: 'companyLegal', label: 'companyLegal', limit: 60 },
+        { key: 'est', input: 'companyEst', label: 'companyEst', limit: 24 },
+        { key: 'tagline', input: 'companyTagline', label: 'companyTagline', limit: 80 }
+    ],
+
+    /**
+     * The Company panel: what this deployment calls itself and what mark it prints.
+     *
+     * The boxes are filled with what is *in force*, not with what is stored, because those
+     * are the same thing to the administrator reading them: a line nobody has configured
+     * shows the one this application ships with, and a line the company emptied shows an
+     * empty box. That is also why the reset button exists - "stop deciding, print what you
+     * shipped with" is a different act from "print nothing here", and only one of them can
+     * be expressed by clearing a box.
+     */
+    companyHtml(data) {
+        const inForce = (key) => {
+            const stored = data ? data[key] : null;
+            return stored === null || stored === undefined ? BRAND_DEFAULTS[key] : String(stored);
+        };
+        const logo = (data && data.logo) || null;
+        const fields = this.COMPANY_LINES.map((line) => `
+                    <div>
+                        <label class="ui-label" for="${line.input}">${this.escapeHtml(I18n.__(line.label))}</label>
+                        <input type="text" id="${line.input}" class="ui-field" maxlength="${line.limit}"
+                               value="${this.escapeHtml(inForce(line.key))}">
+                    </div>`).join('');
+        const markNote = logo
+            ? I18n.__('companyLogoConfigured')
+                .replace('{width}', String(logo.width || 0))
+                .replace('{height}', String(logo.height || 0))
+                .replace('{size}', `${Math.max(1, Math.round(Number(logo.bytes || 0) / 1024))} KB`)
+            : I18n.__('companyLogoShipped');
+        return `
+            <section class="ui-card is-flat" data-company-panel="true" aria-labelledby="companyTitle">
+                <h3 class="ui-section-title" id="companyTitle">${this.escapeHtml(I18n.__('companyTitle'))}</h3>
+                <p class="ui-section-note" style="margin-top:4px">${this.escapeHtml(I18n.__('companyHint'))}</p>
+                <form id="companyForm" class="ui-grid two" style="margin-top:16px">
+                    ${fields}
+                    <div class="ui-row" style="grid-column:1/-1">
+                        <button type="submit" class="ui-btn ui-btn-primary">${this.escapeHtml(I18n.__('save'))}</button>
+                        <button type="button" id="companyReset" class="ui-btn ui-btn-quiet">${this.escapeHtml(I18n.__('companyReset'))}</button>
+                    </div>
+                    <p class="ui-section-note" style="grid-column:1/-1" data-company-blank-note="true">${this.escapeHtml(I18n.__('companyBlankNote'))}</p>
+                </form>
+                <div class="company-mark">
+                    <img class="company-mark-preview" id="companyMarkPreview" src="${this.escapeHtml(BRAND.mark)}" alt=""
+                         width="120" height="60" decoding="async">
+                    <div class="company-mark-body">
+                        <p class="ui-section-note" data-company-mark-note="true">${this.escapeHtml(markNote)}</p>
+                        <div class="ui-row">
+                            <input type="file" id="companyLogoInput" class="ui-field" accept="image/png,image/jpeg,image/webp"
+                                   aria-label="${this.escapeHtml(I18n.__('companyLogoChoose'))}">
+                            ${logo ? `<button type="button" id="companyLogoRemove" class="ui-btn ui-btn-quiet">${this.escapeHtml(I18n.__('companyLogoRemove'))}</button>` : ''}
+                        </div>
+                    </div>
+                </div>
+            </section>`;
+    },
+
+    /**
+     * Saves the four lines: exactly what is in the boxes is what gets stored.
+     *
+     * Sent as strings including the empty one, so an emptied box means "this line is not
+     * printed" - the server keeps that apart from ``null``, and only the reset button below
+     * sends ``null``. Anything else would make "I don't want a legal suffix on the sheet"
+     * and "put the shipped suffix back" the same keystroke.
+     */
+    async saveCompany(event) {
+        if (event && event.preventDefault) event.preventDefault();
+        const body = {};
+        for (const line of this.COMPANY_LINES) {
+            const element = document.getElementById(line.input);
+            body[line.key] = element && element.value !== undefined && element.value !== null
+                ? String(element.value).trim() : '';
+        }
+        return this.sendCompany('/admin/branding', { method: 'POST', body: body }, 'companySaved');
+    },
+
+    /** Puts every line back to the shipped lockup, and says so on the button. */
+    async resetCompanyLines() {
+        const body = {};
+        for (const line of this.COMPANY_LINES) body[line.key] = null;
+        return this.sendCompany('/admin/branding', { method: 'POST', body: body }, 'companyResetDone');
+    },
+
+    /**
+     * Sets the company's mark from a chosen file.
+     *
+     * Checked in the browser first, against the same ceiling and the same type allowlist a
+     * face reference goes through (``checkPhotoFile``, with the wording a logo deserves): a
+     * 6 MB image refused here is one the administrator does not wait for over a site tether
+     * before being told. The server re-checks the bytes and re-encodes them, so this is a
+     * courtesy and never the check that matters.
+     */
+    async pickCompanyLogo(input) {
+        const chosen = input && input.files && input.files[0] ? input.files[0] : null;
+        const problem = this.checkPhotoFile(chosen, {
+            unreadable: 'companyLogoUnreadable',
+            tooLarge: 'companyLogoTooLarge',
+            wrongType: 'companyLogoWrongType'
+        });
+        if (problem) {
+            Toast.error(problem);
+            if (input) input.value = '';
+            return null;
+        }
+        if (!chosen) return null;
+        const form = new FormData();
+        form.append('logo', chosen, chosen.name || 'logo.png');
+        return this.sendCompany('/admin/branding/logo', { method: 'POST', body: form }, 'companyLogoSaved');
+    },
+
+    /** Removes the configured mark, so the shipped one is used again. */
+    async removeCompanyLogo() {
+        return this.sendCompany('/admin/branding/logo', { method: 'DELETE' }, 'companyLogoRemoved');
+    },
+
+    /**
+     * One request, one repaint, one message - the shape all five company actions share.
+     *
+     * The repaint is ``UI.paintAdminConsole`` rather than this panel alone: the name and the
+     * mark are drawn on the rail, on the handset header and on the login panel, and an
+     * administrator who has just renamed the company should see it everywhere at once rather
+     * than in the one box they were typing in. Everything else the console was showing is
+     * rebuilt from the server, and ``State.adminTab`` is what puts them back on this tab.
+     */
+    async sendCompany(endpoint, options, messageKey) {
+        try {
+            const answer = await API.request(endpoint, options);
+            if (answer && answer.branding) this.adoptBranding(answer.branding);
+            Toast.success(I18n.__(messageKey));
+            UI.paintAdminConsole();
+            return answer;
+        } catch (err) {
+            Toast.error(err.message);
+            return null;
+        }
+    },
+
+    /** Takes the server's answer as the lockup in force, here and on the next sheet. */
+    adoptBranding(data) {
+        Brand.apply(data);
+        Brand.remember(data);
+        return data;
+    },
+
+    // -----------------------------------------------------------------
     //  Shifts - a timesheet: one row per shift, for a period the admin picks
     //
     //  The tab used to dump the newest raw ``/admin/logs`` page and call it shifts:
@@ -3252,8 +4401,15 @@ const UI_MODULES = {
         return {
             date: { label: 'date' },
             employee: { label: 'employee' },
+            // The role is a column, not a footnote: an administrator who clocks in works a
+            // shift like anybody else, and the first question about their row is which of
+            // these rows is theirs. It sits beside the name because that is what it
+            // describes, and it is searchable (``shiftsMatches``) so "administrator" is
+            // also a filter rather than only something to read.
+            role: { label: 'role' },
             id: { label: 'userId' },
             site: { label: 'site' },
+            arrival: { label: 'shiftsArrival' },
             hours: { label: 'hours' },
             awaiting: { label: 'shiftsPending' },
             notes: { label: 'shiftsOpenNotes' }
@@ -3262,7 +4418,7 @@ const UI_MODULES = {
 
     /** The order this tab was asked for, and the one Reset puts back. */
     defaultShiftsColumns() {
-        return ['date', 'employee', 'id', 'site', 'hours', 'awaiting', 'notes'];
+        return ['date', 'employee', 'role', 'id', 'site', 'arrival', 'hours', 'awaiting', 'notes'];
     },
 
     /**
@@ -3550,7 +4706,12 @@ const UI_MODULES = {
         if (terms.length === 0) return rows;
         return rows.filter((row) => {
             const haystack = [
-                row.worker_name, row.worker_id, row.site_name, row.date, row.timestamp, row.status
+                row.worker_name, row.worker_id, row.site_name, row.date, row.timestamp, row.status,
+                // The role in both forms, like the credentials roster: the code is how it
+                // arrives, the label is what is on screen - and "who was that administrator
+                // again" is asked by typing the word the table shows.
+                row.role, this.roleLabel(row.role),
+                this.arrivalWords(row)
             ].join(' ').toLowerCase();
             return terms.every((term) => haystack.indexOf(term) >= 0);
         });
@@ -3568,7 +4729,19 @@ const UI_MODULES = {
      */
     sumShiftsRows(rows) {
         const sum = (key) => rows.reduce((total, row) => total + (Number(row[key]) || 0), 0);
-        const awaitingHours = (row) => (row.awaiting_approval ? Number(row.hours) || 0 : 0);
+        // How much of this row is still undecided. The server sends the figure on every
+        // row, so the console sums the server's own arithmetic rather than assuming an
+        // awaiting shift holds all of its hours - which stopped being true when a pending
+        // overtime shift began crediting its standard day and holding only the extra. The
+        // fallback is for a payload from an older server, where holding everything was
+        // the rule; it keeps the two figures summing to ``hours`` either way.
+        const awaitingHours = (row) => {
+            if (!row.awaiting_approval) return 0;
+            if (row.awaiting_approval_hours === undefined || row.awaiting_approval_hours === null) {
+                return Number(row.hours) || 0;
+            }
+            return Number(row.awaiting_approval_hours) || 0;
+        };
         return {
             shifts: rows.length,
             workers: new Set(rows.map((row) => String(row.worker_id))).size,
@@ -3583,7 +4756,11 @@ const UI_MODULES = {
             break_hours: sum('break_hours'),
             workers_with_open_notes: new Set(
                 rows.filter((row) => Number(row.open_notes) > 0).map((row) => String(row.worker_id))
-            ).size
+            ).size,
+            // Counted per shift, not per worker: a count of arrivals, matching the server's
+            // own figure key for key, so a filtered view and the period total are the same
+            // arithmetic over a different set of rows.
+            late_arrivals: rows.filter((row) => row.arrival_verdict === 'late').length
         };
     },
 
@@ -3722,6 +4899,24 @@ const UI_MODULES = {
             event.preventDefault();
             return this.applyShiftsSearch();
         };
+        // The row actions, delegated: rows are a string at paint time, so there is no node
+        // to attach to - and a handler per row would be a handler per row per repaint.
+        // Assigned rather than added, like the two forms above, so repainting the tab
+        // cannot leave the previous paint's listener behind on the same element.
+        content.onclick = (event) => this.onShiftsClick(event);
+    },
+
+    /**
+     * A click anywhere in the Shifts tab. Today one row control is delegated here; every
+     * other control in the tab carries its own handler or its own inline call.
+     */
+    onShiftsClick(event) {
+        const target = event && event.target;
+        const button = target && typeof target.closest === 'function'
+            ? target.closest('[data-print-worker]')
+            : null;
+        if (!button) return undefined;
+        return this.printWorkerMonth((button.dataset || {}).printWorker);
     },
 
     /**
@@ -3762,7 +4957,17 @@ const UI_MODULES = {
                     <input type="date" id="shiftsEnd" value="${this.escapeHtml(range.end)}" class="ui-field">
                 </div>
                 <button type="submit" class="ui-btn ui-btn-primary">${this.OPS_ICONS.table}${this.escapeHtml(I18n.__('viewTotals'))}</button>
-                <button type="button" onclick="UI_MODULES.downloadShiftsCsv()" class="ui-btn">${this.OPS_ICONS.download}${this.escapeHtml(I18n.__('downloadCSV'))}</button>
+                <div>
+                    <!-- Which file the Download button writes. Read when the button is pressed
+                         rather than remembered, so asking for the PDF once does not leave the
+                         next download as a PDF nobody wanted. -->
+                    <label class="ui-label" for="shiftsExportFormat">${this.escapeHtml(I18n.__('shiftsExportFormat'))}</label>
+                    <select id="shiftsExportFormat" class="ui-field">
+                        <option value="csv">${this.escapeHtml(I18n.__('shiftsExportExcel'))}</option>
+                        <option value="pdf">${this.escapeHtml(I18n.__('shiftsExportPdf'))}</option>
+                    </select>
+                </div>
+                <button type="button" onclick="UI_MODULES.downloadShiftsReport()" class="ui-btn">${this.OPS_ICONS.download}${this.escapeHtml(I18n.__('shiftsExportDownload'))}</button>
             </form>
             <div class="ui-row" style="margin-bottom:20px">
                 <!-- The data-preset and data-active attributes stay adjacent and in that
@@ -3823,6 +5028,11 @@ const UI_MODULES = {
             ['break_hours', 'shiftsBreak', this.hoursLabel(totals.break_hours), 'quiet'],
             ['shifts', 'shiftsWorked', String(totals.shifts || 0), ''],
             ['workers', 'shiftsWorkers', String(totals.workers || 0), ''],
+            // The one card that is not about hours: how much of the period walked in after
+            // its window. Amber only when there is something to look at - a zero is the
+            // good news, and a permanent amber cell stops meaning anything.
+            ['late_arrivals', 'shiftsLateArrivals', String(totals.late_arrivals || 0),
+                totals.late_arrivals ? 'warn' : ''],
         ];
         const dayChip = day ? `
             <div style="margin-bottom:16px">
@@ -3838,8 +5048,8 @@ const UI_MODULES = {
         // With no match the cards are left out on purpose: a grid of zeros reads as "this
         // period held no work", which is the opposite of what a no-match means.
         // The same stat tiles the Live Ops board opens with, for the same reason: these
-        // seven figures are what the tab is for, and a seven-cell grid of them reads as
-        // one glance rather than seven. ``data-total`` / ``data-value`` stay adjacent -
+        // figures are what the tab is for, and one grid of them reads as one glance rather
+        // than eight. ``data-total`` / ``data-value`` stay adjacent -
         // the product suite reads the figures off that pair.
         const cardsHtml = noMatches ? '' : `
             <div class="ops-stats" style="margin-bottom:20px">
@@ -3869,6 +5079,11 @@ const UI_MODULES = {
         // The cells carry no class of their own: their padding, their hairline and the row
         // hover all come from ``.ui-table`` on the element, which is what a cell in this
         // table looks like wherever it is drawn - the phone card included.
+        //
+        // The last cell is the one thing on a row that is not a column: the action that
+        // prints *this person's* month. It is painted here rather than added as a column
+        // because it is not a fact about the shift - the column chooser must not offer it,
+        // the CSV must not carry it, and there is nothing to search it for.
         if (Device.isMobile) {
             return `<div class="ui-stack">${rows.map(row => `
                 <div class="ui-card is-stacked"${this.shiftAttr(row)}>
@@ -3879,6 +5094,7 @@ const UI_MODULES = {
                                 <dd class="ui-fact-value" style="text-align:end">${this.shiftsCellHtml(row, key)}</dd>
                             </div>`).join('')}
                     </dl>
+                    <div class="ui-row" style="justify-content:flex-end">${this.shiftPrintActionHtml(row)}</div>
                 </div>`).join('')}</div>`;
         }
         return `
@@ -3888,15 +5104,39 @@ const UI_MODULES = {
                     <thead>
                         <tr>
                             ${columns.map(key => `<th>${this.shiftsColumnLabel(key)}</th>`).join('')}
+                            <th><span class="sr-only">${this.escapeHtml(I18n.__('shiftsPrintWorker'))}</span></th>
                         </tr>
                     </thead>
                     <tbody>
                         ${rows.map(row => `<tr${this.shiftAttr(row)}>
                             ${columns.map(key => `<td>${this.shiftsCellHtml(row, key)}</td>`).join('')}
+                            <td>${this.shiftPrintActionHtml(row)}</td>
                         </tr>`).join('')}
                     </tbody>
                 </table>
             </div>`;
+    },
+
+    /**
+     * The one control on a shift row that is not a column: print this person's month.
+     *
+     * An administrator asked for one worker's timesheet has had one way to get it: download
+     * the whole period and take the other people out of the file. The row already knows
+     * whose shift it is, so a single person's sheet is one tap from the shift that raised
+     * the question - and the shift they clicked is inside the month it prints, which is how
+     * the reader knows they clicked the right row.
+     *
+     * A ``data-`` hook rather than an inline ``onclick``: the CSP's inline-attribute
+     * allowance is pinned per file and may only fall, and the label carries a worker's
+     * *name*, which is text somebody else typed. ``paintShifts`` binds it.
+     */
+    shiftPrintActionHtml(row) {
+        const label = I18n.__('shiftsPrintWorkerNamed')
+            .replace('{name}', row.worker_name || row.worker_id);
+        return `<button type="button" class="ui-btn ui-btn-sm ui-btn-quiet is-icon"
+                        data-print-worker="${this.escapeHtml(row.worker_id)}"
+                        title="${this.escapeHtml(label)}"
+                        aria-label="${this.escapeHtml(label)}">${this.OPS_ICONS.printer}</button>`;
     },
 
     /**
@@ -3913,6 +5153,55 @@ const UI_MODULES = {
             + ` data-awaiting="${row.awaiting_approval ? 'true' : 'false'}"`;
     },
 
+    /**
+     * Whether this shift's arrival was inside the window, and by how much it was not.
+     *
+     * The verdict and the minutes come from the server, which judges the arrival with the
+     * same function the gate did (``shift_windows``), so this cell cannot disagree with the
+     * flag the worker's own card showed. "No clock-in" is a fourth state on purpose: a
+     * force-clock-out, or a shift closed with no arrival on file, is *unknown*, and a cell
+     * that read "on time" there would be inventing punctuality out of missing data.
+     */
+    arrivalCellHtml(row) {
+        const minutes = String(Number(row.arrival_minutes) || 0);
+        const clocked = row.arrival_time ? ` title="${this.escapeHtml(row.arrival_time)}"` : '';
+        if (row.arrival_verdict === 'late') {
+            return `<span class="ui-badge is-warn"${clocked}>${this.escapeHtml(
+                I18n.__('shiftsArrivalLate').replace('{minutes}', minutes))}</span>`;
+        }
+        if (row.arrival_verdict === 'early') {
+            return `<span class="ui-badge"${clocked}>${this.escapeHtml(
+                I18n.__('shiftsArrivalEarly').replace('{minutes}', minutes))}</span>`;
+        }
+        if (row.arrival_verdict === 'on_time') {
+            return `<span class="ui-note"${clocked}>${this.escapeHtml(I18n.__('shiftsArrivalOnTime'))}</span>`;
+        }
+        return `<span class="ui-tone-faint">${this.escapeHtml(I18n.__('shiftsArrivalUnknown'))}</span>`;
+    },
+
+    /**
+     * The arrival in the words a search can match: "On time", "Late 12 min", "Early 5 min".
+     *
+     * The wording that is on screen *and* the verdict code, so "late" finds the late ones
+     * while "late 12" finds the ones that far off - and an administrator reading the console
+     * in Arabic can type the Arabic word and get the same rows. The number is in the haystack
+     * too, because "who was more than an hour late" is asked by typing what is on the screen:
+     * every term has to match, so "late 60" is the answer to it.
+     */
+    arrivalWords(row) {
+        const word = {
+            late: 'shiftsArrivalLate',
+            early: 'shiftsArrivalEarly',
+            on_time: 'shiftsArrivalOnTime'
+        }[row.arrival_verdict];
+        if (!word) return '';
+        const minutes = String(Number(row.arrival_minutes) || 0);
+        // The verdict's own wording and nobody else's: a haystack that carried all three
+        // sentences would make "late" match every row on the tab, which is the opposite of
+        // a search.
+        return [row.arrival_verdict, minutes, I18n.__(word).replace('{minutes}', minutes)].join(' ');
+    },
+
     /** One cell of one row. The only place a column's value is written. */
     shiftsCellHtml(row, key) {
         switch (key) {
@@ -3920,6 +5209,14 @@ const UI_MODULES = {
                 return `<span class="ui-nowrap">${this.escapeHtml(row.date)}</span>`;
             case 'employee':
                 return `<span class="ui-strong">${this.escapeHtml(row.worker_name || row.worker_id)}</span>`;
+            case 'role':
+                // In the reader's words, like every other role on this console. An account
+                // that no longer exists still has shifts here - deleting a login does not
+                // delete the days somebody worked - so the cell says the role is unknown
+                // rather than painting an empty cell the reader would take for "worker".
+                return row.role
+                    ? this.escapeHtml(this.roleLabel(row.role))
+                    : `<span class="ui-tone-faint">\u2014</span>`;
             case 'id':
                 return `<span class="ui-tone-muted">${this.escapeHtml(row.worker_id)}</span>`;
             case 'site':
@@ -3928,6 +5225,8 @@ const UI_MODULES = {
                 return row.site_name
                     ? this.escapeHtml(row.site_name)
                     : `<span class="ui-tone-faint">\u2014</span>`;
+            case 'arrival':
+                return this.arrivalCellHtml(row);
             case 'hours':
                 // The number the server counted, not the raw clock: a shift somebody has
                 // signed off is worth exactly the hours they signed for.
@@ -3956,6 +5255,243 @@ const UI_MODULES = {
             return `<span class="ui-badge is-warn">${I18n.__('shiftsPending')}</span>`;
         }
         return `<span class="ui-note">${this.escapeHtml(row.status || '')}</span>`;
+    },
+
+    /** Which file the Download button writes: the spreadsheet, or the report on paper. */
+    shiftsExportFormat() {
+        const field = document.getElementById('shiftsExportFormat');
+        const chosen = field && field.value ? String(field.value) : '';
+        // Anything that is not a deliberate "pdf" is the spreadsheet. The field is read
+        // from the DOM, so a value this build does not know - a stale page, a browser that
+        // gave the select no value - must not silently turn a download into a print dialog
+        // nobody asked for.
+        return chosen === 'pdf' ? 'pdf' : 'csv';
+    },
+
+    /**
+     * The Download button: one control, two files, and exactly the rows on screen either
+     * way - which is the whole point of building both from the report already in hand.
+     */
+    downloadShiftsReport() {
+        if (this.shiftsExportFormat() === 'pdf') {
+            this.printShiftsReport();
+            return;
+        }
+        this.downloadShiftsCsv();
+    },
+
+    /**
+     * The report as a printable sheet - the PDF half of the download.
+     *
+     * Printed by the browser rather than generated on the server, because the PDF *is* the
+     * print dialog's job here: no PDF library is pinned, no Arabic-capable font ships with
+     * one, and a sheet the browser draws has the reader's own fonts and direction already
+     * right - in Cairo, in Muscat, on a machine whose fonts nobody configured. "Save as
+     * PDF" in that dialog is what writes the file.
+     *
+     * What goes *on* the sheet is this screen's own - the administrator's columns, the
+     * period, the total. How the paper is taken out of the page, named in the dialog and
+     * put back is ``PrintReport``'s, shared with the worker's own timesheet: those three
+     * rules are the same for both readers, and two copies of them is how one of the two
+     * screens ends up leaving its sheet behind.
+     *
+     * The sheet is built from the same rows as the CSV, for the same reason the CSV is
+     * built on the client: a file that has to be re-derived from the server can disagree
+     * with the table it was taken from.
+     */
+    printShiftsReport() {
+        const range = this.shiftsRange();
+        const report = this.shiftsReportFor(range);
+        if (!report) {
+            // Nothing on screen for this period, so there is no honest sheet to print.
+            Toast.error(I18n.__('shiftsNothingToExport'));
+            return;
+        }
+        PrintReport.sheet(
+            this.shiftsPrintHtml(report, range),
+            this.shiftsExportName(range, this.shiftsQuery(), '')
+        );
+    },
+
+    /**
+     * The sheet: what period it covers, what it was filtered to, the rows, and the total.
+     *
+     * The columns are the administrator's own - the same order, the same cells as the table
+     * on screen - because this is the timesheet they are looking at, on paper. The four
+     * fixed columns of the CSV exist so two months of files can be compared; paper is read
+     * by the person who set the columns up.
+     *
+     * What this builds is the *content*: which cells, what the total says, and what an empty
+     * period reads. The frame around it - the title, the period line, the table, the note
+     * about approved hours - is ``PrintReport.sheetHtml``'s, shared with the worker's own
+     * timesheet, so the two sheets cannot drift apart in what they claim about the same
+     * figures.
+     */
+    shiftsPrintHtml(report, range) {
+        const columns = this.shiftsColumns();
+        const shown = this.shiftsVisibleRows(report);
+        const query = this.shiftsQuery();
+        const totals = query ? this.sumShiftsRows(shown) : (report.totals || {});
+        const period = report.period || range;
+        const filterNote = query ? `${I18n.__('shiftsFiltered')}: ${query}` : '';
+        // The total, on paper only: a printed timesheet without one is a list, and the
+        // figure is already computed for the cards above the table on screen.
+        const totalsLine = `${this.escapeHtml(I18n.__('shiftsTotal'))}: <b>${this.escapeHtml(this.hoursLabel(totals.hours))} h</b>`
+            + ` · ${Number(totals.shifts || 0)} ${this.escapeHtml(I18n.__('shiftsWorked'))}`
+            + ` · ${Number(totals.workers || 0)} ${this.escapeHtml(I18n.__('shiftsWorkers'))}`;
+        return PrintReport.sheetHtml({
+            title: I18n.__('shiftsPrintTitle'),
+            meta: [PrintReport.periodLine(period, filterNote)],
+            columns: columns.map((key) => this.shiftsColumnLabel(key)),
+            rows: shown.map((row) => columns.map((key) => this.shiftsCellHtml(row, key))),
+            totals: totalsLine,
+            empty: I18n.__(query ? 'shiftsNoMatches' : 'shiftsEmpty')
+        });
+    },
+
+    /**
+     * The month a per-worker sheet covers: the calendar month the period on screen starts
+     * in, clipped to today while that month is still running.
+     *
+     * Read from the period rather than from the clock, so "this person's month" means the
+     * month the administrator is looking at - the one the tab opened on, or the one a preset
+     * or a shared link put them on - and the button that says which month it prints is
+     * telling the truth. The clip is the presets' own rule: a shifts period describes work
+     * that has happened, and a sheet ending in the future reads as a month that lost its
+     * last shifts. Only a month already under way is clipped; a past month keeps its last
+     * day.
+     */
+    shiftsWorkerMonth(range) {
+        const onScreen = range || this.shiftsRange();
+        const month = String((onScreen && onScreen.start) || '').slice(0, 7);
+        if (!/^\d{4}-\d{2}$/.test(month)) return onScreen;
+        // Day zero of the *next* month is the last day of this one - no month-length table.
+        const last = this.isoDate(new Date(Number(month.slice(0, 4)), Number(month.slice(5, 7)), 0));
+        const today = this.isoDate(new Date());
+        return {
+            start: `${month}-01`,
+            end: `${month}-01` <= today && last > today ? today : last
+        };
+    },
+
+    /**
+     * One person's month, printed: whose it is, the days, and what they add up to.
+     *
+     * Two things this sheet says that the period sheet on the rest of this tab cannot: it
+     * holds one person (the shift's own worker) and it covers that person's whole month,
+     * not the period on screen. Neither is done by filtering the rows this screen happens to
+     * be holding - the rows are asked of the server for one worker and the month's bounds,
+     * through the same endpoint the tab reads, so the figures on paper are the server's own
+     * and a month longer than the period on screen is a month, not a guess.
+     */
+    async printWorkerMonth(workerId) {
+        const id = String(workerId === null || workerId === undefined ? '' : workerId);
+        if (!id) return undefined;
+        const month = this.shiftsWorkerMonth(this.shiftsRange());
+        let report = null;
+        try {
+            report = await API.request(
+                `/admin/reports/shifts?start=${month.start}&end=${month.end}&worker_id=${encodeURIComponent(id)}`
+            );
+        } catch (err) {
+            Toast.error(`${I18n.__('error')}: ${err.message}`);
+            return undefined;
+        }
+        const rows = (report && report.rows) || [];
+        if (rows.length === 0) {
+            // A month nobody worked is not a document: a sheet with a title and no rows is
+            // read as a lost timesheet rather than as somebody who did not work, so this is
+            // refused in words instead of printed.
+            Toast.error(I18n.__('shiftsPrintWorkerEmpty'));
+            return undefined;
+        }
+        PrintReport.sheet(
+            this.workerMonthSheetHtml(report, id),
+            this.workerMonthExportName(month, rows[0].worker_name || id)
+        );
+        return undefined;
+    },
+
+    /**
+     * The sheet: one worker's month, under the same frame as every other report here.
+     *
+     * The columns are the administrator's own, minus the three that identify *whose* rows
+     * these are - the employee, the role and the id. On a sheet about one person they would
+     * repeat the same name down twenty rows, and the line above the table says them once, in
+     * the header where a reader looks for them. What is left keeps the tab's order and the
+     * tab's own cells, so the paper and the screen it came from read the same way.
+     */
+    workerMonthSheetHtml(report, fallbackId) {
+        const totals = report.totals || {};
+        const rows = report.rows || [];
+        const hours = (value) => `${this.hoursLabel(value)} h`;
+        const facts = [
+            `${I18n.__('shiftsTotal')}: <b>${this.escapeHtml(hours(totals.hours))}</b>`,
+            `${this.escapeHtml(I18n.__('shiftsApproved'))}: ${this.escapeHtml(hours(totals.approved_hours))}`
+        ];
+        if (Number(totals.awaiting_approval_hours || 0) > 0) {
+            // Only when something is waiting: a zero on the sheet would read as a decision
+            // that is owed when there is none.
+            facts.push(
+                `${this.escapeHtml(I18n.__('shiftsPendingHours'))}: `
+                + `${this.escapeHtml(hours(totals.awaiting_approval_hours))}`
+            );
+        }
+        facts.push(
+            `${Number(totals.shifts || 0)} ${this.escapeHtml(I18n.__('shiftsWorked'))}`
+            + ` · ${this.escapeHtml(hours(totals.break_hours))} ${this.escapeHtml(I18n.__('shiftsBreak'))}`
+        );
+        const columns = this.workerMonthColumns();
+        return PrintReport.sheetHtml({
+            title: I18n.__('shiftsWorkerSheet'),
+            meta: [this.workerMonthWho(rows[0] || {}, fallbackId), PrintReport.periodLine(report.period || {})],
+            columns: columns.map((key) => this.shiftsColumnLabel(key)),
+            rows: rows.map((row) => columns.map((key) => this.shiftsCellHtml(row, key))),
+            totals: facts.join(' · '),
+            empty: I18n.__('shiftsEmpty')
+        });
+    },
+
+    /**
+     * Who the sheet is about: name, role, id - once, above the table.
+     *
+     * The role is left out when the account is gone (the row carries no role then, and the
+     * timesheet keeps its rows after its login is deleted), rather than printed as a blank.
+     */
+    workerMonthWho(row, fallbackId) {
+        const id = row.worker_id || fallbackId;
+        return [
+            row.worker_name || id,
+            row.role ? this.roleLabel(row.role) : '',
+            id ? `id ${id}` : ''
+        ].filter(Boolean).join(' · ');
+    },
+
+    /** The columns one person's sheet carries: the tab's own order, without the identity. */
+    workerMonthColumns() {
+        // The three that answer "whose row is this" - a question a one-worker sheet answers
+        // in its header instead of on every line.
+        const identity = ['employee', 'role', 'id'];
+        return this.shiftsColumns().filter((key) => identity.indexOf(key) < 0);
+    },
+
+    /**
+     * The name the print dialog offers for one person's month: who, then which month.
+     *
+     * The worker's name is in it on purpose. "Save as PDF" writes into a folder where two of
+     * these sheets may already be, and the other one is a different person.
+     */
+    workerMonthExportName(month, name) {
+        const slug = this.exportSlug(name);
+        return `timesheet${slug ? `_${slug}` : ''}_${month.start}_${month.end}`;
+    },
+
+    /** A text value as a file name's own word: lower case, dashes, nothing exotic. */
+    exportSlug(value) {
+        return String(value || '').toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/^-+|-+$/g, '')
+            .slice(0, 24);
     },
 
     /**
@@ -4043,13 +5579,16 @@ const UI_MODULES = {
      *
      * The search is part of the name so two downloads of the same period do not silently
      * replace each other in the Downloads folder.
+     *
+     * ``extension`` is ``.csv`` for the sheet the page writes itself, and empty for the
+     * printed one: the print dialog names the file after the *document title* and appends
+     * its own extension, so a title that already ended in ``.pdf`` would produce
+     * ``shifts_....pdf.pdf``.
      */
-    shiftsExportName(range, query) {
-        const slug = String(query || '').toLowerCase()
-            .replace(/[^a-z0-9]+/g, '-')
-            .replace(/^-+|-+$/g, '')
-            .slice(0, 24);
-        return `shifts_${range.start}_${range.end}${slug ? `_${slug}` : ''}.csv`;
+    shiftsExportName(range, query, extension = 'csv') {
+        const slug = this.exportSlug(query);
+        const suffix = extension ? `.${extension}` : '';
+        return `shifts_${range.start}_${range.end}${slug ? `_${slug}` : ''}${suffix}`;
     },
 
     // (``sitesLabel()`` and ``pendingHours()`` are gone with the per-worker report: a shift

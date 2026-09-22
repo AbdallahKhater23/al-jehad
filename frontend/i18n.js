@@ -1,20 +1,42 @@
 // What every screen reads: the English table, the loader, and the language switch.
 //
-// Arabic and Hindi used to be in this file, which every session loads - two thirds of a
-// 127 KB first-party download was a table a worker on site cellular would never read. They
-// are in ``i18n.ar.js`` and ``i18n.hi.js`` now, fetched the first time a reader asks for
-// one. The trade is one extra request for the readers who switch languages, and it costs
-// no third-party origin and no build step: the same trade this repo already made when it
-// dropped the render-blocking webfont.
+// Arabic, Hindi and Urdu used to be in this file, which every session loads - two thirds
+// of a 127 KB first-party download was a table a worker on site cellular would never
+// read. They are in ``i18n.ar.js``, ``i18n.hi.js`` and ``i18n.ur.js`` now, fetched the
+// first time a reader asks for one. The trade is one extra request for the readers who
+// switch languages, and it costs no third-party origin and no build step: the same trade
+// this repo already made when it dropped the render-blocking webfont.
 //
-// The two chunk files are mechanically extracted and carry the tables that used to live
-// here, unchanged; ``backend/tests/test_frontend_payload.py`` is what proves it.
+// The chunk files carry the tables that used to live here, unchanged;
+// ``backend/tests/test_frontend_payload.py`` is what proves it.
 const TRANSLATIONS = {
     en: {
         "title": "Site Attendance",
         "loginIntro": "Site attendance for crews on site. Sign in with the ID and the password your administrator gave you.",
         "loginHelp": "Password not working? Ask an administrator to set a new one - your sessions close everywhere when they do.",
-        "companyFooter": "Al-Jehad International Co. - stone, marble and granite since 1983.",
+        "companyFooter": "{brand} - stone, marble and granite since 1983.",
+        // The Company panel: the deployment's own name and mark. Every line here is chrome
+        // around a wordmark that is *not* translated (see ``Brand`` in frontendjavascript.js),
+        // which is why these strings describe the fields rather than repeat their contents.
+        "companyTitle": "Company",
+        "companyHint": "The name and the mark on the login screen, the console, the handset and every printed sheet. Nothing here is translated: a wordmark is the same words in every language.",
+        "companyName": "Name",
+        "companyLegal": "Legal name",
+        "companyEst": "Suffix or founding year",
+        "companyTagline": "Tagline",
+        "companyReset": "Use the shipped lockup",
+        "companyBlankNote": "A line left empty is not printed. The button beside Save puts all four back to the lockup this application ships with.",
+        "companySaved": "Company details saved. Every screen and every sheet is drawn from them now.",
+        "companyResetDone": "Back to the lockup this application ships with.",
+        "companyLogoShipped": "This application's own mark is printed. Upload your logo to replace it - a PNG with a transparent ground keeps its transparency, anything else is stored as a JPEG.",
+        "companyLogoConfigured": "Your own mark: {width}x{height}, {size}. It is printed on every sheet and drawn on the login screen.",
+        "companyLogoChoose": "Upload a logo",
+        "companyLogoRemove": "Remove the logo",
+        "companyLogoSaved": "Logo saved. It is printed from now on.",
+        "companyLogoRemoved": "Logo removed. This application's own mark is used again.",
+        "companyLogoTooLarge": "That image is too large - the limit is 5 MB. A logo prints about 34 mm wide, so a smaller file is sharper on paper anyway.",
+        "companyLogoWrongType": "That file is not an image. Only PNG, JPEG and WebP are accepted.",
+        "companyLogoUnreadable": "That file could not be read. Choose an image file.",
         "login": "Sign In",
         "userId": "User ID",
         "emailOrPhone": "Email or Phone",
@@ -26,7 +48,6 @@ const TRANSLATIONS = {
         "activeShifts": "Active Shifts",
         "forceOut": "Force Out",
         "forceIn": "Force In",
-        "downloadCSV": "Download CSV",
         "attendanceLogs": "Attendance Logs",
         "pendingReviews": "Approvals",
         "sites": "Sites",
@@ -34,6 +55,19 @@ const TRANSLATIONS = {
         "shiftsFrom": "From",
         "shiftsTo": "To",
         "viewTotals": "View totals",
+        // The download's two shapes, and the name the browser offers for the printed one.
+        // Both hold exactly the rows on screen; only the file's form changes.
+        "shiftsExportFormat": "Format",
+        "shiftsExportExcel": "Excel (CSV)",
+        "shiftsExportPdf": "PDF",
+        "shiftsExportDownload": "Download",
+        "shiftsPrintTitle": "Shift report",
+        // One worker's month, from the shift row itself: the control that prints it, what is
+        // said when there is nothing to print, and the title of the sheet it produces.
+        "shiftsPrintWorker": "Print",
+        "shiftsPrintWorkerNamed": "Print {name}'s month",
+        "shiftsPrintWorkerEmpty": "There is nothing to print: that worker worked nothing in this month.",
+        "shiftsWorkerSheet": "Worker timesheet",
         "shiftsThisMonth": "This month",
         "shiftsLastMonth": "Last month",
         "shiftsThisWeek": "This week",
@@ -45,6 +79,15 @@ const TRANSLATIONS = {
         "shiftsWorked": "Shifts worked",
         "shiftsWorkers": "Workers",
         "shiftsTotal": "Total",
+        // The arrival column, and the count of the ones outside the window. The wording is
+        // the screen's own - the punch card's "late - the window closed 12 minutes ago" is
+        // written for somebody standing at a gate, not for a sheet read a month later.
+        "shiftsArrival": "Arrival",
+        "shiftsArrivalOnTime": "On time",
+        "shiftsArrivalLate": "Late {minutes} min",
+        "shiftsArrivalEarly": "Early {minutes} min",
+        "shiftsArrivalUnknown": "No clock-in",
+        "shiftsLateArrivals": "Late arrivals",
         "shiftsApprovedOnly": "One row per shift. Hours an admin has approved are counted in Approved hours; anything still waiting for a decision is marked Awaiting approval and left out of that figure.",
         "shiftsBreak": "Unpaid break",
         "shiftRules": "Shift rules",
@@ -54,6 +97,10 @@ const TRANSLATIONS = {
         "shiftRulesBreak": "Unpaid break (minutes)",
         "shiftRulesBreakAfter": "Break applies after (hours on shift)",
         "shiftRulesAutoClose": "Close the shift automatically when the paid hours are up",
+        // Shown on the rules panel when the two watchers contradict each other: the close
+        // ends the day before the alert is due, so nothing is ever flagged as overtime.
+        "shiftRulesAlertUnreachable": "There is nothing to report with these numbers: the overtime line sits exactly on the {regular} h paid day, so an alert could only fire as the day ends - a message about every ordinary full day, not about a crossing. Set it strictly below {regular} h to be warned before the day ends, or strictly above it to let the day run on into overtime review.",
+        "shiftRulesCloseDeferred": "The automatic close is standing down: the overtime line ({notify} h) is above the paid day ({regular} h), so a shift closed at {regular} h could never be reported crossing it. Shifts now run on to a clock-out, the crossing is reported at {notify} h, and hours past {regular} h wait for overtime approval. Set the overtime line below {regular} h to close shifts automatically again.",
         "shiftRulesSummary": "Hours past the paid limit are not recorded - an administrator is alerted when the system closes a shift.",
         "shiftRulesSaved": "Shift rules saved.",
         "shiftRulesOnSiteDay": "A full day on site",
@@ -71,7 +118,7 @@ const TRANSLATIONS = {
         "shiftsPendingShifts": "Shifts awaiting approval",
         "search": "Search",
         "clear": "Clear",
-        "shiftsSearchPlaceholder": "Name, ID, site or date",
+        "shiftsSearchPlaceholder": "Name, ID, site, date or late",
         "shiftsFiltered": "Filtered",
         "shiftsFilteredTotals": "The totals above cover only the shifts shown.",
         "shiftsNoMatches": "No shift matches this search.",
@@ -86,6 +133,13 @@ const TRANSLATIONS = {
         "credentialsFace": "Face",
         "credentialsFaceEnrolled": "Enrolled",
         "credentialsFaceMissing": "None",
+        "credentialsFaceEnroll": "Enroll my face",
+        "credentialsFaceReplace": "Replace my photo",
+        "credentialsFaceEnrollTitle": "Your reference photo",
+        "credentialsFaceEnrollHint": "Face the camera, alone in the frame, in even light. This photo becomes the template every clock-in is checked against.",
+        "credentialsFaceEnrollTake": "Take the photo",
+        "credentialsFaceEnrollDone": "Your photo is registered. You can clock in now.",
+        "credentialsFaceEnrollFailed": "Enrollment failed",
         "credentialsPasswordSet": "Set",
         "credentialsPasswordNever": "Never set",
         "credentialsChanged": "Changed",
@@ -143,6 +197,8 @@ const TRANSLATIONS = {
         "credentialsPhotoTooLarge": "That photo is too large - the limit is 5 MB. Retake it at a lower resolution.",
         "credentialsPhotoWrongType": "That file is not a photo. Only JPEG, PNG and WebP images are accepted - no documents, PDFs or videos.",
         "credentialsPhotoUnreadable": "That file could not be read. Choose a photo from the phone's gallery.",
+        "credentialsPhotoEditHint": "Leave this empty to keep the photo on file. A photo chosen here replaces the template every clock-in is checked against - the one on file stops working the moment this is saved.",
+        "credentialsPhotoSaved": "Reference photo saved. This person's clock-ins are checked against it from now on.",
         "credentialsLink": "Registration link",
         "credentialsLinkTitle": "Registration link",
         "credentialsLinkHint": "Send this one-time link to somebody who needs an account: they choose their own password and take their own photo, while the ID and the role stay yours to decide. Only a worker or a moallem can be created this way.",
@@ -219,6 +275,43 @@ const TRANSLATIONS = {
         "noteResolvedHint": "Marked resolved by the administrator. Reply if it is not actually done — that reopens the note.",
         "noteClosedHint": "You closed this note.",
         "noteKeepStatus": "Keep current status",
+        // The worker's own inbox: what the system has told *them*, the other side of the
+        // notes they write. The badge on the handset's clock panel and the badge on the
+        // alerts tab are the same count, and the two ``alertsUnread*`` strings are the
+        // banner that carries it - separate keys rather than one with a number in it,
+        // because "1 new alerts" is the kind of thing a reader notices before the message.
+        "alerts": "Alerts",
+        "alertsMine": "My alerts",
+        "alertsIntro": "What the system has told you, kept for you: a shift that ran past the paid day, or a day the system closed at the limit. The record stays here even when the notification never reached the phone.",
+        "alertsEmpty": "Nothing waiting.",
+        "alertsEmptyHint": "Notices about your own shift arrive here, and they stay until you have read them.",
+        "alertsNew": "New",
+        "alertsMarkRead": "Mark as read",
+        "alertsMarkAll": "Mark all as read",
+        "alertsMarkedRead": "Alert marked as read.",
+        "alertsMarkedAll": "All alerts marked as read.",
+        "alertsUnreadOne": "1 new alert",
+        "alertsUnreadMany": "{count} new alerts",
+        "alertsOpen": "See all",
+        "alertsSent": "Sent",
+        "alertKind_overtime_crossed": "Overtime",
+        "alertKind_shift_auto_closed": "Day closed",
+        "alertKind_overtime_authorised": "Overtime authorised",
+        "alertKind_overtime_declined": "Overtime refused",
+        "pushTitle": "Push notifications",
+        "pushChecking": "Checking whether this server can send notifications…",
+        "pushServerOff": "This server cannot send notifications yet.",
+        "pushSwUnsupported": "This browser cannot show push notifications.",
+        "pushSwFailed": "Notifications could not be set up in this browser.",
+        "pushOnNote": "You are notified on this device even when the app is closed.",
+        "pushOffNote": "Turn on to be told here when the system has a message for you.",
+        "pushEnable": "Turn on notifications",
+        "pushDisable": "Turn off notifications",
+        "pushEnabled": "Notifications are on for this device.",
+        "pushDisabled": "Notifications are off for this device.",
+        "pushPermissionDenied": "Notification permission was not granted, so nothing can be delivered.",
+        "pushUnavailable": "Notifications are not available right now.",
+        "pushDevices": "{count} device(s) receive your notifications",
         "open": "Open",
         "save": "Save",
         "roleWorker": "Worker",
@@ -246,20 +339,23 @@ const TRANSLATIONS = {
         "punchWindowEarly": "early — opens in {minutes}",
         "punchWindowLate": "late — the window closed {minutes} ago",
         "punchWindowOffSite": "You are not inside any site's radius — a clock-in from here is not recorded. Move onto the site.",
-        "clockIn": "Clock In",
-        "clockOut": "Clock Out",
+        "clockIn": "Check In",
+        "clockOut": "Check Out",
         "activeShift": "Active Shift",
-        "currentlyClockedOut": "You are currently clocked out.",
+        "currentlyClockedOut": "You are currently checked out.",
         "onShift": "You are on shift",
         "shiftStatus": "Shift status",
-        "clockedInAt": "Clocked in at",
+        "clockedInAt": "Checked in at",
         "elapsed": "Elapsed",
-        "overtimeNeedsApproval": "Past {hours}h — needs overtime approval",
-        "overtimeOpenShiftHint": "The shift stays open and keeps counting until you clock out - your administrator has been alerted.",
+        "overtimeNeedsApproval": "Past {hours}h paid — the overtime line is reached",
+        "overtimeOpenShiftHint": "The shift stays open and keeps counting until you clock out - time past the paid day needs approval from your administrator, who has been alerted.",
         "shiftPaidDay": "Paid day",
         "shiftUnpaidBreak": "Unpaid break",
         "shiftDayComplete": "You have worked your paid day of {paid} h (about {onsite} h on site, including the unpaid break). Nothing more is recorded after it.",
         "shiftEndsNow": "Full day reached",
+        "earlyClockOutTitle": "Clock out early?",
+        "earlyClockOutBody": "You have worked {paid}h of the {regular}h paid day. If you clock out now, this time it will be recorded as {paid}h \u2014 not the full {regular}h day.",
+        "earlyClockOutConfirm": "Confirm and clock out",
         "flaggedForReview": "A shift of yours is waiting for an admin review, so clocking out will be refused until it is cleared. Ask your supervisor to review it.",
         "hoursThisMonth": "Hours this month",
         "hours": "Hours",
@@ -282,6 +378,32 @@ const TRANSLATIONS = {
         "noHistory": "No attendance records yet.",
         "handTimeOnShift": "Time on shift",
         "handNoHistoryHint": "Every clock-in and clock-out you make appears here, newest first.",
+        // Handset access for an account that also runs the console, and the timesheet of
+        // its own that account can read and download.
+        "handsetHint": "Clock in, and read your own hours",
+        "backToConsole": "Back to the console",
+        "myHours": "My hours",
+        "myHoursDownload": "Download CSV",
+        //: The paper half of the same download. Named for what the reader gets rather than
+        //: for the dialog that makes it: the button opens the print dialog, and "Save as
+        //: PDF" in it is what writes the file.
+        "myHoursExportPdf": "PDF (print)",
+        "myHoursMonth": "Month",
+        "myHoursColBreak": "Break",
+        "myHoursColRecorded": "Recorded hours",
+        "myHoursWorked": "Worked",
+        "myHoursApproved": "Approved",
+        "myHoursAwaiting": "Awaiting approval",
+        "myHoursOvertime": "Overtime",
+        "myHoursSites": "Sites worked",
+        "myHoursWhere": "Where the hours were worked",
+        "myHoursNothingToExport": "Nothing to download for this period yet.",
+        // The column chooser: which of the vocabulary this account's own two files carry.
+        "myHoursColumns": "Columns in the file",
+        "myHoursColumnsHint": "Tick what your CSV and PDF should carry. Saved to your account, so next month and any other phone agree.",
+        "myHoursColumnsSave": "Save columns",
+        "myHoursColumnsSaved": "Columns saved.",
+        "myHoursColumnsEmpty": "Keep at least one column.",
         "handRetry": "Try again",
         "handSections": "Sections",
         "handReady": "Ready",
@@ -488,19 +610,90 @@ const TRANSLATIONS = {
         "hintAdmin": "The rules these figures are computed from, and administrator accounts.",
 
         "approvalsTitle": "Pending attendance reviews",
-        "approvalsHint": "A review is a clock-in the app could not confirm by itself: the location was outside the site radius, or the face check did not match. Approving keeps the shift; rejecting records it as not worked. The note is optional, and the worker never sees it.",
+        // The two kinds of review have *opposite* rejections, and the hint used to describe
+        // only the first one - which is part of how the Reject button came to credit full
+        // overtime. Say both, and say that a refusal needs a reason.
+        "approvalsHint": "A review is a shift waiting on your decision. An unconfirmed clock-in - the location was outside the site radius, or the face check did not match - is kept by approving and recorded as not worked by rejecting. A shift past the overtime threshold that you reject keeps the standard paid day and credits no overtime. A rejection needs a reason; the worker never sees your note.",
+        "approvalsRejected": "Rejected and recorded",
+        "approvalsDecided": "Decision saved",
+        "approvalsRejectNeedsNote": "Write a reason before rejecting - it is what the record keeps.",
+        "crossingsTitle": "Overtime still running",
+        "crossingsHint": "These shifts are past the overtime line right now. Authorising a ceiling pays the extra time up to it, and anything past it comes back for a second decision. Declining authorises nothing past the regular day.",
+        "crossingsRunning": "Still on shift",
+        "crossingsPaid": "Paid so far",
+        "crossingsHeld": "Past the line",
+        "crossingsCeiling": "Authorised hours (optional)",
+        "crossingsAccept": "Authorise",
+        "crossingsDecline": "Decline",
+        "crossingsAuthorised": "Authorised up to {hours} h by {who}",
+        "crossingsDeclinedBy": "Declined by {who} - no extra time is authorised for this shift",
+        "crossingsPastCeiling": "{hours} h past the ceiling are not authorised yet - authorise a new ceiling to cover them.",
+        "crossingsDecisionCeiling": "Hours authorised",
+        "crossingsDecisionRecorded": "Hours worked when decided",
+        "crossingsDecisionBy": "Decided by",
+        "crossingsCloseDefers": "Nothing else will end this shift, and an open shift refuses the worker's next clock-in - so clock it out when they finish, or use Force clock out.",
+        "crossingsCeilingInvalid": "Enter a number of hours, or leave it empty for the hours worked so far.",
+        "crossingsAccepted": "Extra time authorised",
+        "crossingsDeclined": "Extra time declined",
         "approvalsEmpty": "Nothing is waiting on you",
         "approvalsEmptyHint": "Every clock-in so far confirmed itself. Anything that needs a decision will appear here.",
         "approvalsSite": "Site",
         "approvalsClockIn": "Clocked in",
         "approvalsNote": "Audit note",
-        "approvalsNotePlaceholder": "Why you decided this (optional, kept on the record)",
+        "approvalsNotePlaceholder": "Why you decided this (needed to reject, kept on the record)",
         "approvalsApprove": "Approve",
         "approvalsReject": "Reject",
         "approvalsNoteUsed": "Your note is saved with the decision",
         "approvalsCount": "{count} waiting on a decision",
         "approvalsWaiting": "Waiting",
         "approvalsDate": "Date",
+        "approvalsEvidence": "Evidence",
+        "approvalsShowFrame": "Show the frame",
+        "approvalsHideFrame": "Hide the frame",
+
+        "adminAlerts": "Alerts",
+        "hintAlerts": "What the system is telling you, and what nobody has answered yet.",
+        "adminAlertsTitle": "System alerts",
+        // The tab is not a log viewer: reading an alert and accepting one are different acts,
+        // and the sentence says so before the first card is drawn. A forced start past a failing
+        // self-test is the case it exists for - the alert records that the deployment was let
+        // through, the acknowledgement records who decided that was acceptable and why.
+        "adminAlertsHint": "Every alert the server writes: a start that bypassed a failing self-test, a notification channel that has stopped delivering, a schema repair, a retention sweep. Reading one is not accepting it - an acknowledgement keeps your reason on the record.",
+        "adminAlertsCount": "{waiting} of {count} waiting for an answer",
+        "adminAlertsEmpty": "Nothing to answer",
+        "adminAlertsEmptyHint": "No alert is waiting. Anything the system raises appears here, with the time it was raised.",
+        "adminAlertsRaised": "Raised {when}",
+        "adminAlertsWaiting": "Waiting for an answer",
+        "adminAlertsAcknowledged": "Acknowledged",
+        "adminAlertsAcknowledgedBy": "Acknowledged by {who} on {when}",
+        "adminAlertsReason": "Reason",
+        "adminAlertsAcknowledge": "Acknowledge",
+        "adminAlertsAcknowledgeNote": "Why this is acceptable",
+        "adminAlertsAcknowledgePlaceholder": "What you checked, and why the deployment can stay as it is",
+        "adminAlertsAcknowledgeKept": "Your note is kept in the audit trail with your name - it is what answers “who decided this, and why”.",
+        "adminAlertsAcknowledgeNeedsNote": "Write why before acknowledging - the note is what the record keeps.",
+        "adminAlertsAcknowledgedToast": "Acknowledged. Your reason is on the record.",
+        "adminAlertsMarkRead": "Mark read",
+        "adminAlertsMarkedRead": "Marked as read",
+        "notifSeverity_critical": "Critical",
+        "notifSeverity_warning": "Warning",
+        "notifSeverity_info": "Information",
+        "approvalsFrameAlt": "The camera frame this punch's match score was measured from",
+        "approvalsFrameMissing": "No frame was stored for this punch.",
+        "approvalsMatchScore": "Match distance",
+        "approvalsMatchVerdict": "Match",
+        "approvalsLiveness": "Liveness",
+        "approvalsFlagReason": "Why it is here",
+        "approvalsScoreFailed": "The frame could not be loaded.",
+        "approvalsVerdictApproved": "Confirmed match",
+        "approvalsVerdictReview": "Not certain",
+        "approvalsVerdictRefused": "Not the same face",
+        "livenessClassLive": "Live",
+        "livenessClassPrint": "Print attack",
+        "livenessClassReplay": "Replay attack",
+        "livenessClassUnknown": "Unknown",
+        "livenessClassUnavailable": "Unavailable",
+        "livenessClassError": "Check failed",
 
         "sitesTitle": "Construction sites",
         "sitesHint": "A site is a place a worker may clock in from: a point and a radius. Clocking in outside every site's radius raises a review instead of being refused, so a wrong pin costs a decision and never a lost shift.",
@@ -524,7 +717,7 @@ const TRANSLATIONS = {
         "sitesWindowStart": "Opens",
         "sitesWindowEnd": "Closes",
         "sitesWindowTimezone": "Timezone",
-        "sitesWindowTimezonePlaceholder": "Africa/Cairo",
+        "sitesWindowTimezonePlaceholder": "Asia/Kuwait",
         "sitesWindowOvernight": "overnight",
         "sitesWindowFromSite": "set on this site",
         "sitesWindowFromCompany": "company window",
@@ -534,20 +727,18 @@ const TRANSLATIONS = {
         "sitesWindowWillInherit": "Saved without times, this site follows the company window again.",
 
         "adminRulesHint": "These are the numbers the whole console reads: the board's overtime line, the payroll totals and the automatic close all come from here.",
-        "adminCreateTitle": "Create an administrator",
-        "adminCreateHint": "A new administrator can see everyone's hours and reset passwords. The ID decides what they may do: 1000-4999 is a standard admin, 5000 and above is a head admin.",
-        "adminId": "Admin ID",
-        "adminIdPlaceholder": "1000 or higher",
-        "adminName": "Full name",
-        "adminPassword": "Password",
-        "adminCreate": "Create the account",
-        "adminCreated": "Administrator created",
+        // Was eight keys for the Admin tab's own create-an-administrator form. The panel is
+        // gone - the Credentials tab's New account form takes the id, the name, the contact
+        // details, the password and the face in one step, and it is the only place an account
+        // is created now. What was worth keeping from that panel was the explanation of the id
+        // ranges, and this is it.
+        "adminCreateMoved": "Accounts, administrators included, are created on the Credentials tab, in New account. The ID decides what an administrator may do: 1000-4999 is a standard admin, 5000 and above is a head admin.",
         "reload": "Reload",
         "languageUnavailable": "That language could not be downloaded. Check your connection and try again.",
         "consoleUnavailable": "The administrator console could not be loaded. Check your connection, then reload the page.",
         // The vendor's credit, which closes every page. ``{brand}`` is the wordmark in
-        // BRAND - a proper noun, so it is the same string in all three languages and only
-        // the two words around it move (Hindi puts them after the name, not before).
+        // BRAND - a proper noun, so it is the same string in every language and only the
+        // words around it move (Hindi puts them after the name, not before).
         "poweredBy": "Powered by {brand}"
     }
 };
@@ -558,7 +749,17 @@ const I18n = {
     //: The languages whose table lives in a file of its own, fetched on demand. English is
     //: the one that stays inline: it is what every fallback lands on, and a reader who has
     //: not chosen a language should not have to wait for a download to see the screen.
-    CHUNKS: ['ar', 'hi'],
+    CHUNKS: ['ar', 'hi', 'ur'],
+
+    //: The languages that read right to left, so the whole layout mirrors for them. A list
+    //: rather than a per-call branch: the second RTL language costs a line here, not an
+    //: audit of every place ``dir`` is set.
+    RTL: ['ar', 'ur'],
+
+    //: Whether a table reads right to left (the current language by default).
+    isRtl(lang) {
+        return this.RTL.indexOf(lang || this.lang) >= 0;
+    },
 
     //: Loads in flight, by language, so two switches in one session fetch one file.
     _loading: {},
@@ -601,8 +802,8 @@ const I18n = {
         const previous = this.lang;
         this.lang = lang;
         localStorage.setItem('lang', lang);
-        // Arabic reads right-to-left; flip the document so the whole layout mirrors.
-        document.documentElement.setAttribute('dir', lang === 'ar' ? 'rtl' : 'ltr');
+        // Arabic and Urdu read right-to-left; flip the document so the layout mirrors.
+        document.documentElement.setAttribute('dir', this.isRtl(lang) ? 'rtl' : 'ltr');
         document.documentElement.setAttribute('lang', lang);
         // The table may be a file this tab has never opened, and repainting before it
         // lands would flash the whole screen in the language the reader just left - the
@@ -626,7 +827,7 @@ const I18n = {
         return table[key] || TRANSLATIONS.en[key] || key;
     },
     applyDirection() {
-        document.documentElement.setAttribute('dir', this.lang === 'ar' ? 'rtl' : 'ltr');
+        document.documentElement.setAttribute('dir', this.isRtl() ? 'rtl' : 'ltr');
         document.documentElement.setAttribute('lang', this.lang);
     },
 

@@ -1,0 +1,185 @@
+"""The coverage arithmetic: invertible letterboxes, a real tiling grid, and what reach follows.
+
+WHY THIS FILE IS PURE
+---------------------
+Everything here is geometry, so nothing here needs a model, an image or a network - which matters
+because the claim it supports is the one a deployment gets wrong quietly. "Can the detector see a
+face at two metres" is answered by a scale factor and an anchor floor, and if that arithmetic is
+optimistic the system does not fail: it detects fewer faces, at the far end of the room, in the
+evening, and nobody sees an error.
+
+The failure this file exists to prevent was in the arithmetic itself. ``tiles`` was treated as a
+direct multiplier on subject scale, so a 2x2 grid was claimed to double it. It does not: each
+window is letterboxed into the *same* 640 canvas, so on 1280x720 the real factor is 1.82x, and the
+reach number derived from 2.0x was about 10 % optimistic - the direction that leaves the person at
+the far end of the room undetected.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+import detector_640
+from detector_640 import DetectorError, Letterbox, tile_origins
+
+
+# ---------------------------------------------------------------------------
+# the letterbox: a mapping, and therefore invertible
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("width", "height"),
+    [(1920, 1080), (1280, 720), (640, 480), (4032, 3024), (720, 1280)],
+)
+@pytest.mark.parametrize("square", [False, True])
+def test_the_letterbox_maps_native_pixels_and_maps_them_back(width, height, square):
+    """A coordinate that survives the round trip is what makes a detection *in the frame* possible.
+
+    The round trip is exact rather than approximate because the plan stores its *effective*
+    per-axis scales (post-rounding of the resample size), not the requested ones.
+    """
+    plan = Letterbox.fit(width, height, 640, 640, square=square)
+    native = np.array(
+        [[0.0, 0.0], [width / 2.0, height / 3.0], [width - 1.0, height - 1.0], [17.0, 401.0]]
+    )
+    detector_pixels = np.stack(
+        [native[:, 0] * plan.sx + plan.off_x, native[:, 1] * plan.sy + plan.off_y], axis=1
+    )
+    assert np.allclose(plan.to_native(detector_pixels), native, atol=1e-9)
+
+    # The canvas is what the model is asked for, and the resample never upscales past it.
+    assert plan.out_w <= 640 and plan.out_h <= 640
+    assert plan.new_w <= plan.out_w and plan.new_h <= plan.out_h
+    if square:
+        assert (plan.out_w, plan.out_h) == (640, 640)
+    else:
+        assert (plan.out_w, plan.out_h) == (plan.new_w, plan.new_h), "no padding when not square"
+
+
+def test_a_padding_region_coordinate_is_clamped_not_invented():
+    """A point in the pad has no native pre-image; returning one would place a box off-frame."""
+    plan = Letterbox.fit(1920, 1080, 640, 640, square=True)
+    assert plan.off_y > 0.0, "a 16:9 frame letterboxed into a square must be padded vertically"
+    padded = np.array([[320.0, 0.0], [320.0, 639.0]])  # top and bottom of the canvas
+    mapped = plan.to_native(padded)
+    assert mapped[:, 1].min() == 0.0 and mapped[:, 1].max() == 1079.0
+    assert (mapped >= 0.0).all()
+
+
+def test_the_plan_refuses_an_impossible_resample():
+    for arguments in ((0, 720, 640, 640), (1280, 0, 640, 640), (1280, 720, 0, 640)):
+        with pytest.raises(DetectorError):
+            Letterbox.fit(*arguments)
+
+
+def test_a_frame_round_trips_through_the_resample():
+    """The pixel mapping and the image resample have to agree, or landmarks land where faces are not."""
+    import cv2
+
+    rng = np.random.default_rng(4)
+    frame = rng.integers(0, 256, (720, 1280, 3), dtype=np.uint8)
+    plan = Letterbox.fit(1280, 720, 640, 640, square=False)
+    resampled = plan.apply(frame)
+    assert (resampled.shape[1], resampled.shape[0]) == (plan.out_w, plan.out_h)
+    # A block of solid colour placed at a known native position must appear, scaled, at the
+    # position the plan predicts - so the two halves of the mapping cannot drift apart.
+    marked = np.zeros((720, 1280, 3), dtype=np.uint8)
+    marked[300:340, 500:540] = 255
+    out = plan.apply(marked)
+    centre = np.array([[520.0, 320.0]])
+    detector_centre = np.stack(
+        [centre[:, 0] * plan.sx + plan.off_x, centre[:, 1] * plan.sy + plan.off_y], axis=1
+    )[0]
+    x, y = int(round(detector_centre[0])), int(round(detector_centre[1]))
+    assert out[y, x].min() > 0, "the marked block must be where the plan says it is"
+    with pytest.raises(DetectorError):
+        plan.apply(np.zeros((720, 1280), dtype=np.uint8))
+
+
+# ---------------------------------------------------------------------------
+# the tiling grid
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("tiles", [1, 2, 3, 4])
+def test_the_grid_is_a_square_of_windows_inside_the_frame(tiles):
+    windows = tile_origins(1280, 720, tiles, 0.2)
+    assert len(windows) == tiles * tiles
+    for x0, y0, x1, y1 in windows:
+        assert 0 <= x0 < x1 <= 1280
+        assert 0 <= y0 < y1 <= 720
+
+
+def test_the_grid_covers_the_frame_so_no_region_is_blind():
+    """A tile pass with a gap is worse than no tile pass: it looks like coverage and is not.
+
+    Checked by painting, not by trusting the arithmetic: rebuild the union of the windows on a
+    downsampled mask and assert every pixel is claimed by at least one window.
+    """
+    covered = np.zeros((72, 128), dtype=bool)
+    scale_x, scale_y = 1280 / 128, 720 / 72
+    for x0, y0, x1, y1 in tile_origins(1280, 720, 3, 0.2):
+        covered[
+            int(y0 / scale_y): int(np.ceil(y1 / scale_y)),
+            int(x0 / scale_x): int(np.ceil(x1 / scale_x)),
+        ] = True
+    assert covered.all(), f"{int((~covered).sum())} blind cells in the tiled pass"
+
+
+def test_the_grid_refuses_a_policy_it_cannot_honour():
+    with pytest.raises(DetectorError):
+        tile_origins(1280, 720, 0, 0.2)
+    with pytest.raises(DetectorError):
+        tile_origins(1280, 720, 2, 1.0)
+    with pytest.raises(DetectorError):
+        tile_origins(1280, 720, 2, -0.1)
+
+
+# ---------------------------------------------------------------------------
+# reach: the number that decides whether a person at 1.5 m is visible at all
+# ---------------------------------------------------------------------------
+def test_the_reach_is_measured_per_window_and_not_multiplied_by_tiles():
+    """The regression this file was written for: 1280x720 with a 2x2 grid is 1.82x, not 2x.
+
+    A detector constructed but never asked for reach is the cheap version of this test; the point
+    is that the *published* figure matches the real window geometry, window by window.
+    """
+    full = Letterbox.fit(1280, 720, 640, 640, square=False).scale
+    assert full == pytest.approx(0.5, abs=1e-9)
+    windows = tile_origins(1280, 720, 2, 0.2)
+    per_window = [
+        Letterbox.fit(x1 - x0, y1 - y0, 640, 640, square=False).scale
+        for x0, y0, x1, y1 in windows
+    ]
+    assert min(per_window) == pytest.approx(0.909, abs=0.002)
+    assert max(per_window) / full < 2.0, "a 2x2 grid does not double the subject scale"
+
+    # A face is visible when its *smallest* appearance across the grid clears the anchor floor,
+    # so the reach is set by the largest window - the one scaled down most.
+    assert 2.0 * full > min(per_window), "the largest window is genuinely the worst case"
+    floor_px = 16.0
+    assert floor_px / min(per_window) == pytest.approx(17.6, abs=0.2)
+
+
+@pytest.mark.parametrize("floor_px", [16.0, 32.0])
+def test_reach_improves_with_tiles_and_never_the_other_way(floor_px):
+    """Monotonicity, as a guard on the per-window arithmetic rather than on a table of numbers.
+
+    The detector is constructed for real (the model ships with the checkout) because the reach
+    numbers are its methods': a stubbed detector would let the geometry and the published figure
+    drift apart, which is the defect this file exists for.
+    """
+    model = Path(__file__).resolve().parent.parent / "models" / "face_detection_yunet_2023mar.onnx"
+    if not model.exists():  # pragma: no cover - the detector model ships with the checkout
+        pytest.skip("the YuNet model is not present")
+    detector = detector_640.YuNetDetector(str(model), input_size=640)
+    previous = float("inf")
+    for tiles in (1, 2, 3):
+        reach = detector.min_detectable_width(1280, 720, floor_px=floor_px, tiles=tiles)
+        assert reach < previous, f"more tiles must not reduce reach (tiles={tiles})"
+        previous = reach
+    assert detector.min_detectable_width(1280, 720, tiles=1, floor_px=16.0) == pytest.approx(32.0)
+    assert detector.min_detectable_width(1920, 1080, tiles=1, floor_px=16.0) == pytest.approx(48.0)
+    assert detector.min_detectable_width(1280, 720, tiles=2, floor_px=16.0) == pytest.approx(
+        17.6, abs=0.2
+    ), "the per-window figure, not floor_px / (scale x tiles) = 16.0"

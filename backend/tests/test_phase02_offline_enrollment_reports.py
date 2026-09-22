@@ -8,7 +8,11 @@ one piece of evidence an attacker fully controls, so the properties under test a
 * the device's own wall clock cannot move the punch in time - the server-derived
   ``anchor + monotonic`` time is what lands in the payroll log;
 * a refused punch is *stored*, never silently dropped;
-* an out-of-order batch still produces the right session and hours.
+* an out-of-order batch still produces the right session and hours;
+* a punch that arrives from the queue materialises as attendance **awaiting review** - the
+  hours are recorded and held, never credited with nobody having looked at them (the
+  workflow itself, including the selfie that is scored on arrival, is
+  ``test_offline_selfie_scoring.py``).
 """
 
 from __future__ import annotations
@@ -39,6 +43,8 @@ from harness import (
 import enrollment
 import offline_sync
 import reports
+import shift_hours
+import shift_windows
 
 TS = "%Y-%m-%d %H:%M:%S"
 DEVICE = "test-device-1"
@@ -228,6 +234,19 @@ def test_offline_clock_in_then_out_materialises_the_shift(client):
         )
         == "unverified_offline"
     ), "an offline capture cannot claim to have passed liveness"
+    # Both ends of the shift, and the reason on each: materialising a queued punch is not the
+    # same as confirming it, so nothing that comes out of this queue is approved on arrival.
+    held = _sql(
+        "SELECT status_code, flag_reason FROM attendance_logs WHERE worker_id = ? AND source = 'offline' "
+        "ORDER BY id",
+        (MOALLEM,),
+    )
+    assert [row[0] for row in held] == ["unverified_offline", "pending_review"], (
+        f"nothing from this queue arrives approved; the departure is the row that is held: {held}"
+    )
+    assert all("offline punch" in (row[1] or "") for row in held), (
+        f"and each row says what it is: {held}"
+    )
     assert db_scalar(
         "SELECT COUNT(*) FROM audit_log WHERE action = 'offline_sync' AND entity_id = ?", (DEVICE,)
     ) == 1
@@ -279,6 +298,102 @@ def test_a_long_offline_shift_keeps_its_real_hours(client):
         f"a long offline shift must be named for the reviewer, not silently shortened: {reason!r}"
     )
 
+
+
+@pytest.mark.parametrize("extra_seconds", (0, -1))
+def test_an_offline_clock_out_is_routed_by_the_shared_resolver(client, extra_seconds):
+    """A punch that arrives hours later reaches the same verdict, to the second.
+
+    The offline path resolved ``overtime_notify_hours`` for itself and compared the
+    *recorded* hours, which round a shift up to the paid day - so a shift that stopped a
+    second short of the line could be held here and approved on the phone. These two cases
+    are the line and one second short of it, and the expected verdict is not written down
+    in this test at all: it is the resolver's, which is the point.
+    """
+    rules = client.get("/api/v1/admin/shift_rules", headers=bearer(ADMIN)).json()
+    line = shift_hours.overtime_rule(rules)
+    break_seconds = int(round(shift_hours.break_hours(rules) * shift_hours.SECONDS_PER_HOUR))
+    offset = line["threshold_seconds"] + break_seconds + extra_seconds
+    expected = shift_hours.overtime_assessment(offset, rules)
+
+    key = _register(client)["device_key"]
+    started = datetime.now() - timedelta(hours=9)
+    anchor = _plant_anchor(MOALLEM, DEVICE, started.strftime(TS))
+    response = _sync(
+        client,
+        [
+            _punch(key, anchor, punch_id="line-in", nonce="n-line-in", action="Clock In", offset_s=0),
+            _punch(
+                key, anchor, punch_id="line-out", nonce="n-line-out",
+                action="Clock Out", offset_s=offset,
+            ),
+        ],
+    )
+    assert response.status_code == 200, response.text[:400]
+    assert response.json()["applied"] == 2
+
+    where = "worker_id = ? AND action = 'Clock Out' AND source = 'offline'"
+    status_code = db_scalar(f"SELECT status_code FROM attendance_logs WHERE {where}", (MOALLEM,))
+    assert (status_code == "pending_overtime") is expected["needs_approval"], (
+        f"the offline path disagreed with the resolver: {status_code} vs {expected}"
+    )
+    hours = db_scalar(f"SELECT hours FROM attendance_logs WHERE {where}", (MOALLEM,))
+    assert hours == pytest.approx(expected["paid_hours"], abs=1e-3)
+    stored_overtime = db_scalar(f"SELECT overtime_hours FROM attendance_logs WHERE {where}", (MOALLEM,))
+    if expected["needs_approval"]:
+        assert stored_overtime == pytest.approx(expected["overtime_hours"], abs=1e-3)
+    else:
+        assert stored_overtime is None
+
+
+def test_an_offline_crossing_reaches_the_workers_own_inbox(client):
+    """Hours later, on a queue that arrived by itself, and the worker is still told.
+
+    This is the one path where the announcement is written by a *materialization* rather
+    than by a punch the worker stood in front of: the shift ended on a phone with no
+    signal, and the notice is owed when the queue finally arrives. It is the same sentence
+    the online paths write (``overtime.announce_crossing``), because the fact is the same -
+    the phone's signal is not part of what happened to the worker's day.
+    """
+    rules = client.get("/api/v1/admin/shift_rules", headers=bearer(ADMIN)).json()
+    line = shift_hours.overtime_rule(rules)
+    break_seconds = int(round(shift_hours.break_hours(rules) * shift_hours.SECONDS_PER_HOUR))
+    # Comfortably past the line, so this is not a boundary test - those are next door.
+    offset = line["threshold_seconds"] + break_seconds + 3600
+
+    key = _register(client)["device_key"]
+    # The anchor is the shift's clock-in, and the clock-out sits ~9.6 h after it - so it has
+    # to be planted before *now* by more than the shift is long, or the punch is refused as
+    # one from the future (which is the offline guard doing its job).
+    started = datetime.now() - timedelta(hours=12)
+    anchor = _plant_anchor(MOALLEM, DEVICE, started.strftime(TS))
+    response = _sync(
+        client,
+        [
+            _punch(key, anchor, punch_id="inbox-in", nonce="n-inbox-in", action="Clock In", offset_s=0),
+            _punch(
+                key, anchor, punch_id="inbox-out", nonce="n-inbox-out",
+                action="Clock Out", offset_s=offset,
+            ),
+        ],
+    )
+    assert response.status_code == 200, response.text[:400]
+    assert response.json()["applied"] == 2
+
+    where = "worker_id = ? AND action = 'Clock Out' AND source = 'offline'"
+    assert db_scalar(f"SELECT status_code FROM attendance_logs WHERE {where}", (MOALLEM,)) == (
+        "pending_overtime"
+    ), "the shift is held for a decision"
+
+    inbox = client.get("/api/v1/worker/me/notifications", headers=bearer(MOALLEM)).json()
+    crossing = [row for row in inbox["notifications"] if row["kind"] == "overtime_crossed"]
+    assert crossing, (
+        "a materialized long shift owes the worker the same notice the online paths give: "
+        f"inbox={inbox['notifications']}"
+    )
+    body = str(crossing[0])
+    assert "approval" in body.lower(), body
+    assert inbox["unread"] >= 1, "and it is unread, which is what the app badges"
 
 
 def test_out_of_order_batch_is_applied_in_effective_time_order(client):
@@ -680,6 +795,127 @@ def test_the_shifts_report_is_a_timesheet_of_one_row_per_shift(client):
     )
 
 
+# ---------------------------------------------------------------------------
+# the arrival: when the shift started, and whether that was inside its window
+# ---------------------------------------------------------------------------
+def _timesheet(client, **params) -> dict:
+    """The timesheet for the whole seeded year, as the console asks for it."""
+    query = "".join(f"&{key}={value}" for key, value in params.items())
+    response = client.get(
+        f"/api/v1/admin/reports/shifts?start=2026-01-01&end=2026-12-31{query}",
+        headers=bearer(ADMIN),
+    )
+    assert response.status_code == 200, response.text[:200]
+    return response.json()
+
+
+def _on_the_company_clock(day: str, hour: int, minute: int = 0) -> str:
+    """A stored timestamp for a chosen moment *on the company's clock*.
+
+    The database holds naive local time (everything is written with ``datetime.now()``) and
+    the report converts it into the site's zone - so "07:30 at the gate" is a different
+    string on every machine that runs this suite, and a test that typed one would be
+    asserting the host's timezone rather than the application's judgement.
+    """
+    zone = shift_windows.resolve_timezone("Asia/Kuwait")
+    chosen = datetime.strptime(f"{day} {hour:02d}:{minute:02d}:00", TS).replace(tzinfo=zone)
+    return chosen.astimezone().strftime(TS)
+
+
+def _plant_shift(worker_id: str, day: str, *, clock_in: str, clock_out: str, hours: float = 8.0) -> None:
+    """A clock-in and a clock-out, written the way the punch path writes them."""
+    _sql(
+        "INSERT INTO attendance_logs (worker_id, site_name, action, timestamp, hours, score, "
+        "status, status_code, source) VALUES (?, 'Downtown Tower A', ?, ?, ?, 0.9, 'Approved', "
+        "'approved', 'online')",
+        (worker_id, "Clock In", clock_in, 0.0),
+    )
+    _sql(
+        "INSERT INTO attendance_logs (worker_id, site_name, action, timestamp, hours, score, "
+        "status, status_code, source) VALUES (?, 'Downtown Tower A', ?, ?, ?, 0.9, 'Approved', "
+        "'approved', 'online')",
+        (worker_id, "Clock Out", clock_out, hours),
+    )
+
+
+def test_each_shift_is_paired_with_the_clock_in_that_started_it(client):
+    """A row is a shift, so it carries the arrival that opened it - not the newest one.
+
+    The seeded history is a clock-in at 05:00 and a clock-out at 13:00 per day, so a report
+    that paired a shift with *any* clock-in, or with the wrong day's, is visible here.
+    """
+    body = _timesheet(client)
+    assert body["rows"], "the seeded history must produce shifts"
+    for row in body["rows"]:
+        assert row["arrival_time"] == f"{row['date']} 05:00:00", row
+        assert row["arrival_verdict"] in reports.ARRIVAL_VERDICTS, row
+        assert (row["arrival_minutes"] == 0) == (row["arrival_verdict"] == "on_time"), (
+            f"minutes and verdict travel together: {row}"
+        )
+    assert body["totals"]["late_arrivals"] == sum(
+        1 for row in body["rows"] if row["arrival_verdict"] == "late"
+    ), "the figure above the table counts the rows under it"
+
+
+def test_the_arrival_is_judged_on_the_site_clock_and_the_window_in_force(client):
+    """Arrivals outside the company window are late by exactly how far outside they were.
+
+    Two shifts for one worker: 04:10 (inside the shipped 04:00-06:30) and 07:30 (an hour
+    after it closed). The window is then moved to 03:00-04:00, which is the trap this pins -
+    the report resolves the window the same way the gate did, so the *same rows* re-read as
+    late by 10 and 210 minutes rather than keeping a verdict nothing can be checked against.
+    """
+    _plant_shift(MOALLEM, "2026-04-06",
+                 clock_in=_on_the_company_clock("2026-04-06", 4, 10),
+                 clock_out=_on_the_company_clock("2026-04-06", 12, 10))
+    _plant_shift(MOALLEM, "2026-04-07",
+                 clock_in=_on_the_company_clock("2026-04-07", 7, 30),
+                 clock_out=_on_the_company_clock("2026-04-07", 15, 30))
+
+    body = _timesheet(client, worker_id=MOALLEM)
+    arrivals = {row["date"]: (row["arrival_verdict"], row["arrival_minutes"]) for row in body["rows"]}
+    assert arrivals == {"2026-04-06": ("on_time", 0), "2026-04-07": ("late", 60)}, arrivals
+    assert body["totals"]["late_arrivals"] == 1
+
+    moved = client.post(
+        "/api/v1/admin/shift_rules",
+        headers=bearer(ADMIN),
+        json={"clock_in_window_start": "03:00", "clock_in_window_end": "04:00"},
+    )
+    assert moved.status_code == 200, moved.text[:300]
+    after = _timesheet(client, worker_id=MOALLEM)
+    later = {row["date"]: (row["arrival_verdict"], row["arrival_minutes"]) for row in after["rows"]}
+    assert later == {"2026-04-06": ("late", 10), "2026-04-07": ("late", 210)}, later
+    assert after["totals"]["late_arrivals"] == 2
+
+
+def test_a_shift_with_no_clock_in_on_file_is_not_counted_as_punctual(client):
+    """A force-clock-out, or a shift closed with no arrival recorded: unknown, not on time."""
+    _sql(
+        "INSERT INTO attendance_logs (worker_id, site_name, action, timestamp, hours, score, "
+        "status, status_code, source) VALUES (?, 'Downtown Tower A', 'Clock Out', ?, 8.0, 0.9, "
+        "'Approved', 'approved', 'online')",
+        (MOALLEM, _on_the_company_clock("2026-04-08", 13, 0)),
+    )
+    body = _timesheet(client, worker_id=MOALLEM)
+    row = body["rows"][0]
+    assert row["arrival_time"] is None and row["arrival_verdict"] is None
+    assert row["arrival_minutes"] is None, "nothing was measured, so nothing may be reported"
+    assert body["totals"]["late_arrivals"] == 0
+
+
+def test_the_arrival_column_never_reaches_the_csv(client):
+    """The screen gained a column; the file did not - two months of sheets still line up."""
+    response = client.get(
+        "/api/v1/admin/reports/export?kind=shifts&start=2026-01-01&end=2026-12-31",
+        headers=bearer(ADMIN),
+    )
+    assert response.status_code == 200, response.text[:200]
+    assert response.text.splitlines()[0] == "Employee,id,site,hours"
+    assert "arrival" not in response.text.lower()
+    assert "late" not in response.text.lower(), "no verdict column in the exported sheet"
+
+
 def test_attendance_report_uses_the_configured_working_days(client):
     response = client.get("/api/v1/admin/reports/attendance", headers=bearer(ADMIN))
     assert response.status_code == 200, response.text[:200]
@@ -758,7 +994,19 @@ def test_the_csv_export_streams_in_batches_and_not_one_row_at_a_time(client):
     async def drain(iterator):
         return [chunk async for chunk in iterator]
 
-    chunks = asyncio.run(drain(reports._csv_response("export.csv", header, rows).body_iterator))
+    # Driven on a worker thread, deliberately, rather than ``asyncio.run`` on this one: that
+    # helper refuses to start when another loop is still marked running on the calling
+    # thread, and the browser suites run playwright's sync API, whose teardown leaves exactly
+    # that behind (probed: a ProactorEventLoop, ``running=True``, surviving
+    # ``sync_playwright()``'s exit - and a fresh loop on *this* thread is refused too, since
+    # the marker is per-thread, not per-loop). A worker thread has no such marker, and the
+    # assertion here is about streaming, not about what the rest of the session left open.
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        chunks = pool.submit(
+            asyncio.run, drain(reports._csv_response("export.csv", header, rows).body_iterator)
+        ).result()
     text = "".join(chunk if isinstance(chunk, str) else chunk.decode("utf-8") for chunk in chunks)
 
     expected = io.StringIO()

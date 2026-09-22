@@ -171,12 +171,30 @@ async def read_photo(upload: UploadFile, *, field: str = "photo", max_bytes: int
     return data
 
 
-def decode_photo(data: bytes, *, field: str = "photo"):
-    """Decode validated bytes into an EXIF-corrected RGB ``PIL.Image``.
+def has_alpha(image: Any) -> bool:
+    """Whether this image carries transparency, in any of the three ways PIL means it.
+
+    ``RGBA``/``LA`` are the channels; a palette image keeps it in ``info['transparency']``,
+    which is how a PNG with a transparent ground is stored. Asked here rather than at each
+    call site because getting it wrong is silent: an image flattened to RGB loses its
+    transparency and prints a coloured box where the paper should show through.
+    """
+    mode = getattr(image, "mode", "")
+    return mode in ("RGBA", "LA") or (mode == "P" and "transparency" in (getattr(image, "info", None) or {}))
+
+
+def decode_photo(data: bytes, *, field: str = "photo", keep_alpha: bool = False):
+    """Decode validated bytes into an EXIF-corrected ``PIL.Image``.
 
     The pixel ceiling is checked before the pixels are touched: five megabytes of JPEG
     can describe a 300 megapixel image, and decoding that is where the memory actually
     goes.
+
+    ``keep_alpha`` is off for every *photo* in this application, and on for the one image
+    that is not one: a company logo. A face is a photograph of a person and has no
+    transparency to preserve, but a mark is drawn on a transparent ground so it can sit on
+    the login panel's green or on white paper - and ``convert("RGB")``, which is right for
+    a selfie, would fill that ground with black.
     """
     from PIL import Image, ImageOps
 
@@ -201,7 +219,10 @@ def decode_photo(data: bytes, *, field: str = "photo"):
     try:
         # ``exif_transpose`` is what makes a portrait phone photo landscape-correct; a
         # face reference stored at the wrong rotation rejects its owner forever.
-        return ImageOps.exif_transpose(image).convert("RGB")
+        upright = ImageOps.exif_transpose(image)
+        if keep_alpha and has_alpha(upright):
+            return upright.convert("RGBA")
+        return upright.convert("RGB")
     except Exception:
         raise _refuse(
             422,

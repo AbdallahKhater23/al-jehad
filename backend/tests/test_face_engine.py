@@ -2,9 +2,10 @@
 
 WHY THIS EXISTS
 ---------------
-A punch is a VGG-Face embedding plus an MTCNN detection - half a second of CPU each on the
-deployment host - and before this engine existed that work ran wherever the caller happened
-to be: on anyio's shared forty-thread pool for the punches, and **on the event loop** for the
+A punch is a FaceNet-128 embedding plus a YuNet detection - tens of milliseconds each on the
+deployment host since the ONNX swap, and half a second apiece before it - and what matters
+here is unchanged: before this engine existed that work ran wherever the caller happened to
+be, on anyio's shared forty-thread pool for the punches, and **on the event loop** for the
 liveness check and three of the four enrollment paths. Nothing bounded how much of it ran at
 once, nothing stopped one upload from freezing every other request in the process, and when
 the machine was overwhelmed the worker at the gate was told their *photo* was the problem.
@@ -260,30 +261,34 @@ def test_a_slow_inference_does_not_stall_another_request(client, monkeypatch):
 # ---------------------------------------------------------------------------
 # 6. nothing bypasses the engine
 # ---------------------------------------------------------------------------
-def _deepface_references(path) -> list[str]:
-    """Real references to the model library in a module - parsed, not grepped.
+#: The embedding engine, and the model library it replaced. Both are scanned for, so this test
+#: is also what would notice TensorFlow/DeepFace coming back: the only module allowed to reach
+#: either is the engine.
+_MODEL_MODULES = {"face_onnx", "deepface"}
 
-    Parsed because prose counts otherwise: ``liveness.py`` explains in a docstring that it
-    runs before ``DeepFace.represent()``, and a text search would report the explanation as
-    a bypass.
+
+def _model_references(path) -> list[str]:
+    """Real references to the embedding engine or the retired model library - parsed, not grepped.
+
+    Parsed because prose counts otherwise: ``liveness.py`` explains in a docstring that it runs
+    before the embedding, and a text search would report the explanation as a bypass.
     """
     import ast
 
     found = []
     for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-        if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("deepface"):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] in _MODEL_MODULES:
             found.append(f"import at line {node.lineno}")
         elif isinstance(node, ast.Import) and any(
-            alias.name == "deepface" for alias in node.names
+            alias.name.split(".")[0] in _MODEL_MODULES for alias in node.names
         ):
             found.append(f"import at line {node.lineno}")
         elif (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "DeepFace"
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in {"DeepFace", "face_onnx"}
         ):
-            found.append(f"{node.func.value.id}.{node.func.attr} at line {node.lineno}")
+            found.append(f"{node.value.id}.{node.attr} at line {node.lineno}")
     return found
 
 
@@ -296,15 +301,15 @@ def test_only_the_engine_calls_the_face_models():
     them on the event loop.
     """
     offenders = {
-        path.name: _deepface_references(path)
+        path.name: _model_references(path)
         for path in sorted(harness.BACKEND_DIR.glob("*.py"))
-        if path.name != "face_engine.py" and _deepface_references(path)
+        if path.name != "face_engine.py" and _model_references(path)
     }
-    # ``main`` is allowed exactly one reference: the startup preload, which runs before the
-    # server accepts a request (nothing to bound, nothing else on the machine yet).
+    # ``main`` is allowed exactly one call: the startup preload, which runs before the server
+    # accepts a request (nothing to bound, nothing else on the machine yet).
     assert set(offenders) == {"main.py"}, offenders
     calls = [item for item in offenders["main.py"] if not item.startswith("import")]
-    assert len(calls) == 1 and "build_model" in calls[0], offenders["main.py"]
+    assert len(calls) == 1 and "load_now" in calls[0], offenders["main.py"]
 
 
 # ---------------------------------------------------------------------------

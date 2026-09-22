@@ -30,7 +30,18 @@ reported by `readiness`'s `face_detector` check and by `/api/v1/status/detail`.
 **When it is absent** the application still works: verification falls back to DeepFace's
 previous detector, thirty times slower on detection and reported as such. Templates written
 while the fallback is live are labelled with the fallback pipeline, so they are not later
-mistaken for YuNet templates (see `biometrics.PIPELINE`).
+mistaken for YuNet templates (see `face_detector.PIPELINE`).
+
+**Replacing this file is not a drop-in.** The crop is the contract: swapping the detector -
+or its alignment, or the model that embeds the crop - moves every stored template and every
+distance, so all three have to move together. Bump `face_detector.PIPELINE`, expect every
+enrolled account to be reported for re-enrollment (`/api/v1/admin/enroll/needs_reenrollment`),
+and **re-derive the decision lines**: the band that turns a distance into approved / review /
+refused is keyed by `(pipeline, model)` in `face_detector.BANDS`, and a build that can run a
+pipeline without one fails the startup gate rather than scoring against numbers measured for
+another crop. The derivation rule, the measured boundaries it currently rests on and the
+method for re-measuring are in `backend/face_detector.py` (the `MatchBand` section) and in the
+README's *Where a face match is decided*.
 
 ## 2. Liveness model — MiniFASNet (not committed)
 

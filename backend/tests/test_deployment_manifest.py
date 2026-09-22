@@ -47,8 +47,7 @@ SERVE = PROJECT_ROOT / "backend" / "serve.py"
 RUNTIME_PINS = (
     "fastapi",
     "uvicorn",
-    "deepface",
-    "tensorflow",
+    "onnxruntime",
     "numpy",
     "scipy",
     "pydantic",
@@ -117,9 +116,15 @@ def test_no_test_only_package_is_installed_on_a_host(name):
 
 
 def test_the_optional_extras_stay_optional():
-    """onnxruntime, qrcode and openpyxl degrade gracefully, so they are not hard requirements."""
+    """qrcode and openpyxl degrade gracefully, so they are not hard requirements.
+
+    ``onnxruntime`` used to be in this list and is deliberately not any more: it is the
+    embedding engine (``face_onnx``), and a host without it cannot verify a single punch - which
+    is a start that must fail loudly at build time, not a feature that quietly reports itself
+    unavailable. Its pin is asserted by ``test_every_runtime_import_is_pinned`` instead.
+    """
     pins = _manifest()
-    for name in ("onnxruntime", "qrcode", "openpyxl"):
+    for name in ("qrcode", "openpyxl"):
         assert name not in pins, (
             f"{name} is an optional extra (see backend/requirements-optional.txt): pinning it "
             "turns a feature that degrades into a start that fails"

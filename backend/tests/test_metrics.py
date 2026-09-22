@@ -103,6 +103,30 @@ def label_values(body: str, metric: str, label: str) -> set:
     return {sample.labels.get(label) for sample in samples(body, metric)}
 
 
+def exercise_every_instrumented_path(client) -> None:
+    """Do the work the payload can only report: one punch, and one explicit transaction.
+
+    A Prometheus client emits *series*, not metric declarations, so a family nobody has recorded
+    is legitimately absent from the payload - which makes "is this metric published?" a question
+    about the process's history unless the test creates that history itself. Left implicit, the
+    history came from whatever else had run: this module's own earlier tests, or ``test_face_
+    engine``. That is invisible while the suite is one process and collection order is fixed,
+    and it is what ``pytest -n auto`` exposes - the test lands in a worker that has done nothing
+    yet and fails on ``attendance_verifications_total``, which looks like a broken metric.
+    """
+    response = clock_in(client, MOALLEM, headers=bearer(MOALLEM))
+    assert response.status_code == 200, response.text[:200]
+
+    # The one path a punch does not take: a punch writes inside the driver's own implicit
+    # transaction, so the lock-wait histogram (BEGIN IMMEDIATE) needs an explicit one.
+    connection = database.connect(isolation_level=None)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("ROLLBACK")
+    finally:
+        connection.close()
+
+
 def _labels_of_families(body: str, prefix: str) -> set[str]:
     """Every label value (and label name) of the metric families whose name starts with ``prefix``.
 
@@ -264,18 +288,11 @@ def test_the_payload_omits_nothing_an_alert_needs(client, app_module):
     instrumented path - and only then insists the payload is complete. A rename, an accidental
     second registry or a metric that stopped being recorded fails here rather than in a
 dashboard months later.
-    """
-    response = clock_in(client, MOALLEM, headers=bearer(MOALLEM))
-    assert response.status_code == 200, response.text[:200]
 
-    # The one path a punch does not take: a punch writes inside the driver's own implicit
-    # transaction, so the lock-wait histogram (BEGIN IMMEDIATE) needs an explicit one.
-    connection = database.connect(isolation_level=None)
-    try:
-        connection.execute("BEGIN IMMEDIATE")
-        connection.execute("ROLLBACK")
-    finally:
-        connection.close()
+    The exercise itself lives in ``exercise_every_instrumented_path`` because the name test below
+    needs exactly the same history, and had been getting it by accident from this test.
+    """
+    exercise_every_instrumented_path(client)
 
     body = scrape(client)
     for family in (
@@ -403,13 +420,42 @@ def test_the_label_sets_stay_small_after_a_full_exercise(client, app_module):
     clock_in(client, MOALLEM, headers=bearer(MOALLEM))
     body = scrape(client)
 
-    # The route vocabulary is defined in code, one label per *route template*, so this is a
-    # tight pin on purpose: it catches a route whose template embeds a caller's value, and a
-    # deliberate feature adds exactly one. Last raised from 30 by
-    # ``/admin/enroll/needs_reenrollment`` (the re-enrollment worklist); the property under
-    # test is that nothing here grows with the *number of requests*, which is what the
-    # assertions below this one use their own counts for.
-    assert len(label_values(body, "attendance_http_requests_total", "route")) <= 31
+    # The route vocabulary is defined in code, one label per *route template*, so what belongs
+    # here is the property rather than a count: the same route asked for with different path
+    # parameters has to be **one** label, and asking again has to add nothing.
+    #
+    # This line used to be a literal ceiling on the labels seen *so far* (last raised to 31 by
+    # ``/admin/enroll/needs_reenrollment``), which measures the test session rather than the
+    # endpoint: a batch of suites that exercises more of the API legitimately sees more
+    # templates, so it fails without anything being wrong - and it says nothing about the
+    # request that would actually be a leak. The route *is* exercised here, which is what makes
+    # "did the parameter become a label?" answerable at all (a route nobody requested has no
+    # label yet; see ``test_a_path_carrying_a_token_is_labelled_by_its_route_template``).
+    def route_labels(payload):
+        return set(label_values(payload, "attendance_http_requests_total", "route"))
+
+    before_routes = route_labels(body)
+    for path in (
+        "/api/v1/q/not-a-real-token",
+        "/api/v1/q/another-made-up-token",
+        "/nope",
+        "/nope/2",
+    ):
+        client.get(path)
+    after_routes = route_labels(scrape(client))
+    assert "/api/v1/q/{token}" in after_routes, (
+        "the punch-link route is labelled by its template: " + repr(sorted(after_routes))
+    )
+    added = after_routes - before_routes
+    assert len(added) <= 2, (
+        "two tokens and two unknown paths may add the template and the one unmatched bucket, "
+        f"not a series each: {sorted(added)}"
+    )
+    assert not any("not-a-real-token" in label or "made-up-token" in label for label in after_routes)
+    # And repeating them adds nothing at all, which is the leak this test is named for.
+    for path in ("/api/v1/q/not-a-real-token", "/api/v1/q/another-made-up-token", "/nope"):
+        client.get(path)
+    assert route_labels(scrape(client)) - after_routes == set()
     assert len(label_values(body, "attendance_http_requests_total", "status")) <= 12
     assert len(label_values(body, "attendance_verifications_total", "outcome")) <= 6
     assert len(label_values(body, "attendance_sqlite_statements_total", "operation")) <= 10
@@ -460,9 +506,9 @@ def test_a_punch_records_the_model_latency_the_score_and_the_outcome(client, app
     assert series_sum(body, "attendance_verifications_total", {"outcome": "approved"}) == before + 1
     assert series_sum(body, "attendance_punches_total", {"action": "clock_in"}) >= 1
 
-    assert value(body, "attendance_face_model_seconds_count", {"operation": "represent", "model": "VGG-Face"}) >= 1
+    assert value(body, "attendance_face_model_seconds_count", {"operation": "represent", "model": "Facenet"}) >= 1
 
-    # Exactly one new distance, and the harness's DeepFace stub returns the enrolled embedding
+    # Exactly one new distance, and the harness's engine stub returns the enrolled embedding
     # verbatim, so that one distance is ~0: the punch was approved on the score the histogram
     # recorded, not on some other code path's opinion of it.
     assert value(body, "attendance_face_match_score_count") == before_scores + 1
@@ -560,8 +606,8 @@ def test_an_engine_failure_is_counted_and_not_swallowed(client, app_module, face
 
     The *model* is what is broken here, not ``face_engine._represent``: that wrapper is where
     the timing lives, so replacing it would remove the instrumentation under test and prove
-    only that nothing was recorded because nothing was running. ``DeepFace.represent`` raising
-    is the real failure mode - out of memory, a corrupt weight file, a frame MTCNN refuses.
+    only that nothing was recorded because nothing was running. The engine's ``embed_as_list``
+    raising is the real failure mode - out of memory, a corrupt graph, a crop it cannot take.
 
     Counted at the model boundary, because that is where the exception starts and where the
     labels are exact (``operation`` and the exception type). The engine job around it is
@@ -574,7 +620,7 @@ def test_an_engine_failure_is_counted_and_not_swallowed(client, app_module, face
         raise RuntimeError("the model exploded")
 
     before = scrape(client)
-    monkeypatch.setattr(face, "represent", broken)
+    monkeypatch.setattr(face, "embed_as_list", broken)
     response = clock_in(client, MOALLEM, headers=bearer(MOALLEM))
     assert response.status_code == 500, response.text[:200]
 
@@ -837,7 +883,7 @@ def test_every_helper_is_silent_when_the_library_is_missing():
         "assert telemetry.AVAILABLE is False, 'the library was importable'\n"
         "assert telemetry.render() == b''\n"
         "telemetry.observe_verification('approved')\n"
-        "telemetry.observe_model_call(operation='represent', seconds=0.5, model='VGG-Face', detector='mtcnn')\n"
+        "telemetry.observe_model_call(operation='represent', seconds=0.5, model='Facenet', detector='yunet')\n"
         "telemetry.observe_http(route='/x', method='GET', status=200, seconds=0.1)\n"
         "telemetry.count_lock_error(operation='select')\n"
         "telemetry.observe_match_score(0.3)\n"
@@ -963,7 +1009,15 @@ def test_a_metric_family_is_never_registered_twice(app_module):
 
 def test_the_counter_and_histogram_names_follow_the_conventions(client):
     """``_total`` on counters, base units (seconds) in names: a dashboard is written against
-    these, so a rename is a breaking change and the shape is pinned here."""
+    these, so a rename is a breaking change and the shape is pinned here.
+
+    Exercised first, for the reason spelled out in ``exercise_every_instrumented_path``: two of
+    the names below (``attendance_verifications_total``, ``attendance_face_model_seconds_*``) are
+    only in the payload once something has recorded them, and this test used to rely on an
+    earlier test in the same process having done so.
+    """
+    exercise_every_instrumented_path(client)
+
     body = scrape(client)
     # Sample names, not family names: these are the strings a PromQL expression or a Grafana
     # panel is written against, and they are what the client library's name mangling produces.

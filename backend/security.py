@@ -45,6 +45,26 @@ WEAK_PASSWORDS = frozenset({"password", "passw0rd", "12345678", "123456789", "pa
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/token", auto_error=False)
 
 
+#: The root tier. One account, seeded deliberately (``tools/seed_developer.py``), never
+#: created through any API: see ``refuse_developer_role`` for why every account-creation path
+#: refuses it by name rather than by omission.
+DEVELOPER_ROLE = "developer"
+
+#: Every role that may reach an administrator surface. ``developer`` is here rather than being
+#: spelled out in each guard so that there is exactly one list to audit; the wildcard in
+#: ``require_role`` below is the other half of the same decision.
+ADMIN_ROLES: frozenset[str] = frozenset({"admin", "head_admin", DEVELOPER_ROLE})
+
+#: The roles a *business* administrator audience is made of - what a route declares, and what
+#: the audience matrix in ``tests/test_role_audience.py`` holds to the shape of the API.
+#:
+#: Deliberately without ``developer``. The declaration answers "who is this route for", and the
+#: developer's access is a cross-cutting *policy* rather than an audience: putting it in every
+#: declaration would rewrite every route's meaning (and the matrix that checks it), and would
+#: hide the bypass in fifty places instead of one.
+DECLARED_ADMIN_ROLES: frozenset[str] = frozenset({"admin", "head_admin"})
+
+
 @dataclass(frozen=True)
 class CurrentUser:
     id: str
@@ -53,8 +73,16 @@ class CurrentUser:
     token_version: int
 
     @property
+    def is_developer(self) -> bool:
+        """The root tier - the one account that is not subject to the role guards."""
+        return self.role == DEVELOPER_ROLE
+
+    @property
     def is_admin(self) -> bool:
-        return self.role in {"admin", "head_admin"}
+        # Administrator *or* above it. Every existing caller of this property is asking
+        # "may this account see the console's administrative surfaces", and the root tier
+        # may see all of them.
+        return self.role in ADMIN_ROLES
 
 
 # ---------------------------------------------------------------------------
@@ -69,11 +97,22 @@ def _truncate_for_bcrypt(password: str) -> str:
 #: endpoint: the ranges are what let an operator tell an account's role from its id, and
 #: two copies of them drift (an enrollment link that mints id 3 as a "moallem" would be
 #: a worker's id in a moallem's slot).
+#: The floor of the developer band. Far above every business role's band on purpose: the id is
+#: the first thing an operator reads in a log line, and a developer account that sat in the
+#: head-admin range would be indistinguishable from one at a glance.
+#:
+#: 64-bit safe by construction. ``users.id`` is TEXT and every consumer parses it with Python's
+#: arbitrary-precision ``int`` (never a fixed-width or JavaScript numeric literal), so 3.09e11
+#: needs no schema change and cannot disturb an ``AUTOINCREMENT`` sequence - the sequences in
+#: this database belong to ``attendance_logs`` and friends, and ``users`` has never had one.
+DEVELOPER_ID_FLOOR = 309_010_000_000
+
 ROLE_ID_RANGES: dict[str, tuple[int, int | None]] = {
     "worker": (1, 499),
     "moallem": (500, 999),
     "admin": (1000, 4999),
     "head_admin": (5000, None),
+    DEVELOPER_ROLE: (DEVELOPER_ID_FLOOR, None),
 }
 
 ROLE_ID_MESSAGES: dict[str, str] = {
@@ -81,7 +120,33 @@ ROLE_ID_MESSAGES: dict[str, str] = {
     "moallem": "Lead Worker (Moallem) ID must be in range 500-999.",
     "admin": "Admin ID must be in range 1000-4999.",
     "head_admin": "Head Admin ID must be 5000 or greater.",
+    DEVELOPER_ROLE: f"Developer ID must be {DEVELOPER_ID_FLOOR} or greater.",
 }
+
+#: Roles no API may create, whoever is asking.
+#:
+#: The developer account is minted by ``tools/seed_developer.py`` and by nothing else. An
+#: administrator who could create one could promote themselves to a tier that reads the audit
+#: trail and the alert hub - the exact escalation this role exists to make impossible - so the
+#: refusal is explicit and by name, in every creation path, rather than an accident of some
+#: validation range happening not to include it.
+UNASSIGNABLE_ROLES: frozenset[str] = frozenset({DEVELOPER_ROLE})
+
+
+def refuse_developer_role(role: str) -> None:
+    """Refuse to create an account in an unassignable role. Raises ``HTTPException(403)``.
+
+    Called by every path that can write a ``users`` row with a role a caller chose: the
+    console's create, the administrator invite, the roster import and the self-service paths.
+    """
+    if str(role) in UNASSIGNABLE_ROLES:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "This role is not grantable through the API. It is provisioned by the "
+                "deployment's own seed tool, which is the only thing that may create it."
+            ),
+        )
 
 
 def validate_user_id_for_role(user_id: str, role: str) -> None:
@@ -229,11 +294,24 @@ async def get_current_user(
 
 
 def require_role(*allowed_roles: str) -> Callable:
-    """Dependency factory: ``Depends(require_role("admin", "head_admin"))``."""
+    """Dependency factory: ``Depends(require_role("admin", "head_admin"))``.
+
+    **The root tier is a superset, and this is the only place that says so.** A developer
+    session satisfies every guard, including the ones that were written years before the role
+    existed - a wildcard that cannot go stale, because it is not repeated in the routes it
+    applies to. ``_allowed_roles`` keeps holding the *business* audience, so the audience
+    matrix still reads each route's declaration for what it means; the bypass is one line here
+    rather than fifty declarations, and one line is auditable.
+
+    The reverse direction is ordinary and strict: a developer-only route is built from
+    ``require_role(DEVELOPER_ROLE)``, and an administrator is refused by it because their role
+    is not in the set and they are not the developer. A wildcard is a superset, not a
+    mutual-trust relationship.
+    """
     allowed = frozenset(allowed_roles)
 
     def dependency(current: CurrentUser = Depends(get_current_user)) -> CurrentUser:
-        if current.role not in allowed:
+        if current.role not in allowed and not current.is_developer:
             raise HTTPException(
                 status_code=403,
                 detail=f"Requires one of these roles: {', '.join(sorted(allowed))}.",
@@ -256,6 +334,15 @@ def ensure_self_or_role(target_id: str, current: CurrentUser, roles: tuple[str, 
 
 
 # Pre-built guards, reused so every endpoint shares one implementation.
+#
+# The administrator guards name the *declared* administrators, not ``ADMIN_ROLES``: the
+# developer reaches them through the wildcard above, and listing it here would put the bypass
+# back into every declaration this file was written to keep clean.
 any_authenticated = require_role("worker", "moallem", "admin", "head_admin")
 admin_only = require_role("admin", "head_admin")
 head_admin_only = require_role("head_admin")
+#: The developer surface. Nothing below the root tier passes it, by construction.
+developer_only = require_role(DEVELOPER_ROLE)
+
+#: The guard the request names, kept as one name so the intent is greppable at the route.
+require_developer = developer_only

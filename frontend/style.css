@@ -182,6 +182,20 @@ input, select, textarea, button {
     font-family: inherit;
 }
 
+/* A quick double tap is a second tap, not a zoom.
+
+   The viewport asks for ``user-scalable=no``, which Android honours and iOS has ignored
+   since 10 - so on an iPhone a person who taps the clock button twice (which is what
+   somebody does when the first press has not produced a camera yet) zoomed the page in
+   instead of pressing the button again, and then had to pinch back out at the gate.
+
+   ``manipulation`` keeps panning and pinch-zoom and drops only the double-tap gesture, so
+   it is on the things that are *pressed*. Text boxes are deliberately not in this list:
+   double-tapping a word is how the caret is placed, and that affordance stays. */
+button, a, label, select, summary, [role='button'], .ui-chip, .ops-chip {
+    touch-action: manipulation;
+}
+
 /* ---------- Mobile app shell ---------- */
 .app-shell {
     display: flex;
@@ -291,6 +305,10 @@ input, select, textarea, button {
     padding-bottom: 6px;
     scrollbar-width: none;
     -webkit-overflow-scrolling: touch;
+    /* A sideways flick belongs to the strip. Without this the flick that reaches either
+       end carries on into the browser: iOS Safari reads it as the back gesture and the
+       app is gone, and Android paints the glow on a page that does not move. */
+    overscroll-behavior-x: contain;
 }
 .tab-strip::-webkit-scrollbar { display: none; }
 .tab-strip button {
@@ -328,11 +346,22 @@ input, select, textarea, button {
     padding: 0;
 }
 
+/* The early clock-out warning is shown *over* the open camera overlay: the short shift
+   is refused while the worker is still holding the phone up, so the question has to sit
+   above the camera (70) and below the toasts (90) that report the result. */
+.modal-backdrop.is-over-camera { z-index: 80; }
+
 .modal-card {
     background: var(--card-bg);
     color: var(--text-color);
     width: 100%;
+    /* ``vh`` is the large viewport on a phone - the height the page would have if the URL
+       bar were hidden - so a sheet capped at 92vh is taller than the screen the reader is
+       looking at, and the first row of it starts under the browser chrome. The ``dvh``
+       line is the same cap against the height actually available right now; it is second
+       so a browser without ``dvh`` keeps the ``vh`` rule above it. */
     max-height: 92vh;
+    max-height: 92dvh;
     overflow-y: auto;
     border-radius: 1.5rem 1.5rem 0 0;
     padding: 20px 20px calc(20px + var(--safe-bottom));
@@ -1199,6 +1228,10 @@ html.dark,
     padding: var(--ui-5) var(--ui-4);
     padding-left: calc(var(--ui-4) + var(--safe-left));
     padding-right: calc(var(--ui-4) + var(--safe-right));
+    /* The home indicator / gesture bar, at the other end from the notch. Without it the
+       last row of a table - or the credit under it - is painted over by the bar, and the
+       fix cannot be found by scrolling because it is already at the bottom. */
+    padding-bottom: calc(var(--ui-5) + var(--safe-bottom));
 }
 
 .admin-grid {
@@ -1365,6 +1398,24 @@ html.dark,
 
 .admin-mobile-hint { margin: 0 0 var(--ui-3); }
 
+/*
+   The sticky band is the tab strip and nothing else.
+
+   It used to carry the tab's title, the brand mark and the four action buttons as well,
+   which came to about 149px on a phone - a sixth of an iPhone viewport, permanently, on a
+   screen whose entire job is showing an operator a table. And it was spent on things that
+   do not need to survive scrolling: the title answers "what am I looking at" once, when the
+   tab is tapped, and the identity of the signed-in admin is a question asked before a
+   destructive button, not while scrolling payroll. Those now scroll away with the pane
+   (``.admin-mobile-bar``, the first thing in the frame); what stays pinned is the strip,
+   which is the one control that has to be reachable from anywhere in a long table.
+
+   ``padding-top`` is the notch. The directive is `viewport-fit=cover`, so the page is
+   responsible for the status bar and the home indicator itself: the header's *background*
+   fills the top inset while its *content* stays below it, which is why the inset is padding
+   on the sticky element rather than a margin on the strip. A margin would scroll the strip
+   up under the notch and paint the tabs across the clock.
+*/
 .admin-mobile-head {
     position: sticky;
     top: 0;
@@ -1376,13 +1427,47 @@ html.dark,
     padding-right: calc(var(--ui-4) + var(--safe-right));
 }
 
+/*
+   The title and the console's actions, in the frame rather than in the sticky band.
+
+   A plain block wrapping a row and the action group, so it inherits the frame's side
+   padding and its own notch insets: on a landscape phone the forehead cuts into the left
+   edge, and a bar pinned to the viewport edge would sit under it.
+*/
+.admin-mobile-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--ui-2);
+    margin-bottom: var(--ui-3);
+    min-width: 0;
+}
+
+/* The mark and the tab title. ``min-width: 0`` is what lets a long tab name ellipsize
+   inside the flex row instead of pushing the action buttons off the edge. */
+.admin-mobile-bar-lead {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+}
+
 .admin-tabs {
     display: flex;
     gap: var(--ui-2);
     overflow-x: auto;
+    /* Air above the strip as well as below it, so a device with no inset is not the only
+       one where the tabs do not touch the border. */
+    padding-top: var(--ui-2);
     padding-bottom: var(--ui-2);
     scrollbar-width: none;
     -webkit-overflow-scrolling: touch;
+    /* See ``.tab-strip``: eight tabs of about 820px in a 290-360px window means the strip
+       is swiped constantly, and every swipe that reaches the end of it used to be handed
+       to the browser instead of stopping there. */
+    overscroll-behavior-x: contain;
 }
 .admin-tabs::-webkit-scrollbar { display: none; }
 .admin-tabs button {
@@ -1727,6 +1812,31 @@ html.dark .ui-btn-warn:hover:not(:disabled) { color: #0f172a; }
     border-radius: var(--ui-radius-sm);
     max-height: 288px;
 }
+/* A review card's evidence: the frame beside its numbers. The frame is the stored
+   thumbnail (256px on the long edge), so it is drawn at its natural size up to that and
+   never stretched - a picture of a face blown up past its pixels reads as evidence it
+   is not. The row wraps, so on a phone the numbers drop under the picture instead of
+   squeezing it. */
+.ui-evidence { margin-top: var(--ui-3); }
+.ui-evidence-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--ui-3);
+    align-items: flex-start;
+    margin-top: var(--ui-2);
+}
+.ui-evidence-media { flex: 0 0 auto; }
+.ui-evidence-media .ui-photo {
+    margin-top: 0;
+    max-width: 256px;
+    max-height: 256px;
+}
+.ui-evidence-facts { flex: 1 1 220px; min-width: 0; }
+.ui-evidence-facts .ui-btn { margin-bottom: var(--ui-2); }
+.ui-evidence .ui-note.is-warn { margin-top: var(--ui-2); }
+/* The flag sentence can be the longest text on the card: it breaks rather than pushing
+   the approve/reject row sideways. */
+.ui-evidence .ui-note { overflow-wrap: anywhere; }
 /* A cell whose value is a paragraph becomes a cell that ends in an ellipsis: the notes
    list is read by scanning, and a subject wrapped onto four lines is a row nobody can
    compare with the one above it. */
@@ -1795,6 +1905,33 @@ html.dark .ui-btn-warn:hover:not(:disabled) { color: #0f172a; }
 }
 .ui-fact-sub { font-size: 12px; color: var(--ops-muted); }
 
+/* ---------- Company mark: the console's preview -------------------------
+   The mark as the company set it, on the same ground the paper it prints on
+   uses. A fixed box with ``contain``, because a configured logo is whatever
+   shape was uploaded - a wide wordmark or a square seal - and the panel
+   should not resize itself around it. */
+
+.company-mark {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--ui-4);
+    margin-top: var(--ui-4);
+    padding-top: var(--ui-4);
+    border-top: 1px solid var(--ops-border);
+}
+.company-mark-preview {
+    width: 120px;
+    height: 60px;
+    object-fit: contain;
+    object-position: center;
+    background: #fff;
+    border: 1px solid var(--ops-border);
+    border-radius: 8px;
+    padding: 4px;
+}
+.company-mark-body { display: flex; flex-direction: column; gap: var(--ui-2); min-width: 0; }
+
 /* ---------- States: loading, empty, error ------------------------------- */
 
 .ui-skeleton { display: flex; flex-direction: column; gap: var(--ui-3); }
@@ -1855,7 +1992,17 @@ html.dark .ui-btn-warn:hover:not(:disabled) { color: #0f172a; }
 /* ---------- Small screens ------------------------------------------------ */
 
 @media (max-width: 1023px) {
-    .admin-frame { padding: var(--ui-3) var(--ui-3) var(--ui-6); padding-left: calc(var(--ui-3) + var(--safe-left)); padding-right: calc(var(--ui-3) + var(--safe-right)); }
+    /* Tighter gutters than the desktop frame, and the same rule at the bottom: the home
+       indicator is added to the padding here rather than left to the shorthand above.
+       This override is what a phone actually gets, so an inset set only on the base rule
+       is an inset that never applies where it was needed - which is how it was written the
+       first time. */
+    .admin-frame {
+        padding: var(--ui-3) var(--ui-3) var(--ui-6);
+        padding-left: calc(var(--ui-3) + var(--safe-left));
+        padding-right: calc(var(--ui-3) + var(--safe-right));
+        padding-bottom: calc(var(--ui-6) + var(--safe-bottom));
+    }
     .ui-surface { padding: var(--ui-4); }
 }
 
@@ -2043,6 +2190,32 @@ html.dark .ui-btn-warn:hover:not(:disabled) { color: #0f172a; }
     height: 3px;
     border-radius: 0 0 999px 999px;
     background: var(--ops-primary);
+}
+
+/* The unread count on the alerts tab: a numeral over the icon's shoulder.
+
+   Over the icon rather than beside the word, because the bar is a grid of equal columns and
+   a tab whose label is three characters wider than its neighbours' moves every one of them.
+   ``inset-inline-end`` so an Arabic or Urdu handset mirrors it with the rest of the bar, and
+   18px of height because that is what a two-digit number needs at 11px - it is a badge, not
+   a control, and nothing is ever tapped on it: the tab around it is the target. */
+.hand-tab-count {
+    position: absolute;
+    top: 3px;
+    inset-inline-end: 20%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 4px;
+    border-radius: 999px;
+    background: var(--ops-danger);
+    color: #fff;
+    font-size: 11px;
+    font-weight: 800;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
 }
 
 /* ---------- The shift, as the one card that matters --------------------- */
@@ -2337,6 +2510,52 @@ html.dark .ui-btn-warn:hover:not(:disabled) { color: #0f172a; }
 .hand-section-title { margin: 0; font-size: 16px; font-weight: 800; letter-spacing: -0.01em; }
 .hand-section-note { margin: 2px 0 0; font-size: 12px; color: var(--ops-muted); max-width: 52ch; }
 
+/* --- the column chooser: a <details> inside the report card --------------- */
+/* Folded away, because the card it sits in is the report and this is the shape of two
+   documents: a worker who never opens it still gets the file they always got. Themed on
+   the handset's own tokens, since this block lives on the worker's phone rather than in
+   the console. */
+.hand-columns {
+    margin-top: var(--ui-4);
+    padding-top: var(--ui-3);
+    border-top: 1px dashed var(--ops-border);
+}
+.hand-columns > summary {
+    display: flex;
+    align-items: center;
+    gap: var(--ui-2);
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--ops-text);
+    cursor: pointer;
+    list-style: none;
+}
+.hand-columns > summary::-webkit-details-marker { display: none; }
+.hand-columns > summary::after {
+    content: '';
+    margin-inline-start: auto;
+    width: 7px;
+    height: 7px;
+    border-right: 2px solid currentColor;
+    border-bottom: 2px solid currentColor;
+    transform: rotate(45deg);
+    transition: transform 160ms ease;
+}
+.hand-columns[open] > summary::after { transform: rotate(-135deg); }
+.hand-columns > summary:focus-visible { outline: 2px solid var(--ops-primary); outline-offset: 2px; border-radius: 8px; }
+/* Two columns on a phone as well as on a desk: eight checkboxes in one column is a scroll,
+   and the tap target is the label rather than the box (see ``.ui-check``). */
+.hand-columns-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: var(--ui-2) var(--ui-4);
+    margin: var(--ui-3) 0;
+}
+.hand-columns .ui-btn { margin-top: var(--ui-1); }
+/* No print rule of its own: the PDF path hides everything but the sheet
+   (``body.is-printing-report > *:not(.print-sheet)``), and a plain Ctrl+P on this page
+   prints the page. */
+
 .hand-note-line { margin: 0 0 var(--ui-3); font-size: 12px; font-weight: 600; color: var(--ops-warn); }
 
 /* A callout, not a billboard. Outlined on all four sides at full warning saturation,
@@ -2433,6 +2652,47 @@ html.dark .ui-btn-warn:hover:not(:disabled) { color: #0f172a; }
 .hand-alert button {
     margin-top: var(--ui-2);
     min-height: 40px;
+}
+
+/* The banner, as the whole band being the target.
+
+   Same warn band as the review alert above it - the two answer the same question ("what is
+   waiting on me before I tap") - with three differences that come from being a control: it
+   stretches the full width of the card, it carries its own label at the end, and it is
+   centred rather than top-aligned because the icon is one line of a two-line message. */
+.hand-alert.is-tappable {
+    width: 100%;
+    align-items: center;
+    cursor: pointer;
+}
+.hand-alert.is-tappable:active { transform: translateY(1px); }
+.hand-alert-body {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+    flex: 1 1 auto;
+    text-align: start;
+}
+.hand-alert-headline { font-weight: 800; }
+/* The server's own sentence about the event, one line of it: the full one is a tap away, and
+   a card that grows by three lines for every notice it is carrying is a card that buries
+   the clock button it sits above. */
+.hand-alert-line {
+    font-weight: 600;
+    color: var(--ops-text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+/* "See all", and "Mark as read" on an unread notice. Underlined rather than a button of its
+   own: both sit inside a control, and a control inside a control is a tap that does not do
+   what the tap before it did. */
+.hand-alert-more {
+    flex: none;
+    font-weight: 800;
+    text-decoration: underline;
+    color: inherit;
 }
 
 /* ---------- History: a rail on a phone, a table on a desk -------------- */
@@ -2593,5 +2853,83 @@ html.dark .ui-btn-warn:hover:not(:disabled) { color: #0f172a; }
     .hand-app select,
     .hand-app input[type='text'],
     .hand-app input[type='password'] { min-height: 40px; }
+}
+
+/* ==========================================================================
+   The printed shift report - the PDF half of the Shifts tab's download.
+
+   The sheet is built in the page from the rows already on screen and printed by
+   the browser, whose "Save as PDF" writes the file. Both readers print through
+   PrintReport - the console's Shifts tab and the handset's My hours - so the
+   rules below describe paper, not a screen. Everything below is about that: the
+   screen behind the sheet leaves the page, and the sheet stops being a screen
+   and becomes a ruled table - no hover, no phone layout, no colour printer to
+   rely on. Both rules are scoped to the body class the print path sets while the
+   dialog is open, so a plain Ctrl+P on the page still prints the page rather
+   than an empty sheet.
+   ========================================================================== */
+.print-sheet { display: none; }
+
+@media print {
+    body.is-printing-report > *:not(.print-sheet) { display: none !important; }
+    body.is-printing-report > .print-sheet { display: block; }
+
+    @page { margin: 14mm; }
+
+    body.is-printing-report .print-sheet {
+        color: #111;
+        background: #fff;
+        font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+        font-size: 10pt;
+    }
+    /* The company's own head, at the top of every sheet: its mark and its words, so the
+       page an administrator signs and the page a worker hands in both say whose payroll
+       they are. A rule under it, because the title below is the *report's* heading and
+       the two must not read as one paragraph. */
+    body.is-printing-report .print-sheet-brand {
+        display: flex;
+        align-items: center;
+        gap: 8mm;
+        padding-bottom: 4mm;
+        margin-bottom: 5mm;
+        border-bottom: 1px solid #ddd;
+    }
+    /* A fixed box the mark is fitted into rather than a size of its own: a configured
+       logo is whatever shape the company uploaded (a wide wordmark, a square seal), and
+       the header is a band whose height the report's own layout depends on. ``contain``
+       keeps the aspect ratio; the box keeps the row. */
+    body.is-printing-report .print-sheet-mark {
+        width: 34mm;
+        height: 18mm;
+        object-fit: contain;
+        object-position: left center;
+    }
+    body.is-printing-report .print-sheet-company { font-size: 14pt; font-weight: 700; margin: 0; }
+    body.is-printing-report .print-sheet-sub { font-size: 9pt; margin: 1px 0 0; }
+    body.is-printing-report .print-sheet-tagline { font-size: 8pt; letter-spacing: .06em; margin: 2px 0 0; }
+    body.is-printing-report .print-sheet-title { font-size: 16pt; font-weight: 700; margin: 0 0 4px; }
+    body.is-printing-report .print-sheet-meta { font-size: 10pt; margin: 0 0 14px; }
+    body.is-printing-report .print-sheet-table { width: 100%; border-collapse: collapse; }
+    body.is-printing-report .print-sheet-table th {
+        text-align: start;
+        border-bottom: 1.5px solid #111;
+        padding: 4px 6px;
+    }
+    body.is-printing-report .print-sheet-table td {
+        border-bottom: 0.5px solid #bbb;
+        padding: 4px 6px;
+        vertical-align: top;
+    }
+
+    /* A tone is a colour on screen - amber for hours nobody signed off, grey for
+       the faint cells. On paper there is no colour to read it from, so the words
+       inside the badge have to carry the meaning on their own. */
+    body.is-printing-report .ui-badge,
+    body.is-printing-report .ui-tone-warn,
+    body.is-printing-report .ui-tone-muted,
+    body.is-printing-report .ui-tone-faint { color: #111; background: transparent; }
+    body.is-printing-report .print-sheet-totals { font-size: 11pt; font-weight: 700; margin: 12px 0 0; }
+    body.is-printing-report .print-sheet-empty { font-size: 11pt; margin: 12px 0; }
+    body.is-printing-report .print-sheet-note { font-size: 8.5pt; margin: 10px 0 0; max-width: 90ch; }
 }
 

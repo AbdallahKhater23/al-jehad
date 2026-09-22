@@ -89,16 +89,40 @@ except Exception as exc:  # pragma: no cover - exercised by the suite's import p
         signature at import: a stand-in that raised ``TypeError`` on ``Counter(name, doc,
         labels, registry=...)`` would not degrade, it would stop the application from starting -
         which is the failure mode this whole design exists to avoid.
+
+        ``record`` is the one extension over a silent object. The application's *write* path
+        works identically with and without the library - ``labels(...).inc()`` either counts
+        into the registry or arrives here - but the *read* path cannot: the real child object
+        carries the series' value, and this one has nowhere to put it. ``record`` receives the
+        label values (as keyword arguments, exactly as ``labels()`` was called) so a receiver
+        can key observations the way the real registry would - tests use a dict keyed like the
+        counter's label values. Without it a test can only assert that the application did not
+        crash, not that a request was refused *for a stated reason*.
         """
 
+        #: Set by whoever needs the degraded-mode read path (the test suite). Kept on the
+        #: class, not the instance, because ``labels()`` returns ``self`` - there is one
+        #: object per metric, not one per series. Receives the label values of the series
+        #: being incremented; may be ``None`` when nobody is reading.
+        record: Any = None
+
         def __init__(self, *args, **kwargs):
-            pass
+            self._label_kwargs: dict = {}
 
         def labels(self, *args, **kwargs):
+            if kwargs:
+                self._label_kwargs = dict(kwargs)
+            elif args:
+                # Positional form: ``labels("value1", "value2")``. The label names live on
+                # the real class; the stand-in does not have them, so the receiver sees only
+                # the values. ``count_netguard_refusal`` uses keywords, which is the form the
+                # degraded read path needs.
+                self._label_kwargs = {"values": tuple(args)}
             return self
 
         def inc(self, *args, **kwargs):
-            pass
+            if Counter.record is not None:
+                Counter.record(**self._label_kwargs)
 
     class Gauge(Counter):  # type: ignore[no-redef]
         def set(self, *args, **kwargs):
@@ -152,7 +176,12 @@ INFERENCE_BUCKETS = (0.01, 0.025, 0.05, 0.1, 0.25, 0.4, 0.6, 0.8, 1.0, 1.5, 2.0,
 QUEUE_BUCKETS = (0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0)
 #: A cosine distance over 4096 floats is a dot product: microseconds, or something is wrong.
 COSINE_BUCKETS = (0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.05, 0.1)
-#: The score itself, bucketed around the two decision thresholds (0.40 approve, 0.60 review).
+#: The score itself, on a **fixed** grid that brackets every decision line this application
+#: has used or could use: 0.35/0.40/0.45/0.50/0.55/0.60 cover both pipelines' bands
+#: (``face_detector.MatchBand``). Fixed on purpose. The bands are now derived per pipeline and
+#: will move again at the next crop change, and this histogram is how that change is *seen* -
+#: a grid that moved with the lines would silently rescale the very distribution being
+#: watched, and the before/after comparison would be gone at the moment it mattered most.
 #: A histogram, not a gauge: the *distribution* is what tells an operator the model or the
 #: hardware changed, and the bucket boundaries make "how many landed in the review band"
 #: answerable in one PromQL expression.
@@ -216,8 +245,10 @@ COSINE_SECONDS = _histogram(
 )
 MATCH_SCORE = _histogram(
     "attendance_face_match_score",
-    "Cosine distance between the stored reference and the live capture (bucketed at the "
-    "decision thresholds: <= 0.40 approves, <= 0.60 routes to review, above that is refused).",
+    "Cosine distance between the stored reference and the live capture, on a fixed grid that "
+    "brackets both pipelines' decision lines. The lines themselves are derived per pipeline "
+    "from measured genuine/impostor boundaries - see face_detector.MatchBand, and "
+    "/api/v1/readiness for the band in force.",
     (),
     SCORE_BUCKETS,
 )

@@ -20,8 +20,11 @@ that survives review:
    422 about the frame, and the card stays up with the server's sentence on it;
 2. two quick taps on the clock button opened two camera overlays - two live streams,
    two shutters, and a second frame queued as a second punch;
-3. a rejected site or admin form did nothing at all: the promise rejected into the
-   console, so "Site name already exists." never reached the admin.
+3. a rejected form did nothing at all: the promise rejected into the console, so "Site
+   name already exists." never reached the admin. Asserted against the site form and the
+   Credentials tab's account-creation form - the second used to be an administrator form
+   on the Admin tab, which is gone: accounts, administrators included, are created in one
+   place now.
 
 Node is optional; without it these skip rather than fail.
 """
@@ -53,43 +56,18 @@ function toasts(env) {
     return env.evaluate("(document.getElementById('toastRoot').__children || []).map((el) => el.textContent)");
 }
 
-// The capture step needs things a stub DOM does not have: a drawable video and a
-// canvas that can produce a JPEG. Everything the assertions are about - which fields
-// the punch carries, and what a refused punch does to the open overlay - is the page's
-// own code, not these three stubs.
+// Two overrides, because this suite is about what the page does *with* a punch rather than
+// about taking one: it calls ``submitAttendance`` directly, so it never needs a video with a
+// frame on it. A suite about the capture itself uses the camera the harness installs instead
+// (see ``test_frontend_punch_capture``).
+//
+// The DOM patch this function used to carry - a canvas that could make a JPEG, an element whose
+// ``remove()`` detached it, a ``getElementById`` that found an appended node - is gone: the
+// harness models those now, which is what made the camera card coming down assertable at all.
 function stubCamera(env) {
     env.evaluate("Location.current = async () => '30.05,31.23'");
     env.evaluate("Object.defineProperty(Camera, 'isSupported', { value: true, configurable: true })");
     env.evaluate("Camera.start = async () => ({ getTracks: () => [] })");
-    // Three things the stub DOM lacks and the flow needs: a canvas that can make a JPEG,
-    // an element whose ``remove()`` actually detaches it, and a ``getElementById`` that
-    // finds an element the page has already appended.
-    //
-    // The last one is what makes "the camera came down" observable at all: the stub used
-    // to hand out a fresh object per id, so the page's ``getElementById('cameraOverlay')``
-    // was never the node it had appended and ``remove()`` was a no-op on a second object.
-    // A real browser resolves the id to that node, which is the behaviour under test, and
-    // the same gap made the double-tap count meaningless (two overlays were counted from
-    // the body while the page held two different objects).
-    env.evaluate(`(function () {
-        const make = document.createElement;
-        const find = document.getElementById;
-        document.createElement = function (tag) {
-            const el = make.call(document, tag);
-            if (tag === 'canvas') {
-                el.getContext = () => ({ drawImage() {} });
-                el.toBlob = (done) => done(new Blob(['frame'], { type: 'image/jpeg' }));
-            }
-            el.remove = function () {
-                const at = document.body.__children.indexOf(el);
-                if (at >= 0) document.body.__children.splice(at, 1);
-            };
-            return el;
-        };
-        document.getElementById = function (id) {
-            return (document.body.__children || []).find((el) => el.id === id) || find.call(document, id);
-        };
-    })()`);
 
     return env;
 }
@@ -226,23 +204,107 @@ function overlays(env) {
     results.site_form = { unhandled: rejected, toasts: toasts(env) };
 }
 
-// 3b. and a rejected admin form does too
+// 3b. and a rejected account-creation form does too. The form this used to drive lived on the
+// Admin tab and is gone - accounts, administrators included, are created from the Credentials
+// tab - so the same property is asserted against the screen that took the job over: the server
+// says no, the reason reaches the administrator, nothing rejects into the console.
 {
     const env = envWithSession('head_admin');
-    env.setResponder((url) => (url.indexOf('/admin/admins/add') >= 0
-        ? { status: 400, body: { detail: 'Admin ID must be in range 1000-4999.' } }
-        : { status: 200, body: [] }));
-    await env.evaluate("UI_MODULES.renderAdminManagement(document.getElementById('adminContent'))");
-    env.evaluate("document.getElementById('adminId').value = '5000'");
-    env.evaluate("document.getElementById('adminName').value = 'Duplicate'");
-    env.evaluate("document.getElementById('adminPass').value = 'Duplicate-Pass-123'");
+    env.setResponder((url) => (url.indexOf('/admin/users/create') >= 0
+        ? { status: 409, body: { detail: 'User ID already exists.' } }
+        : { status: 200, body: url.indexOf('/admin/users') >= 0 ? [] : {} }));
+    await env.evaluate("UI.renderAdminTab('Credentials')");
+    await env.evaluate("UI_MODULES.openCredentialsMode('create')");
+    env.evaluate("document.getElementById('credentialsNewId').value = '1'");
+    env.evaluate("document.getElementById('credentialsNewName').value = 'Duplicate'");
     let rejected = null;
     try {
-        await env.evaluate("document.getElementById('addAdminForm').onsubmit({ preventDefault() {} })");
+        await env.evaluate("UI_MODULES.createCredentialsAccount()");
     } catch (err) {
         rejected = err.message;
     }
-    results.admin_form = { unhandled: rejected, toasts: toasts(env) };
+    results.create_form = { unhandled: rejected, toasts: toasts(env) };
+}
+
+// 1e. a short clock-out is refused as a *question*: the card stays up, two buttons appear
+// over it, and nothing is sent until one of them is pressed
+{
+    const env = envWithSession();
+    stubCamera(env);
+    const punches = [];
+    env.setResponder((url, init) => {
+        if (url.indexOf('/attendance/verify') >= 0) {
+            punches.push(Array.from(init.body.keys()));
+            return { status: 409, body: { detail: {
+                error_code: 'confirm_early_checkout',
+                message: 'You have worked 7.20h of the 8.00h paid day.',
+                paid_hours: 7.2, regular_hours: 8.0, short_hours: 0.8
+            } } };
+        }
+        return { status: 200, body: {} };
+    });
+    await env.evaluate("UI.openCamera('Clock Out', '30.05,31.23')");
+    env.evaluate("document.getElementById('attendanceVideo').videoWidth = 640");
+    // Deliberately not awaited yet: this promise does not settle until the question is
+    // answered, so awaiting it here would deadlock against the answer below.
+    const pending = env.evaluate("UI.submitAttendance('Clock Out', '30.05,31.23')");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const modal = env.evaluate("document.getElementById('modalRoot').innerHTML");
+    results.early_question = {
+        punches: punches.length,
+        first_fields: punches[0] || [],
+        has_flag_on_first: (punches[0] || []).indexOf('confirm_early_checkout') >= 0,
+        over_camera: modal.indexOf('is-over-camera') >= 0,
+        says_paid: modal.indexOf('7.20') >= 0,
+        says_day: modal.indexOf('8.00') >= 0,
+        buttons: env.evaluate(
+            "['confirmEarlyOut', 'cancelEarlyOut'].filter((id) => !!document.getElementById(id).__handlers.click).length"
+        ),
+        camera_open_flag: env.evaluate('!!UI._cameraOpen')
+    };
+
+    env.evaluate("document.getElementById('cancelEarlyOut').__handlers.click()");
+    await pending;
+    results.early_cancelled = {
+        punches: punches.length,
+        modal_cleared: env.evaluate("document.getElementById('modalRoot').innerHTML") === '',
+        camera_open_flag: env.evaluate('!!UI._cameraOpen'),
+        shutter_live: env.evaluate("document.getElementById('captureBtn').disabled === false")
+    };
+}
+
+// 1f. confirming repeats the very same punch, carrying the flag the server asked for
+{
+    const env = envWithSession();
+    stubCamera(env);
+    const punches = [];
+    env.setResponder((url, init) => {
+        if (url.indexOf('/attendance/verify') >= 0) {
+            punches.push(Array.from(init.body.keys()));
+            if (punches.length === 1) {
+                return { status: 409, body: { detail: {
+                    error_code: 'confirm_early_checkout', message: 'short',
+                    paid_hours: 6.5, regular_hours: 8.0, short_hours: 1.5
+                } } };
+            }
+            return { status: 200, body: { message: 'Clocked Out of Downtown Tower A.' } };
+        }
+        return { status: 200, body: {} };
+    });
+    await env.evaluate("UI.openCamera('Clock Out', '30.05,31.23')");
+    env.evaluate("document.getElementById('attendanceVideo').videoWidth = 640");
+    const pending = env.evaluate("UI.submitAttendance('Clock Out', '30.05,31.23')");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    env.evaluate("document.getElementById('confirmEarlyOut').__handlers.click()");
+    await pending;
+    results.early_confirmed = {
+        punches: punches.length,
+        second_fields: punches[1] || [],
+        has_flag: (punches[1] || []).indexOf('confirm_early_checkout') >= 0,
+        modal_cleared: env.evaluate("document.getElementById('modalRoot').innerHTML") === '',
+        camera_open_flag: env.evaluate('!!UI._cameraOpen')
+    };
 }
 """
 
@@ -319,7 +381,37 @@ def test_a_rejected_site_form_tells_the_admin(results):
     assert outcome["toasts"] == ["Site name already exists."]
 
 
-def test_a_rejected_admin_form_tells_the_admin(results):
-    outcome = results["admin_form"]
-    assert outcome["unhandled"] is None
-    assert outcome["toasts"] == ["Admin ID must be in range 1000-4999."]
+def test_a_rejected_create_form_tells_the_admin(results):
+    outcome = results["create_form"]
+    assert outcome["unhandled"] is None, "the handler must not reject into the console"
+    assert outcome["toasts"] == ["User ID already exists."]
+
+
+def test_a_short_clock_out_asks_before_it_records(results):
+    """The refusal is a question: the card stays up, with two buttons and the server's numbers."""
+    outcome = results["early_question"]
+    assert outcome["punches"] == 1, "only the first attempt is sent until the question is answered"
+    assert outcome["has_flag_on_first"] is False, "the phone must not pre-answer the question"
+    assert outcome["over_camera"], "asked over the open camera, not hidden behind it"
+    assert outcome["says_paid"] and outcome["says_day"], (
+        "the sentence has to carry both the hours that will be recorded and the full day"
+    )
+    assert outcome["buttons"] == 2, "confirm and cancel, and nothing else"
+    assert outcome["camera_open_flag"] is True, "the worker is still holding the phone up"
+
+
+def test_cancelling_the_early_clock_out_sends_nothing_and_keeps_the_camera(results):
+    outcome = results["early_cancelled"]
+    assert outcome["punches"] == 1, "a cancel must not record a second punch"
+    assert outcome["modal_cleared"] is True
+    assert outcome["camera_open_flag"] is True
+    assert outcome["shutter_live"] is True, "the worker can take the selfie again, or just leave"
+
+
+def test_confirming_repeats_the_punch_with_the_flag(results):
+    outcome = results["early_confirmed"]
+    assert outcome["punches"] == 2, "the answer is the same tap a second time"
+    assert outcome["has_flag"], (
+        f"the repeat must carry confirm_early_checkout, got {outcome['second_fields']}"
+    )
+    assert outcome["modal_cleared"] is True
