@@ -5,7 +5,6 @@
     "dockerfilePath": "Dockerfile"
   },
   "deploy": {
-    "startCommand": "python backend/serve.py --tunnel",
     "healthcheckPath": "/api/v1/status",
     "healthcheckTimeout": 300,
     "restartPolicyType": "ON_FAILURE",

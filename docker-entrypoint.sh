@@ -31,5 +31,14 @@ chown -R "$RUN_AS_USER:$RUN_AS_USER" "$STATE_ROOT"
 # re-exec as the unprivileged user; exec so PID 1 stays the server and receives
 # the platform's signals (TERM -> graceful shutdown) instead of a wrapper that
 # would swallow them.
+#
+# With arguments, exec THOSE (they are the command the platform asked for - Railway
+# appends its startCommand to the image's ENTRYPOINT); with none, run the server.
+# Appending the default AFTER "$@" is what produced a 502 on one deploy: serve.py
+# received the platform's whole command line again as positional arguments and
+# exited on the unrecognized arguments, and the container crash-looped.
+if [ "$#" -gt 0 ]; then
+    exec setpriv --reuid="$RUN_AS_USER" --regid="$RUN_AS_USER" --clear-groups "$@"
+fi
 exec setpriv --reuid="$RUN_AS_USER" --regid="$RUN_AS_USER" --clear-groups \
-    python backend/serve.py --tunnel "$@"
+    python backend/serve.py --tunnel
