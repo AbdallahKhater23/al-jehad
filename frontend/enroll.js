@@ -8,7 +8,13 @@
 (function () {
     "use strict";
 
-    var API = "/api/v1";
+    //: Base URLs are owned by ``api-config.js``, loaded by the page before this file:
+    //: production Worker origin, the direct-Railway diagnostics origin, and the normaliser.
+    //: Endpoint paths here carry no ``/api/v1`` prefix - this constant owns it, exactly
+    //: once, so a request can never become ``/api/v1/api/v1/...``.
+    var API = (typeof resolveAPIBase === "function")
+        ? resolveAPIBase()
+        : (location.origin + "/api/v1");
     var token = decodeURIComponent(location.pathname.split("/").filter(Boolean).pop() || "");
     var minPasswordLength = 8;
     var isRegister = false;

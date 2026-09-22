@@ -319,11 +319,14 @@ const OFFLINE_DB = {
 const OfflineHttp = {
     baseURL() {
         if (typeof API !== 'undefined' && API.baseURL) return API.baseURL;
+        // ``api-config.js`` owns the URLs and the normaliser; this fallback is for a
+        // session where the app (and therefore ``API``) never arrived but the queue did.
+        if (typeof resolveAPIBase === 'function') return resolveAPIBase();
         return window.location.origin + '/api/v1';
     },
 
     async post(path, body, token) {
-        const headers = { 'Content-Type': 'application/json' };
+        const headers = { 'Content-Type': 'application/json', Accept: 'application/json' };
         if (token) headers['Authorization'] = `Bearer ${token}`;
         if (typeof API !== 'undefined' && API.isTunnelHost && API.isTunnelHost()) {
             headers['ngrok-skip-browser-warning'] = 'true';

@@ -73,6 +73,7 @@ FRONTEND = PROJECT_ROOT / "frontend"
 #: harness's own fallback cannot disagree about what "the shipped files" are - the check names
 #: these files when one of them will not load.
 DEFAULT_SCRIPTS: Final = (
+    "api-config.js",
     "i18n.js",
     "i18n.ar.js",
     "i18n.hi.js",
