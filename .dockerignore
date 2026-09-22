@@ -14,7 +14,13 @@ backend/venv/
 # Test-only: the suite and its browser stack never run on the host.
 backend/tests/
 backend/requirements-dev.txt
-backend/requirements-optional.txt
+
+# ``backend/requirements-optional.txt`` DOES travel, and that is a decision rather than an
+# oversight. Each entry in it is a feature that degrades gracefully when the package is
+# missing - which is why the file is not ``requirements.txt`` - but "degrades" is not "works":
+# without ``pywebpush`` the deployment cannot reach a worker whose app is closed, and its own
+# self-test says so (``worker_push_delivery``). The image therefore installs the extras it
+# wants (see the Dockerfile); what stays out of the build context is the test stack above.
 
 # Local state and biometric data — never in an image layer.
 times.db

@@ -22,6 +22,18 @@
 
 set -e
 
+# The listen port is the image's own, not the platform's.
+#
+# WHY: Railway injects a generated PORT (this deploy got 8080) while its edge routes
+# the public domain to the port the Dockerfile EXPOSEs (8000). The app faithfully
+# listened on 8080, the edge knocked on 8000, and the result was a 502 with a perfectly
+# healthy self-test - the exact failure mode the port can never settle from inside the
+# app, because the app cannot know which door the edge chose. The container must be
+# self-consistent, so the listen port is pinned to the EXPOSEd port. APP_PORT moves
+# both together (and overrides any injected PORT) when a deployment needs another.
+APP_PORT="${APP_PORT:-8000}"
+export PORT="$APP_PORT"
+
 STATE_ROOT="${STATE_ROOT:-/data}"
 RUN_AS_USER="${RUN_AS_USER:-appuser}"
 
@@ -41,4 +53,4 @@ if [ "$#" -gt 0 ]; then
     exec setpriv --reuid="$RUN_AS_USER" --regid="$RUN_AS_USER" --clear-groups "$@"
 fi
 exec setpriv --reuid="$RUN_AS_USER" --regid="$RUN_AS_USER" --clear-groups \
-    python backend/serve.py --tunnel
+    python backend/serve.py --tunnel --port "$APP_PORT"

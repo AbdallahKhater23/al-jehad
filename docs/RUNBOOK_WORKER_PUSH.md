@@ -37,12 +37,21 @@ they asked for.
    is why a desktop test at the default origin works.)
 2. **The optional sender package.** `pywebpush` is deliberately not a hard requirement - it is
    listed in `backend/requirements-optional.txt`, and a deployment that does not install it
-   starts normally with `transport_available()` naming it as the reason:
+   starts normally with `transport_available()` naming it as the reason.
+
+   **On a host built from this repository there is nothing to do**: the `Dockerfile` installs that
+   file, because a service that advertises worker push has to be able to send. The install is only
+   yours to run on a machine that supplies its own dependencies - a laptop, or an image of your
+   own:
 
    ```bash
    cd backend
    pip install -r requirements-optional.txt
    ```
+
+   The two halves are worth keeping apart when something is not working: the *package* is a build
+   decision, the VAPID key pair below is an environment setting, and `transport_available()` names
+   whichever one is missing rather than saying "push is down" about both.
 
 3. **A browser that supports service workers**, per the phone in question. The card reports
    `pushSwUnsupported` when it does not, and the inbox still works.

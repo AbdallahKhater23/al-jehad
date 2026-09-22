@@ -45,6 +45,7 @@ So this suite pins four things:
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import datetime, timedelta
 
@@ -52,6 +53,7 @@ import pytest
 import harness
 from harness import ADMIN, DB_PATH, MOALLEM, bearer, db_scalar
 
+import database
 import overtime
 import shift_hours
 
@@ -413,3 +415,60 @@ def test_readiness_reports_the_deferral_and_the_unreachable_alert(client):
     _set_rules(client, overtime_notify_hours=8.0)
     assert check_for("overtime_alert_reachable").ok is False
     assert check_for("overtime_close_deferred").ok is True
+
+
+# ---------------------------------------------------------------------------
+# 6. the reader itself
+# ---------------------------------------------------------------------------
+def test_the_rules_reader_owns_its_connection_the_way_the_database_hands_one_out(
+    client, caplog, monkeypatch
+):
+    """``overtime.rules()`` with no connection is the startup path, and it used to fail there, quietly.
+
+    ``database.db()`` is a **context manager**, not a connection: it opens, commits or rolls back and
+    closes. The reader treated what it returned as a connection and closed it in a ``finally``, which
+    raised ``AttributeError: '_GeneratorContextManager' object has no attribute 'close'``. Its only
+    no-connection caller is ``start_watcher``, inside the ``except`` that exists so the timer starts
+    regardless - so every startup logged one warning line and nothing else, and the watcher went on to
+    announce the *shipped* precedence while the deployment's settings said something else. A rule
+    reader that cannot read the rules is the one failure in this module that must not be quiet.
+
+    Asserted from both ends, because either half alone would pass over the bug: the reader returns the
+    **stored** row rather than the shipped default, and the startup announcement carries the stored
+    number rather than the shipped one.
+    """
+    _set_rules(client, overtime_notify_hours=7.5)  # deliberately not the shipped 8.1
+
+    # 1. the reader, standing on its own - this is the call that raised
+    stored = overtime.rules()
+    assert stored["overtime_notify_hours"] == pytest.approx(7.5), "the stored row wins"
+    assert stored["regular_hours"] == pytest.approx(8.0), (
+        "columns the row leaves alone keep the shipped default"
+    )
+
+    # 2. a connection the caller owns stays the caller's: both scans read the rules in the middle of
+    #    their own transaction, and a reader that closed their handle would end it under them.
+    with database.db() as conn:
+        assert overtime.rules(conn)["overtime_notify_hours"] == pytest.approx(7.5)
+        conn.execute("SELECT 1 FROM shift_rules").fetchone()
+
+    # 3. the startup announcement, which is where the warning appeared on every boot. The scans are
+    #    stubbed out: the pass is another suite's subject, and a real sweep here would make this test
+    #    about the clock rather than about the reader.
+    monkeypatch.setattr(overtime, "scan_auto_close", lambda: {"closed": 0, "deferred": False})
+    monkeypatch.setattr(overtime, "scan_overtime", lambda: {"notified": 0})
+    caplog.set_level(logging.INFO, logger="attendance.overtime")
+    caplog.clear()
+    try:
+        assert overtime.start_watcher(interval=3600, enabled=True) is True
+    finally:
+        overtime.stop_watcher(timeout=10)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert not any("could not read the day-end rules" in message for message in messages), messages
+    assert any("7.5" in message for message in messages), (
+        "the watcher announces the deployment's stored numbers: " + repr(messages)
+    )
+    assert not any("8.1" in message for message in messages), (
+        "the shipped default leaked into the announcement: " + repr(messages)
+    )

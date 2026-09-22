@@ -42,8 +42,27 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # Dependencies first, so an application-only change does not re-download the wheels.
-COPY requirements.txt .python-version ./
-RUN python -m pip install --no-cache-dir -r requirements.txt
+#
+# TWO MANIFESTS, AND WHY THE SECOND ONE IS HERE
+# --------------------------------------------
+# requirements.txt is the runtime freeze: what the application imports to do its job.
+# backend/requirements-optional.txt is the other kind of dependency - each entry is a feature
+# that *degrades* when the package is missing, which is exactly why none of them is in the
+# runtime freeze. But a deployment does not merely have to boot; it has to do what it says it
+# does, and this one advertises worker push. The VAPID key pair that turns Web Push on is an
+# environment setting an operator can supply in a minute, and the *package* is not - without
+# ``pywebpush`` in this image, ``push.transport_available()`` answers "the optional pywebpush
+# package is not installed" however correct VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY are, the
+# startup self-test reports ``worker_push_delivery`` as a degraded check, and a phone that is
+# closed never rings. Installing the list here is how the image opts in to the extras; a host
+# that wants a leaner image deletes this line and loses the features, not the boot (that is
+# what "degrades gracefully" is for).
+#
+# It also brings ``py-vapid``, which is what ``python -m push --generate-keys``
+# (docs/RUNBOOK_WORKER_PUSH.md) generates the key pair with - so the same image that sends a
+# push can produce the credentials for it.
+COPY requirements.txt backend/requirements-optional.txt .python-version ./
+RUN python -m pip install --no-cache-dir -r requirements.txt -r requirements-optional.txt
 
 # The application: the backend module tree (including backend/models/, where the YuNet
 # detector ships with the code and facenet128.onnx — 87 MB — must be present, because

@@ -212,6 +212,50 @@ def test_the_dockerfile_carries_what_the_manifest_cannot_name():
     )
 
 
+def test_the_image_installs_the_optional_extras_this_deployment_advertises():
+    """A deployment that cannot send is one whose push advisory never clears.
+
+    Web Push needs two things that live in different places: a VAPID key pair, which is an
+    environment setting an operator supplies in a minute, and ``pywebpush``, which is a
+    package and therefore a *build* decision. The optional manifest holds the second one -
+    it is optional precisely because the application boots without it (``push`` imports it
+    inside a function and reports the absence as its own reason) - so an image that does not
+    install that file answers "the optional pywebpush package is not installed" however
+    correct ``VAPID_PUBLIC_KEY`` and ``VAPID_PRIVATE_KEY`` are, and the readiness gate raises
+    ``worker_push_delivery`` on a channel somebody has just finished configuring.
+
+    Both halves are asserted, because the failure is silent in both directions: an install
+    line pointing at a file the build context does not carry fails the *build*, and an
+    ignore line puts the file back on the wrong side of it while the install line still
+    reads correctly.
+    """
+    optional = PROJECT_ROOT / "backend" / "requirements-optional.txt"
+    assert "pywebpush" in optional.read_text(encoding="utf-8"), (
+        "the optional manifest is where the push extra is named; transport_available() quotes "
+        "pywebpush as the missing piece"
+    )
+
+    dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    installs = [line for line in dockerfile.splitlines() if "pip install" in line]
+    assert any("requirements-optional.txt" in line for line in installs), (
+        "the image must install the extras it advertises, or VAPID keys alone cannot make a "
+        "worker's phone ring"
+    )
+    assert any("COPY" in line and "requirements-optional.txt" in line for line in dockerfile.splitlines()), (
+        "pip install can only read a file the build context carried in"
+    )
+
+    ignored = [
+        line.strip()
+        for line in (PROJECT_ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+        if line.strip().split(" ")[0] == "backend/requirements-optional.txt"
+    ]
+    assert not ignored, (
+        f"{ignored} excludes the optional manifest from the build context while the Dockerfile "
+        "installs it: the image would ship without the extras and the push advisory would stay up"
+    )
+
+
 def test_the_healthcheck_path_is_a_route_that_answers_without_a_session(client):
     """Railway is not a user: a path that needs a token marks every deploy unhealthy."""
     path = json.loads(RAILWAY.read_text(encoding="utf-8"))["deploy"]["healthcheckPath"]
@@ -223,6 +267,29 @@ def test_the_healthcheck_path_is_a_route_that_answers_without_a_session(client):
 # ---------------------------------------------------------------------------
 # the port the host gives us
 # ---------------------------------------------------------------------------
+def test_the_exposed_port_and_the_pinned_listen_port_cannot_drift():
+    """The edge routes to the EXPOSEd port; the server must be listening on that port.
+
+    Railway injects a generated PORT (8080 on one deploy) while routing the public domain
+    to the port the Dockerfile EXPOSEs (8000). An app that listens on whichever PORT the
+    platform happens to inject is an app the edge can 502 while its own self-test reports
+    every check green - which is precisely what happened. The entrypoint pins the listen
+    port (APP_PORT, default 8000) to the EXPOSEd one, so the two numbers have to move
+    together, and this assertion is what notices when they stop.
+    """
+    dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    exposed = re.search(r"^EXPOSE\s+(\d+)", dockerfile, re.MULTILINE)
+    assert exposed, "the Dockerfile must EXPOSE the port the edge routes to"
+
+    entrypoint = (PROJECT_ROOT / "docker-entrypoint.sh").read_text(encoding="utf-8")
+    pinned = re.search(r"APP_PORT=\"?\$\{APP_PORT:-(\d+)\}", entrypoint)
+    assert pinned, "the entrypoint must pin the listen port (APP_PORT), not trust an injected PORT"
+    assert exposed.group(1) == pinned.group(1), (
+        f"the image EXPOSEs {exposed.group(1)} but the entrypoint listens on {pinned.group(1)}: "
+        "the edge would route to a port with nothing behind it - a 502 with a healthy app"
+    )
+
+
 def test_the_port_flag_defaults_to_the_host_s_port_and_stays_8000_locally(serve_module, monkeypatch):
     """One command on the laptop and on the host, with the port written down once."""
     monkeypatch.delenv("PORT", raising=False)
