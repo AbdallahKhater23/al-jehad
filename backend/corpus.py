@@ -1101,6 +1101,7 @@ def maybe_capture_punch(
     site: str | None = None,
     camera: str | None = None,
     pipeline: str | None = None,
+    gate: Any | None = None,
 ) -> str | None:
     """Capture a punch frame for calibration, if this deployment collects them. Never raises.
 
@@ -1112,6 +1113,10 @@ def maybe_capture_punch(
     in stored-image coordinates and reproduce exactly for anyone who opens that file later. That is worth
     one extra detection pass on an opt-in path: the alternative is landmarks in native coordinates that
     only mean the same thing if the reader reconstructs the same downscale.
+
+    It is judged by the same gate the camera puller uses, and a frame that gate *discards* is not stored
+    at all. A punch capture that arrived with no assessment would read as "assessed and fine" to every
+    downstream tool - the one frame source nobody looks at would be the one that never gets flagged.
     """
     if not getattr(settings, "calibration_capture_enabled", False):
         return None
@@ -1126,6 +1131,23 @@ def maybe_capture_punch(
             log.debug("corpus: skipping a punch capture with %d faces", len(found))
             return None
         faced = found[0]
+        box = faced.get("facial_area") and _box_of(faced["facial_area"])
+        # The same gate the camera puller uses, applied to a live punch - imported here rather than at
+        # module level because ``corpus_ingest`` is written on top of this module, and a live capture is
+        # the *only* thing here that needs the policy. Without it a punch capture would arrive with no
+        # assessment at all, which reads as "assessed and fine" to everybody downstream: the one frame
+        # source that never gets looked at would be the one that never gets flagged.
+        import corpus_ingest
+
+        quality = corpus_ingest.assess(
+            box=box,
+            score=faced.get("confidence"),
+            landmarks=faced["landmarks"],
+            gate=gate,
+        )
+        if quality.discard:
+            log.debug("corpus: skipping a punch capture the gate discarded (%s)", quality.reason)
+            return None
         identity = str(worker_id) if worker_id and verdict in LABEL_CARRYING_VERDICTS else None
         record = store(
             prepared,
@@ -1139,8 +1161,10 @@ def maybe_capture_punch(
             ),
             identity=identity,
             landmarks=faced["landmarks"],
-            box=faced.get("facial_area") and _box_of(faced["facial_area"]),
+            box=box,
             score=faced.get("confidence"),
+            quality=quality.as_dict(),
+            landmark_source=face_detector.DETECTOR_NAME,
             source=SOURCE_PUNCH,
             consent=LIVE_CONSENT,
             actor="system:punch",

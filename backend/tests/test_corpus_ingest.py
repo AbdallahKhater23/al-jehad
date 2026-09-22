@@ -155,6 +155,27 @@ def test_pose_is_scale_and_translation_invariant():
         assert large[axis] == pytest.approx(reference[axis], abs=1e-6)
 
 
+def test_roll_is_folded_because_the_threshold_is_about_uprightness_not_the_signed_angle():
+    """A head past vertical folds to the small number it is, instead of a 170-degree roll.
+
+    ``atan2`` of the eye line is a *signed* angle in (-180, 180]; the gate's threshold is about how far
+    from upright a head is, which is the folded quantity. Two consequences are pinned here, and both are
+    the kind of thing that only shows up on a real gate: a face rolled 170 degrees is a 10-degree
+    deviation (not a 170-degree one, which would be a spurious discard), while one rolled 95 degrees is a
+    85-degree deviation and *is* discarded. Five landmarks cannot tell a face from the same five points
+    rotated half a turn - the detector's own ordering convention is what fails there, and it is why this
+    fold exists to make the number mean what the threshold says.
+    """
+    past_vertical, _, _ = corpus_ingest.pose_of(_face(roll=170.0))
+    assert abs(past_vertical) <= 15.0
+    assert corpus_ingest.assess(box=[0.0, 0.0, 96.0, 96.0], score=0.9, landmarks=_face(roll=170.0)).flags == []
+
+    near_vertical, _, _ = corpus_ingest.pose_of(_face(roll=95.0))
+    assert near_vertical == pytest.approx(-85.0, abs=1.0)
+    quality = corpus_ingest.assess(box=[0.0, 0.0, 96.0, 96.0], score=0.9, landmarks=_face(roll=95.0))
+    assert quality.discard is True and quality.reason == "extreme_roll"
+
+
 def test_a_face_too_small_for_a_pose_is_unmeasurable_rather_than_silently_zero():
     degenerate = np.array(
         [[10.0, 10.0], [10.0, 10.0], [11.0, 12.0], [10.0, 20.0], [14.0, 20.0]], dtype=np.float32
@@ -255,10 +276,19 @@ def test_a_folder_that_is_not_there_is_refused(tmp_path):
         list(corpus_ingest.DirectorySource(tmp_path / "nope").frames())
 
 
-def test_a_camera_thats_not_there_is_refused_with_the_thing_to_check():
+def test_a_camera_thats_not_there_is_refused_with_the_thing_to_check(monkeypatch):
+    """Deterministic: the capture object reports itself closed, so no network is involved.
+
+    The alternative - an unroutable RTSP URL - makes this suite depend on how long a particular build of
+    FFMPEG takes to give up, which is a test that fails on somebody else's machine for a reason that has
+    nothing to do with this code.
+    """
+    _install_capture(monkeypatch, _FakeCapture(opens=False))
     with pytest.raises(corpus_ingest.IngestError) as caught:
-        list(corpus_ingest.CameraSource("rtsp://10.255.255.1/gate", open_timeout_ms=50).frames())
-    assert "could not open" in str(caught.value) and "RTSP" in str(caught.value)
+        list(corpus_ingest.CameraSource("rtsp://admin:hunter2@10.0.0.9/gate").frames())
+    message = str(caught.value)
+    assert "could not open" in message and "RTSP" in message
+    assert "hunter2" not in message, "a failure message must not print the stream's credentials"
 
 
 class _FakeCapture:
@@ -297,16 +327,14 @@ def _install_capture(monkeypatch, fake: _FakeCapture) -> None:
 
 
 def test_a_camera_source_honours_the_limit_the_sampling_and_releases_the_handle(monkeypatch):
-    import cv2
-
     fake = _FakeCapture(frames=10)
     _install_capture(monkeypatch, fake)
     source = corpus_ingest.CameraSource(0, limit=2, every=3)
     frames = list(source.frames())
     assert len(frames) == 2
     assert [frame.name for frame in frames] == ["webcam:0#1", "webcam:0#2"]
+    assert fake.reads == 4, "every=3 samples the stream rather than taking everything"
     assert fake.released is True, "the handle is released even when the pull ends early"
-    assert cv2 is not None
 
 
 def test_a_camera_that_goes_silent_ends_the_pull_and_says_so(monkeypatch):

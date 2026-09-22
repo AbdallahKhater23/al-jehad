@@ -1,0 +1,8 @@
+# Line endings that survive a Windows checkout into the container.
+#
+# A shell script written on Windows gets CRLF if git's autocrlf converts it - and
+# /bin/sh in the container then fails with ``no such file or directory`` for a file
+# that clearly exists: it is the \r it cannot find. The entrypoint is the file this
+# kills, so its endings are pinned.
+docker-entrypoint.sh text eol=lf
+*.sh text eol=lf

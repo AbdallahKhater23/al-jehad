@@ -64,7 +64,18 @@ COPY frontend/ frontend/
 RUN mkdir -p /data/worker_photos /data/local_references /data/punch_frames /data/quick_link_photos \
  && useradd --system --uid 10001 --create-home appuser \
  && chown -R appuser:appuser /app /data
-USER appuser
+
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# The entrypoint starts as root ONLY to take ownership of the mounted volume back (a
+# platform volume arrives root-owned, and the mount erases the ownership this image
+# gave /data), then re-execs the server as appuser. The application never runs with
+# privileges; see docker-entrypoint.sh. USER stays root here because chown needs it -
+# dropping it at the image level is what produced the Permission denied on the first
+# deploy, and dropping it inside the entrypoint is what fixes it without giving the
+# app process root.
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 
 # Where the app writes. ``config.py`` reads each of these from the environment by name;
 # pointing them into /data is the whole persistence story. On Railway: mount a volume
@@ -84,5 +95,3 @@ EXPOSE 8000
 # ``healthcheckPath``. Same route, same contract - it must answer 200 without a session.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${PORT:-8000}/api/v1/status" || exit 1
-
-CMD ["python", "backend/serve.py", "--tunnel"]
