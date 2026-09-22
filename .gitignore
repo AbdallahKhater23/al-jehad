@@ -8,9 +8,13 @@ backend/certs/
 # Place it at backend/models/minifasnet.onnx (see backend/models/README.md).
 backend/models/*.onnx
 backend/models/*.onnx.*
-# ...except the face detector. 232 KB, and the difference between a 10 ms and a 308 ms
-# detection on every punch, so it ships with the code instead of behind a deploy step.
+# ...except the face detector and the embedding engine. The YuNet detector (232 KB) is
+# the difference between a 10 ms and a 308 ms detection on every punch, and
+# facenet128.onnx (87 MB) is the embedding engine itself - the startup gate REFUSES to
+# serve without a band's model present, so either one missing from a Railway build is an
+# app that never boots. Both ship with the code instead of behind a deploy step.
 !backend/models/face_detection_yunet_2023mar.onnx
+!backend/models/facenet128.onnx
 times.db
 # SQLite sidecar files created by WAL mode while the server runs
 times.db-wal
@@ -25,7 +29,10 @@ quick_link_photos
 # test run that stored a frame left the checkout with hundreds of untracked JPEGs.
 punch_frames
 .vscode
-Dockerfile
+# The Dockerfile is the deployment artifact Railway builds from (railway.json names it);
+# ignoring the file that deploys the service is how the image and the repo drift apart.
+!Dockerfile
+!.dockerignore
 test_odoo.py
 backups/
 

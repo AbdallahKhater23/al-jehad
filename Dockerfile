@@ -1,0 +1,88 @@
+# syntax=docker/dockerfile:1
+#
+# Site Attendance — the image Railway builds and serves.
+#
+# WHY A DOCKERFILE (railway.json's builder is DOCKERFILE, not NIXPACKS)
+# ---------------------------------------------------------------------
+# Nixpacks guesses a build from the repository's shape; this file states it. The two
+# guesses that matter here are the ones Nixpacks cannot see from file names alone:
+#
+#  * opencv-python (the YuNet face detector, ``backend/face_detector.py``) is the
+#    non-headless wheel and links against libGL at import time. A slim image without
+#    the two system packages below imports cv2 as "libGL.so.1: cannot open shared
+#    object file" — which surfaces at *runtime*, after a green build, as an app that
+#    crash-loops on every deploy.
+#  * the state this app writes — the SQLite database and the four biometric/evidence
+#    directories (``config.py`` reads them from the environment, the way
+#    ``DATABASE_PATH`` works) — has to live under one mountable root, so a Railway
+#    volume at /data keeps payroll data across deploys instead of losing every punch
+#    to the next one.
+#
+# The interpreter tracks ``.python-version`` (3.12) and the manifest was frozen on
+# 3.12; ``backend/tests/test_deployment_manifest.py`` keeps the pair honest.
+
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+# System libraries the runtime manifest cannot name:
+#   libgl1, libglib2.0-0 — what ``import cv2`` dynamically loads (see above);
+#   curl                 — the container HEALTHCHECK probe (Railway uses its own
+#                          healthcheckPath and ignores this one; it is for local runs).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        libgl1 \
+        libglib2.0-0 \
+        curl \
+ && rm -rf /var/lib/apt/lists/*
+
+# Dependencies first, so an application-only change does not re-download the wheels.
+COPY requirements.txt .python-version ./
+RUN python -m pip install --no-cache-dir -r requirements.txt
+
+# The application: the backend module tree (including backend/models/, where the YuNet
+# detector ships with the code and facenet128.onnx — 87 MB — must be present, because
+# the startup gate refuses to serve without it), and the frontend it serves as static
+# files.
+COPY backend/ backend/
+COPY frontend/ frontend/
+
+# State root. The directories are created *here*, in the image, rather than left to the
+# app: ``serve.py`` deliberately refuses to create a missing database directory (a
+# silently-papered-over volume looks exactly like a mounted one until the redeploy that
+# takes every punch with it), so the image owning the mount point is what makes a
+# first boot without a volume work — and attaching a Railway volume at /data is what
+# makes the *second* boot keep the first one's data.
+#
+# Run as a non-root user: the container needs write access to exactly two trees
+# (/app for nothing at runtime, /data for all of it), not the filesystem.
+RUN mkdir -p /data/worker_photos /data/local_references /data/punch_frames /data/quick_link_photos \
+ && useradd --system --uid 10001 --create-home appuser \
+ && chown -R appuser:appuser /app /data
+USER appuser
+
+# Where the app writes. ``config.py`` reads each of these from the environment by name;
+# pointing them into /data is the whole persistence story. On Railway: mount a volume
+# at /data and every deploy keeps its database, enrolled faces and evidence frames.
+ENV DATABASE_PATH=/data/times.db \
+    WORKER_PHOTOS_DIR=/data/worker_photos \
+    LOCAL_REFS_DIR=/data/local_references \
+    PUNCH_FRAMES_DIR=/data/punch_frames \
+    QUICK_LINK_PHOTOS_DIR=/data/quick_link_photos
+
+# serve.py reads PORT (Railway injects it) and --tunnel means plain HTTP on this side:
+# the platform terminates TLS, and serving our self-signed certificate behind its proxy
+# is what breaks GPS and the camera on a worker's phone while the dashboard looks fine.
+EXPOSE 8000
+
+# For ``docker run`` / compose, not Railway: the platform has its own
+# ``healthcheckPath``. Same route, same contract - it must answer 200 without a session.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${PORT:-8000}/api/v1/status" || exit 1
+
+CMD ["python", "backend/serve.py", "--tunnel"]
