@@ -154,6 +154,23 @@ const Modal = {
 // Sending this header keeps fetch() calls returning JSON instead of that page.
 const TUNNEL_HOST_SUFFIXES = ['ngrok-free.dev', 'ngrok-free.app', 'ngrok.app', 'ngrok.io', 'ngrok.dev'];
 
+//: The base URLs are owned by ``api-config.js`` (loaded by the page before this file):
+//: production Worker origin, direct-Railway diagnostics origin, the normaliser and the
+//: resolution order all live there. This file only consumes them.
+const PRODUCTION_API_BASE_URL = (typeof API_BASE_URL !== 'undefined' && API_BASE_URL) || 'https://al-jehad1.abdallahtamet281.workers.dev/api/v1';
+const FALLBACK_API_BASE_URL = (typeof API_FALLBACK_BASE_URL !== 'undefined' && API_FALLBACK_BASE_URL) || 'https://al-jehad-production.up.railway.app/api/v1';
+const normalizeBaseURL = (typeof normalizeAPIBaseURL === 'function')
+    ? normalizeAPIBaseURL
+    : function (candidate) {   // same rule, kept for a page that loaded this file alone
+        let url = String(candidate || '').trim();
+        if (!url) return '';
+        url = url.replace(/\/+$/, '');
+        if (/(^|\/)api\/v\d+$/.test(url)) return url;
+        const cut = url.match(/^(https?:\/\/[^/]+)\/api\/v\d+(?=\/|$)/);
+        if (cut) return cut[0];
+        return url;
+    };
+
 //: Endpoints that check a credential sent in the *body* rather than the bearer token.
 //:
 //: A 401 from one of these is a complaint about that credential, not a dead session, and
@@ -176,10 +193,16 @@ const API = {
     // HTTP is what broke geolocation/camera on phones (see backend/serve.py),
     // and it would also be blocked as mixed content on an https:// tunnel.
     resolveBaseURL(loc = window.location) {
+        // Resolution lives in ``api-config.js`` (see its header for the order); this
+        // delegation keeps every caller of ``API.resolveBaseURL`` on the one rule.
+        if (typeof resolveAPIBase === 'function') return normalizeBaseURL(resolveAPIBase(loc));
+        // Fallback for a page that loaded this file alone: the same order, inline.
+        const fromWindow = (typeof API_BASE_URL !== 'undefined' && API_BASE_URL) ? API_BASE_URL : null;
+        if (fromWindow) return normalizeBaseURL(fromWindow);
         const override = localStorage.getItem('apiBaseURL');
-        if (override) return override.replace(/\/+$/, '');
+        if (override) return normalizeBaseURL(override);
         const { protocol, hostname, port, origin } = loc;
-        if (protocol === 'file:') return `http://${hostname || 'localhost'}:8000/api/v1`;
+        if (protocol === 'file:') return normalizeBaseURL(PRODUCTION_API_BASE_URL);
         // ``serve.py`` serves the page and the API from a single origin - on the default
         // port, on any ``--port``, on a LAN IP, and behind an HTTPS tunnel (ngrok,
         // Cloudflare, ...) - so the page's own origin is the answer, whatever the port.
@@ -187,11 +210,12 @@ const API = {
         // which made ``serve.py --port 8443`` call a server that was not there - or,
         // worse, a different one that happened to be on 8000: a second database, read
         // and written without a word in the UI.
-        if (!STATIC_DEV_SERVER_PORTS.has(port)) return `${origin}/api/v1`;
-        // A static dev server hosting the frontend folder on its own: the API really is
-        // on another origin. Anything else can set ``localStorage.apiBaseURL``, which is
+        if (!STATIC_DEV_SERVER_PORTS.has(port)) return normalizeBaseURL(`${origin}/api/v1`);
+        // A static dev server hosting the frontend folder on its own: the page is on a
+        // different origin from every API this deployment fronts, so point at the
+        // production Worker. Anything else can set ``localStorage.apiBaseURL``, which is
         // checked above.
-        return `${protocol}//${hostname}:8000/api/v1`;
+        return normalizeBaseURL(PRODUCTION_API_BASE_URL);
     },
     isTunnelHost(hostname = window.location.hostname) {
         const host = String(hostname || '').toLowerCase();
@@ -201,8 +225,17 @@ const API = {
         if (!this._base) this._base = this.resolveBaseURL();
         return this._base;
     },
+    /** The direct Railway origin, for diagnostics when the Worker is the suspect. */
+    get fallbackBaseURL() {
+        return normalizeBaseURL(FALLBACK_API_BASE_URL);
+    },
+    /** Route subsequent requests straight at Railway (diagnostics switch). */
+    useFallback() {
+        this._base = this.fallbackBaseURL;
+        return this._base;
+    },
     async request(endpoint, options = {}) {
-        const headers = { ...options.headers };
+        const headers = { Accept: 'application/json', ...options.headers };
         // Never send a placeholder: "Bearer dummy" is a signature failure, so the
         // server answers 401 "Invalid token" and every tap looks like a mystery
         // bug. A missing token is a broken session and is reported as one below.

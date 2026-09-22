@@ -51,6 +51,7 @@ SCRIPT_SRC = re.compile(r"""<script\b[^>]*\bsrc=["']([^"']+)["']""", re.IGNORECA
 #: document's own tags, so a script added back here fails this suite rather than appearing
 #: in every session's payload.
 SHIPPED = [
+    "api-config.js",
     "boot.js",
     "i18n.js",
     "frontendjavascript.js",
@@ -64,7 +65,7 @@ DEFERRED = ["admin_modules.js", "i18n.ar.js", "i18n.hi.js", "i18n.ur.js"]
 
 #: A worker's phone: the document's list, which is what the harness is given for the
 #: sessions below that must not have the console module in them.
-PHONE = ["i18n.js", "frontendjavascript.js", "offline_queue.js", "worker_modules.js"]
+PHONE = ["api-config.js", "i18n.js", "frontendjavascript.js", "offline_queue.js", "worker_modules.js"]
 
 #: The one place the three tables genuinely disagree, and not part of this change: the
 #: offline-queue and device-registration sentences were added in English only. A worker who
