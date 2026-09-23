@@ -217,17 +217,21 @@ def test_the_factory_builds_each_family_without_handing_it_another_familys_keywo
     assert "unknown detector kind" in str(unknown.value), unknown.value
 
 
-def test_the_factory_refuses_a_square_input_for_the_backend_that_has_no_such_mode(tmp_path):
-    """Refused by name rather than ignored: a fixed-shape engine profile is a real requirement.
+def test_the_square_flag_is_accepted_for_the_backend_that_is_always_square(tmp_path):
+    """The flag used to be refused for SCRFD; the backend now always pads to a square canvas.
 
-    Silently dropping the flag would hand an operator the aspect-fitted geometry while they believe
-    they are running the square input their TensorRT profile was built for - a model whose inputs
-    are not the shape it was designed around, and no error to notice.
+    The refusal existed because the request could not be honoured - SCRFD was aspect-fitted, so an
+    operator asking for the fixed-shape square input a TensorRT profile needs would have been
+    handed a different geometry with no error. SCRFD's published exports declare their head grids
+    as ``(input/stride)**2`` (the 10G file's statically), so a square canvas is the only geometry
+    whose cells can be decoded at all - the flag is now satisfied rather than rejected, and the
+    backend is reached instead of the argument check. Both spellings must survive: a caller that
+    passes it and a caller that does not get the same square input.
     """
-    with pytest.raises(DetectorError) as excinfo:
-        detector_640.build_detector(
-            "scrfd", str(tmp_path / "scrfd.onnx"), input_size=640, square=True
-        )
-    message = str(excinfo.value)
-    assert "no square-letterbox mode" in message, message
-    assert "YuNet" in message, message
+    missing = tmp_path / "scrfd.onnx"
+    for square in (True, False):
+        with pytest.raises(DetectorError) as excinfo:
+            detector_640.build_detector("scrfd", str(missing), input_size=640, square=square)
+        message = str(excinfo.value)
+        assert "SCRFD model not found" in message, (square, message)
+        assert "unexpected keyword argument" not in message, (square, message)

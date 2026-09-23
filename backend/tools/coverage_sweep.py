@@ -90,7 +90,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Iterator
 
 #: Run as a script, this file is ``sys.path[0]``. The application modules are importable only once
 #: the backend directory is on the path - the same preamble every tool here carries.
@@ -100,17 +100,23 @@ for _entry in (_TOOLS_DIR, _BACKEND_DIR):
     if _entry not in sys.path:
         sys.path.insert(0, _entry)
 
-from corpus_ingest import DetectorSpec, GateConfig, assess, as_bgr  # noqa: E402
+from corpus_ingest import DetectorSpec, Frame, GateConfig, assess, as_bgr  # noqa: E402
 from PIL import Image  # noqa: E402
 
 import corpus  # noqa: E402
 
 
-#: The file the SCRFD configuration looks for when nobody names one: the conventional export
-#: name, resolved *beside the live YuNet model* rather than at an absolute path - the detector
+#: The files the SCRFD configuration looks for when nobody names one: the conventional export
+#: names, resolved *beside the live YuNet model* rather than at an absolute path - the detector
 #: model path is already an operator-controlled location (``FACE_DETECTOR_MODEL_PATH``), and a
 #: second network belongs in the same place rather than in a second place to remember.
-SCRFD_MODEL_FILENAME: Final = "scrfd_10g_bnkps.onnx"
+#:
+#: Both are searched, in this order. The 2.5G head is first because this deployment is CPU-only and
+#: it is the smaller, faster network of the two (3.3 MB against 17 MB); the 10G head is the one the
+#: original runbook named, so a checkout that already holds it keeps working. Either file is
+#: measured under the same spec - the name in the report always says which one produced the
+#: numbers, so a sweep can never be read as a comparison of a file it did not run.
+SCRFD_MODEL_FILENAMES: Final = ("scrfd_2.5g_bnkps.onnx", "scrfd_10g_bnkps.onnx")
 
 #: What counts as "found" when a frame holds more than one face.
 #:
@@ -157,6 +163,75 @@ def spec_name(spec: DetectorSpec) -> str:
     return f"{spec.kind}@{spec.input_size}{tiles}"
 
 
+@dataclass
+class CorpusStoreSource:
+    """The calibration corpus *in place*, as a sweep source.
+
+    The store's layout already is the folder contract (``<identity>/<capture>.jpg`` plus its
+    sidecar), so an export works - and for the band derivation it is the documented hand-off. For a
+    sweep it is the wrong first move: an export is a second copy of people's faces on disk, and this
+    tool is read-only on purpose. Reading the store directly is what lets the measurement run where
+    the corpus actually is (the deployment's volume) without duplicating it, and it removes a step
+    that is otherwise skipped on the day someone wants the number.
+
+    The filters default to the *opposite* of the export's, deliberately. An export destined for a
+    band excludes hard cases, because a threshold fitted to hard cases is a threshold for hard
+    cases; a coverage sweep wants exactly those frames, since the ones the gate flagged are the ones
+    whose recoverability is the question. Everything is included unless a caller says otherwise, and
+    the report records which filters were in force.
+    """
+
+    include_unlabelled: bool = True
+    include_hard_cases: bool = True
+    _skipped: list[tuple[str, str]] = field(default_factory=list, repr=False)
+
+    @property
+    def camera(self) -> str | None:
+        """No single camera: a corpus is whatever the capture period swept up, gate by gate."""
+        return None
+
+    @property
+    def skipped(self) -> list[tuple[str, str]]:
+        return self._skipped
+
+    def frames(self) -> Iterator[Frame]:
+        self._skipped.clear()
+        for record in corpus.sidecars():
+            if record.identity is None and not self.include_unlabelled:
+                continue
+            if record.hard_case and not self.include_hard_cases:
+                continue
+            try:
+                # ``convert("RGB")`` for the same reason the folder source does it: the detector
+                # wants three channels, and the stored copy is not guaranteed to be one.
+                image = Image.open(record.image).convert("RGB")
+            except (OSError, ValueError) as exc:
+                self._skipped.append((record.image, f"unreadable: {exc}"))
+                continue
+            yield Frame(
+                image=image,
+                name=os.path.basename(record.image),
+                camera=record.camera,
+                captured_at=record.captured_at,
+                source=corpus.SOURCE_DIRECTORY,
+                meta={
+                    "path": record.image,
+                    "identity": record.identity,
+                    "capture": record.capture_id,
+                    "hard_case": record.hard_case,
+                },
+            )
+
+    def as_dict(self) -> dict[str, Any]:
+        """What the report says about where the frames came from."""
+        return {
+            "kind": "calibration_store",
+            "root": str(corpus.root_dir()),
+            "include_unlabelled": self.include_unlabelled,
+            "include_hard_cases": self.include_hard_cases,
+        }
+
+
 class SweepError(RuntimeError):
     """A run that cannot be trusted: a configuration that will not build, or a corpus it cannot read.
 
@@ -171,9 +246,19 @@ class FrameOutcome:
 
     frame: str
     found: bool
+    #: Where the frame came from, when the source knows: a corpus is routinely organised one folder
+    #: per identity (``angela-merkel/01.jpg``), so the *name* alone does not identify a file and two
+    #: different frames can share it. Anything that joins frames across configurations must not join
+    #: on the name; this is the field that can be printed instead.
+    path: str | None = None
     #: The reason a face was lost: ``no_face``, ``many_faces`` (unresolvable to one subject), or a
     #: quality discard reason from the gate (``quality:too_small``, ...). ``None`` when found.
     miss_reason: str | None = None
+    #: The corpus identity the frame is filed under, when the source knows one (the calibration
+    #: store does; a folder of frames does not). It is what turns a coverage figure into "which
+    #: worker is the far one": nine misses among four people is a different finding from nine among
+    #: nine.
+    identity: str | None = None
     #: How many detections the raw detector returned, before any subject rule. Kept whatever the
     #: outcome, because it is the denominator of the tuning question: a configuration that finds
     #: three faces where another finds one is reaching further, and only this number shows it.
@@ -299,6 +384,7 @@ def sweep(
     progress=None,
     skipped_configs: list[dict[str, Any]] | None = None,
     subject: str = SUBJECT_EXACTLY_ONE,
+    source_info: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The sweep over a whole corpus. Read-only; returns a JSON-shaped report.
 
@@ -354,11 +440,21 @@ def sweep(
         frame_outcomes = sweep_frame(
             prepared.frame, specs, detectors=built, gate=active, subject=subject
         )
+        meta = getattr(frame, "meta", None) or {}
+        source_path = meta.get("path")
+        source_identity = meta.get("identity")
         for spec, outcome in zip(specs, frame_outcomes):
             outcome.frame = frame.name
+            outcome.path = str(source_path) if source_path else None
+            outcome.identity = str(source_identity) if source_identity else None
             outcomes[spec_name(spec)].append(outcome)
 
     by_name = {spec_name(s): s for s in specs}
+    # Every configuration saw the same frames in the same order, so one list answers for all of
+    # them. Reported because a corpus laid out one folder per identity collides constantly on
+    # basenames, and a reader who joins the JSON by ``frame`` alone would silently join frames.
+    every_frame = next(iter(outcomes.values())) if outcomes else []
+    duplicate_frame_names = len(every_frame) - len({o.frame for o in every_frame})
     results = {
         name: {
             "spec": by_name[name].fingerprint(),
@@ -377,6 +473,8 @@ def sweep(
             "outcomes": [
                 {
                     "frame": o.frame,
+                    "path": o.path,
+                    "identity": o.identity,
                     "found": o.found,
                     "miss_reason": o.miss_reason,
                     "faces": o.faces,
@@ -393,6 +491,12 @@ def sweep(
     return {
         "frames_read": frames_read,
         "unreadable": unreadable,
+        "duplicate_frame_names": duplicate_frame_names,
+        "identities": sorted({o.identity for o in every_frame if o.identity}),
+        # Where the frames came from, recorded because it changes what the numbers *mean*: a corpus
+        # of the deployment's own captures and a folder of somebody else's photographs answer
+        # different questions with the same table.
+        "source": source_info,
         "gate": active.as_dict(),
         # The counting rule these found-counts were taken under. Same reasoning as the gate: a
         # coverage figure is a claim about a *rule*, and the two rules differ by large margins on
@@ -429,6 +533,13 @@ def flip_table(results: dict[str, Any], specs: list[DetectorSpec]) -> list[dict[
     reads as a progression: each row answers "moving from the previous configuration to this
     one, which frames come back?" - the direct, frame-level measure of the coverage claim.
 
+    The two configurations are paired **by position, not by frame name**. Every configuration sees
+    the same frames in the same order and appends one outcome per frame, so position is exact - and
+    the name is not: a corpus is routinely laid out one folder per identity (``angela-merkel/01.jpg``,
+    ``barack-obama/01.jpg``), where a dozen different frames share the name ``01.jpg``. Joining on
+    the name collapsed them into one row, which under-reported every flip (a 48-frame corpus of 12
+    identities reported 12 frames' worth of movement) without any error to notice.
+
     ``crosses_detector`` marks the row where the *network* changes rather than the input size.
     Two configurations of the same family differ by one variable the deployment controls, and a
     flip there is a tuning result; two families differ by the weights themselves, and a flip
@@ -438,24 +549,25 @@ def flip_table(results: dict[str, Any], specs: list[DetectorSpec]) -> list[dict[
     rows: list[dict[str, Any]] = []
     for previous, current in zip(specs[:-1], specs[1:]):
         prev_name, curr_name = spec_name(previous), spec_name(current)
-        prev_outcomes = {o["frame"]: o for o in results[prev_name]["outcomes"]}
-        curr_outcomes = {o["frame"]: o for o in results[curr_name]["outcomes"]}
+        prev_outcomes = results[prev_name]["outcomes"]
+        curr_outcomes = results[curr_name]["outcomes"]
         recovered = [
             {
-                "frame": name,
+                "frame": o["frame"],
+                **({"path": o["path"]} if o.get("path") else {}),
                 **({"face_px": o["face_px"]} if o.get("face_px") else {}),
                 # The detection count, when it is more than one: a frame recovered with a crowd
                 # in it was recovered by a reach gain, not by resolving an ambiguity, and under
                 # ``--multi-subject`` that distinction is the whole measurement.
                 **({"faces": o["faces"]} if o.get("faces", 0) > 1 else {}),
             }
-            for name, o in curr_outcomes.items()
-            if not prev_outcomes[name]["found"] and o["found"]
+            for before, o in zip(prev_outcomes, curr_outcomes)
+            if not before["found"] and o["found"]
         ]
         lost = [
-            name
-            for name, o in curr_outcomes.items()
-            if prev_outcomes[name]["found"] and not o["found"]
+            (o.get("path") or o["frame"])
+            for before, o in zip(prev_outcomes, curr_outcomes)
+            if before["found"] and not o["found"]
         ]
         rows.append(
             {
@@ -478,6 +590,13 @@ def render(report: dict[str, Any]) -> str:
     lines: list[str] = []
     lines.append(f"frames swept: {report['frames_read']}"
                  + (f" ({report['unreadable']} unreadable)" if report["unreadable"] else ""))
+    source = report.get("source") or {}
+    if source:
+        lines.append(f"  source: {source.get('kind')} at {source.get('root')}")
+    identities = report.get("identities") or []
+    if identities:
+        shown = ", ".join(identities[:8]) + (", ..." if len(identities) > 8 else "")
+        lines.append(f"  identities: {len(identities)} ({shown})")
     # Which rule the found-counts were taken under. The two rules part company on precisely the
     # frames this tool exists to study, so a percentage without its rule beside it is not a
     # coverage figure - it is a number that could mean "would the gate keep this frame" or
@@ -492,6 +611,12 @@ def render(report: dict[str, Any]) -> str:
         lines.append(
             "  subject rule: ONE - a frame must resolve to a single subject, as the punch path "
             "requires; several faces is a many_faces loss. Use --multi-subject to measure reach."
+        )
+    if report.get("duplicate_frame_names"):
+        lines.append(
+            f"  note: {report['duplicate_frame_names']} frame names repeat across this corpus "
+            "(one folder per identity does this); frames are paired by position, and each flip "
+            "row names its file, not just its basename."
         )
     for name, config in report["configs"].items():
         share = config["found"] / config["frames"] * 100 if config["frames"] else 0.0
@@ -523,7 +648,9 @@ def render(report: dict[str, Any]) -> str:
         for entry in flip["recovered"][:5]:
             px = f" (face {entry['face_px']}px)" if entry.get("face_px") else ""
             crowd = f", {entry['faces']} faces" if entry.get("faces") else ""
-            lines.append(f"    + {entry['frame']}{px}{crowd}")
+            # Prefer the path: on a corpus laid out one folder per identity, ``03.jpg`` does not
+            # say which file to open.
+            lines.append(f"    + {entry.get('path') or entry['frame']}{px}{crowd}")
         for name in flip["lost"][:5]:
             lines.append(f"    - {name}")
         hidden = flip["recovered_count"] - 5
@@ -543,7 +670,11 @@ def main(argv: list[str] | None = None) -> int:
             "pass --multi-subject when the corpus has bystanders in it."
         )
     )
-    parser.add_argument("--corpus", required=True, help="folder of gate frames to sweep")
+    parser.add_argument("--corpus", default=None, help="folder of gate frames to sweep")
+    parser.add_argument("--corpus-store", action="store_true",
+                        help="sweep the calibration corpus in place instead of a folder: one command "
+                             "where the corpus lives (the deployment's volume), and no second copy "
+                             "of people's faces written to disk just to measure them")
     parser.add_argument("--detector-model", default=None,
                         help="YuNet model file (default: the live pipeline's own, resolved the way "
                              "face_detector resolves it)")
@@ -563,12 +694,37 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", default=None, help="write the full report here")
     parser.add_argument("--min-score", type=float, default=0.6,
                         help="detector score threshold, applied identically to every configuration")
+    parser.add_argument("--exclude-unlabelled", action="store_true",
+                        help="with --corpus-store: measure only captures that have an identity; off "
+                             "by default, because an unlabelled frame is still a frame the detector "
+                             "either finds a face in or does not")
+    parser.add_argument("--exclude-hard-cases", action="store_true",
+                        help="with --corpus-store: drop the captures the gate flagged. Off by "
+                             "default - the flagged frames are the ones whose recoverability a "
+                             "coverage experiment is about")
     args = parser.parse_args(argv)
 
-    root = Path(args.corpus)
-    if not root.is_dir():
-        print(f"corpus folder not found: {root}", file=sys.stderr)
+    if bool(args.corpus) == bool(args.corpus_store):
+        print(
+            "pass exactly one source: --corpus <folder> for a folder of frames, or "
+            "--corpus-store to sweep the calibration corpus in place.",
+            file=sys.stderr,
+        )
         return 2
+
+    source_info: dict[str, Any]
+    if args.corpus_store:
+        source = CorpusStoreSource(
+            include_unlabelled=not args.exclude_unlabelled,
+            include_hard_cases=not args.exclude_hard_cases,
+        )
+        source_info = source.as_dict()
+    else:
+        root = Path(args.corpus)
+        if not root.is_dir():
+            print(f"corpus folder not found: {root}", file=sys.stderr)
+            return 2
+        source_info = {"kind": "folder", "root": str(root)}
 
     import face_detector
 
@@ -587,8 +743,11 @@ def main(argv: list[str] | None = None) -> int:
     models = {"yunet": detector_model}
     scrfd_model = args.scrfd_model or os.environ.get("SCRFD_MODEL_PATH") or ""
     if not scrfd_model:
-        conventional = Path(detector_model).with_name(SCRFD_MODEL_FILENAME)
-        scrfd_model = str(conventional) if conventional.exists() else ""
+        for filename in SCRFD_MODEL_FILENAMES:
+            conventional = Path(detector_model).with_name(filename)
+            if conventional.exists():
+                scrfd_model = str(conventional)
+                break
 
     skipped_configs: list[dict[str, Any]] = []
     scrfd_spec = DetectorSpec(kind="scrfd", input_size=640, tiles=1)
@@ -604,9 +763,12 @@ def main(argv: list[str] | None = None) -> int:
         # Refused rather than dropped in silence: the whole reason this configuration exists is
         # that the detector comparison has to be measured here. Falling back to three lines would
         # print a report that looks like one network won a contest it never entered.
+        looked_for = " or ".join(
+            filename + f" (beside {detector_model})" for filename in SCRFD_MODEL_FILENAMES
+        )
         print(
             "the SCRFD model is missing, so the detector comparison cannot be measured:\n"
-            f"  looked for {scrfd_model or SCRFD_MODEL_FILENAME + ' (beside ' + detector_model + ')'}\n"
+            f"  looked for {scrfd_model or looked_for}\n"
             "Put the ONNX file there, pass --scrfd-model /path/to/scrfd.onnx, set "
             "SCRFD_MODEL_PATH, or pass --skip-scrfd to measure only the YuNet configurations "
             "(the report will say SCRFD was not measured).",
@@ -630,22 +792,39 @@ def main(argv: list[str] | None = None) -> int:
         if spec.kind in models
     ]
 
-    from corpus_ingest import DirectorySource
+    if not args.corpus_store:
+        from corpus_ingest import DirectorySource
 
-    source = DirectorySource(root)
+        source = DirectorySource(Path(args.corpus))
+
     def progress(name: str, index: int, total: int) -> None:
         print(f"\r  sweeping {index}/{total}: {name[:60]}", end="", flush=True)
 
     subject = SUBJECT_ANY if args.multi_subject else SUBJECT_EXACTLY_ONE
     try:
         report = sweep(source, specs, progress=progress, skipped_configs=skipped_configs,
-                       subject=subject)
+                       subject=subject, source_info=source_info)
     except SweepError as exc:
         # A configuration that will not build is the operator's next step, not a stack trace:
         # the commonest case by far is a ``--scrfd-model`` pointing at the wrong file.
         print(str(exc), file=sys.stderr)
         return 2
     print("\r" + " " * 79 + "\r", end="")  # clear the progress line
+    if args.corpus_store and not report["frames_read"]:
+        # An empty *folder* is a legitimate thing to sweep. An empty corpus store is almost always
+        # the reason the operator is here: capture was never switched on, the volume is not mounted,
+        # or the process is reading a different database. Printing four 0/0 lines would look like a
+        # result from four configurations that measured nothing.
+        print(
+            "the calibration corpus is empty - 0 captures - so there is nothing to sweep.\n"
+            f"  corpus root : {source_info.get('root')}\n"
+            "Capture has to be switched on and left on for a few days before it holds anything:\n"
+            "  CALIBRATION_CAPTURE_ENABLED=true, CALIBRATION_CORPUS_DIR on the volume\n"
+            "  python tools/corpus_admin.py stats   # what the store holds, and what a band needs\n"
+            "Or sweep frames that already exist: --corpus <folder of images>.",
+            file=sys.stderr,
+        )
+        return 2
     print(render(report))
     if args.json:
         Path(args.json).write_text(json.dumps(report, indent=1), encoding="utf-8")

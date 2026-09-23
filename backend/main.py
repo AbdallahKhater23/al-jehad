@@ -2024,7 +2024,14 @@ async def verify_worker(
     # the server allocate its own size in memory.
     file_bytes = await uploads.read_photo(selfie, field="selfie")
     image = uploads.decode_photo(file_bytes, field="selfie")
-    image.thumbnail((640, 640))
+    # The pixel ceiling for the frame the detector sees. 640 used to be the number; the
+    # working-distance band (0.7-1.5 m, see the framing coach) puts a face at 53-113 px in
+    # a 640-wide frame, and the alignment template wants ~112 - so beyond ~0.7 m the crop
+    # was being upscaled before it was embedded, and every extra metre cost match score.
+    # 1280 keeps the crop at native scale through ~1.5 m. Latency scales with frame area,
+    # not linearly: YuNet on a 1280x960 frame costs ~55 ms against ~15 ms at 640, and the
+    # embedding itself is size-independent (always a 112x112 crop).
+    image.thumbnail((settings.punch_selfie_max_px, settings.punch_selfie_max_px))
     # ``rgb_array`` feeds the liveness model, which was trained on RGB crops;
     # ``img_array`` is the BGR view the detector and the embedding contract expect - see
     # ``face_onnx``, which does not convert channels anywhere. Computing both here keeps

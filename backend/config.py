@@ -327,6 +327,16 @@ class Settings(BaseModel):
     #  link, and every photo inside a bulk ZIP. 5 MB is comfortably above a phone
     #  camera JPEG (2-4 MB) and far below anything an incident report needs to be.
     upload_max_photo_bytes: int = 5 * 1024 * 1024
+    #  Long edge of the frame the face pipeline sees on a punch (clock-in/out, quick
+    #  link, offline sync - one number everywhere, see the punch endpoints). 640 used
+    #  to be the number; the working-distance band (0.7-1.5 m, see the framing coach)
+    #  puts a face at 53-113 px in a 640-wide frame, and the alignment template wants
+    #  ~112 - so beyond ~0.7 m the crop was being upscaled before it was embedded, and
+    #  every extra metre cost match score. 1280 keeps the crop at native scale through
+    #  ~1.5 m. Latency scales with frame area, not linearly: YuNet on a 1280x960 frame
+    #  costs ~55 ms against ~15 ms at 640, and the embedding itself is size-independent
+    #  (always a 112x112 crop).
+    punch_selfie_max_px: int = 1280
 
     # -- worker notes (the written channel between a worker and the admin) ---
     #  A note is cheap to write and expensive to ignore, so the two controls are a
@@ -676,6 +686,7 @@ def build_settings(*, env_file: Path | None = None) -> Settings:
         offline_batch_max=_env_int("OFFLINE_BATCH_MAX", 50),
         offline_duplicate_window_seconds=_env_int("OFFLINE_DUPLICATE_WINDOW_SECONDS", 90),
         upload_max_photo_bytes=_env_int("UPLOAD_MAX_PHOTO_BYTES", 5 * 1024 * 1024),
+        punch_selfie_max_px=_env_int("PUNCH_SELFIE_MAX_PX", 1280),
         notes_rate_limit=_env_str("NOTES_RATE_LIMIT", "30/minute") or "30/minute",
         notes_max_open_per_worker=_env_int("NOTES_MAX_OPEN_PER_WORKER", 20),
         notes_max_subject_chars=_env_int("NOTES_MAX_SUBJECT_CHARS", 120),
