@@ -541,6 +541,7 @@ def build_detector(
     input_size: int = 640,
     tiles: int = 1,
     overlap: float = 0.2,
+    square: bool = False,
     **kwargs: Any,
 ) -> Any:
     """Factory returning a detector *bound to its tiling policy*, so call sites cannot forget it.
@@ -548,10 +549,26 @@ def build_detector(
     A call site that constructs a detector and then forgets ``tiles=2`` silently reverts the
     coverage fix; binding the policy at construction makes that failure impossible rather than
     merely documented.
+
+    ``square`` is named here rather than left in ``**kwargs`` because the two backends do not
+    agree on it: YuNet takes it (a fixed-shape TensorRT engine needs a square input), and SCRFD
+    does not have the mode at all - it fits its input to the frame's aspect. Left in ``**kwargs``
+    it was forwarded to whichever backend was being built, so *every* SCRFD construction through
+    this factory died with ``ScrfdDetector.__init__() got an unexpected keyword argument
+    'square'`` - which is how the coverage sweep's fourth configuration found it. Requesting a
+    square input for SCRFD is now refused by name instead of ignored: an operator asking for a
+    fixed-shape engine profile and silently getting an aspect-fitted input has a model whose
+    geometry is not the one they designed for.
     """
     if kind == "yunet":
-        detector: Any = YuNetDetector(model_path, input_size=input_size, **kwargs)
+        detector: Any = YuNetDetector(model_path, input_size=input_size, square=square, **kwargs)
     elif kind == "scrfd":
+        if square:
+            raise DetectorError(
+                "the SCRFD backend has no square-letterbox mode: it fits its input to the "
+                "frame's aspect (see ScrfdDetector). Drop the square flag, or use the YuNet "
+                "backend where a fixed-shape engine requires a square input."
+            )
         detector = ScrfdDetector(model_path, input_size=input_size, **kwargs)
     else:
         raise DetectorError(f"unknown detector kind {kind!r}; expected 'yunet' or 'scrfd'")

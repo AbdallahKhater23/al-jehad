@@ -5017,14 +5017,20 @@ const UI_MODULES = {
     },
 
     /**
-     * A click anywhere in the Shifts tab. Today one row control is delegated here; every
-     * other control in the tab carries its own handler or its own inline call.
+     * A click anywhere in the Shifts tab. Two row controls are delegated here - the edit
+     * affordance and the print action - because rows are a string at paint time, so there
+     * is no node to attach a handler to; every other control in the tab carries its own
+     * handler or its own inline call.
      */
     onShiftsClick(event) {
         const target = event && event.target;
-        const button = target && typeof target.closest === 'function'
-            ? target.closest('[data-print-worker]')
-            : null;
+        if (!target || typeof target.closest !== 'function') return undefined;
+        const edit = target.closest('[data-edit-hours]');
+        if (edit) {
+            const dataset = edit.dataset || {};
+            return this.editShiftHoursModal(dataset.editHours, dataset.editWorker, dataset.editRecorded);
+        }
+        const button = target.closest('[data-print-worker]');
         if (!button) return undefined;
         return this.printWorkerMonth((button.dataset || {}).printWorker);
     },
@@ -5243,10 +5249,99 @@ const UI_MODULES = {
     shiftPrintActionHtml(row) {
         const label = I18n.__('shiftsPrintWorkerNamed')
             .replace('{name}', row.worker_name || row.worker_id);
-        return `<button type="button" class="ui-btn ui-btn-sm ui-btn-quiet is-icon"
+        // The edit affordance rides beside the print action, and only on a row whose hours
+        // are settled: a shift still awaiting a decision is answered in the Approvals queue,
+        // and an edit affordance there would invite settling it "by the side door". The
+        // server refuses those rows too - this is a courtesy, not the guard.
+        const edit = this.shiftEditable(row)
+            ? `<button type="button" class="ui-btn ui-btn-sm ui-btn-quiet is-icon"
+                        data-edit-hours="${this.escapeHtml(String(row.log_id))}"
+                        data-edit-worker="${this.escapeHtml(String(row.worker_name || row.worker_id))}"
+                        data-edit-recorded="${this.escapeHtml(String(row.recorded_hours ?? row.hours ?? ''))}"
+                        title="${this.escapeHtml(I18n.__('shiftHoursEditTitle'))}"
+                        aria-label="${this.escapeHtml(I18n.__('shiftHoursEditTitle'))}">${this.OPS_ICONS.pencil}</button>`
+            : '';
+        return `${edit}<button type="button" class="ui-btn ui-btn-sm ui-btn-quiet is-icon"
                         data-print-worker="${this.escapeHtml(row.worker_id)}"
                         title="${this.escapeHtml(label)}"
                         aria-label="${this.escapeHtml(label)}">${this.OPS_ICONS.printer}</button>`;
+    },
+
+    /**
+     * Whether a shift row's hours may be corrected.
+     *
+     * Payable or rejected rows are settled - their figures are history an administrator
+     * may correct with an audit trail behind it. Rows still held for a decision (the
+     * server names the same set) are not offered the form at all: editing around the
+     * review would stand in for the decision the queue exists to record.
+     */
+    shiftEditable(row) {
+        const code = String(row.status_code || '');
+        return ['approved', 'auto_closed_8h', 'overtime_rejected', 'rejected', 'forced_out'].indexOf(code) >= 0;
+    },
+
+    /**
+     * The hours-correction dialog for a shift that was already worked.
+     *
+     * One field - the figure the administrator is signing - prefilled with what the row
+     * records now, and the note optional. The server re-derives the overtime from the
+     * named figure and appends the before/after pair to the audit trail, so the dialog
+     * has no arithmetic of its own to get wrong.
+     */
+    editShiftHoursModal(logId, workerName, recordedHours) {
+        const name = this.escapeHtml(String(workerName || logId));
+        const recorded = recordedHours !== '' && recordedHours != null && isFinite(Number(recordedHours))
+            ? Number(recordedHours)
+            : null;
+        const backdrop = Modal.open(`
+            <h3 style="margin-top:0">${this.escapeHtml(I18n.__('shiftHoursEditTitle'))}</h3>
+            <p class="ops-note" style="margin-top:0">${this.escapeHtml(I18n.__('shiftHoursEditWorker'))}: <span class="ui-strong">${name}</span></p>
+            ${recorded !== null ? `<p class="ops-note">${this.escapeHtml(I18n.__('shiftHoursEditRecorded'))}: ${this.escapeHtml(this.hoursLabel(recorded))}</p>` : ''}
+            <label class="ops-stat-label" for="editShiftHours">${this.escapeHtml(I18n.__('shiftHoursEditLabel'))}</label>
+            <input id="editShiftHours" class="ops-field" type="number" min="0" max="24" step="0.25" inputmode="decimal"
+                   value="${recorded !== null ? this.escapeHtml(String(recorded)) : ''}" />
+            <label class="ops-stat-label" for="editShiftHoursNote" style="margin-top:12px">${this.escapeHtml(I18n.__('shiftHoursEditNoteLabel'))}</label>
+            <input id="editShiftHoursNote" class="ops-field" type="text" maxlength="300"
+                   placeholder="${this.escapeHtml(I18n.__('shiftHoursEditNoteHint'))}" />
+            <p class="ops-note">${this.escapeHtml(I18n.__('shiftHoursEditHint'))}</p>
+            <div class="ui-row" style="margin-top:16px">
+                <button type="button" class="ops-btn ops-btn-primary" id="editShiftHoursGo">${this.escapeHtml(I18n.__('shiftHoursEditConfirm'))}</button>
+                <button type="button" class="ops-btn" id="editShiftHoursCancel">${this.escapeHtml(I18n.__('cancel'))}</button>
+            </div>`, { dismissible: true });
+        if (!backdrop) return;
+        // Both buttons bound, not inline: the inline-handler budget in ``test_frontend_xss``
+        // only falls, and a dialog that binds one button by id can bind the other the same way.
+        const cancel = backdrop.querySelector('#editShiftHoursCancel');
+        if (cancel && typeof cancel.addEventListener === 'function') {
+            cancel.addEventListener('click', () => Modal.close());
+        }
+        backdrop.querySelector('#editShiftHoursGo').addEventListener('click', async () => {
+            const field = backdrop.querySelector('#editShiftHours');
+            const noteField = backdrop.querySelector('#editShiftHoursNote');
+            const hours = Number(String((field && field.value) || '').trim());
+            if (!isFinite(hours) || hours < 0 || hours > 24) {
+                Toast.error(I18n.__('shiftHoursEditInvalid'));
+                return;
+            }
+            const go = backdrop.querySelector('#editShiftHoursGo');
+            if (go) go.disabled = true;
+            try {
+                const res = await API.request(`/admin/shifts/${encodeURIComponent(String(logId))}/hours`, {
+                    method: 'POST',
+                    body: {
+                        hours,
+                        note: noteField && String(noteField.value || '').trim() ? String(noteField.value).trim() : null
+                    }
+                });
+                Modal.close();
+                Toast.success(res.message || I18n.__('shiftHoursEditConfirm'));
+                const pane = document.getElementById('adminContent');
+                if (pane) this.loadShiftsReport(pane);
+            } catch (err) {
+                if (go) go.disabled = false;
+                Toast.error(err.message);
+            }
+        });
     },
 
     /**
