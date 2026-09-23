@@ -2144,6 +2144,15 @@ async def verify_worker(
         # blame their photo, is how a bug survives a week of "it keeps saying no".
         reason = str(face_data["error"])
         error_code, message = _frame_refusal(reason)
+        # The frame the check could not use is the one a coverage question is *about*: a worker far
+        # enough back that the detector cannot see them produces exactly this refusal, and until
+        # this call every one of those frames was discarded here - before the capture hook below,
+        # which is why a week of capturing successful punches could never hold the small-face
+        # regime. Opt-in, off by default, never raises, and it does not touch the verdict: this is
+        # still a refusal, and the worker still gets the same sentence with the same status code.
+        corpus.maybe_capture_punch(
+            image, worker_id=str(current.id), verdict=None, refused_reason=reason
+        )
         # A photo the check could not use is its own outcome, never lumped in with a mismatch:
         # "no face in the frame" and "that is not this worker" have different causes and
         # different fixes, and a review queue built from the sum of them cannot be acted on.
@@ -4701,8 +4710,15 @@ async def list_corpus_consents(
         except sqlite3.Error:
             rows = []
         granted = corpus.consented_workers(conn)
+    # The switch is half of the answer and the *window* is the other half: "capture is on" with an
+    # end date is a collection period, and "capture is on" with no end date is the thing this
+    # deployment is not supposed to be able to become by accident. Reported as a state rather than
+    # a boolean so an operator reads "closes in 6 days" or "a typo, capture is not running" here
+    # instead of discovering it from the absence of captures a week later.
+    window = corpus.capture_window()
     return {
         "capture_enabled": bool(settings.calibration_capture_enabled),
+        "capture_window": window.as_dict(),
         "consented_workers": sorted(granted),
         "decisions": [dict(row) for row in rows],
     }

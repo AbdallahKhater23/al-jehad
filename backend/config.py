@@ -304,6 +304,18 @@ class Settings(BaseModel):
     #  is a biometric store nobody asked for. When it is on, every face is stored with the detector
     #  that produced its crop, under a retention period an operator purges by hand.
     calibration_capture_enabled: bool = False
+    #  When non-empty, capture stops at this instant: ISO-8601, UTC, e.g.
+    #  ``2026-10-01T00:00:00Z``. Empty means no window (capture runs while the switch is on).
+    #  A collection period is a decision with an end, and an operator who says "for a week"
+    #  has already named one: leaving that in a calendar reminder means the deployment keeps
+    #  collecting faces until somebody remembers, which is the exact failure the switch's own
+    #  comment warns about. Expressed as an instant rather than a duration so a restart does
+    #  not restart the clock.
+    #
+    #  Malformed values **stop** capture rather than being ignored: the stricter answer to
+    #  "when does this end?" is the safe one when the answer is unreadable, because the other
+    #  reading is "indefinitely", applied to a biometric store.
+    calibration_capture_until: str = ""
     #  Long edge of a stored frame. 1280 keeps a 1920x1080 gate frame's subject at two thirds of its
     #  native size; 0 keeps the original, which is what an experiment about the small-face regime
     #  wants - because downscaling *moves a corpus into* that regime.
@@ -695,6 +707,7 @@ def build_settings(*, env_file: Path | None = None) -> Settings:
         metrics_token=_env_str("METRICS_TOKEN"),
         push_enabled=_env_flag("PUSH_ENABLED", True),
     calibration_capture_enabled=_env_flag("CALIBRATION_CAPTURE_ENABLED", False),
+    calibration_capture_until=_env_str("CALIBRATION_CAPTURE_UNTIL") or "",
     calibration_corpus_max_px=_env_int("CALIBRATION_CORPUS_MAX_PX", 1280),
     calibration_corpus_retention_days=_env_int("CALIBRATION_CORPUS_RETENTION_DAYS", 180),
         vapid_public_key=_env_str("VAPID_PUBLIC_KEY"),

@@ -152,14 +152,32 @@ can do better: the punch path already knows how to file captures into a labelled
 runs — the gate selfies the lines actually have to separate. The corpus is opt-in and off by
 default.
 
-### 1. Turn capture on
+### 1. Turn capture on — for a stated period
 
-Two environment variables on the service:
+Three environment variables on the service:
 
 ```bash
 CALIBRATION_CAPTURE_ENABLED=true
+CALIBRATION_CAPTURE_UNTIL=2026-10-01T00:00:00Z    # ISO-8601 UTC; empty = no end date
 CALIBRATION_CORPUS_DIR=/data/calibration_corpus   # must be ON THE VOLUME
 ```
+
+``CALIBRATION_CAPTURE_UNTIL`` is the end of the collection period. It is an **instant**, not a
+duration, so a redeploy does not restart the clock — and a period with an end is the only shape a
+biometric collection should have: "for a week" left as a calendar reminder is a deployment that
+keeps collecting faces until somebody remembers. Capture stops by itself at that instant.
+
+A value that cannot be parsed **stops** capture rather than being ignored. The other reading of an
+unreadable deadline is "indefinitely", and that is not the reading to pick by accident for a store
+of people's faces. Read the state any time from ``GET /api/v1/admin/corpus_consents``, which
+answers ``capture_window``:
+
+| ``state`` | meaning |
+|---|---|
+| ``off`` | the switch is off — nothing is captured |
+| ``open`` | inside the window, with ``seconds_remaining`` |
+| ``closed`` | the window has passed, **or** the deadline is unreadable |
+| ``open_ended`` | on, with no end date — deliberate, and worth a second look |
 
 ``/data`` (or wherever the volume is mounted) because a corpus that lives on the container
 filesystem is erased by the next deploy. Redeploy once with the variables set. From then on
@@ -208,10 +226,38 @@ asks "delete my face" is answered by ``tools/corpus_admin.py purge --identity <i
 withdrawal record is what makes that request auditable. Consent and erasure are deliberately
 different operations with different records.
 
+### 1c. The frames a week of punches will actually add
+
+A corpus built from *successful* punches cannot hold the small-face regime, and no switch changes
+that. Two reasons, both now fixed:
+
+* **The call site.** A worker far enough back that the detector cannot see them is refused at the
+  face check, and that refusal used to happen *before* the capture hook — so the exact frame class
+  the coverage question is about was discarded by control flow. The refusal path now calls in with
+  the refusal reason recorded, which is what puts a distant frame in the corpus at all.
+* **The reach.** The capture re-detects on its own stored copy, and it used to do so at the punch
+  pipeline's own input size. The reach that refused the frame is therefore the reach that could not
+  store it either, so only faces the punch had already found were ever filed. When the pipeline's
+  pass yields no single usable face, the capture looks again at twice the reach
+  (``corpus.WIDENED_REACH_INPUT_SIZE``) and files the specimen it finds there — with the provenance
+  saying which pass found it (``input_size`` on the detector fingerprint, ``reach=widened`` in the
+  note), because "the punch detector saw this" and "only the wide pass saw this" are different
+  claims about the same corpus.
+
+**For those frames to exist, workers have to punch from further back.** The framing coach accepts the
+whole 0.7–1.5 m band and warns below about 1.6 m; a worker who stands well back and is refused is
+now producing usable evidence rather than a lost frame. That is the point of the week: the corpus's
+value is the small-face regime, and the only way it appears is that somebody stands in it.
+
+Refused captures stay **unlabelled**. ``approved`` is the only verdict that established an identity;
+a refusal is the absence of that claim, so naming the punching worker would be the corpus inventing
+a label out of a successful login. Label one by hand only when the frame really shows that worker.
+
 ### 2. Collect, then label what a human must decide
 
-Let the site run for a few days of normal punches. Then look at what gathered (run these in
-the Railway shell, ``python`` is on the image's ``PATH``):
+Let the site run for a few days of normal punches — for a distance experiment, stand workers further
+back than the coach asks for, so the refused frames exist at all. Then look at what gathered (run
+these in the Railway shell, ``python`` is on the image's ``PATH``):
 
 ```bash
 python backend/tools/corpus_admin.py stats                # what the corpus holds, in band terms
@@ -222,6 +268,32 @@ python backend/tools/corpus_admin.py label --capture <id> --identity <worker_id>
 Label a refused capture only when you can see from the frame (``punch_frames`` stores the same
 punch as evidence) that it really is that worker. A label you are unsure about is the one the
 unlabelled partition exists to hold. The derivation reads labelled identities only, so
+
+### 2b. Re-run the coverage sweep on what the week collected
+
+This is the measurement the week exists for: the same corpus, every detector configuration, no
+storage and no second copy of anybody's face on disk.
+
+```bash
+python backend/tools/coverage_sweep.py --corpus-store --json /data/coverage-after.json
+```
+
+The report answers, per configuration (``yunet@320``, ``yunet@640``, ``yunet@640+2x2tiling``, and
+SCRFD when a model is present): how many real faces each one **found**, how many it **discarded and
+why** (``no_face``, ``many_faces``, or a gate reason such as ``quality:too_small``), what each cost
+in milliseconds, and the **flip table** — the frames one configuration recovers that another loses,
+which is the only honest way to price a detector change on this deployment's own traffic.
+
+Read the two defaults deliberately: ``--exclude-hard-cases`` and ``--exclude-unlabelled`` are both
+**off**, because the flagged frames are precisely the ones whose recoverability the sweep is about.
+Turning them on answers a different question ("how does the pipeline do on frames it already likes")
+and will make every configuration look equally good.
+
+Compare against the baseline in ``docs/RUNBOOK_EMBEDDER_MIGRATION.md`` — the sweep run before the
+week, on the frames that existed then — and treat a configuration as an upgrade candidate only if it
+wins on *this* corpus, not on the published numbers.
+
+
 uncertainty here costs coverage, never correctness.
 
 ### 3. Export and measure
