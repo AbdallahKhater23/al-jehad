@@ -1015,19 +1015,19 @@ def compare_faces_sync(reference_json_path: str, live_image_data) -> dict:
         # subject-sized are still two people, and this still refuses.
         subjects = face_detector.subject_detections(live_embedding_objs)
         if subjects.merged or subjects.specks:
-            log.info(
-                "face count for worker %s: %s",
-                current.id,
-                subjects.summary(),
-            )
+            # No worker id here on purpose: this function is handed a template path and a photo, and
+            # does not know who the caller is. The endpoint that does know logs it (see the refusal
+            # branch in ``verify_worker``), and the count travels back in the result for that.
+            log.info("face detection on a punch frame: %s", subjects.summary())
 
         if subjects.count > 1:
-            log.warning(
-                "refusing a punch for worker %s: %s (the frame holds more than one subject-sized face)",
-                current.id,
-                subjects.summary(),
-            )
-            return {"verified": False, "distance": 99.9, "error": "Multiple faces detected."}
+            return {
+                "verified": False,
+                "distance": 99.9,
+                "error": "Multiple faces detected.",
+                "faces": subjects.count,
+                "face_count_detail": subjects.summary(),
+            }
         if not subjects.count:
             # Detections that are all too small to be a person: the frame has no usable face, and
             # "no face was found" is what the worker can act on (step closer), where "more than one
@@ -2169,6 +2169,17 @@ async def verify_worker(
         # blame their photo, is how a bug survives a week of "it keeps saying no".
         reason = str(face_data["error"])
         error_code, message = _frame_refusal(reason)
+        # What the count actually was, for a refusal about the number of people in the frame: the
+        # worker's sentence stays simple, and the log carries what an operator needs to tell a
+        # bystander from a duplicated box (see ``face_detector.subject_detections``). Silent when
+        # the check had no count to report, so a no-face refusal logs nothing new.
+        if face_data.get("face_count_detail"):
+            log.warning(
+                "frame refused for worker %s (%s): %s",
+                current.id,
+                reason,
+                face_data["face_count_detail"],
+            )
         # The frame the check could not use is the one a coverage question is *about*: a worker far
         # enough back that the detector cannot see them produces exactly this refusal, and until
         # this call every one of those frames was discarded here - before the capture hook below,

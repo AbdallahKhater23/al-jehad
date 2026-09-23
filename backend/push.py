@@ -711,11 +711,19 @@ def stranded_notices(conn: sqlite3.Connection, *, now: datetime | None = None) -
 def _stranded_report(reading: dict) -> str:
     """The whole reading in one sentence an operator can act on, not a count on its own."""
     notices = reading["notices"]
+    failures = int(reading.get("channel_failures", reading["with_device"]))
     sentence = (
         f"{notices} worker notification(s) for {reading['workers']} worker(s) passed the "
         f"{reading['window_minutes']}-minute push window without being delivered "
         f"(oldest {reading['age']} old)."
     )
+    # The finding comes first when there is one: this sentence is the alert body, and an operator
+    # reading it should hit the fixable half before the context.
+    if failures and failures != notices:
+        sentence += (
+            f" {failures} of them were the channel's to deliver - attempted, or a device was"
+            " registered - and did not arrive."
+        )
     if reading["no_device"]:
         sentence += (
             f" {reading['no_device']} have no live device at all: nothing was sent, and nothing"
@@ -771,6 +779,10 @@ def _record_stranded(conn: sqlite3.Connection, reading: dict, *, now: datetime |
         payload={
             "window_minutes": reading["window_minutes"],
             "notices": reading["notices"],
+            # The finding and the context, both on the row: the alert is written because of the
+            # first, and an operator closing it wants to know the second did not disappear.
+            "channel_failures": reading["channel_failures"],
+            "waiting_for_device": reading["waiting_for_device"],
             "workers": reading["workers"],
             "oldest": reading["oldest"],
             "age_seconds": reading["age_seconds"],

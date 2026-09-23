@@ -331,8 +331,13 @@ def test_the_same_hour_is_told_once_and_the_next_hour_again(push_ready, app_modu
     The watcher tick and the dispatch path can both take the reading in the same minute, and
     neither is "the" alert - so the row is deduplicated on the hour rather than guarded by the
     caller.
+
+    Seeded with a registered device, because this is the dedupe of an alert that *should* be
+    written: a notice nothing was asked to deliver is not alerted at all (see
+    ``test_a_backlog_waiting_for_a_device_is_reported_but_never_alerted``).
     """
-    _seed_notice(age_minutes=90)
+    _seed_device(WORKER)
+    _seed_notice(WORKER, age_minutes=90)
 
     assert push.alert_stranded_notices(now=ANCHOR)["alerted"] is True
     second = push.alert_stranded_notices(now=ANCHOR + timedelta(minutes=10))
@@ -407,7 +412,10 @@ def test_the_dispatch_path_takes_the_reading_too(monkeypatch, app_module):
     monkeypatch.setattr(settings, "vapid_private_key", "private-key-for-tests", raising=False)
     monkeypatch.setattr(push, "_load_webpush", lambda: (_never_push, RuntimeError), raising=True)
 
-    _seed_notice(age_minutes=120)
+    # A device is registered, so the notice is the channel's to deliver and its non-arrival is
+    # the finding this path reports.
+    _seed_device(WORKER)
+    _seed_notice(WORKER, age_minutes=120)
 
     with db(write=True) as conn:
         summary = push.dispatch(conn, now=ANCHOR, send=_never_push)
@@ -438,19 +446,57 @@ def test_a_dispatch_on_a_deployment_that_cannot_push_stays_silent(monkeypatch, a
 # ---------------------------------------------------------------------------
 # The surfaces: visible without opening a database
 # ---------------------------------------------------------------------------
-def test_readiness_reports_the_backlog_as_an_advisory(push_ready, app_module):
+def test_readiness_reports_a_channel_that_was_asked_and_did_not_deliver(push_ready, app_module):
+    """The state the check exists for: a device is registered, and nothing arrives."""
     now = datetime.now()
-    _seed_notice(age_minutes=45, now=now)
+    _seed_device(WORKER)
+    _seed_notice(WORKER, age_minutes=45, now=now)
     _seed_notice(MOALLEM, age_minutes=30, now=now)
 
     check = readiness._check_worker_notice_backlog({})
     assert check.name == "worker_notice_backlog"
     assert check.tier == readiness.TIER_ADVISORY
-    assert check.ok is False
+    assert check.ok is False, "a notice the channel was asked to deliver and did not must fail"
     assert "2 worker notification(s)" in check.detail
     assert check.value["notices"] == 2 and check.value["workers"] == 2
     assert check.value["measured"] is True
-    assert check.value["no_device"] == 2
+    assert check.value["channel_failures"] == 1, "only the registered worker's notice is a failure"
+    assert check.value["waiting_for_device"] == 1
+    assert check.value["no_device"] == 1
+
+
+def test_a_backlog_waiting_for_a_device_is_reported_but_is_not_a_failure(push_ready, app_module):
+    """Undelivered without a failure, and the difference is the whole point.
+
+    A notice written for a worker who has never allowed notifications was never sent anywhere:
+    nothing was refused, nothing failed, and no operator action changes it. Counting that as a
+    failing channel reports a fault that cannot be reproduced or fixed - and on this deployment
+    it did exactly that, because every notice written before notifications were enabled is
+    undelivered for that reason and stays so until retention ages it out (180 days). The state
+    is still *reported*, in full, so "green" here does not mean "nobody should look".
+
+    It is also not alerted: an alert row an hour claiming a broken channel would be the same
+    false claim, written where an operator cannot argue with it.
+    """
+    now = datetime.now()
+    _seed_notice(age_minutes=45, now=now)
+    _seed_notice(MOALLEM, age_minutes=30, now=now)
+
+    check = readiness._check_worker_notice_backlog({})
+    assert check.ok is True, "a backlog no channel was asked to deliver was reported as a failure"
+    assert check.value["notices"] == 2, "the reading still reports what is waiting"
+    assert check.value["channel_failures"] == 0
+    assert check.value["waiting_for_device"] == 2
+    assert "2 notice(s) are waiting" in check.detail, check.detail
+    assert "nothing was sent, so nothing was refused" in check.detail, check.detail
+
+    # Read at the same moment the notices were seeded: ``ANCHOR`` is a fixed past instant, and
+    # against it these rows are still inside the window and there is nothing to say at all.
+    result = push.alert_stranded_notices(now=now)
+    assert result["notices"] == 2, "the alert path must see the same backlog readiness reports"
+    assert result["alerted"] is False
+    assert result["reason"] == "no channel failure: the backlog is waiting for a device"
+    assert _alerts() == []
 
 
 def test_the_public_probe_carries_it_so_a_quiet_channel_is_visible_from_outside(
@@ -459,10 +505,11 @@ def test_the_public_probe_carries_it_so_a_quiet_channel_is_visible_from_outside(
     """The point of the whole feature: an uptime monitor sees a dead channel.
 
     The readiness probe is the surface that is actually watched, and it is the only one an
-    automated check can read. The backlog has to appear there as a degraded check - and the
-    anonymous projection must stay a verdict, never the plumbing.
+    automated check can read. A channel that was asked and did not deliver has to appear there
+    as a degraded check - and the anonymous projection must stay a verdict, never the plumbing.
     """
-    _seed_notice(age_minutes=45, now=datetime.now())
+    _seed_device(WORKER)
+    _seed_notice(WORKER, age_minutes=45, now=datetime.now())
 
     response = client.get("/api/v1/readiness")
     body = response.json()
@@ -527,7 +574,10 @@ def test_the_watcher_tick_takes_the_reading(monkeypatch, app_module):
     monkeypatch.setattr(overtime, "scan_auto_close", lambda: {"closed": 0, "deferred": False})
     monkeypatch.setattr(overtime, "scan_overtime", lambda: {"notified": 0})
 
-    _seed_notice(age_minutes=600, now=datetime.now())
+    # Registered device: the tick exists to catch a channel that was asked and went quiet, and
+    # only that reaches the alert (a notice waiting for a device is reported in readiness).
+    _seed_device(WORKER)
+    _seed_notice(WORKER, age_minutes=600, now=datetime.now())
 
     try:
         assert overtime.start_watcher(interval=5, enabled=True) is True
