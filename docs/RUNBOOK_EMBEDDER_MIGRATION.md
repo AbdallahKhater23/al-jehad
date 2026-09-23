@@ -181,11 +181,103 @@ Two decisions worth stating rather than discovering:
   `square=True` only when a fixed-shape engine (a TensorRT profile) requires it.
 * **Cost is linear in windows.** Measured on this box with YuNet at 640, one 1280x720 frame:
   22 ms at `tiles=1`, 44 ms at `tiles=2` (4 windows), 154 ms at `tiles=4` (16 windows). Tile only the
-  frames that need it - a gate camera whose subjects stand close does not.
-
-**The detector is not the whole of coverage.** A crop upscaled from 112x112 to the graph's 160x160
+  frames that need it - a gate camera whose subjects stand close does not.**The detector is not the whole of coverage.** A crop upscaled from 112x112 to the graph's 160x160
 input carries interpolation blur that no threshold absorbs, which is why Phase 2 aligns *directly*
 onto the 160 template: one resample, ever.
+
+### Measure the coverage on your own frames
+
+The arithmetic above is generic; your gate is not. Before choosing a configuration, run the sweep:
+one folder of real frames through **four** configurations — 320, 640, 640+2x2 tiling, and **SCRFD
+at 640** — with every miss named by its reason (`no_face`, `many_faces`, a quality discard) and a
+flip table showing exactly which frames each step recovers. Read-only — it stores nothing and needs
+no consent, because deciding to collect is the decision it informs.
+
+The first three hold the network fixed (YuNet) and vary input size and tiling, which is the dial
+this deployment controls. The fourth is the detector *comparison*: same corpus, same frames, same
+score threshold, a different network. It is there because the published detection-rate tables for
+SCRFD were measured on somebody else's images — whether its stride-8 and -16 heads find more of
+*our* workers, at *our* gate exposures, is a measurement and not a citation. It is compared at 640
+untiled so the step changes one thing: tiling SCRFD as well would measure two changes and answer
+neither question.
+
+SCRFD needs its own ONNX file, which does not ship with this checkout. Put
+`scrfd_10g_bnkps.onnx` beside the YuNet model (`backend/models/`), or point `--scrfd-model` at it,
+or set `SCRFD_MODEL_PATH`:
+
+```bash
+python backend/tools/coverage_sweep.py --corpus /data/sweep-frames \
+    --scrfd-model /data/models/scrfd_10g_bnkps.onnx \
+    --json /tmp/sweep.json
+```
+
+If that file is absent the run **refuses** rather than quietly printing three lines: a report that
+lists three configurations and says nothing about the fourth reads as "the other network was
+measured and lost", which is the assumption the fourth configuration exists to replace. To sweep
+without it, say so — `--skip-scrfd` — and the report records `scrfd@640: NOT MEASURED` in the
+terminal output and in the JSON's `skipped_configs`, so nobody mistakes the artifact for a
+comparison.
+
+Read the output in this order: the `found` share per configuration (the headline), the
+`misses_by_reason` (a `many_faces` count under tiling usually means background faces entering the
+tiled windows — narrow the camera's view or raise the score threshold, it is not a detector-size
+verdict), then the flip rows (`320 -> 640: +N recovered` is the upgrade's direct yield on *your*
+frames).
+
+### Whose face counts
+
+A `many_faces` count is a statement about a *rule*, not about the detector, and the two questions it
+conflates matter differently depending on where the camera points:
+
+* **would the punch path keep this frame?** A clock-in needs one subject — two faces of near-equal
+  size is an ambiguity the gate refuses rather than guesses at, so the bystander is correctly a
+  `many_faces` loss. This is the default, and it is the rule the deployment actually enforces.
+* **how far does this detector reach?** A passer-by does not make the detector worse. Under the
+  single-subject rule, though, **tiling is charged for every extra person its own wider field of
+  view pulls in** — so the configuration most able to reach a distant face reports the *lowest*
+  coverage, and the report says "tiling made things worse" when what happened is that more people
+  were in shot.
+
+`--multi-subject` switches to the second question: a frame counts as found when **any** detection
+clears the gate. Two things keep it honest. It relaxes the *count* only — every detection still has
+to clear the same gate (face size, pose, score), so a distant speck cannot make a frame count as
+covered — and the rule is recorded in the report header and the JSON's `subject` field, because a
+found-share without its rule beside it is a number that could mean either thing. The shipped gate is
+untouched by it.
+
+Run both on the same folder whenever the corpus has bystanders in it. The strict run says what the
+pipeline would discard; the multi-subject run says what the detector could see; the gap between them
+is the bystander cost of that configuration, which is the number to know before pointing a tiled
+detector at a public doorway. Each configuration's line carries the raw count
+(`multi-face frames: N (M counted by the any-face rule)`) so the gap is visible without subtracting
+shares by hand.
+
+```bash
+python backend/tools/coverage_sweep.py --corpus /data/sweep-frames --multi-subject \
+    --scrfd-model /data/models/scrfd_10g_bnkps.onnx --json /tmp/sweep-reach.json
+``` The last flip row is the only one marked `[changes detector: yunet -> scrfd]`: that row is
+the family comparison, and the three before it are tuning steps — do not read a tiling gain as
+evidence about SCRFD. The report also names the model *files* each family ran with (`models`), and
+each configuration's spec carries the file's digest, so "SCRFD found 3 more" stays answerable next
+to the weights it was measured with. The full JSON keeps one entry per frame per configuration, so
+"which frames flipped" is answerable months later.
+
+First run on this deployment's own 18 stored punch frames (2026-09): 320 found 18/18, 640 found
+18/18, 640+tiling found 3/18 — tiling's wider field of view pulled background people into the
+windows, and the single-subject rule reported the ambiguity. On frames this close-in, tiling buys
+nothing and costs 6.5x the detector time; the sweep is how you find that out before deploying it.
+
+Read that 3/18 as the *rule* it is, then re-run it with `--multi-subject` before concluding
+anything about tiling: if the 15 losses were `many_faces` they were bystanders, and the same
+frames may show tiling reaching faces the untiled windows miss. A bystander corpus makes the effect
+blunt — on the 48 public-figure portraits in `temp/faces` (2026-09), every one of tiling's 24
+losses was a `many_faces` it had itself introduced, and under `--multi-subject` all three
+configurations found 48/48: the whole apparent "tiling halves coverage" result was a counting rule,
+not a detector. Those portraits are a sanity corpus, not a gate — the point is only that on a
+crowded frame the strict count measures the crowd.
+
+
+
 
 ## Phase 2 - the contract, measured rather than assumed
 

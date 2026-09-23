@@ -665,6 +665,26 @@ class ReviewRejectionRequest(BaseModel):
         return textguard.prose(value, field="Rejection reason", max_length=textguard.MAX_NOTE)
 
 
+class ShiftHoursEditRequest(BaseModel):
+    """A correction to a shift that has already been worked.
+
+    ``hours`` is the figure the administrator is signing: it becomes both the recorded
+    hours and the approved hours, because a correction the record still disagreed with
+    would be no correction at all. ``note`` is optional - most edits speak for themselves
+    - but whatever is typed rides the audit trail beside the before/after figures.
+    """
+
+    hours: float
+    note: str | None = None
+
+    @field_validator("note")
+    @classmethod
+    def _plain_note(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return textguard.prose(value, field="Note", max_length=textguard.MAX_NOTE, allow_empty=True)
+
+
 class PasswordEditRequest(BaseModel):
     worker_id: str
     new_password: str
@@ -3852,6 +3872,106 @@ async def reject_review(
     }
 
 
+@router.post("/admin/shifts/{log_id}/hours")
+async def edit_worked_shift_hours(
+    request: Request, log_id: int, req: ShiftHoursEditRequest, current: CurrentUser = Depends(admin_only)
+):
+    """Correct the hours of a shift that has already been worked and filed.
+
+    The clock records what it saw, but the clock is not always right about the *day*: the
+    punch pair straddled a mid-shift errand, the offline replay arrived twice, or the
+    figure an approval settled carries a typo. Until now the only paths that touched a
+    filed row's hours were the review decisions - so a settled shift carrying a wrong
+    number had no correction at all, and "edit the timesheet" meant editing the database
+    by hand. This endpoint is the ordinary, audited way to do that.
+
+    What it deliberately does NOT do:
+
+    * **reopen a decision.** A row awaiting review is answered by the review, not edited
+      around it - editing a pending row would let an edit stand in for the decision the
+      queue exists to record, so pending rows are refused here.
+    * **touch an open shift.** A shift still running is closed by the clock-out (or a
+      force-out); there is nothing filed yet to correct.
+
+    The row keeps its status code - the answer the review gave is history - and only the
+    figures move: ``hours`` and ``approved_hours`` take the corrected figure together (a
+    record that disagreed with its own approval would repeat in every report), and
+    ``overtime_hours`` is re-derived from the same resolver the approval gate uses, so a
+    corrected 9.5 h day credits 1.5 h of overtime under a regular day of 8 h - computed,
+    never typed.
+
+    The edit is appended to the audit trail as ``shift_hours_edit`` with the before and
+    after figures, because a timesheet that changed without a trail is not a timesheet -
+    it is a rumour.
+    """
+    hours = round(float(req.hours), 4)
+    if hours < 0 or hours > overtime.MAX_AUTHORISED_HOURS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"hours must be between 0 and {overtime.MAX_AUTHORISED_HOURS:g} for one shift"
+            ),
+        )
+
+    with db(write=True) as conn:
+        row = conn.execute(
+            "SELECT worker_id, hours, status, status_code, approved_hours, overtime_hours, action "
+            "FROM attendance_logs WHERE id = ?",
+            (log_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Attendance log record not found.")
+        if row["action"] != ACTION_CLOCK_OUT:
+            raise HTTPException(status_code=400, detail="Only a clock-out row carries a shift's hours.")
+        code = str(row["status_code"] or "")
+        if code in ("pending_review", "pending_overtime", "unverified_offline", "auto_closed"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "This shift is still waiting on a decision (a review answer, or the "
+                    "auto-close) - settle it there rather than editing around it."
+                ),
+            )
+
+        regular_hours = float(get_shift_rules()["regular_hours"])
+        overtime_hours = round(max(0.0, hours - regular_hours), 4)
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute(
+            "UPDATE attendance_logs SET hours = ?, approved_hours = ?, overtime_hours = ?, "
+            "reviewed_by = ?, reviewed_at = ? WHERE id = ?",
+            (hours, hours, overtime_hours, current.id, now_str, log_id),
+        )
+        _audit(
+            conn,
+            action="shift_hours_edit",
+            actor=current,
+            entity="attendance_logs",
+            entity_id=log_id,
+            before={
+                "hours": row["hours"],
+                "approved_hours": row["approved_hours"],
+                "overtime_hours": row["overtime_hours"],
+                "status_code": code,
+            },
+            after={
+                "hours": hours,
+                "approved_hours": hours,
+                "overtime_hours": overtime_hours,
+                "note": req.note,
+            },
+            request=request,
+        )
+    return {
+        "status": "success",
+        "message": (
+            f"Shift corrected to {hours:g}h "
+            f"(overtime re-derived at {overtime_hours:g}h)."
+        ),
+        "hours": hours,
+        "overtime_hours": overtime_hours,
+    }
+
+
 @router.post("/admin/force_clock_in")
 async def force_clock_in(
     request: Request, req: ForceClockRequest, current: CurrentUser = Depends(admin_only)
@@ -3981,6 +4101,7 @@ async def force_clock_out(
             status=STATUS_FORCED_OUT,
             status_code="approved",
             source="admin_override",
+            approved_hours=hours_worked,
             overtime_hours=assessment["overtime_hours"] or None,
             break_hours=break_taken or None,
         )

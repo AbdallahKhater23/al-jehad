@@ -183,3 +183,51 @@ def test_reach_improves_with_tiles_and_never_the_other_way(floor_px):
     assert detector.min_detectable_width(1280, 720, tiles=2, floor_px=16.0) == pytest.approx(
         17.6, abs=0.2
     ), "the per-window figure, not floor_px / (scale x tiles) = 16.0"
+
+
+# ---------------------------------------------------------------------------
+# the factory: both families build, and each gets only the keywords it has
+# ---------------------------------------------------------------------------
+def test_the_factory_builds_each_family_without_handing_it_another_familys_keywords(tmp_path):
+    """The defect the coverage sweep's fourth configuration walked into.
+
+    ``square`` used to sit in ``**kwargs`` and was therefore forwarded to whichever backend was
+    being built. YuNet takes it; SCRFD does not have the mode at all - so *every* SCRFD
+    construction through this factory died with ``ScrfdDetector.__init__() got an unexpected
+    keyword argument 'square'``. Nothing caught it, because no test built a SCRFD detector through
+    the factory: the backend was exercised only by hand, if at all.
+
+    A missing model proves the point without one on disk: with the keyword bug the rejection is a
+    ``TypeError`` from argument binding, and with it fixed the rejection is the backend's own
+    ``DetectorError`` naming the file. That difference is exactly what this asserts.
+    """
+    missing = tmp_path / "not-here.onnx"
+    yunet_model = Path(__file__).resolve().parent.parent / "models" / "face_detection_yunet_2023mar.onnx"
+    assert yunet_model.exists(), "the YuNet model ships with the checkout"
+
+    built = detector_640.build_detector("yunet", str(yunet_model), input_size=640)
+    assert callable(built) and built.detector.input_size == 640
+
+    with pytest.raises(DetectorError) as scrfd_error:
+        detector_640.build_detector("scrfd", str(missing), input_size=640)
+    assert "SCRFD model not found" in str(scrfd_error.value), scrfd_error.value
+
+    with pytest.raises(DetectorError) as unknown:
+        detector_640.build_detector("retinaface", str(missing))
+    assert "unknown detector kind" in str(unknown.value), unknown.value
+
+
+def test_the_factory_refuses_a_square_input_for_the_backend_that_has_no_such_mode(tmp_path):
+    """Refused by name rather than ignored: a fixed-shape engine profile is a real requirement.
+
+    Silently dropping the flag would hand an operator the aspect-fitted geometry while they believe
+    they are running the square input their TensorRT profile was built for - a model whose inputs
+    are not the shape it was designed around, and no error to notice.
+    """
+    with pytest.raises(DetectorError) as excinfo:
+        detector_640.build_detector(
+            "scrfd", str(tmp_path / "scrfd.onnx"), input_size=640, square=True
+        )
+    message = str(excinfo.value)
+    assert "no square-letterbox mode" in message, message
+    assert "YuNet" in message, message
