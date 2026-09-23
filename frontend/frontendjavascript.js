@@ -2142,8 +2142,17 @@ const UI = {
         if (!metrics.faceDetection || !metrics.face) return null;
         if (!metrics.face.count) return 'framingNoFace';
         if (metrics.face.count > 1) return 'framingManyFaces';
-        if (metrics.face.area < 0.12) return 'framingCloser';
-        if (metrics.face.area > 0.75) return 'framingFurther';
+        //: The good window, in real distances. Face width is ~0.16 m; on a ~66° phone
+        //: front camera the face's share of the frame is (0.16 / (2·d·tan 33°))², which
+        //: puts 0.7 m at ~3% of the frame area and 1.2 m at ~1.1%. The old floor (12%)
+        //: demanded ~0.36 m — an arm's-length-plus selfie — and told everybody standing
+        //: a sensible step away to "move closer". The window below accepts the whole
+        //: 0.7–1.5 m band the pipeline was measured for, warns only when the face is
+        //: genuinely marginal (<1%: past ~1.9 m), and asks for more distance only above
+        //: 35% (~0.21 m, where the face no longer fits the alignment template's margins).
+        //: The warn floor is 0.6% (~1.6 m): genuinely out of range, not merely far.
+        if (metrics.face.area < 0.006) return 'framingCloser';
+        if (metrics.face.area > 0.35) return 'framingFurther';
         return 'framingGood';
     },
 

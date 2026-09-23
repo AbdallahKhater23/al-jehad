@@ -24,7 +24,7 @@ is about the pipeline that feeds it.
 | --- | --- |
 | `backend/corpus.py` | the labelled corpus: capture, label, export, statistics, erasure, and the live punch hook |
 | `backend/tools/corpus_admin.py` | the operator command for it (not `corpus.py`: every tool here puts its own directory on `sys.path`, and a tool called `corpus.py` would shadow the store for the punch path) |
-| `backend/detector_640.py` | resolution-correct localisation: an invertible `Letterbox`, YuNet at 640 (square or aspect-matched), an optional `tiles x tiles` pass with greedy NMS merging, and a `ScrfdDetector` for extreme range |
+| `backend/detector_640.py` | resolution-correct localisation: an invertible `Letterbox`, YuNet at 640 (square or aspect-matched), an optional `tiles x tiles` pass with greedy NMS merging, and a `ScrfdDetector` for extreme range (reads both SCRFD export conventions, decodes on a square canvas) |
 | `backend/face_align.py` | one-resample alignment: a closed-form Umeyama similarity transform from native-frame landmarks straight onto the 160x160 template, plus the four input `Contract`s |
 | `backend/facenet_ort.py` | the ORT session (IOBinding, thread tuning, warmup) and **host-side L2** on the raw output |
 | `backend/calibration.py` | the band rule, its identity-cluster bootstrap, and the refusal when no line can separate the distributions |
@@ -201,15 +201,34 @@ SCRFD were measured on somebody else's images — whether its stride-8 and -16 h
 untiled so the step changes one thing: tiling SCRFD as well would measure two changes and answer
 neither question.
 
-SCRFD needs its own ONNX file, which does not ship with this checkout. Put
-`scrfd_10g_bnkps.onnx` beside the YuNet model (`backend/models/`), or point `--scrfd-model` at it,
-or set `SCRFD_MODEL_PATH`:
+SCRFD needs its own ONNX file, which does not ship with this repository's git history. Put
+`scrfd_2.5g_bnkps.onnx` **or** `scrfd_10g_bnkps.onnx` beside the YuNet model (`backend/models/`),
+or point `--scrfd-model` at it, or set `SCRFD_MODEL_PATH`:
 
 ```bash
-python backend/tools/coverage_sweep.py --corpus /data/sweep-frames \
-    --scrfd-model /data/models/scrfd_10g_bnkps.onnx \
-    --json /tmp/sweep.json
+# the 2.5G head, 3.3 MB - the one the CPU-only deployment should measure first
+curl -L -o backend/models/scrfd_2.5g_bnkps.onnx \
+  https://huggingface.co/MonsterMMORPG/files1/resolve/main/scrfd_2.5g_bnkps.onnx
+
+python backend/tools/coverage_sweep.py --corpus /data/sweep-frames --json /tmp/sweep.json
 ```
+
+The two names are searched in that order (2.5G first: a tenth of the size, faster on CPU, and the
+reach difference between the two heads is on the order of a few pixels). Either file is measured
+under the same spec, and the report's `models` block always names the file that produced the
+numbers — so a sweep can never be read as a comparison of a file it did not run. Whichever you
+download, check it loads before trusting a report: the two head *conventions* and the canvas
+geometry are documented in the `ScrfdDetector` docstring, and a file that parses neither way is
+refused by name at construction rather than returning an empty detection list that reads as "no
+face in frame".
+
+**SCRFD is decoded on a square canvas, and no other shape will do.** Its published exports lay
+their heads out as `(input/stride)**2` cells — 12800, 3200 and 800 at input 640 — and the 10G
+file declares those shapes *statically*. Feed it an aspect-fitted canvas (640x360 for a 16:9 frame,
+what the ordinary YuNet path produces) and the real grids come out 7200, 1840 and 480, which no
+single rounding rule explains: boxes would land in the wrong place with no error to notice. The
+frame is therefore letterboxed into a square canvas with padding, the subject keeps its full scale,
+and the decoder refuses any other canvas by name.
 
 If that file is absent the run **refuses** rather than quietly printing three lines: a report that
 lists three configurations and says nothing about the fourth reads as "the other network was
@@ -254,13 +273,25 @@ shares by hand.
 
 ```bash
 python backend/tools/coverage_sweep.py --corpus /data/sweep-frames --multi-subject \
-    --scrfd-model /data/models/scrfd_10g_bnkps.onnx --json /tmp/sweep-reach.json
+    --json /tmp/sweep-reach.json
 ``` The last flip row is the only one marked `[changes detector: yunet -> scrfd]`: that row is
 the family comparison, and the three before it are tuning steps — do not read a tiling gain as
 evidence about SCRFD. The report also names the model *files* each family ran with (`models`), and
 each configuration's spec carries the file's digest, so "SCRFD found 3 more" stays answerable next
 to the weights it was measured with. The full JSON keeps one entry per frame per configuration, so
 "which frames flipped" is answerable months later.
+
+Two things about the flip rows worth knowing before reading them:
+
+* **frames are paired by position, not by name.** A corpus is routinely laid out one folder per
+  identity (`angela-merkel/01.jpg`, `barack-obama/01.jpg`), where a dozen frames share the name
+  `01.jpg`; joining on that name collapsed them and under-reported every flip. The report counts
+  the repeats and says so (`note: N frame names repeat across this corpus`), and each row prints
+  the file rather than the basename.
+* **one score threshold, applied to both families.** `--min-score` (default 0.6) is the gate's
+  threshold and the comparison is only fair because both networks answer to it — but the two score
+  scales are not calibrated to each other (SCRFD's own default is 0.5). A sensitivity run at 0.5
+  is worth ten seconds when a family's number looks like a threshold artefact.
 
 First run on this deployment's own 18 stored punch frames (2026-09): 320 found 18/18, 640 found
 18/18, 640+tiling found 3/18 — tiling's wider field of view pulled background people into the
@@ -275,6 +306,53 @@ losses was a `many_faces` it had itself introduced, and under `--multi-subject` 
 configurations found 48/48: the whole apparent "tiling halves coverage" result was a counting rule,
 not a detector. Those portraits are a sanity corpus, not a gate — the point is only that on a
 crowded frame the strict count measures the crowd.
+
+#### Which frames to sweep
+
+The corpus that decides the detector question is the deployment's own stored punch frames, on the
+Railway volume (`/data/punch_frames`; copy or `tar` a sample out if you would rather sweep it
+elsewhere). They are **not** in any checkout, and one trap is worth naming: the repository's own
+`punch_frames/` directory holds the *test harness's* output — 240x240 flat placeholders of
+`(128, 132, 136)` written by the suite's synthetic punches, with 396 of them byte-identical — so
+sweeping it measures nothing but the placeholder. (It looks like data: 1511 files, real JPEGs, real
+names. Check the mean and the content hashes before trusting a folder as a corpus.)
+
+```bash
+# beside the volume, or inside the service: `railway run python backend/tools/coverage_sweep.py ...`
+python backend/tools/coverage_sweep.py --corpus /data/punch_frames --json /tmp/sweep-gate.json
+```
+
+Until that run exists, the numbers below are a comparison of the two networks on *photographs* —
+useful for validating the plumbing and the decode, not for choosing a detector.
+
+#### First four-configuration run (2026-09, 48 real photographs, `temp/faces`)
+
+Run after the SCRFD file was added, so all four lines are measured rather than three measured and
+one assumed. Strict rule, `--min-score 0.6`, times are detector milliseconds for the whole corpus:
+
+| configuration | found | misses | detect time |
+|---|---|---|---|
+| `yunet@320` | 38/48 (79.2 %) | 10 `many_faces` | 0.9 s |
+| `yunet@640` | 37/48 (77.1 %) | 11 `many_faces` | 2.7 s |
+| `yunet@640+2x2tiling` | 24/48 (50.0 %) | 24 `many_faces` | 8.1 s |
+| **`scrfd@640`** | **38/48 (79.2 %)** | 8 `many_faces`, 2 `quality:extreme_pitch` | 3.1 s |
+
+On this corpus SCRFD is the only configuration that recovers frames the others lose: the
+`yunet@640+2x2tiling -> scrfd@640` row reads **+16 recovered, −2 lost (net +14)**, for about the
+cost of a single YuNet pass at 640 (64 ms/frame against tiling's 170 ms). Under `--multi-subject`
+SCRFD is the one configuration with a genuine miss — 46/48, and both losses are
+`quality:extreme_pitch`, i.e. the *gate* refusing the pose rather than the detector failing to find
+the face.
+
+Three honest caveats before this is read as a migration decision:
+
+1. **These are portraits, not gate frames.** The corpus that decides this is the deployment's own
+   punch frames; see the command below. Public-figure photographs are clean, front-on and
+   well-lit — exactly the conditions where a detector comparison looks flattest.
+2. **`many_faces` counts are a property of the corpus**, not the network: portraits have crowds in
+   them, and one-subject frames lose to bystanders under the strict rule.
+3. **A 0.5 threshold run is nearly identical** (37/37/23/36): the ranking is stable, and the
+   threshold mostly moves bystander counts, not detector reach.
 
 
 

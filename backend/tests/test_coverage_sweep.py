@@ -241,6 +241,60 @@ def test_the_report_is_json_shaped_and_names_its_gate(stubbed_specs):
         assert "spec" in config and config["spec"]["input_size"] in (320, 640)
 
 
+def test_the_flip_table_pairs_frames_by_position_when_basenames_repeat():
+    """A corpus laid out one folder per identity repeats '01.jpg' - and the flip table must not care.
+
+    This was found by running the sweep on the real portrait corpus (48 frames, 12 identities, four
+    names), where joining the two configurations on the frame *name* collapsed forty-eight frames
+    into twelve and under-reported every flip. Nothing errored: the counts were simply smaller than
+    the frames that moved. The pairing is by position, because every configuration is handed the
+    same frames in the same order, and each row carries its file's path for a reader joining by hand.
+    """
+    from coverage_sweep import default_specs, flip_table, spec_name
+
+    specs = default_specs()[:2]  # yunet@320 -> yunet@640
+    paths = ["angela-merkel/01.jpg", "barack-obama/01.jpg", "bill-gates/01.jpg"]
+
+    def outcomes(found: list[bool]) -> list[dict]:
+        return [
+            {"frame": "01.jpg", "path": path, "found": flag, "face_px": 48.0 if flag else None,
+             "miss_reason": None if flag else "no_face", "faces": 1}
+            for path, flag in zip(paths, found)
+        ]
+
+    results = {
+        spec_name(specs[0]): {"outcomes": outcomes([True, False, False])},
+        spec_name(specs[1]): {"outcomes": outcomes([False, False, True])},
+    }
+    row = flip_table(results, specs)[0]
+    # Two frames moved, in opposite directions, and both share the name "01.jpg".
+    assert row["recovered_count"] == 1, row
+    assert row["recovered"][0]["path"] == "bill-gates/01.jpg", row["recovered"]
+    assert row["lost"] == ["angela-merkel/01.jpg"], row["lost"]
+    assert row["net"] == 0, row
+
+
+def test_the_sweep_reports_a_corpus_whose_basenames_repeat(stubbed_specs):
+    """The trap is named in the report rather than left for the reader to fall into."""
+    from coverage_sweep import default_specs, render, sweep
+
+    class _Frames:
+        def frames(self):
+            return iter([
+                Frame(image=_face_pixels(1280, 720, 640, 360, 48), name="01.jpg",
+                      meta={"path": f"person-{index}/01.jpg"})
+                for index in range(3)
+            ])
+
+        skipped: list = []
+
+    report = sweep(_Frames(), default_specs())
+    assert report["frames_read"] == 3
+    assert report["duplicate_frame_names"] == 2, report["duplicate_frame_names"]
+    assert "frame names repeat" in render(report), render(report)
+    assert report["configs"]["yunet@640"]["outcomes"][0]["path"] == "person-0/01.jpg"
+
+
 def test_flip_table_compares_configurations_in_the_order_given(stubbed_specs):
     """The progression reads 320 -> 640 -> 640+tiling -> SCRFD; the order is the report's grammar."""
     from coverage_sweep import default_specs, flip_table, spec_name
@@ -603,6 +657,40 @@ def test_the_cli_carries_multi_subject_into_the_report(monkeypatch, tmp_path, st
     assert relaxed["subject"] == "any"
     assert strict["gate"] == relaxed["gate"], "the relaxed rule changes the count, never the gate"
     assert set(relaxed["configs"]) == set(strict["configs"])
+
+
+def test_the_scrfd_file_is_found_beside_the_yunet_model_without_being_named(
+    monkeypatch, tmp_path, capsys
+):
+    """Both conventional names are searched, and the report says which file was measured.
+
+    The deployment keeps its models in one place, so an operator who drops the SCRFD export beside
+    the YuNet file should not have to name it on the command line - and should not have to guess
+    which of the two conventional names this tool favours. The order is asserted (the CPU-friendly
+    2.5G head first) and so is the outcome that matters: the report names the file, so a sweep can
+    never be read as a comparison the download did not produce.
+    """
+    import face_detector
+
+    from coverage_sweep import SCRFD_MODEL_FILENAMES, main
+
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    yunet = models_dir / "face_detection_yunet_2023mar.onnx"
+    yunet.write_bytes(b"stubbed: DetectorSpec.build is patched")
+    (models_dir / SCRFD_MODEL_FILENAMES[1]).write_bytes(b"the 10G head")
+    (models_dir / SCRFD_MODEL_FILENAMES[0]).write_bytes(b"the 2.5G head, but not the only one")
+    monkeypatch.setattr(face_detector, "model_path", lambda: str(yunet))
+    monkeypatch.setattr(DetectorSpec, "build", lambda self: _StrideStub(48.0, 640, self.tiles,
+                                                                        kind=self.kind))
+    _stub_directory_source(monkeypatch)
+
+    out = tmp_path / "sweep.json"
+    assert main(["--corpus", str(_frames_dir(tmp_path)), "--json", str(out)]) == 0
+    report = json.loads(out.read_text(encoding="utf-8"))
+    named = report["models"]["scrfd"][0]
+    assert SCRFD_MODEL_FILENAMES[0] in named, report["models"]
+    capsys.readouterr()  # the sweep prints its report; nothing here asserts the text
 
 
 def test_a_missing_scrfd_model_is_refused_rather_than_quietly_dropped(monkeypatch, tmp_path, stubbed_specs, capsys):

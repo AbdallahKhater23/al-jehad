@@ -405,12 +405,36 @@ class ScrfdDetector:
     * the blob contract is RGB with mean 127.5 and scale 1/128 - insightface's own preprocessing.
       Getting this wrong produces detections that look plausible and are 20 px off.
 
-    Output names are matched by pattern and completeness is *enforced*: a model whose heads are
-    named differently is refused at construction rather than returning an empty detection list
-    that reads as "no face in frame".
+    Two export conventions are read, and completeness is *enforced* under both: a file that fits
+    neither is refused at construction rather than returning an empty detection list that reads as
+    "no face in frame".
+
+    * ``score_8`` / ``bbox_8`` / ``kps_8`` - the head names the SCRFD repo's own export script
+      writes. The stride is in the name.
+    * **numeric names** (``448``, ``471``, ...) - the convention insightface ships, where the
+      tensors are named after their graph ids and the layout is positional: every score tensor,
+      then every bbox, then every keypoint, each block in the same stride order. This is what
+      ``scrfd_2.5g_bnkps.onnx`` and ``scrfd_10g_bnkps.onnx`` (the two files the runbook points at)
+      actually contain, and it is why the *stride* has to be recovered from the geometry - rows
+      against the input size - and validated per inference rather than trusted from a name.
+
+    **The canvas is square, and that is a requirement rather than a preference.** Every published
+    export of this family declares ``(input/stride)**2`` cells per head - 12800, 3200 and 800 at
+    input 640 - and the 10G file declares those shapes *statically*, so it will not accept an
+    aspect-fitted canvas at all. Feeding one anyway (a 640x360 canvas for a 16:9 frame, the shape
+    the aspect-fit path produces) silently breaks the arithmetic: the real grids come out 7200,
+    1840 and 480, which is neither ``input/stride`` squared nor consistently rounded, so a decoder
+    that assumes the square grid either decodes the wrong cells or refuses. The frame is therefore
+    letterboxed into a square canvas - aspect preserved, padded - which keeps the subject at full
+    scale and makes ``grid = (input/stride)**2`` exactly true. ``detect`` refuses a non-square
+    canvas by name rather than decoding geometry it cannot verify.
     """
 
     _PATTERN: Final = re.compile(r"^(score|bbox|kps)_(\d+)$")
+    #: Last dimension of each tensor family, used to identify the positional layout. A score
+    #: tensor is one value per candidate, a box is four, and SCRFD's five landmarks are ten -
+    #: which is also the check that keeps a foreign export (YuNet's 1/1/4/10 per stride) out.
+    _WIDTHS: Final = {"score": 1, "bbox": 4, "kps": 10}
 
     def __init__(
         self,
@@ -452,23 +476,131 @@ class ScrfdDetector:
             kind, stride = match.group(1), int(match.group(2))
             branches.setdefault(stride, {})[kind] = output.name
         incomplete = sorted(s for s, kinds in branches.items() if set(kinds) != {"score", "bbox", "kps"})
-        if not branches or incomplete:
-            raise DetectorError(
-                "SCRFD export does not expose a complete score_/bbox_/kps_ set per stride "
-                f"(strides seen: {sorted(branches)}; incomplete: {incomplete}); refusing to decode"
-            )
-        self._strides: Final = sorted(branches)
-        self._branches = branches
-        log.info("SCRFD ready: input=%d strides=%s", self.input_size, self._strides)
+        #: Heads resolved at construction (the named convention), or empty when the strides can only
+        #: be known per inference (the positional one).
+        self._strides: Final[tuple[int, ...]] = ()
+        #: The positional layout as (score, bbox, kps) output indices, or empty for the named one.
+        self._layout: list[tuple[int, int, int]] = []
+        if branches and not incomplete:
+            self._strides = tuple(sorted(branches))
+            self._branches = branches
+        else:
+            # The named convention did not describe this file. Before refusing, read it the other
+            # documented way: the positional layout insightface ships, whose strides cannot be
+            # known until an inference says how many rows each head produced.
+            layout = self._numeric_layout()
+            if layout is None:
+                observed = [tuple(o.shape) for o in self._session.get_outputs()]
+                raise DetectorError(
+                    "SCRFD export exposes neither a complete score_/bbox_/kps_ set per stride "
+                    f"(strides seen: {sorted(branches)}; incomplete: {incomplete}) nor the "
+                    f"insightface positional layout (score/bbox/kps blocks, last dims 1/4/10; "
+                    f"outputs seen: {observed}); refusing to decode"
+                )
+            self._branches = branches
+            self._layout = layout
+        log.info(
+            "SCRFD ready: input=%d strides=%s layout=%s",
+            self.input_size,
+            self._strides or "positional (resolved per inference)",
+            "numeric" if self._layout else "named",
+        )
 
-    def _decode(self, plan: Letterbox, outputs: list[np.ndarray]) -> list[Detection]:
-        names = [output.name for output in self._session.get_outputs()]
+    def _numeric_layout(self) -> list[tuple[int, int, int]] | None:
+        """Head indices per stride for insightface's numeric-named export, or ``None``.
+
+        The convention is positional *and* unlabelled, so it is derived from two facts that a
+        different model cannot easily satisfy at once: the outputs come in three equal blocks
+        (all scores, all boxes, all keypoints) and each block's tensors carry the family's last
+        dimension. YuNet, the most likely wrong file to be pointed at, interleaves its heads
+        (1, 1, 4, 10 per stride), so it fails the block test rather than being misread.
+        """
+        outputs = self._session.get_outputs()
+        count = len(outputs)
+        if count == 0 or count % 3:
+            return None
+        widths: list[int] = []
+        for output in outputs:
+            shape = list(output.shape)
+            if len(shape) != 2 or not isinstance(shape[-1], int):
+                return None
+            widths.append(int(shape[-1]))
+        block = count // 3
+        expected = (
+            [self._WIDTHS["score"]] * block
+            + [self._WIDTHS["bbox"]] * block
+            + [self._WIDTHS["kps"]] * block
+        )
+        if widths != expected:
+            return None
+        return [(index, block + index, 2 * block + index) for index in range(block)]
+
+    def _positional_stride(self, rows: int) -> int:
+        """The stride a head was computed at, from its row count and the input size.
+
+        ``rows = anchors * (input/stride)**2`` on the square canvas this backend always feeds, so
+        the stride is recoverable - but only if exactly one (anchors, stride) pair explains the
+        row count. SCRFD ships two anchors per cell and the one-anchor export exists, so both are
+        tried; two explanations is not a preference to break, it is a file we do not understand,
+        and the refusal says which row count was ambiguous.
+        """
+        candidates: list[int] = []
+        for anchors in (2, 1):
+            if rows % anchors:
+                continue
+            side = math.isqrt(rows // anchors)
+            if side == 0 or side * side != rows // anchors or self.input_size % side:
+                continue
+            stride = self.input_size // side
+            if stride >= 4 and stride & (stride - 1) == 0 and stride not in candidates:
+                candidates.append(stride)
+        if len(candidates) != 1:
+            raise DetectorError(
+                f"a SCRFD head with {rows} rows does not resolve to exactly one stride at input "
+                f"{self.input_size} (candidates: {candidates}); refusing to decode"
+            )
+        return candidates[0]
+
+    def _output_plan(self, outputs: list[np.ndarray]) -> dict[int, dict[str, int]]:
+        """strides -> {kind: index into ``outputs``}, whichever convention this file follows."""
+        if self._branches:
+            names = [output.name for output in self._session.get_outputs()]
+            return {
+                stride: {kind: names.index(name) for kind, name in kinds.items()}
+                for stride, kinds in self._branches.items()
+            }
+        plan: dict[int, dict[str, int]] = {}
+        for score, bbox, kps in self._layout:
+            stride = self._positional_stride(int(np.asarray(outputs[score]).size))
+            if stride in plan:
+                raise DetectorError(
+                    f"two SCRFD heads resolved to stride {stride}; refusing to decode"
+                )
+            plan[stride] = {"score": score, "bbox": bbox, "kps": kps}
+        return plan
+
+    def _decode(
+        self, plan: Letterbox, outputs: list[np.ndarray], *, canvas: tuple[int, int]
+    ) -> list[Detection]:
+        canvas_h, canvas_w = int(canvas[0]), int(canvas[1])
+        if canvas_h != self.input_size or canvas_w != self.input_size:
+            # The heads are laid out on a grid derived from the *canvas*: an aspect-fitted canvas
+            # makes ``input/stride`` false in one axis and the cell count is not recoverable from
+            # the tensors. Refused by name, because decoding it anyway would produce boxes that
+            # look plausible and point at the wrong pixels.
+            raise DetectorError(
+                f"SCRFD needs a square canvas of {self.input_size}x{self.input_size} for its "
+                f"(input/stride)**2 head layout, got {canvas_w}x{canvas_h}; refusing to decode"
+            )
         found: list[Detection] = []
-        for stride in self._strides:
-            kinds = self._branches[stride]
-            scores = np.asarray(outputs[names.index(kinds["score"])], dtype=np.float32).reshape(-1)
-            boxes = np.asarray(outputs[names.index(kinds["bbox"])], dtype=np.float32)
-            kpss = np.asarray(outputs[names.index(kinds["kps"])], dtype=np.float32)
+        branches = self._output_plan(outputs)
+        if not branches:
+            raise DetectorError("the SCRFD session exposed no heads to decode")
+        for stride in sorted(branches):
+            kinds = branches[stride]
+            scores = np.asarray(outputs[kinds["score"]], dtype=np.float32).reshape(-1)
+            boxes = np.asarray(outputs[kinds["bbox"]], dtype=np.float32)
+            kpss = np.asarray(outputs[kinds["kps"]], dtype=np.float32)
             grid_h, grid_w = self.input_size // stride, self.input_size // stride
             cells = grid_h * grid_w
             if scores.size == 0 or scores.size % cells:
@@ -516,7 +648,9 @@ class ScrfdDetector:
             sub = frame[y0:y1, x0:x1]
             if sub.size == 0:  # pragma: no cover
                 continue
-            plan = Letterbox.fit(sub.shape[1], sub.shape[0], self.input_size, self.input_size)
+            plan = Letterbox.fit(
+                sub.shape[1], sub.shape[0], self.input_size, self.input_size, square=True
+            )
             payload = plan.apply(sub)
             # insightface contract: BGR -> RGB, mean 127.5, scale 1/128, NCHW float32.
             chw = np.ascontiguousarray(payload[:, :, ::-1].transpose(2, 0, 1))[None].astype(np.float32)
@@ -525,7 +659,7 @@ class ScrfdDetector:
                 outputs = self._session.run(None, {self._input_name: blob})
             except Exception as exc:  # noqa: BLE001 - surfaced with the frame's geometry
                 raise DetectorError(f"SCRFD inference failed on a {x1 - x0}x{y1 - y0} window: {exc}") from exc
-            for detection in self._decode(plan, outputs):
+            for detection in self._decode(plan, outputs, canvas=payload.shape[:2]):
                 bx, by, bw, bh = detection.box
                 detection.box = (bx + x0, by + y0, bw, bh)
                 detection.landmarks = detection.landmarks + np.array([x0, y0], dtype=np.float32)
@@ -563,12 +697,11 @@ def build_detector(
     if kind == "yunet":
         detector: Any = YuNetDetector(model_path, input_size=input_size, square=square, **kwargs)
     elif kind == "scrfd":
-        if square:
-            raise DetectorError(
-                "the SCRFD backend has no square-letterbox mode: it fits its input to the "
-                "frame's aspect (see ScrfdDetector). Drop the square flag, or use the YuNet "
-                "backend where a fixed-shape engine requires a square input."
-            )
+        # ``square`` is accepted and ignored: this backend letterboxes into a square canvas always,
+        # because its published exports declare their head grids as ``(input/stride)**2`` and the
+        # 10G file's are even static. It used to be refused - back when SCRFD was aspect-fitted,
+        # where honouring the flag was impossible - so a caller asking for the fixed-shape square
+        # input a TensorRT profile needs now simply gets the square input this backend always feeds.
         detector = ScrfdDetector(model_path, input_size=input_size, **kwargs)
     else:
         raise DetectorError(f"unknown detector kind {kind!r}; expected 'yunet' or 'scrfd'")

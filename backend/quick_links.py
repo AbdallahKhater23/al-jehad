@@ -728,7 +728,10 @@ async def submit_quick_punch(
     # --- the photo policy, then the photo ----------------------------------------------
     file_bytes = await uploads.read_photo(selfie, field="selfie")
     image = uploads.decode_photo(file_bytes, field="selfie")
-    image.thumbnail((640, 640))
+    # Same ceiling as the live punch endpoints (``settings.punch_selfie_max_px``): a
+    # quick link is a punch, and a worker at 1.2 m deserves the same native-scale crop
+    # whichever way the punch reaches the server.
+    image.thumbnail((settings.punch_selfie_max_px, settings.punch_selfie_max_px))
     # ``rgb_array`` feeds the liveness model (trained on RGB crops), ``img_array`` is the BGR
     # view the detector expects - the same split ``/attendance/verify`` makes, and for the
     # same reason: two consumers must not silently swap channel order.

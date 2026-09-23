@@ -1025,12 +1025,14 @@ _MATCH_PHRASES = {
 def _frame_arrays(blob: bytes) -> tuple[np.ndarray, np.ndarray]:
     """``(rgb, bgr)`` for one selfie: the same ceiling and channel order as a live punch.
 
-    ``main.py`` thumbnails to 640 px before either model sees the frame, and hands the
-    liveness model RGB while DeepFace expects BGR. A scoring path that skipped either would
-    print a number beside the online one that was measured on different pixels.
+    ``main.py`` thumbnails to ``settings.punch_selfie_max_px`` before either model sees the
+    frame, and hands the liveness model RGB while DeepFace expects BGR. A scoring path that
+    skipped either would print a number beside the online one that was measured on different
+    pixels - which is also why the ceiling is the *same* setting, not a private 640: the
+    offline score must be measured on the same pixels the online one would have been.
     """
     image = uploads.decode_photo(blob, field="selfie")
-    image.thumbnail((640, 640))
+    image.thumbnail((settings.punch_selfie_max_px, settings.punch_selfie_max_px))
     rgb = np.array(image)
     return rgb, rgb[:, :, ::-1]
 

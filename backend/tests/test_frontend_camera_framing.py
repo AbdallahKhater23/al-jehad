@@ -45,9 +45,21 @@ const ADVICE = {
     flat: frame({ luminance: 120, contrast: 3 }),
     no_face: frame({ face: { count: 0, area: 0 } }),
     many_faces: frame({ face: { count: 2, area: 0.5 } }),
-    closer: frame({ face: { count: 1, area: 0.05 } }),
-    further: frame({ face: { count: 1, area: 0.9 } }),
-    good: frame({}),
+    // "Move closer" is for a genuinely marginal face only: below 1% of the frame is
+    // past ~1.9 m on a 66° phone camera. 0.05 (≈0.7 m) and 0.03 (≈0.9 m) are IN the
+    // good window now — the old 12% floor demanded an arm's-length selfie.
+    closer: frame({ face: { count: 1, area: 0.005 } }),
+    further: frame({ face: { count: 1, area: 0.5 } }),
+    good: frame({ face: { count: 1, area: 0.03 } }),
+    // The whole working band the pipeline was measured for must read as good framing:
+    // 3% ≈ 0.7 m, 1.5% ≈ 1.0 m, 1.1% ≈ 1.2 m, 0.7% ≈ 1.5 m.
+    good_far: frame({ face: { count: 1, area: 0.03 } }),
+    good_1m: frame({ face: { count: 1, area: 0.015 } }),
+    good_1_2m: frame({ face: { count: 1, area: 0.011 } }),
+    good_1_5m: frame({ face: { count: 1, area: 0.007 } }),
+    // A very close frame (arm's length or nearer) now gets the advice the old rule gave
+    // everybody: the face overfills the alignment template's margins above 35% (~0.21 m).
+    too_close: frame({ face: { count: 1, area: 0.4 } }),
     // Dark *and* faceless: the light is the thing to fix first.
     dark_and_faceless: frame({ luminance: 10, face: { count: 0, area: 0 } }),
     // No detector in this browser: say nothing rather than guess about faces.
@@ -145,6 +157,11 @@ def test_the_advice_for_a_frame(results):
         "closer": "framingCloser",
         "further": "framingFurther",
         "good": "framingGood",
+        "good_far": "framingGood",
+        "good_1m": "framingGood",
+        "good_1_2m": "framingGood",
+        "good_1_5m": "framingGood",
+        "too_close": "framingFurther",
         "dark_and_faceless": "framingDark",
         "no_detector": None,
         "no_detector_dark": "framingDark",
