@@ -517,6 +517,77 @@ def sweep(
     }
 
 
+def resolve_specs(
+    *,
+    detector_model: str | None = None,
+    scrfd_model: str | None = None,
+    skip_scrfd: bool = False,
+    min_score: float = 0.6,
+) -> tuple[list[DetectorSpec], list[dict[str, Any]], dict[str, str]]:
+    """The configurations to run, with each family's model file resolved.
+
+    Shared by the command line and the standing report on purpose: two places that each decide
+    which files the four configurations run would eventually disagree, and a report whose numbers
+    came from different weights than the other report's is precisely the comparison nobody can
+    make. Raises :class:`SweepError` naming what was looked for; the caller adds its own next step,
+    because the flags to pass are a command line's business and not a watcher's.
+
+    Returns ``(specs, skipped_configs, models)``.
+    """
+    import face_detector
+
+    if not detector_model:
+        resolved = Path(face_detector.model_path())
+        if not resolved.exists():
+            raise SweepError(
+                f"the live pipeline's detector model is missing: {resolved}"
+            )
+        detector_model = str(resolved)
+
+    # Per family, because the fourth configuration is a different network: pointing every spec at
+    # the YuNet file would run YuNet four times under a SCRFD label - a comparison that reports
+    # the answer it was asked not to assume.
+    models = {"yunet": detector_model}
+    skipped_configs: list[dict[str, Any]] = []
+    found = scrfd_model or os.environ.get("SCRFD_MODEL_PATH") or ""
+    if not found:
+        for filename in SCRFD_MODEL_FILENAMES:
+            conventional = Path(detector_model).with_name(filename)
+            if conventional.exists():
+                found = str(conventional)
+                break
+    if skip_scrfd:
+        spec = DetectorSpec(kind="scrfd", input_size=640, tiles=1)
+        skipped_configs.append(
+            {"name": spec_name(spec), "reason": "--skip-scrfd was passed", "spec": spec.fingerprint()}
+        )
+    elif not found or not Path(found).exists():
+        looked_for = " or ".join(
+            filename + f" (beside {detector_model})" for filename in SCRFD_MODEL_FILENAMES
+        )
+        raise SweepError(
+            "the SCRFD model is missing, so the detector comparison cannot be measured:\n"
+            f"  looked for {found or looked_for}"
+        )
+    else:
+        models["scrfd"] = found
+
+    specs = [
+        DetectorSpec(
+            kind=spec.kind,
+            model_path=models[spec.kind],
+            input_size=spec.input_size,
+            tiles=spec.tiles,
+            overlap=spec.overlap,
+            square=spec.square,
+            score_threshold=min_score,
+        )
+        for spec in default_specs()
+        if spec.kind in models
+    ]
+    return specs, skipped_configs, models
+
+
 def _counts(outcomes: list[FrameOutcome]) -> dict[str, int]:
     """Miss reasons for one configuration, largest first."""
     counts: dict[str, int] = {}
@@ -726,71 +797,28 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         source_info = {"kind": "folder", "root": str(root)}
 
-    import face_detector
-
-    detector_model = args.detector_model
-    if not detector_model:
-        resolved = Path(face_detector.model_path())
-        if not resolved.exists():
-            print(f"the live pipeline's detector model is missing: {resolved}; pass --detector-model",
-                  file=sys.stderr)
-            return 2
-        detector_model = str(resolved)
-
-    # Per family, because the fourth configuration is a different network: pointing every spec at
-    # the YuNet file would run YuNet four times under a SCRFD label - a comparison that reports
-    # the answer it was asked not to assume.
-    models = {"yunet": detector_model}
-    scrfd_model = args.scrfd_model or os.environ.get("SCRFD_MODEL_PATH") or ""
-    if not scrfd_model:
-        for filename in SCRFD_MODEL_FILENAMES:
-            conventional = Path(detector_model).with_name(filename)
-            if conventional.exists():
-                scrfd_model = str(conventional)
-                break
-
-    skipped_configs: list[dict[str, Any]] = []
-    scrfd_spec = DetectorSpec(kind="scrfd", input_size=640, tiles=1)
-    if args.skip_scrfd:
-        skipped_configs.append(
-            {
-                "name": spec_name(scrfd_spec),
-                "reason": "--skip-scrfd was passed",
-                "spec": scrfd_spec.fingerprint(),
-            }
+    try:
+        specs, skipped_configs, _models = resolve_specs(
+            detector_model=args.detector_model,
+            scrfd_model=args.scrfd_model,
+            skip_scrfd=args.skip_scrfd,
+            min_score=args.min_score,
         )
-    elif not scrfd_model or not Path(scrfd_model).exists():
-        # Refused rather than dropped in silence: the whole reason this configuration exists is
-        # that the detector comparison has to be measured here. Falling back to three lines would
-        # print a report that looks like one network won a contest it never entered.
-        looked_for = " or ".join(
-            filename + f" (beside {detector_model})" for filename in SCRFD_MODEL_FILENAMES
-        )
-        print(
-            "the SCRFD model is missing, so the detector comparison cannot be measured:\n"
-            f"  looked for {scrfd_model or looked_for}\n"
-            "Put the ONNX file there, pass --scrfd-model /path/to/scrfd.onnx, set "
-            "SCRFD_MODEL_PATH, or pass --skip-scrfd to measure only the YuNet configurations "
-            "(the report will say SCRFD was not measured).",
-            file=sys.stderr,
-        )
+    except SweepError as exc:
+        # Refused rather than dropped in silence: the whole reason the fourth configuration exists
+        # is that the detector comparison has to be measured here. Falling back to three lines
+        # would print a report that looks like one network won a contest it never entered.
+        print(str(exc), file=sys.stderr)
+        if "SCRFD model is missing" in str(exc):
+            print(
+                "Put the ONNX file there, pass --scrfd-model /path/to/scrfd.onnx, set "
+                "SCRFD_MODEL_PATH, or pass --skip-scrfd to measure only the YuNet configurations "
+                "(the report will say SCRFD was not measured).",
+                file=sys.stderr,
+            )
+        else:
+            print("pass --detector-model to name the YuNet file", file=sys.stderr)
         return 2
-    else:
-        models["scrfd"] = scrfd_model
-
-    specs = [
-        DetectorSpec(
-            kind=spec.kind,
-            model_path=models[spec.kind],
-            input_size=spec.input_size,
-            tiles=spec.tiles,
-            overlap=spec.overlap,
-            square=spec.square,
-            score_threshold=args.min_score,
-        )
-        for spec in default_specs()
-        if spec.kind in models
-    ]
 
     if not args.corpus_store:
         from corpus_ingest import DirectorySource

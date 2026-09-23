@@ -80,6 +80,12 @@ KIND_RETENTION_SWEEP = "retention_sweep"
 #: than from an event. Severity warning, not critical: attendance keeps working, every notice
 #: is still in the worker's own inbox, and what an operator has lost is the phone ringing.
 KIND_WORKER_PUSH_UNDELIVERED = "push_undelivered"
+#: The standing detector-coverage report: the run where SCRFD started recovering more of this
+#: deployment's own punch frames than YuNet did, or the run where it stopped. A *change* in the
+#: detector comparison is the event - a report that says the same thing every day is a report
+#: nobody opens - and it is the cue to re-read the embedder migration runbook rather than a
+#: punch-level fault.
+KIND_COVERAGE_REPORT = "coverage_report"
 
 SEVERITY_INFO = "info"
 SEVERITY_WARNING = "warning"

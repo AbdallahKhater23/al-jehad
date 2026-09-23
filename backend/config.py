@@ -482,6 +482,52 @@ class Settings(BaseModel):
     #: "A. Engineer deleted 1 400 audit rows" are different sentences in an investigation.
     retention_actor: str | None = None
 
+    # -- the standing detector-coverage report (see ``coverage_report``) ----
+    #  ``tools/coverage_sweep.py`` measures which faces the detectors find, on this
+    #  deployment's own frames, and is the evidence for or against moving to SCRFD. Run by
+    #  hand it answers for the month somebody sampled; the timer below re-answers it when the
+    #  gate's frame folder grows, and flags the run where SCRFD overtakes YuNet. The cost is
+    #  real - a detector pass over a sample of frames on the box that serves punches - which is
+    #  why the sample is capped, the cadence is daily, and *none* of it runs before the models
+    #  have preloaded and the first shift's punches have gone through.
+    standing_sweep_enabled: bool = True
+    standing_sweep_interval_seconds: int = 24 * 3600
+    #: The first check after boot waits past the preload for the same reason retention's does:
+    #: measuring is CPU work on the box every punch shares.
+    standing_sweep_initial_delay_seconds: int = 600
+    #: Where the gate's own frames are. This is *not* the calibration corpus: these are the
+    #: frames a punch actually stored, so the report measures the deployment rather than a
+    #: curated sample of it, and it needs no capture flag to have content.
+    standing_sweep_corpus_dir: Path = Path("punch_frames")
+    #: Where snapshots and the trigger state live. Point this at the volume on a platform
+    #: (``STANDING_SWEEP_DIR=/data/coverage_reports``) if the reports are wanted across
+    #: deploys; the default is beside the app, which is ephemeral - a report is regenerated,
+    #: so losing it costs one cadence.
+    standing_sweep_dir: Path = Path("coverage_reports")
+    #: How many of the newest frames one measurement reads. This is the entire cost control:
+    #: four configurations over 200 frames is about 90 seconds of CPU on a bare server, and
+    #: the report says how many frames the folder actually holds beside the sample.
+    standing_sweep_sample: int = 200
+    #: New frames, not frames: the finding is a *change* in what the cameras show, and a
+    #: handful of new frames cannot move a found-share by more than noise.
+    standing_sweep_min_new_frames: int = 25
+    #: The margin, in frames, that counts as SCRFD overtaking YuNet. One is the smallest
+    #: honest step - a tie is reported as a tie - and a deployment that only wants to hear
+    #: about a decisive move raises it.
+    standing_sweep_min_margin_frames: int = 1
+    #: Run snapshots to keep. They are the evidence behind a flag, so the newest few are kept
+    #: and the older ones are pruned; 0 keeps every run.
+    standing_sweep_keep: int = 5
+    #: The face-detector gate the sweep applies. Left at the punch path's own threshold by
+    #: default, because a measurement taken under a different gate is not evidence about the
+    #: gate - raise or lower it only to ask a question about the threshold itself.
+    standing_sweep_min_score: float = 0.6
+    #: The counting rule: ``exactly_one`` (the punch path's - a second face is a refusal) or
+    #: ``any`` (a face is found if any detection clears the gate). The default is the rule the
+    #: deployment enforces; ``any`` is the one that answers how far a detector reaches, and the
+    #: value travels into the report either way.
+    standing_sweep_subject: str = "exactly_one"
+
     @property
     def startup_override_active(self) -> bool:
         """True only for a *reasoned* and possibly time-limited override.
@@ -725,13 +771,36 @@ def build_settings(*, env_file: Path | None = None) -> Settings:
         retention_initial_delay_seconds=_env_int("RETENTION_INITIAL_DELAY_SECONDS", 300),
         retention_dry_run=_env_flag("RETENTION_DRY_RUN", False),
         retention_punch_photo_days=_env_int("RETENTION_PUNCH_PHOTO_DAYS", 30),
-    retention_punch_frame_days=_env_int("RETENTION_PUNCH_FRAME_DAYS", 30),
+        retention_punch_frame_days=_env_int("RETENTION_PUNCH_FRAME_DAYS", 30),
         retention_biometric_days=_env_int("RETENTION_BIOMETRIC_DAYS", 7),
         retention_audit_days=_env_int("RETENTION_AUDIT_DAYS", 365),
         retention_punch_queue_days=_env_int("RETENTION_PUNCH_QUEUE_DAYS", 90),
         retention_anchor_days=_env_int("RETENTION_ANCHOR_DAYS", 7),
         retention_max_items_per_sweep=_env_int("RETENTION_MAX_ITEMS_PER_SWEEP", 20_000),
         retention_actor=_env_str("RETENTION_ACTOR"),
+        #  The standing coverage report. The interval has a floor of five minutes - a timer that
+        #  measured every few seconds would be a load test on the gate that carries it - and the
+        #  sample cap counts frames, not time, because that is what the cost is proportional to.
+        standing_sweep_enabled=_env_flag("STANDING_SWEEP_ENABLED", True),
+        standing_sweep_interval_seconds=max(
+            300, _env_int("STANDING_SWEEP_INTERVAL_SECONDS", 24 * 3600)
+        ),
+        standing_sweep_initial_delay_seconds=max(
+            0, _env_int("STANDING_SWEEP_INITIAL_DELAY_SECONDS", 600)
+        ),
+        standing_sweep_corpus_dir=_env_path(
+            "STANDING_SWEEP_CORPUS_DIR",
+            _env_path("PUNCH_FRAMES_DIR", PROJECT_ROOT / "punch_frames"),
+        ),
+        standing_sweep_dir=_env_path("STANDING_SWEEP_DIR", PROJECT_ROOT / "coverage_reports"),
+        standing_sweep_sample=max(0, _env_int("STANDING_SWEEP_SAMPLE", 200)),
+        standing_sweep_min_new_frames=max(0, _env_int("STANDING_SWEEP_MIN_NEW_FRAMES", 25)),
+        standing_sweep_min_margin_frames=max(
+            0, _env_int("STANDING_SWEEP_MIN_MARGIN_FRAMES", 1)
+        ),
+        standing_sweep_keep=max(0, _env_int("STANDING_SWEEP_KEEP", 5)),
+        standing_sweep_min_score=_env_float("STANDING_SWEEP_MIN_SCORE", 0.6),
+        standing_sweep_subject=_env_str("STANDING_SWEEP_SUBJECT", "exactly_one") or "exactly_one",
     )
 
 
@@ -805,6 +874,18 @@ def write_env_file(path: Path | None = None, *, overwrite: bool = False) -> Path
         "RETENTION_AUDIT_DAYS=365\n"
         "# Set RETENTION_DRY_RUN=1 to report without deleting while you evaluate it:\n"
         "RETENTION_DRY_RUN=0\n"
+        "# The standing detector-coverage report: re-measures which detector settings find this\n"
+        "# deployment's own punch frames, and notifies when SCRFD overtakes YuNet. It reads\n"
+        "# PUNCH_FRAMES_DIR by default, samples the newest STANDING_SWEEP_SAMPLE frames once a\n"
+        "# day, and only measures when at least STANDING_SWEEP_MIN_NEW_FRAMES have landed.\n"
+        "# Read docs/RUNBOOK_EMBEDDER_MIGRATION.md first; STANDING_SWEEP_ENABLED=0 turns it off,\n"
+        "# and the same run is available by hand as `python -m coverage_report --once`:\n"
+        "STANDING_SWEEP_ENABLED=1\n"
+        "# STANDING_SWEEP_DIR=/data/coverage_reports\n"
+        "# STANDING_SWEEP_INTERVAL_SECONDS=86400\n"
+        "# STANDING_SWEEP_SAMPLE=200\n"
+        "# STANDING_SWEEP_MIN_NEW_FRAMES=25\n"
+        "# STANDING_SWEEP_MIN_MARGIN_FRAMES=1\n"
         "# Prometheus scrape token for GET /metrics. Leave empty to require an admin JWT:\n"
         "METRICS_TOKEN=\n",
         encoding="utf-8",
