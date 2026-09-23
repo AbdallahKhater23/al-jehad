@@ -329,6 +329,13 @@ os.environ["OVERTIME_WATCHER_ENABLED"] = "0"
 # retention suite starts it deliberately, with ``enabled=True``, for the two tests that are
 # about the timer itself.
 os.environ["RETENTION_ENABLED"] = "0"
+# The standing coverage report is the same hazard again, and the one no test wants on by
+# accident: it runs detectors over a folder of frames on a timer, it writes a report and it
+# sends a notification when SCRFD overtakes YuNet. The suite that is *about* the report starts
+# it deliberately with ``enabled=True`` against its own throwaway corpus; every other test
+# wants it quiet, because a timer measuring in the background would make an assertion about
+# the punch-frame folder a race with a sweep.
+os.environ["STANDING_SWEEP_ENABLED"] = "0"
 # Liveness is exercised with an injected fake ONNX session; leaving the mode at the
 # shipped default (advisory) means a test that does not opt in is never blocked by an
 # absent model, exactly like a real deployment that has not installed one yet.

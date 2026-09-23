@@ -74,6 +74,7 @@ log = logging.getLogger("attendance.api")
 import biometrics
 import branding
 import corpus
+import coverage_report
 import database
 import developer
 import enrollment
@@ -3456,6 +3457,20 @@ async def count_overtime_crossings(current: CurrentUser = Depends(admin_only)):
     return _json({"count": sum(1 for item in overtime.open_crossings() if item.get("needs_answer"))})
 
 
+@router.get("/admin/coverage_report")
+async def get_coverage_report(current: CurrentUser = Depends(admin_only)):
+    """The standing detector-coverage report: the last sweep's verdict, and whether it is running.
+
+    The measurement behind the embedder migration - which detector settings find this
+    deployment's own punch frames, and whether SCRFD finds more of them than YuNet - re-taken
+    when new frames land. Read from the report files the timer writes, never recomputed here:
+    a console refresh must not run four detectors over two hundred frames. The payload is the
+    verdict and the job's shape (cadence, sample, corpus size); the per-frame evidence stays in
+    the JSON on disk, which is what an operator opens when the verdict surprises them.
+    """
+    return _json(coverage_report.summary())
+
+
 @router.get("/admin/overtime/crossings")
 async def list_overtime_crossings(current: CurrentUser = Depends(admin_only)):
     """Open shifts past the overtime line: the decisions the Approvals queue is holding.
@@ -5055,11 +5070,20 @@ async def lifespan(application: FastAPI):
     # tidies up. ``python -m retention --apply`` is the entry point for a deployment that
     # would rather schedule it from cron.
     application.state.retention_sweeper = retention.start_watcher()
+    # The standing detector-coverage report is the third timer of the same shape, and it starts
+    # after the same gate for the same reason. It is the measurement behind the embedder
+    # migration - which detector settings find this deployment's real faces, and whether SCRFD
+    # finds more of them than YuNet - so it re-runs itself when new punch frames land instead of
+    # going stale in the month somebody happened to sample a corpus. Thread, not task: it runs
+    # detectors, which is exactly the blocking CPU work the overtime watcher's comment above
+    # warns about. ``python -m coverage_report --once`` is the cron-shaped entry point.
+    application.state.coverage_reporter = coverage_report.start_watcher()
     try:
         yield
     finally:
         overtime.stop_watcher()
         retention.stop_watcher()
+        coverage_report.stop_watcher()
         # Stops the inference workers, so a graceful shutdown does not wait on threads that
         # uvicorn knows nothing about. They are daemons and would die with the process
         # anyway; saying so here is what keeps the queue from being drained behind a
