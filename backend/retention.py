@@ -562,6 +562,63 @@ def _sweep_punch_frames(conn: sqlite3.Connection, *, dry_run: bool) -> dict[str,
     return result
 
 
+def _sweep_refused_punches(conn: sqlite3.Connection, *, dry_run: bool) -> dict[str, Any]:
+    """Wipe refused punches and their frames past the window.
+
+    Refused punches are evidence about *failures*, not attendance - they keep for the same
+    window the log rows' frames keep (``punch_frame_days``), then the row goes with the file.
+    One pass, not two: every refused punch row owns its frame outright (the name is claimed
+    in ``punch_frames.referenced_names``), so the residue pass in ``_sweep_punch_frames``
+    already collects any file whose row outlived it - this sweep only has to age the rows.
+
+    Never fails the sweep: a table from before migration 22 simply contributes nothing.
+    """
+    import punch_frames
+
+    result = _blank()
+    cutoff = policy().cutoff(policy().punch_frame_days)
+    directory = str(punch_frames.FRAMES_DIR)
+    if cutoff is None:
+        result["skipped"] = "punch frame retention is 0 (keep every frame)"
+        return result
+    try:
+        rows = conn.execute(
+            "SELECT id, punch_frame FROM refused_punches "
+            "WHERE created_at < ? AND punch_frame IS NOT NULL AND punch_frame <> '' "
+            f"ORDER BY id{_cap_sql(policy().cap)}",
+            (cutoff,),
+        ).fetchall()
+    except sqlite3.Error:
+        result["skipped"] = "refused_punches table does not exist yet"
+        return result
+    result["matched"] = len(rows)
+    removed: list[str] = []
+    for row in rows:
+        name = os.path.basename(str(row["punch_frame"]))
+        try:
+            size = secure_remove(name, directory=directory, dry_run=dry_run)
+        except OSError as exc:
+            _fail(result, name, exc)
+            continue
+        result["bytes"] += size
+        removed.append(name)
+        if not dry_run:
+            conn.execute("DELETE FROM refused_punches WHERE id = ?", (row["id"],))
+        result["references"] += 1
+
+    # Rows old enough to have had no frame at all (disk full at punch time) age out too.
+    if not dry_run:
+        try:
+            conn.execute("DELETE FROM refused_punches WHERE created_at < ?", (cutoff,))
+        except sqlite3.Error:
+            pass
+
+    result["digest"] = digest(removed)
+    result["listed"] = _listed(removed)
+    result["deleted"] = 0 if dry_run else len(removed)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # target: biometric templates and reference selfies
 # ---------------------------------------------------------------------------
@@ -975,6 +1032,7 @@ def _report_attendance(conn: sqlite3.Connection, *, dry_run: bool) -> dict[str, 
 TARGETS = (
     ("punch_photos", _sweep_punch_photos),
     ("punch_frames", _sweep_punch_frames),
+    ("refused_punches", _sweep_refused_punches),
     ("biometric_files", _sweep_biometric_files),
     ("audit_log", _sweep_audit_log),
     ("notifications", _sweep_notifications),

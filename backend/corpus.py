@@ -139,9 +139,14 @@ SOURCE_RTSP: Final = "rtsp"
 #: captures actually include the small-face regime the failures are at" - without a custom script.
 FACE_SIZE_BUCKETS: Final = ((0, 32), (32, 64), (64, 128), (128, 10_000))
 
+#: Consent basis recorded on a capture taken from live traffic under a *worker's own* opt-in. Named
+#: once so every record carries the same string, and so an operator reading the corpus can see exactly
+#: what was relied on - and can see, per capture, whether the person in the frame is the one who said
+#: yes (``worker-granted``) or whether the capture predates the per-worker requirement (the older
+#: deployment string, kept below so history reads honestly rather than being relabelled).
+WORKER_CONSENT: Final = "worker-granted: per-worker opt-in, audited in corpus_capture_consents"
 
-class CorpusError(RuntimeError):
-    """A corpus operation that cannot be completed as asked."""
+class CorpusError(RuntimeError):    """A corpus operation that cannot be completed as asked."""
 
 
 # ---------------------------------------------------------------------------
@@ -1090,6 +1095,11 @@ LABEL_CARRYING_VERDICTS: Final = frozenset({"approved"})
 
 #: Consent basis recorded on a capture taken from live traffic. Named once so every record carries the
 #: same string, and so an operator reading the corpus can see exactly what was relied on.
+#:
+#: Kept as the basis for captures taken *before* per-worker consent existed, so an old sidecar reads
+#: as what it was. New live captures must not use it: ``maybe_capture_punch`` now requires the
+#: worker's own opt-in (``WORKER_CONSENT``), because a deployment switch states the operator's
+#: intent to collect and nothing about the person in the frame.
 LIVE_CONSENT: Final = "deployment: CALIBRATION_CAPTURE_ENABLED with worker notice"
 
 
@@ -1103,9 +1113,18 @@ def maybe_capture_punch(
     pipeline: str | None = None,
     gate: Any | None = None,
 ) -> str | None:
-    """Capture a punch frame for calibration, if this deployment collects them. Never raises.
+    """Capture a punch frame for calibration, if this deployment collects them *and this worker
+    has opted in*. Never raises.
 
-    Off unless an operator turned it on (``CALIBRATION_CAPTURE_ENABLED``), and deliberately quiet about
+    Two switches, and both must be on - the deployment's (``CALIBRATION_CAPTURE_ENABLED``, the
+    operator's statement that this site collects at all) and the worker's own (the newest row in
+    ``corpus_capture_consents``, recorded through an audited endpoint). The first switch alone was
+    the original design and it was not enough: a consent basis that says "the deployment decided"
+    is a decision made about somebody, not by them, and the person in the frame is the one whose
+    face is kept. A worker who has not opted in - or a punch from an unauthenticated path with no
+    worker at all - is never captured, whatever the operator flipped.
+
+    Deliberately quiet about
     everything else: this runs inside the punch path, and a measurement aid must not be able to fail a
     punch or change its answer - the same rule ``shadow``'s scorer follows, for the same reason.
 
@@ -1119,6 +1138,11 @@ def maybe_capture_punch(
     downstream tool - the one frame source nobody looks at would be the one that never gets flagged.
     """
     if not getattr(settings, "calibration_capture_enabled", False):
+        return None
+    # The worker's own half of the consent. A read per capture, through the same indexed lookup the
+    # consent endpoint writes - and a *failed* read answers no, because the failure mode of a
+    # consent check must never be "capture anyway".
+    if not worker_consent(worker_id):
         return None
     try:
         import face_detector
@@ -1166,7 +1190,7 @@ def maybe_capture_punch(
             quality=quality.as_dict(),
             landmark_source=face_detector.DETECTOR_NAME,
             source=SOURCE_PUNCH,
-            consent=LIVE_CONSENT,
+            consent=WORKER_CONSENT,
             actor="system:punch",
             camera=camera or site,
             note=f"verdict={verdict or 'unknown'}" + (f" site={site}" if site else ""),
@@ -1175,6 +1199,163 @@ def maybe_capture_punch(
     except Exception as exc:  # noqa: BLE001 - a punch must not fail over a measurement aid
         log.warning("corpus: could not capture a punch frame for %s: %s", worker_id, exc)
         return None
+
+
+def _box_of(area: dict[str, Any]) -> list[float]:
+    return [
+        float(area.get("x") or 0),
+        float(area.get("y") or 0),
+        float(area.get("w") or 0),
+        float(area.get("h") or 0),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# per-worker consent (the corpus's own opt-in record)
+# ---------------------------------------------------------------------------
+#: The table this module owns in the database. It is the one piece of the corpus that lives in a
+#: table rather than a sidecar, because it must be *writable at capture time* (the punch path asks
+#: it) and *append-only against tampering* (see migration 23's triggers) - neither is natural in a
+#: file format the tools copy around.
+CONSENT_TABLE: Final = "corpus_capture_consents"
+
+
+def _consent_conn():
+    """A write connection for the consent table, opened only by the functions that need one.
+
+    Imported late, like every other use of the database in this module: ``corpus`` is importable
+    by the offline tools, which run without the application's database.
+    """
+    from database import db
+
+    return db
+
+
+def _now_text() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def worker_consent(worker_id: str | None, conn=None) -> bool:
+    """Has this worker opted in to calibration capture? The punch path asks this every capture.
+
+    The newest row per worker *is* the state: a grant with ``revoked_at IS NULL`` is a yes,
+    anything else - no row, or a withdrawal as the newest decision - is a no. Deliberately strict
+    in that direction: the corpus is a biometric store, and the failure mode of answering "yes"
+    on missing data is a face filed under a consent nobody can produce. ``conn`` lets a caller
+    inside an open transaction reuse it; every other caller opens its own read-only connection.
+    """
+    if not worker_id:
+        return False
+    query = (
+        f"SELECT granted, revoked_at FROM {CONSENT_TABLE} "
+        "WHERE worker_id = ? ORDER BY id DESC LIMIT 1"
+    )
+    try:
+        if conn is not None:
+            row = conn.execute(query, (str(worker_id),)).fetchone()
+            return bool(row and row["granted"] and row["revoked_at"] is None)
+        with _db() as own:
+            row = own.execute(query, (str(worker_id),)).fetchone()
+            return bool(row and row["granted"] and row["revoked_at"] is None)
+    except Exception:  # noqa: BLE001 - a capture path must not fail over a consent read
+        return False
+
+
+def _db():
+    """A fresh read connection, through the application's own factory.
+
+    Imported late so the offline tools can import this module without the database.
+    """
+    from database import db
+
+    return db()
+
+
+def record_consent(
+    conn,
+    *,
+    worker_id: str,
+    granted: bool,
+    actor_id: str,
+    note: str | None = None,
+    ip: str | None = None,
+    now: str | None = None,
+) -> int:
+    """Append one consent decision and make it the worker's current one. Returns the row id.
+
+    The table is append-only *at the database level* (migration 23's triggers reject UPDATE and
+    DELETE), so "current" is a property of the newest row rather than a flag to maintain: the
+    newest row per worker is the state, and every older row is history that no query can rewrite.
+    That is stronger than an ``is_current`` flag - a flag invites the exact UPDATE the trigger
+    forbids - so the table has no flag at all, and reads use ``MAX(id)`` per worker.
+    """
+    moment = now or _now_text()
+    cursor = conn.execute(
+        f"INSERT INTO {CONSENT_TABLE} "
+        "(worker_id, granted, note, created_at, created_by, created_ip, revoked_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            str(worker_id),
+            1 if granted else 0,
+            note,
+            moment,
+            str(actor_id),
+            ip,
+            None if granted else moment,
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def consent_history(worker_id: str, conn=None) -> list[dict[str, Any]]:
+    """The worker's consent decisions, newest first. The audit's answer, one SELECT long."""
+    try:
+        if conn is not None:
+            rows = conn.execute(
+                f"SELECT * FROM {CONSENT_TABLE} WHERE worker_id = ? ORDER BY id DESC",
+                (str(worker_id),),
+            ).fetchall()
+        else:
+            with _db() as own:
+                rows = own.execute(
+                    f"SELECT * FROM {CONSENT_TABLE} WHERE worker_id = ? ORDER BY id DESC",
+                    (str(worker_id),),
+                ).fetchall()
+    except Exception:  # noqa: BLE001 - a reader reports, never raises
+        return []
+    return [
+        {
+            "id": int(row["id"]),
+            "granted": bool(row["granted"]),
+            "revoked": row["revoked_at"] is not None,
+            "note": row["note"],
+            "created_at": row["created_at"],
+            "created_by": row["created_by"],
+            "revoked_at": row["revoked_at"],
+        }
+        for row in rows
+    ]
+
+
+def consented_workers(conn=None) -> set[str]:
+    """Every worker whose newest decision is a live grant - what the corpus's coverage reads."""
+    try:
+        if conn is not None:
+            rows = conn.execute(
+                f"SELECT worker_id FROM {CONSENT_TABLE} c "
+                "WHERE granted = 1 AND revoked_at IS NULL "
+                "AND id = (SELECT MAX(id) FROM corpus_capture_consents WHERE worker_id = c.worker_id)"
+            ).fetchall()
+        else:
+            with _db() as own:
+                rows = own.execute(
+                    f"SELECT worker_id FROM {CONSENT_TABLE} c "
+                    "WHERE granted = 1 AND revoked_at IS NULL "
+                    "AND id = (SELECT MAX(id) FROM corpus_capture_consents WHERE worker_id = c.worker_id)"
+                ).fetchall()
+    except Exception:  # noqa: BLE001
+        return set()
+    return {str(row["worker_id"]) for row in rows}
 
 
 def _box_of(area: dict[str, Any]) -> list[float]:

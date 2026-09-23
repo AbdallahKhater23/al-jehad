@@ -144,6 +144,122 @@ Then, in this order:
    detail and `approve` / `review` / `genuine_ceiling` / `impostor_floor` in its value. An
    operator whose review queue moves wants those four numbers, not the verdict.
 
+## Deriving the band from live traffic on a volume-backed deployment (Railway and friends)
+
+Sections 1–3 measure on a laptop, from a corpus somebody assembled by hand. A deployed site
+can do better: the punch path already knows how to file captures into a labelled corpus
+(``corpus.maybe_capture_punch``), so the deployment collects its own calibration while it
+runs — the gate selfies the lines actually have to separate. The corpus is opt-in and off by
+default.
+
+### 1. Turn capture on
+
+Two environment variables on the service:
+
+```bash
+CALIBRATION_CAPTURE_ENABLED=true
+CALIBRATION_CORPUS_DIR=/data/calibration_corpus   # must be ON THE VOLUME
+```
+
+``/data`` (or wherever the volume is mounted) because a corpus that lives on the container
+filesystem is erased by the next deploy. Redeploy once with the variables set. From then on
+punches are re-detected once on their downscaled copy and filed — **but only for a worker who
+has opted in** (see the consent section below): the deployment switch states that this site
+collects at all, and the per-worker opt-in states that this particular person agreed. Frames
+from workers who never answered, or who withdrew, are not captured — whatever the switch says.
+
+**approved** punches from a consenting worker carry their worker id as the label automatically
+(that verdict established an identity), and **refused** or multi-face captures land under
+``_unlabelled`` for a human to decide. A capture is never destroyed by a wrong verdict; it is
+only left unlabelled. The consent basis is recorded on every capture as
+``worker-granted: per-worker opt-in, audited in corpus_capture_consents`` — the older basis
+(``deployment: CALIBRATION_CAPTURE_ENABLED with worker notice``) appears only on captures taken
+before per-worker consent existed, so history reads as what it was.
+
+### 1b. The per-worker consent (required for any capture at all)
+
+A worker opts in — or out — in their own app, which records the decision in two places at once:
+
+* ``corpus_capture_consents`` (append-only at the database level): one row per decision, with
+  the direction, an optional note, the timestamp, the actor and the request's IP. The newest
+  row per worker is the state; nothing in the table can be updated or deleted, so the history
+  is evidence rather than a current value.
+* ``audit_log``: the same decision as ``corpus_capture_consent``, with the actor and
+  provenance the audit trail already carries.
+
+The endpoints, both for the signed-in worker themselves:
+
+```bash
+# grant (the worker's own action in the app):
+POST /api/v1/worker/me/corpus/consent   {"granted": true, "note": "optional context"}
+# withdraw - same endpoint, no administrator in the loop, on purpose:
+POST /api/v1/worker/me/corpus/consent   {"granted": false, "note": "changed my mind"}
+# what they agreed to, and the full history of their own decisions:
+GET  /api/v1/worker/me/corpus/consent
+```
+
+The operator's view — who has consented, and every decision written — is
+``GET /api/v1/admin/corpus_consents``. The consented set is exactly the coverage a derivation
+can plan around; there is no way to capture outside it.
+
+**Withdrawal is about the future.** Captures already taken stay in the corpus until
+``purge`` removes them (per identity, on request) or retention ages them out; a worker who
+asks "delete my face" is answered by ``tools/corpus_admin.py purge --identity <id>``, and the
+withdrawal record is what makes that request auditable. Consent and erasure are deliberately
+different operations with different records.
+
+### 2. Collect, then label what a human must decide
+
+Let the site run for a few days of normal punches. Then look at what gathered (run these in
+the Railway shell, ``python`` is on the image's ``PATH``):
+
+```bash
+python backend/tools/corpus_admin.py stats                # what the corpus holds, in band terms
+python backend/tools/corpus_admin.py list --unlabelled    # the captures nobody has decided about
+python backend/tools/corpus_admin.py label --capture <id> --identity <worker_id>
+```
+
+Label a refused capture only when you can see from the frame (``punch_frames`` stores the same
+punch as evidence) that it really is that worker. A label you are unsure about is the one the
+unlabelled partition exists to hold. The derivation reads labelled identities only, so
+uncertainty here costs coverage, never correctness.
+
+### 3. Export and measure
+
+```bash
+python backend/tools/corpus_admin.py export --destination /tmp/corpus-export
+python backend/tools/derive_facenet_band.py --corpus /tmp/corpus-export --json /tmp/band.json
+```
+
+The tool embeds through the deployment's own live pipeline, so what it prints is measured in
+exactly the vector space the punches run in. It still refuses — exit code 2 — when the corpus
+cannot support a line (too few identities, overlapping distributions); ``stats`` says which.
+A window too narrow for two lines prints the one-line band and says so, like the current one.
+
+### 4. Install it
+
+The band is **code**, not configuration — there is no environment variable that injects one,
+deliberately, because an unmeasured override is the failure this whole design exists to
+prevent. So: copy the printed ``MatchBand(...)`` into ``face_detector.BANDS`` in the checkout
+(replacing the provisional entry), run
+``python -m pytest backend/tests/test_face_match_bands.py -q`` locally, commit and push. The
+redeploy is the rollout. The evidence string travels with the band, so the next reader can
+see which corpus produced it and when.
+
+### 5. Housekeeping
+
+The corpus is deliberately **not** swept by the retention timer (see ``corpus.py``). It is
+the operator's store:
+
+```bash
+python backend/tools/corpus_admin.py purge --older-than-days 180   # dry run by default
+python backend/tools/corpus_admin.py purge --identity <id> --apply # an erasure request
+```
+
+When the new band is installed and serving, turn ``CALIBRATION_CAPTURE_ENABLED`` back off —
+the corpus keeps whatever it gathered, and a later re-measurement starts from it rather than
+from nothing.
+
 ## What this checkout measured, and what it installed
 
 On 2026-09-22 the tool was run here against `temp/faces` (12 public figures, 48 images, 21

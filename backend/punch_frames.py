@@ -132,10 +132,25 @@ def resolve_stored(name: str | None) -> str | None:
 
 
 def referenced_names(conn: Any) -> set[str]:
-    """Every frame name any log row still claims - what retention must not sweep away."""
-    return {
+    """Every frame name any row still claims - what retention must not sweep away.
+
+    Two tables claim frames: the attendance log (the review-card evidence) and the refused
+    punch (the triage surface). A claimant added in a second place and not listed here is how
+    retention deletes a live card's evidence, so the set is the union, by construction.
+    """
+    names: set[str] = {
         os.path.basename(str(row["punch_frame"]))
         for row in conn.execute(
             "SELECT punch_frame FROM attendance_logs WHERE punch_frame IS NOT NULL AND punch_frame <> ''"
         ).fetchall()
     }
+    try:
+        names |= {
+            os.path.basename(str(row["punch_frame"]))
+            for row in conn.execute(
+                "SELECT punch_frame FROM refused_punches WHERE punch_frame IS NOT NULL AND punch_frame <> ''"
+            ).fetchall()
+        }
+    except Exception:  # noqa: BLE001 - a database without migration 22 claims nothing here
+        pass
+    return names

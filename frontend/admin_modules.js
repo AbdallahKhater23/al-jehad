@@ -434,7 +434,7 @@ const UI_MODULES = {
                 <td><div class="ops-badges">${this.liveOpsBadgesHtml(facts)}</div></td>
                 <td class="is-end">
                     <button type="button" class="ops-btn ops-btn-danger" data-force-out="${this.escapeHtml(session.worker_id)}"
-                            onclick="UI.forceAction('${this.liveOpsInlineString(session.worker_id)}', 'out', '${this.liveOpsInlineString(session.site_name)}')">${this.escapeHtml(I18n.__('forceOut'))}</button>
+                            onclick="UI.forceOutModal('${this.liveOpsInlineString(session.worker_id)}', '${this.liveOpsInlineString(session.worker_name || session.worker_id)}', '${this.liveOpsInlineString(session.clock_in_time || '')}')">${this.escapeHtml(I18n.__('forceOut'))}</button>
                 </td>
             </tr>`;
     },
@@ -464,7 +464,7 @@ const UI_MODULES = {
                 <p class="ops-note">${this.liveOpsPaidLineHtml(facts)}</p>
                 <div class="ops-card-foot">
                     <button type="button" class="ops-btn ops-btn-danger" data-force-out="${this.escapeHtml(session.worker_id)}"
-                            onclick="UI.forceAction('${this.liveOpsInlineString(session.worker_id)}', 'out', '${this.liveOpsInlineString(session.site_name)}')">${this.escapeHtml(I18n.__('forceOut'))}</button>
+                            onclick="UI.forceOutModal('${this.liveOpsInlineString(session.worker_id)}', '${this.liveOpsInlineString(session.worker_name || session.worker_id)}', '${this.liveOpsInlineString(session.clock_in_time || '')}')">${this.escapeHtml(I18n.__('forceOut'))}</button>
                 </div>
             </article>`;
     },
@@ -1033,6 +1033,9 @@ const UI_MODULES = {
         // error path below this promise is never awaited, and an unhandled rejection is a
         // console error nobody can act on.
         const crossingsRead = API.request('/admin/overtime/crossings').catch(() => []);
+        // The refusals read is separately fatal too: it is triage evidence, not the queue's
+        // primary content, and a read that fails leaves its own section empty.
+        const refusalsRead = API.request('/admin/refused_punches?days=1').catch(() => []);
         let logs;
         try {
             logs = await API.request('/admin/pending_reviews');
@@ -1043,7 +1046,8 @@ const UI_MODULES = {
             return;
         }
         const crossings = await crossingsRead;
-        content.innerHTML = `<div class="ui-page" data-approvals="true">${this.crossingsSectionHtml(Array.isArray(crossings) ? crossings : [])}${this.approvalsHtml(Array.isArray(logs) ? logs : [])}</div>`;
+        const refusals = await refusalsRead;
+        content.innerHTML = `<div class="ui-page" data-approvals="true">${this.crossingsSectionHtml(Array.isArray(crossings) ? crossings : [])}${this.approvalsHtml(Array.isArray(logs) ? logs : [])}${this.refusalsSectionHtml(Array.isArray(refusals) ? refusals : [])}</div>`;
         // One delegated pass over every "show the frame" button on the page: a repaint
         // between paint and tap cannot orphan it, and no inline handler is added (the count
         // ``test_frontend_xss`` pins only falls). The guards are the same ones
@@ -1073,6 +1077,16 @@ const UI_MODULES = {
                     this.showReviewFrame(button.getAttribute('data-show-frame'));
                 });
             });
+            bindEach('[data-refusal-show-frame]', (button) => {
+                button.addEventListener('click', () => {
+                    this.showRefusalFrame(button.getAttribute('data-refusal-show-frame'));
+                });
+            });
+            bindEach('[data-refusal-clear]', (button) => {
+                button.addEventListener('click', () => {
+                    this.handleRefusalClear(button.getAttribute('data-refusal-clear'));
+                });
+            });
             // The two answers to a live crossing, bound the same way and for the same reasons:
             // a repaint between paint and tap cannot orphan a listener, and no inline handler is
             // added - ``test_frontend_xss`` pins the count of those, and it only ever falls.
@@ -1098,6 +1112,97 @@ const UI_MODULES = {
      * what the rest of it is paid for. Reading a queue row is a step towards deciding it;
      * reading a crossing decided nothing at all, which is why it does not live in Alerts.
      */
+    /**
+     * The refused punches: today's face-check refusals, the frame beside the score.
+     *
+     * A refusal is evidence about the system as much as the worker - a band derived from the
+     * wrong corpus refuses honest workers all day at scores just past the line, and the only
+     * way to see that is the scores and the faces together. Read-only: there is no approve
+     * path (a refusal was never attendance), only a clear so the triaged list shrinks.
+     */
+    refusalsSectionHtml(items) {
+        if (!Array.isArray(items) || items.length === 0) return '';
+        return `
+            <p class="ui-section-note" data-refusals-title="true">${this.escapeHtml(I18n.__('refusalsTitle'))}</p>
+            <p class="ui-section-note" data-refusals-hint="true">${this.escapeHtml(I18n.__('refusalsHint'))}</p>
+            <div class="ui-stack">${items.map((item) => this.refusalCardHtml(item)).join('')}</div>`;
+    },
+
+    refusalCardHtml(item) {
+        const id = this.escapeHtml(String(item.id));
+        const who = this.escapeHtml(item.name || item.worker_id || '?');
+        const sub = this.escapeHtml([item.worker_id, item.site_name]
+            .filter(Boolean).join(' \u00b7 '));
+        const score = item.score === null || item.score === undefined
+            ? '\u2014'
+            : Number(item.score).toFixed(4);
+        const action = item.action === 'clock_out' ? I18n.__('forceOut') : I18n.__('forceIn');
+        const when = String(item.created_at || '');
+        return `
+            <article class="ui-card" data-refusal="${id}">
+                <div class="ui-row ui-row-between">
+                    <div>
+                        <strong>${who}</strong>
+                        <div class="ops-stat-label">${sub}</div>
+                    </div>
+                    <span class="ui-badge is-warn">${this.escapeHtml(action)}</span>
+                </div>
+                <div class="ops-stat-grid" style="margin-top:12px">
+                    <div class="ops-stat">
+                        <span class="ops-stat-label">${this.escapeHtml(I18n.__('refusalsScore'))}</span>
+                        <span class="ops-stat-value">${this.escapeHtml(score)}</span>
+                    </div>
+                    <div class="ops-stat">
+                        <span class="ops-stat-label">${this.escapeHtml(I18n.__('refusalsReason'))}</span>
+                        <span class="ops-stat-value">${this.escapeHtml(String(item.error_code || ''))}</span>
+                    </div>
+                    <div class="ops-stat">
+                        <span class="ops-stat-label">${this.escapeHtml(I18n.__('refusalsWhen'))}</span>
+                        <span class="ops-stat-value">${this.escapeHtml(when)}</span>
+                    </div>
+                </div>
+                <img id="refusalFrame${id}" class="hidden" alt="" style="margin-top:12px;max-width:160px;border-radius:8px" />
+                <div class="ui-row" style="margin-top:12px">
+                    ${item.frame_url ? `<button type="button" class="ui-btn" data-refusal-show-frame="${id}">${this.escapeHtml(I18n.__('refusalsShowFrame'))}</button>` : ''}
+                    <button type="button" class="ui-btn" data-refusal-clear="${id}">${this.escapeHtml(I18n.__('refusalsClear'))}</button>
+                </div>
+            </article>`;
+    },
+
+    /** The same authenticated-blob fetch the review frame uses, against the refusal route. */
+    async showRefusalFrame(refusalId) {
+        const id = String(refusalId);
+        const image = document.getElementById(`refusalFrame${id}`);
+        const button = document.querySelector(`[data-refusal-show-frame="${CSS.escape(id)}"]`);
+        const headers = {};
+        if (State.token) headers['Authorization'] = `Bearer ${State.token}`;
+        if (button) button.disabled = true;
+        try {
+            const response = await fetch(`${API.baseURL}/admin/refused_punch_frame/${encodeURIComponent(id)}`, { headers });
+            if (!response.ok) throw new Error(I18n.__('approvalsScoreFailed'));
+            const blob = await response.blob();
+            if (image) {
+                image.src = URL.createObjectURL(blob);
+                image.classList.remove('hidden');
+            }
+            if (button) button.remove();
+        } catch (err) {
+            Toast.error(err.message || I18n.__('approvalsScoreFailed'));
+            if (button) button.disabled = false;
+        }
+    },
+
+    async handleRefusalClear(refusalId) {
+        const id = String(refusalId);
+        try {
+            await API.request(`/admin/refused_punches/${encodeURIComponent(id)}/clear`, { method: 'POST' });
+            Toast.success(I18n.__('refusalsCleared'));
+            this.renderAdminTab('Approvals');
+        } catch (err) {
+            Toast.error(err.message);
+        }
+    },
+
     crossingsSectionHtml(items) {
         if (!Array.isArray(items) || items.length === 0) return '';
         return `
@@ -1285,6 +1390,11 @@ const UI_MODULES = {
             return;
         }
         Toast.success(I18n.__(accept ? 'crossingsAccepted' : 'crossingsDeclined'));
+        // The answer changed the count the badge carries, so the badge is re-asked (forced,
+        // past the throttle) before the tab repaints: a repaint that re-fetched and re-painted
+        // would agree with it a moment later, but one repaint per answer is what the operator
+        // is watching, and the badge should not lag the card it was counted from.
+        if (typeof UI !== 'undefined' && UI.refreshApprovalsBadge) UI.refreshApprovalsBadge(true);
         UI.renderAdminTab('Approvals');
     },
 

@@ -346,6 +346,67 @@ def _audit(
         pass
 
 
+def _record_refused_punch(
+    *,
+    worker_id: str,
+    site_name: str | None,
+    action: str,
+    error_code: str,
+    score: float | None,
+    punch_frame: str | None,
+    source: str,
+    biometric_id: str | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> int | None:
+    """Keep a refused punch's evidence for triage, instead of throwing it away.
+
+    The refusal path has the frame and the score in hand and, before this table, discarded
+    both: an operator whose workers were refused all day could see neither. This is the
+    write-half of that surface (the read-half is ``/admin/refused_punches``).
+
+    ``conn=None`` (the punch path's call) opens its own short write transaction, because the
+    caller is raising a 422 and has no open transaction to lend. With a connection the row
+    joins the caller's transaction, which is how the offline-sync refusals write.
+
+    Never raises to its caller for its own work: the punch's 422 is the worker's answer and
+    must not depend on whether the evidence was kept. (Disk failures mid-``store_frame`` are
+    the caller's problem - the frame arrives here already stored or ``None``.)
+    """
+    try:
+        pipeline = biometrics.current_pipeline()
+    except Exception:  # noqa: BLE001 - a pipeline name is decoration on a refusal record
+        pipeline = None
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _write(target: sqlite3.Connection) -> int:
+        cursor = target.execute(
+            """
+            INSERT INTO refused_punches
+                (worker_id, biometric_id, site_name, action, error_code, score,
+                 pipeline, source, punch_frame, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                worker_id,
+                biometric_id,
+                site_name,
+                action,
+                error_code,
+                score,
+                pipeline,
+                source,
+                punch_frame,
+                stamp,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    if conn is not None:
+        return _write(conn)
+    with db(write=True) as own:
+        return _write(own)
+
+
 def _insert_log(
     conn: sqlite3.Connection,
     *,
@@ -549,6 +610,14 @@ class ForceClockRequest(BaseModel):
     #: Empty means "the site the administrator picked", so it is allowed to be absent; when
     #: present it must be a name that could have come from the sites table.
     site_name: str = ""
+    #: The hours the administrator is *authorising* for this shift, for the close of a shift
+    #: whose clock data cannot be trusted to speak for itself - the forgotten clock-out above all:
+    #: a worker who left the site at 18:00 and is force-closed at 23:00 did not work ten hours,
+    #: and the only person who can name the figure is the one closing the shift.
+    #: Absent (the default) keeps the arithmetic exactly as it was - the clock decides. When
+    #: stated it must be within ``0..24`` h and at least 0.25 h steps are the console's choice,
+    #: not the API's: the server accepts any figure it can mean.
+    hours: float | None = None
 
     @field_validator("site_name")
     @classmethod
@@ -1737,6 +1806,83 @@ async def get_my_push_config(current: CurrentUser = Depends(any_authenticated)):
     return {**push.browser_config(), "subscriptions": int(count)}
 
 
+class CorpusConsentRequest(BaseModel):
+    """The worker's own answer to "may we keep your punch frames for calibration?".
+
+    ``granted`` is the decision; ``note`` is optional free-text (vetted as prose, like every
+    note here): it is the *which ask did they answer* that a bare yes loses, and the one thing
+    a later audit of the consent wants. A withdrawal carries it the same way - "changed my
+    mind" is a sentence worth keeping, not just a boolean flip.
+    """
+
+    granted: bool
+    note: str | None = None
+
+    @field_validator("note")
+    @classmethod
+    def _plain_note(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return textguard.prose(value, field="Consent note", max_length=textguard.MAX_NOTE, allow_empty=False)
+
+
+@router.get("/worker/me/corpus/consent")
+async def get_my_corpus_consent(current: CurrentUser = Depends(any_authenticated)):
+    """The worker's own capture consent, as the app should show it: current state plus history.
+
+    Visible to the worker *and only about the worker* - the history is their decisions, not the
+    corpus. A worker who cannot see what they agreed to cannot be said to have agreed
+    knowingly, so this read is half of what makes the grant meaningful.
+    """
+    return {
+        "granted": corpus.worker_consent(current.id),
+        "history": corpus.consent_history(current.id),
+        "capture_enabled": bool(settings.calibration_capture_enabled),
+    }
+
+
+@router.post("/worker/me/corpus/consent")
+async def set_my_corpus_consent(
+    request: Request,
+    payload: CorpusConsentRequest,
+    current: CurrentUser = Depends(any_authenticated),
+):
+    """Grant or withdraw the worker's own opt-in to calibration capture, on the record.
+
+    One endpoint for both directions, because a *withdrawal* is the decision that needs the
+    least friction: a worker who wants out must not have to find a different screen, or wait
+    for an administrator. The decision is appended to ``corpus_capture_consents`` (append-only
+    at the database level) **and** to ``audit_log`` with the actor and request provenance, so
+    "who said yes, when, from where" is answerable from two independent records.
+
+    The endpoint answers identically whether capture is enabled or not: the consent is the
+    worker's decision about *their* face, and the deployment switch is the operator's decision
+    about the site. One must not gate the other - a worker opt-in recorded while capture is
+    off stays on the record for the day the operator turns it on, and a worker is never asked
+    to consent twice because an operator toggled a variable.
+    """
+    granted = payload.granted
+    with db(write=True) as conn:
+        consent_id = corpus.record_consent(
+            conn,
+            worker_id=current.id,
+            granted=granted,
+            actor_id=current.id,
+            note=payload.note,
+            ip=request.client.host if request.client else None,
+        )
+        _audit(
+            conn,
+            action="corpus_capture_consent",
+            actor=current,
+            entity="corpus_capture_consents",
+            entity_id=consent_id,
+            after={"granted": granted, "note": payload.note},
+            request=request,
+        )
+    return {"status": "success", "granted": granted, "consent_id": consent_id}
+
+
 @router.post("/worker/me/push/subscribe")
 async def subscribe_my_push(
     request: Request,
@@ -2030,7 +2176,26 @@ async def verify_worker(
         # thrown away. The liveness refusal above already answers 422 with this same
         # {error_code, message} shape, which the client renders as a readable message.
         telemetry.observe_verification("rejected")
-        punch_frames.discard_frame(punch_frame)
+        # A refusal used to discard the frame and leave nothing at all: the score went into
+        # the 422 body and vanished, and an operator whose workers were all refused could see
+        # neither the scores nor the faces. The record below is the triage surface - the
+        # frame, the score and the reason kept for the day, readable in the console and
+        # swept by retention like any other evidence store. Best-effort on both halves: a
+        # refusal must not fail *because* recording it failed, and the 422 below is the
+        # worker's answer either way.
+        try:
+            _record_refused_punch(
+                conn=None,
+                worker_id=str(current.id),
+                site_name=detected_site,
+                action=action,
+                error_code="face_mismatch",
+                score=float(similarity_score),
+                punch_frame=punch_frame,
+                source="online",
+            )
+        except Exception:  # noqa: BLE001 - the refusal itself must survive a recording failure
+            log.warning("could not record the refused punch for worker %s", current.id, exc_info=True)
         raise HTTPException(
             status_code=422,
             detail={
@@ -3241,6 +3406,20 @@ class CrossingDecisionRequest(BaseModel):
         return textguard.prose(value, field="Note", max_length=textguard.MAX_NOTE, allow_empty=True)
 
 
+@router.get("/admin/overtime/crossings/count")
+async def count_overtime_crossings(current: CurrentUser = Depends(admin_only)):
+    """How many crossings are waiting on a person, without the queue's payload.
+
+    Exists for the nav badge: the console paints the Approvals tab's count on screens where
+    the tab is *not* open, so the full ``open_crossings`` shape - a decision payload, break
+    arithmetic and an overtime sentence per shift - would be fetched and dropped on every
+    poll. One small read, ``needs_answer`` being the same guard the queue's cards use to
+    decide whether they are a question: a decided-but-still-covered shift is information,
+    not something an operator must act on, and it must not light a badge.
+    """
+    return _json({"count": sum(1 for item in overtime.open_crossings() if item.get("needs_answer"))})
+
+
 @router.get("/admin/overtime/crossings")
 async def list_overtime_crossings(current: CurrentUser = Depends(admin_only)):
     """Open shifts past the overtime line: the decisions the Approvals queue is holding.
@@ -3385,6 +3564,106 @@ def _pending_review_row(row) -> dict:
         except face_detector.UnknownPipelineError:
             item["match_verdict"] = None
     return item
+
+
+@router.get("/admin/refused_punches")
+async def list_refused_punches(
+    current: CurrentUser = Depends(admin_only),
+    days: int = 1,
+):
+    """The refused punches: what the band refused, with the score and the frame beside it.
+
+    The triage surface the deployment needed and never had: a worker who keeps being told
+    "we could not confirm that is you" used to leave no record at all, so an operator whose
+    band was derived from the wrong corpus could see neither the scores nor the faces. This
+    lists them - newest first, ``days`` back (default today, capped at 7) - each row carrying
+    the distance, the reason the punch was refused, and whether a frame is waiting
+    (``frame_url``, served by :func:`admin_refused_punch_frame`).
+
+    The frame is a link rather than inline data, for the same reason the review queue does
+    it this way: a day of refusals would otherwise carry every picture whether or not
+    anybody looked. Rows are read-only evidence - there is no approve path, because a
+    refused punch was never attendance - and retention sweeps them on the frame window.
+    """
+    window = max(0, min(int(days), 7))
+    with db() as conn:
+        if window == 0:
+            rows = conn.execute(
+                """
+                SELECT r.id, r.worker_id, u.name, r.site_name, r.action, r.error_code,
+                       r.score, r.pipeline, r.source, r.punch_frame, r.created_at
+                FROM refused_punches r
+                LEFT JOIN users u ON r.worker_id = u.id
+                ORDER BY r.id DESC
+                """
+            ).fetchall()
+        else:
+            cutoff = (datetime.now() - timedelta(days=window)).strftime("%Y-%m-%d 00:00:00")
+            rows = conn.execute(
+                """
+                SELECT r.id, r.worker_id, u.name, r.site_name, r.action, r.error_code,
+                       r.score, r.pipeline, r.source, r.punch_frame, r.created_at
+                FROM refused_punches r
+                LEFT JOIN users u ON r.worker_id = u.id
+                WHERE r.created_at >= ?
+                ORDER BY r.id DESC
+                """,
+                (cutoff,),
+            ).fetchall()
+    items = []
+    for row in rows:
+        item = dict(row)
+        frame = item.pop("punch_frame", None)
+        item["frame_url"] = f"/api/v1/admin/refused_punch_frame/{item['id']}" if frame else None
+        items.append(item)
+    return _json(items)
+
+
+@router.get("/admin/refused_punch_frame/{refusal_id}")
+async def admin_refused_punch_frame(refusal_id: int, current: CurrentUser = Depends(admin_only)):
+    """The downscaled frame one refused punch was measured from. Administrator-only.
+
+    The same contract as the review frame: ``resolve_stored`` proves the path is inside the
+    frame directory before anything is opened, and a row whose frame was never stored or has
+    been swept answers 404 rather than pretending to have a picture.
+    """
+    with db() as conn:
+        row = conn.execute(
+            "SELECT punch_frame FROM refused_punches WHERE id = ?", (refusal_id,)
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="This refusal has no record.")
+    path = punch_frames.resolve_stored(row["punch_frame"])
+    if path is None:
+        raise HTTPException(status_code=404, detail="No frame was stored for this refusal.")
+    return FileResponse(path, media_type="image/jpeg")
+
+
+@router.post("/admin/refused_punches/{refusal_id}/clear")
+async def clear_refused_punch(refusal_id: int, current: CurrentUser = Depends(admin_only)):
+    """Mark one refusal as seen, so a triaged list stays a list of what still needs looking at.
+
+    Deliberately a *clear* and not a delete: the evidence stays on disk until retention
+    sweeps it, and the audit trail says who decided it needed nothing further. A refusal is
+    not attendance and cannot become one - there is no approve path here, only a way for the
+    list to shrink once somebody has looked.
+    """
+    with db(write=True) as conn:
+        row = conn.execute(
+            "SELECT id, worker_id FROM refused_punches WHERE id = ?", (refusal_id,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="This refusal has no record.")
+        conn.execute("DELETE FROM refused_punches WHERE id = ?", (refusal_id,))
+        _audit(
+            conn,
+            action="refused_punch_clear",
+            actor=current,
+            entity="refused_punches",
+            entity_id=refusal_id,
+            after={"worker_id": row["worker_id"]},
+        )
+    return {"status": "success", "message": "Refusal cleared."}
 
 
 @router.get("/admin/pending_review_frame/{log_id}")
@@ -3646,6 +3925,24 @@ async def force_clock_out(
         record = shift_hours.recorded_shift(seconds_on_site / 3600.0, rules)
         hours_worked = record["paid_hours"]
         break_taken = record["break_hours"]
+        # An administrator-named figure overrides the clock. The forgotten clock-out is the
+        # case: the session has run all night, and the paid hours the clock would record are
+        # nobody's estimate of the shift. The figure given is what the row records - subject
+        # to the same bounds any hours field answers to - and the audit event carries both
+        # numbers, so "the clock said 10.9 h and the administrator authorised 9.5 h" is a
+        # sentence the trail can produce months later.
+        authorised_override: float | None = None
+        if req.hours is not None:
+            authorised_override = round(float(req.hours), 4)
+            if authorised_override < 0 or authorised_override > overtime.MAX_AUTHORISED_HOURS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"hours must be between 0 and {overtime.MAX_AUTHORISED_HOURS:g} "
+                        "for one shift"
+                    ),
+                )
+            hours_worked = authorised_override
         # ... and the overtime figure comes from the same resolver as the approval gate.
         # This path records the row as *approved* rather than routing it for review, which
         # is the point of an override: the administrator closing the shift is the person
@@ -3662,6 +3959,14 @@ async def force_clock_out(
             shift_hours.overtime_assessment(seconds_on_site, rules),
             rules,
         )
+        if authorised_override is not None:
+            # The named figure is the decision: hours past it are not silently paid but held
+            # exactly as an answered crossing would hold them, so the override and the
+            # Approvals queue produce the same row for the same answer.
+            assessment["overtime_hours"] = round(
+                max(0.0, authorised_override - float(assessment["regular_hours"])), 4
+            )
+            assessment["authorised_hours"] = authorised_override
         now_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
         conn.execute("DELETE FROM active_sessions WHERE worker_id = ?", (req.worker_id,))
@@ -3701,6 +4006,7 @@ async def force_clock_out(
             entity="active_sessions",
             entity_id=req.worker_id,                after={
                     "hours": hours_worked,
+                    "clock_recorded_hours": record["paid_hours"],
                     "break_hours": break_taken,
                     "elapsed_hours": assessment["elapsed_hours"],
                     "log_id": log_id,
@@ -3711,7 +4017,13 @@ async def force_clock_out(
     return {
         "status": "success",
         "message": (
-            f"Worker {req.worker_id} successfully Force Clocked Out. {record['description']}."
+            f"Worker {req.worker_id} successfully Force Clocked Out. "
+            + (
+                f"Recorded at the authorised {hours_worked:.2f}h "
+                f"(the clock would have recorded {record['paid_hours']:.2f}h)."
+                if authorised_override is not None
+                else record["description"]
+            )
         ),
         "hours": hours_worked,
         "break_hours": break_taken,
@@ -4234,6 +4546,38 @@ async def remove_branding_logo(request: Request, current: CurrentUser = Depends(
             )
         payload = branding.payload_for_api(conn)
     return {"status": "success", "removed": had, "branding": payload}
+
+
+@router.get("/admin/corpus_consents")
+async def list_corpus_consents(
+    limit: int = 200, current: CurrentUser = Depends(admin_only)
+):
+    """Who has opted in to calibration capture, and the decision history behind it.
+
+    This is the operator's half of the consent picture: the corpus coverage an operator can
+    plan a derivation around is exactly the set this returns, and the deployment switch (an
+    environment variable) means nothing without it - capture runs only for the intersection of
+    the two. Per-worker histories are included because "granted, then withdrawn" is the state
+    whose *captures* an erasure request will name, and that question is answered here rather
+    than by re-deriving it from a folder of sidecars.
+    """
+    limit = max(1, min(int(limit), 500))
+    with db() as conn:
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT id, worker_id, granted, note, created_at, created_by, revoked_at "
+                "FROM corpus_capture_consents ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        except sqlite3.Error:
+            rows = []
+        granted = corpus.consented_workers(conn)
+    return {
+        "capture_enabled": bool(settings.calibration_capture_enabled),
+        "consented_workers": sorted(granted),
+        "decisions": [dict(row) for row in rows],
+    }
 
 
 @router.get("/admin/shift_rules")

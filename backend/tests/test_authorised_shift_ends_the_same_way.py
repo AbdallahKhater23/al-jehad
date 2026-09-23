@@ -323,6 +323,52 @@ def test_a_force_clock_out_without_an_answer_still_holds_the_excess(client, app_
     assert row["overtime_hours"] == pytest.approx(1.5, abs=0.01), row
 
 
+def test_a_force_clock_out_can_record_the_hours_the_administrator_names(client, app_module):
+    """The forgotten clock-out: the clock says 12 h, the administrator authorises 10.
+
+    The session has run on for hours the worker was not on site, so the clock's own figure is
+    nobody's estimate of the shift. The named figure is what the row records - and the audit
+    event carries the clock's figure beside it, so the gap between the two stays answerable.
+    Hours past the paid day are held exactly as an answered crossing holds them, which keeps
+    this override and the Approvals queue writing the same row for the same answer.
+    """
+    ON_SITE_HOURS
+    _plant_open_shift(hours_on_site=12.5)
+
+    response = client.post(
+        "/api/v1/admin/force_clock_out",
+        headers=bearer(ADMIN),
+        json={"worker_id": WORKER, "hours": 10.0},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["hours"] == pytest.approx(10.0, abs=0.01), body
+    assert "10.00" in body["message"] and "12" in body["message"], body
+
+    row = _last_clock_out()
+    assert row["hours"] == pytest.approx(10.0, abs=0.01), row
+    # 10 h named against an 8 h paid day: 2 h of overtime, held for the ordinary approval.
+    assert row["overtime_hours"] == pytest.approx(2.0, abs=0.01), row
+    assert row["status_code"] == "approved", row
+
+
+def test_a_force_clock_out_refuses_an_hours_figure_that_cannot_be_meant(client, app_module):
+    _plant_open_shift(hours_on_site=1.0)
+    before = db_scalar("SELECT COUNT(*) FROM attendance_logs WHERE action = ?", (main.ACTION_CLOCK_OUT,))
+
+    response = client.post(
+        "/api/v1/admin/force_clock_out",
+        headers=bearer(ADMIN),
+        json={"worker_id": WORKER, "hours": overtime.MAX_AUTHORISED_HOURS + 1},
+    )
+    assert response.status_code == 400, response.text
+    assert "between 0 and" in response.json()["detail"], response.text
+    # Nothing was written: the shift is still open and no new clock-out row exists.
+    assert db_scalar("SELECT COUNT(*) FROM active_sessions WHERE worker_id = ?", (WORKER,)) == 1
+    after = db_scalar("SELECT COUNT(*) FROM attendance_logs WHERE action = ?", (main.ACTION_CLOCK_OUT,))
+    assert after == before, "the refused override wrote a clock-out row"
+
+
 def test_the_hours_worked_decide_what_is_held_not_the_ceiling(client, app_module):
     """The ceiling is a limit, not a figure to be paid: the hours decide what is held past it.
 

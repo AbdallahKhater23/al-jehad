@@ -728,12 +728,19 @@ ACTIVITY_TABLES: Final = (
                                 # Real usage leaves them live, and ``open_crossings`` hands one
                                 # back inside every queue item - so a suite about an
                                 # *unanswered* crossing would inherit somebody's approval
-    "developer_alerts",         # the private alert hub: an infrastructure alert raised by real
+    "developer_alerts",        # the private alert hub: an infrastructure alert raised by real
                                 # usage is exactly what a suite about alerting must not
                                 # inherit, and the hub is read as a whole
     "developer_config",         # runtime flags and log levels, shared by every worker through
                                 # the database. A test that flips one has to flip it back by
                                 # being cleared, not by remembering to
+    "refused_punches",          # the triage record of the punches the face check refused.
+                                # Real usage files refusals all day; a suite asserting "the
+                                # refused punch is the one this test just caused" would
+                                # inherit somebody else's refusals and read them as its own
+    "corpus_capture_consents",  # per-worker opt-in to calibration capture. Real usage grants
+                                # and withdraws these; a suite testing the capture gate would
+                                # inherit a live "granted" row and read it as its own setup
 )
 
 #: Tables left exactly as the live database have them: the two ledgers this application
@@ -1050,22 +1057,31 @@ def clear_activity() -> None:
     connection = sqlite3.connect(str(current_db_path()), timeout=30.0, isolation_level=None)
     try:
         connection.execute("BEGIN IMMEDIATE")
-        guard = connection.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
-            (retention.AUDIT_DELETE_GUARD,),
-        ).fetchone()
-        guard_sql = str(guard[0]) if guard is not None and guard[0] else None
-        if guard_sql:
-            connection.execute(f"DROP TRIGGER IF EXISTS {retention.AUDIT_DELETE_GUARD}")
+        # Both append-only guards are lifted the same way, and both put back in the same
+        # transaction: ``audit_log`` (retention's guard) and ``corpus_capture_consents``
+        # (migration 23's), whose consent history is evidence for exactly the same reason the
+        # audit trail is. The guards exist for the right reason and this is not a reason to
+        # weaken them - read the trigger out of ``sqlite_master``, drop it, delete, put the
+        # same text back, so a crash in the middle leaves the guard on.
+        guard_names = (retention.AUDIT_DELETE_GUARD, "corpus_capture_consents_no_update", "corpus_capture_consents_no_delete")
+        guards: list[tuple[str, str]] = []
+        for name in guard_names:
+            row = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?", (name,)
+            ).fetchone()
+            if row is not None and row[0]:
+                guards.append((name, str(row[0])))
         try:
+            for name, _sql in guards:
+                connection.execute(f"DROP TRIGGER IF EXISTS {name}")
             for table in ACTIVITY_TABLES:
                 try:
                     connection.execute(f"DELETE FROM {table}")
                 except sqlite3.OperationalError:
                     continue
         finally:
-            if guard_sql:
-                connection.execute(guard_sql)
+            for _name, sql in guards:
+                connection.execute(sql)
         connection.commit()
     except BaseException:
         connection.rollback()

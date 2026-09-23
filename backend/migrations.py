@@ -35,7 +35,7 @@ from security import hash_password
 #: ``MIGRATIONS``. ``readiness`` refuses to start a deployment whose database is older, so a
 #: migration added without bumping this is a server that will not boot; the invariant is
 #: asserted in ``tests/test_site_shift_windows.py`` rather than left to memory.
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 23
 
 #: Magic number stamped into the SQLite header so we can recognise "this is our
 #: database" - cheap protection against pointing DATABASE_PATH at some other file.
@@ -1282,6 +1282,132 @@ def migration_21_overtime_authorisations(conn: sqlite3.Connection) -> None:
     )
 
 
+def migration_22_refused_punches(conn: sqlite3.Connection) -> None:
+    """The punch the band refused: score, reason and frame, kept for triage instead of dropped.
+
+    WHY THIS EXISTS
+    ---------------
+    A refused punch used to leave *nothing*: the frame was written and then discarded, the score
+    went into the 422 body and vanished, and the only trace was a log line. That is exactly the
+    wrong shape for the refusal the deployment actually needs to see - the one where a band
+    derived from the wrong corpus refuses honest workers all day. A queue of refusals with the
+    frame beside the score is the difference between "it keeps saying mismatch" (unsolvable) and
+    "11 refusals today, all at 0.51-0.55, frames look like the worker" (the band is wrong).
+
+    Deliberately NOT an attendance_logs row
+    ---------------------------------------
+    A refusal is not attendance: nothing was worked, nothing is payable, and putting it in the
+    logs would put it in every report, export and payroll join in the application. It is its own
+    store, with its own retention, readable only by administrators.
+
+    Fields mirror what the 422 already said (worker, site, score, error reason) plus the frame,
+    which the refusal path had in memory and threw away. ``punch_frame`` uses the same store and
+    conventions as the log rows' frames (random name, same directory, same sweep), so one
+    retention implementation covers both.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS refused_punches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            worker_id TEXT,
+            biometric_id TEXT,
+            site_name TEXT,
+            action TEXT NOT NULL,
+            error_code TEXT NOT NULL,
+            score REAL,
+            pipeline TEXT,
+            source TEXT NOT NULL DEFAULT 'online',
+            punch_frame TEXT,
+            created_at DATETIME NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_refused_punches_created "
+        "ON refused_punches(created_at DESC, id DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_refused_punches_worker "
+        "ON refused_punches(worker_id, created_at DESC)"
+    )
+
+
+def migration_23_corpus_capture_consents(conn: sqlite3.Connection) -> None:
+    """A worker's own yes-or-no on calibration capture, as an append-only record.
+
+    WHY THIS EXISTS
+    ---------------
+    The calibration corpus is a biometric store, and until this table the consent basis for
+    live captures was a deployment-wide string: ``CALIBRATION_CAPTURE_ENABLED`` with a notice.
+    An operator flipping one switch decided for every worker at once, and the record kept
+    saying "the deployment consented" long after anybody had stopped asking whether the
+    person *in the frame* had. A face kept for calibration is that person's face; the
+    deployment switch is necessary (it states the operator intends to collect at all) but it
+    is not sufficient, and this table is the sufficient half.
+
+    WHY APPEND-ONLY
+    ---------------
+    Consent is a decision with a history, not a flag: "granted in March, withdrawn in June"
+    answers a different question than "never granted" - the first names a corpus that may
+    already hold captures, the second one that should hold none. The current state is the
+    newest row per worker (``is_current``), and older rows are kept so the answer to "when did
+    this start, and when did they take it back" is a SELECT rather than a memory. The
+    database-level trigger pattern this codebase already uses (audit_log) rejects UPDATE and
+    DELETE, so history cannot be quietly rewritten by a careless query.
+
+    ``revoked_at`` is NULL for a grant and stamped for a withdrawal - the same shape
+    ``worker_push_subscriptions`` uses for a live device versus a retired one, so a reader of
+    this codebase already knows how to read it.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS corpus_capture_consents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            worker_id TEXT NOT NULL,
+            granted INTEGER NOT NULL,
+            is_current INTEGER NOT NULL DEFAULT 1,
+            note TEXT,
+            created_at DATETIME NOT NULL,
+            created_by TEXT NOT NULL,
+            created_ip TEXT,
+            superseded_at DATETIME,
+            revoked_at DATETIME,
+            revoked_ip TEXT
+        )
+        """
+    )
+    # The newest row answers the question; the index also serves "the whole history for this
+    # worker" in creation order, which is what an audit of a consent reads.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_corpus_consents_worker "
+        "ON corpus_capture_consents(worker_id, id DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_corpus_consents_current "
+        "ON corpus_capture_consents(is_current) WHERE is_current = 1"
+    )
+    # Append-only in the database, like audit_log: a consent history that UPDATE or DELETE can
+    # rewrite is not a history, it is whatever the last query left.
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS corpus_capture_consents_no_update
+        BEFORE UPDATE ON corpus_capture_consents
+        BEGIN
+            SELECT RAISE(ABORT, 'corpus_capture_consents is append-only');
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS corpus_capture_consents_no_delete
+        BEFORE DELETE ON corpus_capture_consents
+        BEGIN
+            SELECT RAISE(ABORT, 'corpus_capture_consents is append-only');
+        END
+        """
+    )
+
+
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "audit_notifications_shift_rules", migration_1_audit_notifications_shift_rules),
     (2, "provenance_columns_status_code", migration_2_provenance_columns),
@@ -1304,6 +1430,8 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (19, "notification_acknowledgement", migration_19_notification_acknowledgement),
     (20, "developer_operations", migration_20_developer_operations),
     (21, "overtime_authorisations", migration_21_overtime_authorisations),
+    (22, "refused_punches", migration_22_refused_punches),
+    (23, "corpus_capture_consents", migration_23_corpus_capture_consents),
 ]
 
 

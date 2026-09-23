@@ -233,6 +233,41 @@ def test_a_shift_past_the_line_only_appears_while_it_is_open(client, app_module)
     _plant_open_shift()  # ... and now past the line
     assert len(client.get("/api/v1/admin/overtime/crossings", headers=bearer(ADMIN)).json()) == 1
 
+
+def test_the_count_endpoint_answers_the_nav_badge_without_the_queue_payload(client, app_module):
+    """The badge count: what the queue's own ``needs_answer`` flag says, and nothing else.
+
+    The console paints this on screens where the tab is *not* open, on a poll - so the
+    endpoint must answer one small number rather than the queue's decision payloads and
+    hour arithmetic. Counted from ``needs_answer`` (the same guard the tab's cards use to
+    decide whether they are a question) rather than from raw queue length, so a shift that
+    has been answered and is still covered is information, and must not light a badge.
+    """
+    # No crossing, no badge.
+    assert client.get("/api/v1/admin/overtime/crossings/count", headers=bearer(ADMIN)).json() == {"count": 0}
+
+    _plant_open_shift()  # 9 h on site, past the 8.1 h line, nobody has answered
+    body = client.get("/api/v1/admin/overtime/crossings/count", headers=bearer(ADMIN)).json()
+    assert body == {"count": 1}, body
+
+    # The queue agrees with the badge, from the same flag: one card asking, one badge.
+    queue = client.get("/api/v1/admin/overtime/crossings", headers=bearer(ADMIN)).json()
+    assert [item for item in queue if item["needs_answer"]] and len(queue) == 1
+
+    # Answer it, and the badge falls with the question - the accept that covers the shift
+    # leaves the crossing on the queue as information, but nothing for a person to do.
+    client.post(
+        f"/api/v1/admin/overtime/crossings/{WORKER}/accept",
+        headers=bearer(ADMIN), json={"authorised_hours": 9.5, "note": "within the badge test"},
+    )
+    assert client.get("/api/v1/admin/overtime/crossings/count", headers=bearer(ADMIN)).json() == {"count": 0}
+
+    # The same audience guard the queue answers with: workers and leads get 403, an
+    # anonymous caller 401 - a badge is a read of a console surface, no matter how small.
+    for role in (WORKER, MOALLEM):
+        assert client.get("/api/v1/admin/overtime/crossings/count", headers=bearer(role)).status_code == 403
+    assert client.get("/api/v1/admin/overtime/crossings/count").status_code == 401
+
     with db(write=True) as conn:  # the shift ends
         conn.execute("DELETE FROM active_sessions WHERE worker_id = ?", (WORKER,))
     assert client.get("/api/v1/admin/overtime/crossings", headers=bearer(ADMIN)).json() == [], (
@@ -350,11 +385,23 @@ def test_the_answer_refuses_what_cannot_be_meant(client, app_module):
     assessment = _assessment()
     path = f"/api/v1/admin/overtime/crossings/{WORKER}/accept"
 
+    # A ceiling BELOW the hours already worked is now a legal answer, not a refusal: the
+    # operator authorises the day up to the figure they named, and the hours past it stay
+    # on the shift as the unauthorised excess (kept counting, settled at the clock-out).
+    # A shift at 12 h can be authorised for the agreed 10. What is still refused is a
+    # figure that cannot be meant at all: one shift past 24 h is a stray digit.
     below = client.post(
         path, json={"authorised_hours": 1.0}, headers=bearer(ADMIN)
     )
-    assert below.status_code == 400, below.text
-    assert "already worked" in below.json()["detail"], below.text
+    assert below.status_code == 200, below.text
+    assert below.json()["authorised_hours"] == 1.0, below.text
+    stored = _decisions()
+    assert len(stored) == 1 and stored[0]["authorised_hours"] == 1.0, stored
+    # A refusal covers the shift for its whole length, so the next question cannot be asked
+    # through the API - the standing decision is cleared the way nothing in production does,
+    # purely to put the bound check within reach.
+    with db(write=True) as conn:
+        conn.execute("DELETE FROM overtime_authorisations")
     above = client.post(
         path, json={"authorised_hours": overtime.MAX_AUTHORISED_HOURS + 1}, headers=bearer(ADMIN)
     )
@@ -362,7 +409,6 @@ def test_the_answer_refuses_what_cannot_be_meant(client, app_module):
 
     # A shift that has not crossed the line is not a question, and a worker with no open shift
     # is not one either: both answer 404 rather than writing an authorisation for nothing.
-    assert not _decisions()
     with db(write=True) as conn:
         conn.execute("DELETE FROM active_sessions WHERE worker_id = ?", (WORKER,))
     missing = client.post(path, json={}, headers=bearer(ADMIN))
@@ -886,13 +932,16 @@ def test_a_repeated_answer_tells_the_worker_nothing_new(client, app_module):
 def test_a_refused_answer_writes_no_notice_at_all(client, app_module):
     """Nothing partial: the notice is written in the transaction that writes the decision.
 
-    A decision that is refused (a ceiling below what has already been worked) must leave neither
-    a row nor a notice, or the worker is told about an authorisation that does not exist.
+    A decision that is refused (a ceiling past the 24 h bound) must leave neither a row nor a
+    notice, or the worker is told about an authorisation that does not exist. A ceiling below
+    the hours worked is no longer in this company: it is a legal answer now - the operator
+    names what they are authorising and the excess keeps counting - so it writes a row and
+    delivers its notice like any other acceptance.
     """
     _plant_open_shift()
     refused = client.post(
         f"/api/v1/admin/overtime/crossings/{WORKER}/accept",
-        json={"authorised_hours": 1.0},
+        json={"authorised_hours": overtime.MAX_AUTHORISED_HOURS + 1},
         headers=bearer(ADMIN),
     )
     assert refused.status_code == 400, refused.text

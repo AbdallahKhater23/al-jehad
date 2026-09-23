@@ -1650,6 +1650,71 @@ def _check_face_match_band(ctx: dict) -> Check:
     )
 
 
+def _check_calibration_corpus(ctx: dict) -> Check:
+    """How far the calibration corpus is from supporting a band derivation.
+
+    Advisory, and deliberately so in both directions: capture being off is a configuration
+    a deployment may legitimately keep (the shipped band serves), and a corpus still filling
+    is not a fault but a countdown. What must not happen is silence - the provisional band
+    was derived from public portraits because nothing said "your own traffic is the better
+    corpus", and the operator who asks "has it been a few days yet?" deserves an answer at
+    every boot rather than a shell session.
+
+    The numbers are the ones ``corpus.stats()`` computes in the terms the derivation tool
+    actually consumes - genuine pairs, impostor pairs, identities - so this check and a
+    ``derive_facenet_band.py`` run can never disagree about what the corpus holds.
+    """
+    import corpus
+    from config import settings as live_settings
+
+    if not live_settings.calibration_capture_enabled:
+        return Check(
+            "calibration_corpus",
+            TIER_ADVISORY,
+            True,
+            "capture is off; set CALIBRATION_CAPTURE_ENABLED=true with CALIBRATION_CORPUS_DIR "
+            "on the volume to collect the gate selfies a real band is measured from",
+            {"capture_enabled": False},
+        )
+    try:
+        summary = corpus.stats()
+    except Exception as exc:  # noqa: BLE001 - an unreadable store is reported, never fatal
+        return Check("calibration_corpus", TIER_ADVISORY, True, f"could not be checked: {exc}")
+
+    details = {
+        "capture_enabled": True,
+        "captures": summary["captures"],
+        "labelled": summary["labelled"],
+        "unlabelled": summary["unlabelled"],
+        "identities": summary["identities"],
+        "genuine_pairs": summary["genuine_pairs"],
+        "impostor_pairs": summary["impostor_pairs"],
+        "can_support_floor": summary["can_support_floor"],
+    }
+    if summary["can_support_floor"]:
+        return Check(
+            "calibration_corpus",
+            TIER_ADVISORY,
+            True,
+            f"ready to derive: {summary['labelled']} labelled capture(s) across "
+            f"{summary['identities']} identity/ies give {summary['genuine_pairs']} genuine and "
+            f"{summary['impostor_pairs']} impostor pair(s) - run "
+            "tools/derive_facenet_band.py per docs/RUNBOOK_FACE_BAND.md, then reinstall the "
+            "printed band in face_detector.BANDS",
+            details,
+        )
+    return Check(
+        "calibration_corpus",
+        TIER_ADVISORY,
+        True,
+        f"collecting: {summary['captures']} capture(s) so far ({summary['labelled']} labelled, "
+        f"{summary['unlabelled']} awaiting a label) - a derivation needs at least two capture(s) "
+        "per identity and 100 impostor pair(s) across identities; keep the site running "
+        "normally and check back in a few days",
+        details,
+    )
+
+
 def _check_clock_sanity(ctx: dict) -> Check:
     try:
         conn = _open(ctx.get("db_path"), read_only=True)
@@ -1795,6 +1860,7 @@ CHECKS = (
     _check_face_engine,
     _check_face_detector,
     _check_face_match_band,
+    _check_calibration_corpus,
     _check_liveness,
     _check_clock_sanity,
     _check_database_path,

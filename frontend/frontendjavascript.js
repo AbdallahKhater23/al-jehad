@@ -962,10 +962,18 @@ const UI = {
         this._unreadResyncBound = true;
         if (typeof window !== 'undefined' && window.addEventListener) {
             window.addEventListener('focus', () => this.resyncUnreadBadge());
+            // The same return-to-tab moments, for the console's crossings badge: a crossing
+            // answered from another admin's console is invisible to this one until it is
+            // re-asked, and "Approvals 3" pointing at a queue somebody already emptied is a
+            // badge that trains nobody to read it.
+            window.addEventListener('focus', () => this.refreshApprovalsBadge());
         }
         if (typeof document !== 'undefined' && document.addEventListener) {
             document.addEventListener('visibilitychange', () => {
-                if (document.visibilityState !== 'hidden') this.resyncUnreadBadge();
+                if (document.visibilityState !== 'hidden') {
+                    this.resyncUnreadBadge();
+                    this.refreshApprovalsBadge();
+                }
             });
         }
     },
@@ -2286,7 +2294,77 @@ const UI = {
     paintAdminConsole() {
         if (Device.isMobile) this.renderAdminMobile();
         else this.renderAdminDesktop();
+        this.refreshApprovalsBadge();
         return this.renderAdminTab(State.adminTab);
+    },
+
+    //: When the crossings badge was last re-read, so the pair of events one tab return
+    //: produces (``visibilitychange`` and ``focus``) costs one request - the same throttle
+    //: ``resyncUnreadBadge`` runs for the worker's unread badge.
+    _crossingsResyncedAt: 0,
+
+    /**
+     * Read the unanswered-crossing count and paint it on the Approvals tab.
+     *
+     * The count is a number from the moment it was fetched, and a crossing is answered by
+     * *somebody else's* console as often as by this one - two admins on two phones is the
+     * normal case, not the edge case - so it is re-asked when the tab returns to view,
+     * the same moments the worker's unread badge resyncs on.
+     *
+     * Asked on the console only: a worker's handset has no Approvals tab, and a request
+     * every gate selfie costs would be refused with 403 anyway. A failure is silence, for
+     * the reason every badge in this app is: a count that cannot be read is not worth an
+     * error replacing a screen that works, and the badge keeps whatever it last said.
+     */
+    async refreshApprovalsBadge(force) {
+        const admin = !!State.user && State.user.role !== 'worker' && State.user.role !== 'moallem';
+        if (!State.token || !admin) return;
+        if (typeof API === 'undefined' || !API.request) return;
+        const now = Date.now();
+        if (!force && now - this._crossingsResyncedAt < 1000) return;
+        this._crossingsResyncedAt = now;
+        try {
+            const data = await API.request('/admin/overtime/crossings/count');
+            State.crossingsWaiting = Math.max(0, Number(data && data.count) || 0);
+        } catch (err) {
+            return; // keep the last painted count; the next return-to-tab retries
+        }
+        this.paintApprovalsBadge();
+    },
+
+    /**
+     * Repaint every Approvals tab button's badge in place.
+     *
+     * The rail and the phone strip both render a button with ``data-admin-tab="Approvals"``
+     * but only one layout is up at a time; repainting by query rather than re-rendering the
+     * nav means a decision on the open tab clears its own badge without rebuilding the rail.
+     * ``aria-hidden`` on the numeral, matching the worker's unread badge: "Approvals 3" is
+     * not the tab's name, and the count reaches a screen reader through the tab's own
+     * ``aria-label`` instead.
+     */
+    paintApprovalsBadge() {
+        if (typeof document === 'undefined' || !document.querySelectorAll) return;
+        const count = Math.max(0, Number(State.crossingsWaiting) || 0);
+        document.querySelectorAll('[data-admin-tab="Approvals"]').forEach((button) => {
+            if (!button || typeof button.querySelector !== 'function') return;
+            let badge = null;
+            try { badge = button.querySelector('[data-crossings-badge]'); } catch (err) { badge = null; }
+            if (count > 0) {
+                if (!badge) {
+                    badge = document.createElement('span');
+                    badge.className = 'tab-count';
+                    badge.setAttribute('data-crossings-badge', 'true');
+                    badge.setAttribute('aria-hidden', 'true');
+                    if (typeof button.appendChild === 'function') button.appendChild(badge);
+                }
+                badge.textContent = count > 99 ? '99+' : String(count);
+                badge.setAttribute('data-crossings-badge', String(count));
+                button.setAttribute('aria-label', `${I18n.__('pendingReviews')} - ${I18n.__('approvalsBadgeLabel')} ${count}`);
+            } else if (badge && typeof badge.remove === 'function') {
+                badge.remove();
+                button.removeAttribute('aria-label');
+            }
+        });
     },
 
     /**
@@ -2667,6 +2745,64 @@ const UI = {
         const site = document.getElementById('forceInSite');
         if (!worker || !site) return;
         return this.forceAction(String(worker.value || ''), 'in', String(site.value || ''));
+    },
+
+    /**
+     * The Force Out question, asked before anything is written.
+     *
+     * A forced close is the one clock-out nobody's phone pressed, and its usual case is the
+     * forgotten clock-out: the session has run on for hours the worker was not on site. The
+     * clock's own figure is offered as the default and the administrator can name the hours
+     * they are actually authorising instead - both numbers end up on the record (the audit
+     * event carries the clock's figure beside the recorded one), and hours past the paid day
+     * are held for the ordinary overtime approval either way.
+     */
+    forceOutModal(workerId, workerName, clockInTime) {
+        const id = this.escapeHtml ? this.escapeHtml(String(workerId)) : String(workerId);
+        const name = this.escapeHtml ? this.escapeHtml(String(workerName || workerId)) : String(workerName || workerId);
+        const clockIn = this.escapeHtml ? this.escapeHtml(String(clockInTime || '')) : String(clockInTime || '');
+        const hoursField = [
+            `<p class="ops-note" style="margin-top:0">`,
+            this.escapeHtml(I18n.__('forceOutHint')),
+            `</p>`,
+            clockIn ? `<p class="ops-note">${this.escapeHtml(I18n.__('approvalsClockIn'))}: ${clockIn}</p>` : '',
+            `<label class="ops-stat-label" for="forceOutHours">${this.escapeHtml(I18n.__('forceOutHoursLabel'))}</label>`,
+            `<input id="forceOutHours" class="ops-field" type="number" min="0" max="24" step="0.25" inputmode="decimal" />`,
+            `<p class="ops-note">${this.escapeHtml(I18n.__('forceOutHoursHint'))}</p>`
+        ].join('');
+        const backdrop = Modal.open(`
+            <h3 style="margin-top:0">${this.escapeHtml(I18n.__('forceOutTitle').replace('{name}', name))}</h3>
+            ${hoursField}
+            <div class="ui-row" style="margin-top:16px">
+                <button type="button" class="ops-btn ops-btn-danger" id="forceOutGo">${this.OPS_ICONS ? this.escapeHtml(this.OPS_ICONS.check) : ''}${this.escapeHtml(I18n.__('forceOutConfirm'))}</button>
+                <button type="button" class="ops-btn" onclick="Modal.close()">${this.escapeHtml(I18n.__('cancel'))}</button>
+            </div>`, { dismissible: true });
+        if (!backdrop) return;
+        backdrop.querySelector('#forceOutGo').addEventListener('click', async () => {
+            const field = backdrop.querySelector('#forceOutHours');
+            const raw = String((field && field.value) || '').trim();
+            let hours = null;
+            if (raw) {
+                hours = Number(raw);
+                if (!isFinite(hours) || hours < 0 || hours > 24) {
+                    Toast.error(I18n.__('forceOutHoursHint'));
+                    return;
+                }
+            }
+            const go = backdrop.querySelector('#forceOutGo');
+            if (go) go.disabled = true;
+            try {
+                const body = { admin_id: State.user.id, worker_id: String(workerId), site_name: '' };
+                if (hours !== null) body.hours = hours;
+                const res = await API.request('/admin/force_clock_out', { method: 'POST', body });
+                Modal.close();
+                Toast.success(res.message || I18n.__('forceOut'));
+                this.renderAdminTab(State.adminTab);
+            } catch (err) {
+                if (go) go.disabled = false;
+                Toast.error(err.message);
+            }
+        });
     },
 
     // Was referenced by the Live Ops table but never implemented, so the

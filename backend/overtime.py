@@ -712,9 +712,11 @@ def decide_crossing(
     ``accept`` without a number authorises the paid hours recorded *at that moment* - the rule
     this application applies to money elsewhere: approve what there is evidence for. An operator
     who wants the rest of the night covered says so with a number, and that is a deliberate act
-    with a figure on it rather than a blanket. Hours past the ceiling are not silently paid: they
-    queue again as a second, distinct question, with this decision on the record as what they
-    were measured against.
+    with a figure on it rather than a blanket. A number BELOW what has been worked is also
+    accepted: the day is authorised up to that figure, and the hours past it keep counting and
+    settle at the clock-out as the unauthorised excess, held for review like any unanswered
+    crossing. Hours past the ceiling are not silently paid: they queue again as a second,
+    distinct question, with this decision on the record as what they were measured against.
 
     A refusal is stored as a ceiling of the regular paid day rather than as a missing row:
     "nobody has answered" and "the answer is no" are different states of the same queue, and only
@@ -751,10 +753,14 @@ def decide_crossing(
         return answered
     if accept:
         ceiling = float(authorised_hours) if authorised_hours is not None else recorded
-        if ceiling < recorded:
-            raise ValueError(
-                f"authorised hours ({ceiling:g}) are less than the {recorded:.2f} h already worked"
-            )
+        # A ceiling BELOW the hours already worked is a legal answer, not a typo to refuse:
+        # the operator is authorising the day up to the figure they named, and the hours past
+        # it are not lost - they stay on the shift, keep counting, and settle at the clock-out
+        # as the unauthorised excess (held for review, exactly like an unanswered crossing).
+        # Refusing this shape forced the operator into all-or-nothing: a worker still on site
+        # at 12 h could not be authorised for the agreed 10. The one guard that remains is the
+        # width of a figure that could not be meant: one shift cannot be authorised for more
+        # than ``MAX_AUTHORISED_HOURS`` - a stray digit there is a typo detector, not a policy.
         if ceiling > MAX_AUTHORISED_HOURS:
             raise ValueError(
                 f"authorised hours ({ceiling:g}) are past the {MAX_AUTHORISED_HOURS:g} h limit "
