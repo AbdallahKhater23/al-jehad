@@ -204,6 +204,109 @@ def test_many_faces_is_its_own_reason_and_not_a_gate_discard(stubbed_specs, monk
     assert all(o.miss_reason == "many_faces" for o in outcomes), [o.miss_reason for o in outcomes]
 
 
+def test_the_store_source_reads_the_corpus_where_it_lives(monkeypatch, tmp_path, stubbed_specs):
+    """The store *is* the folder contract, so an export is a copy - and a copy of faces is worth not making.
+
+    The sweep reads the calibration store in place (one command where the corpus is, no second
+    copy of anybody's face on disk), and it counts the frames a *coverage* experiment wants: the
+    flagged ones included. This pins both, plus the two things the report needs to be honest -
+    which source produced it, and whose frames they are.
+    """
+    from coverage_sweep import CorpusStoreSource, default_specs, render, sweep
+
+    images = {}
+    for index, (identity, flags, hard) in enumerate(
+        (("nadia", [], False), ("omar", ["small_face"], True), ("omar", [], False))
+    ):
+        path = tmp_path / f"capture_{index}.jpg"
+        _face_pixels(1280, 720, 640, 360, 48).save(path)
+        images[path.name] = capture_stub(str(path), identity=identity, hard_case=hard, flags=flags)
+
+    # Only the store read is stubbed: the sweep still runs the real ``corpus.prepare`` and its own
+    # gate over the frames, which is the part the numbers come from.
+    monkeypatch.setattr(corpus, "sidecars", lambda **kwargs: list(images.values()))
+    monkeypatch.setattr(corpus, "root_dir", lambda: "/data/calibration_corpus")
+    source = CorpusStoreSource()
+    assert source.as_dict()["kind"] == "calibration_store"
+
+    report = sweep(source, default_specs(), source_info=source.as_dict())
+    assert report["frames_read"] == 3, "a flagged capture is still a frame the detector sees"
+    assert report["identities"] == ["nadia", "omar"], report["identities"]
+    assert report["source"]["kind"] == "calibration_store"
+    assert "identities: 2" in render(report), render(report)
+    # The identity travels per frame, which is what turns a coverage figure into "which worker is
+    # the far one": the per-frame entry is where a reader checks it.
+    assert {o["identity"] for o in report["configs"]["yunet@640"]["outcomes"]} == {"nadia", "omar"}
+
+
+def capture_stub(path: str, *, identity, hard_case: bool, flags: list[str]):
+    """A ``corpus.Capture`` with only the fields the sweep's store source reads."""
+
+    class _Capture:
+        pass
+
+    record = _Capture()
+    record.capture_id = Path(path).stem
+    record.identity = identity
+    record.image = path
+    record.camera = "gate-1"
+    record.captured_at = "2026-09-20T08:15:00Z"
+    record.quality = {"flags": flags}
+    record.hard_case = hard_case
+    return record
+
+
+def test_the_store_source_reports_an_unreadable_capture_rather_than_stopping(
+    monkeypatch, tmp_path, stubbed_specs
+):
+    """One truncated JPEG in the store is not a reason to abandon the measurement."""
+    from coverage_sweep import CorpusStoreSource, default_specs, sweep
+
+    good = tmp_path / "good.jpg"
+    _face_pixels(1280, 720, 640, 360, 48).save(good)
+    broken = tmp_path / "broken.jpg"
+    broken.write_bytes(b"not a jpeg at all")
+    monkeypatch.setattr(corpus, "sidecars", lambda **kwargs: [
+        capture_stub(str(good), identity="nadia", hard_case=False, flags=[]),
+        capture_stub(str(broken), identity="omar", hard_case=False, flags=[]),
+    ])
+    monkeypatch.setattr(corpus, "root_dir", lambda: "/data/calibration_corpus")
+
+    source = CorpusStoreSource()
+    report = sweep(source, default_specs())
+    assert report["frames_read"] == 1, report["frames_read"]
+    assert report["unreadable"] == 0, "the source skips it before the sweep ever counts it"
+    assert len(source.skipped) == 1 and source.skipped[0][0] == str(broken), source.skipped
+    assert "unreadable" in source.skipped[0][1], source.skipped
+
+
+def test_the_cli_refuses_a_store_sweep_when_the_store_is_empty(monkeypatch, tmp_path, capsys):
+    """Zero captures is the operator's next step, not four configurations measuring nothing."""
+    from coverage_sweep import main
+
+    monkeypatch.setattr(corpus, "sidecars", lambda **kwargs: [])
+    monkeypatch.setattr(corpus, "root_dir", lambda: "/data/calibration_corpus")
+    assert main(["--corpus-store", "--skip-scrfd"]) == 2
+    err = capsys.readouterr().err
+    assert "calibration corpus is empty" in err, err
+    assert "CALIBRATION_CAPTURE_ENABLED" in err, err
+    assert "corpus_admin.py stats" in err, err
+
+
+def test_the_cli_needs_exactly_one_source(monkeypatch, tmp_path, stubbed_specs, capsys):
+    """A folder and a store are two different corpora; asking for both is a guess, not a merge."""
+    from coverage_sweep import main
+
+    corpus_dir = _frames_dir(tmp_path)
+    _stub_directory_source(monkeypatch)
+    monkeypatch.setattr(corpus, "sidecars", lambda **kwargs: [])
+    monkeypatch.setattr(corpus, "root_dir", lambda: "/data/calibration_corpus")
+    assert main(["--skip-scrfd"]) == 2
+    assert main(["--corpus", str(corpus_dir), "--corpus-store", "--skip-scrfd"]) == 2
+    err = capsys.readouterr().err
+    assert "exactly one source" in err, err
+
+
 def test_the_sweep_stores_nothing(monkeypatch, tmp_path):
     """The measurement aid must not write: no capture, no sidecar, no consent row."""
     from coverage_sweep import default_specs, sweep
