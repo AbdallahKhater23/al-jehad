@@ -2218,6 +2218,33 @@ html.dark .ui-btn-warn:hover:not(:disabled) { color: #0f172a; }
     font-variant-numeric: tabular-nums;
 }
 
+/*
+   The crossings badge on the console's Approvals tab (rail and phone strip alike).
+
+   The worker's unread badge (.hand-tab-count) sits over an icon because its tab bar is a
+   grid of icons; the console's tabs are pills of icon-plus-word, so the numeral rides at
+   the pill's end edge rather than over anything, and it is the same voice - the danger
+   ground, the tabular figures - as the badge it answers to on the handset.
+*/
+.tab-count {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 18px;
+    height: 18px;
+    margin-inline-start: auto;
+    padding: 0 5px;
+    border-radius: 999px;
+    background: var(--ops-danger);
+    color: #fff;
+    font-size: 11px;
+    font-weight: 800;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+    flex: none;
+}
+.admin-tabs button .tab-count { margin-inline-start: var(--ui-2); }
+
 /* ---------- The shift, as the one card that matters --------------------- */
 
 /* The card is a *reading order* - what this is, which state it is in, how long it has

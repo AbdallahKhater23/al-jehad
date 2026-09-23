@@ -240,9 +240,16 @@ def test_a_column_the_code_writes_is_never_declared_inside_an_older_migration():
     # The rule: a column may be *named* only by the migration that introduces it. Mentioned
     # anywhere older means it is inside a migration existing databases have already recorded
     # as applied - which is exactly where ``punch_frame`` shipped when every clock-out broke.
+    # Two homes are legal when they introduce the *same column name on different tables*:
+    # migration 18 adds ``attendance_logs.punch_frame`` and migration 22 creates
+    # ``refused_punches.punch_frame`` - same name, different columns, each introduced by the
+    # migration that owns its table. What the rule forbids is a *second mention of the same
+    # table's column* in an older migration, so the guard's failure mode (a name appearing in
+    # a migration that could never have known it) stays the thing that bites.
     punch_frame_homes = sorted(name for name, names in mentions.items() if "punch_frame" in names)
-    assert punch_frame_homes == ["migration_18_punch_frame"], (
-        f"punch_frame must be introduced by migration 18 and named nowhere older: {punch_frame_homes}"
+    assert punch_frame_homes == ["migration_18_punch_frame", "migration_22_refused_punches"], (
+        f"punch_frame must be introduced by migrations 18 and 22 (one table each) and named "
+        f"nowhere else: {punch_frame_homes}"
     )
 
 

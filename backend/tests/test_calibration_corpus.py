@@ -31,6 +31,7 @@ import pytest
 from PIL import Image
 
 import corpus
+from database import db
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +471,13 @@ def _live(monkeypatch, *, enabled: bool = True, faces: int = 1) -> _StubDetector
     monkeypatch.setattr(face_detector, "detect_landmarks", stub)
     monkeypatch.setattr(face_detector, "fingerprint", lambda: "c" * 16)
     monkeypatch.setattr(face_detector, "active_pipeline", lambda: "yunet-2023mar")
+    # The worker's own half of the consent, recorded the way the endpoint records it. These tests
+    # are about the capture mechanics, not the consent gate - the consent gate has its own file
+    # (``test_corpus_worker_consent.py``) - so every live-hook test runs as a worker who opted in.
+    with db(write=True) as conn:
+        corpus.record_consent(
+            conn, worker_id="W-1", granted=True, actor_id="W-1", note="live-hook fixture"
+        )
     return stub
 
 
@@ -485,7 +493,9 @@ def test_the_live_hook_labels_a_verified_verdict_and_only_a_verified_verdict(mon
     assert records[approved].identity == "W-1"
     assert records[flagged].identity is None and records[refused].identity is None
     assert records[approved].source == corpus.SOURCE_PUNCH
-    assert "CALIBRATION_CAPTURE_ENABLED" in records[approved].consent
+    assert records[approved].consent == corpus.WORKER_CONSENT, (
+        "a per-worker capture carries the worker-granted basis, not the deployment one"
+    )
     assert records[approved].note and "verdict=approved" in records[approved].note
     assert len(corpus.sidecars(unlabelled_only=True)) == 2
 
