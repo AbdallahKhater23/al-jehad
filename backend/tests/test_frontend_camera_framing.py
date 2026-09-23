@@ -106,7 +106,8 @@ Object.keys(ADVICE).forEach((name) => {
     });
     // What the coach says about the two cases that used to be wrong, end to end.
     results.subject_advice = {};
-    ['one_worker', 'duplicated_nested', 'worker_and_speck', 'specks_only', 'two_people'].forEach((name) => {
+    ['one_worker', 'duplicated_nested', 'duplicated_overlapping', 'worker_and_speck',
+     'specks_only', 'two_people'].forEach((name) => {
         results.subject_advice[name] = env.evaluate(
             'UI.framingAdvice(' +
             JSON.stringify(frame({ face: results.subjects[name] })) +
@@ -243,3 +244,66 @@ def test_the_hint_is_part_of_the_card_and_stops_with_it(results):
     assert card["keeps_advice"], "the static capture hint must stay under the shutter"
     assert card["coach_running"], "the coach never started"
     assert card["stopped_with_card"], "the coach outlived the card it was watching"
+
+
+# ---------------------------------------------------------------------------
+# who is actually in the frame
+# ---------------------------------------------------------------------------
+# The coach's count is what produces "Only one person can be in the frame", and the browser's
+# detector does not report people - it reports *responses*. One worker standing alone arrives
+# as two overlapping boxes often enough that workers were being told to get somebody else out
+# of a frame that held only them, and one of them was stopped with a sentence about a person
+# who was never there. These pin the counting rule and the advice it feeds.
+def test_one_face_reported_twice_is_one_person(results):
+    for case in ("duplicated_nested", "duplicated_overlapping"):
+        subject = results["subjects"][case]
+        assert subject["count"] == 1, f"{case}: {subject}"
+        assert subject["merged"] == 1, f"{case}: {subject}"
+        assert results["subject_advice"][case] != "framingManyFaces", (
+            f"{case}: one face in two boxes is not two people"
+        )
+
+
+def test_a_face_shaped_speck_is_not_a_person(results):
+    subject = results["subjects"]["worker_and_speck"]
+    assert subject["count"] == 1, subject
+    assert subject["rawCount"] == 2 and subject["ignored"] == 1, subject
+    assert results["subject_advice"]["worker_and_speck"] == "framingGood", (
+        "a speck of poster behind the worker must not be advice about a second person"
+    )
+
+
+def test_specks_alone_are_no_face_at_all(results):
+    subject = results["subjects"]["specks_only"]
+    assert subject["count"] == 0, subject
+    assert results["subject_advice"]["specks_only"] == "framingNoFace", (
+        "with only specks in the frame, the honest instruction is that no face is there"
+    )
+
+
+def test_two_people_are_still_two_people(results):
+    subject = results["subjects"]["two_people"]
+    assert subject["count"] == 2, subject
+    assert subject["merged"] == 0, subject
+    assert results["subject_advice"]["two_people"] == "framingManyFaces", (
+        "the rule that matters must survive the fix: two workers is still two people"
+    )
+
+
+def test_boxes_that_only_touch_are_not_merged(results):
+    assert results["subjects"]["two_overlapping"]["count"] == 2, results["subjects"]["two_overlapping"]
+
+
+def test_the_area_is_the_subject_not_the_sum(results):
+    """The area drives "move closer"/"move further", so it must describe the person in front."""
+    alone = results["subjects"]["one_worker"]["area"]
+    with_speck = results["subjects"]["worker_and_speck"]["area"]
+    assert abs(alone - with_speck) < 1e-9, (alone, with_speck)
+    assert 0.006 < alone < 0.35, f"the good-window fixture should read as good framing: {alone}"
+
+
+def test_the_sample_is_wide_enough_for_the_face_detector(results):
+    assert results["sample_width"] >= 240, (
+        "160 px was too coarse for window.FaceDetector: it produced the overlapping boxes "
+        "that made one worker look like two"
+    )
