@@ -933,6 +933,12 @@ const UI = {
         // permission is requested here - that is the switch on the profile tab, and a
         // prompt fired at boot is how an app teaches people to refuse.
         if (typeof WORKER_MODULES !== 'undefined') WORKER_MODULES.initPush().catch(() => {});
+        // The capture-consent state is read once per session for the same reason the push
+        // config is: the profile tab should say what the worker actually decided, on the
+        // first open, rather than "checking…" until they tap something. A read, not a
+        // write - nothing about a consent is ever changed by opening the app.
+        if (typeof WORKER_MODULES !== 'undefined')
+            WORKER_MODULES.initCorpusConsent().catch(() => {});
         // A push tapped with the app closed lands here: the worker has no way to say
         // "that one" except through this message, and marking it read is what makes
         // the badge agree with the lock screen they just cleared.
@@ -1442,6 +1448,7 @@ const UI = {
                         <div id="historyTable">${this.loadingHtml()}</div>
                     </section>
                     <section class="hand-card"><div id="workerNotes"></div></section>
+                    <section class="hand-card"><div id="corpusConsent"></div></section>
                     <section class="hand-card"><div id="pushSettings"></div></section>
                 </div>
             </div>
@@ -1457,7 +1464,16 @@ const UI = {
             pushHost.innerHTML = WORKER_MODULES.pushSettingsHtml();
             WORKER_MODULES.bindPushSettings(pushHost);
         }
+        this.paintCorpusConsent();
         this.renderDevicePanel(document.getElementById('devicePanel'));
+    },
+
+    /** Paint and bind the capture-consent card, where it is in the layout. */
+    paintCorpusConsent() {
+        const host = document.getElementById('corpusConsent');
+        if (!host) return;
+        host.innerHTML = WORKER_MODULES.corpusConsentHtml();
+        WORKER_MODULES.bindCorpusConsent(host);
     },
 
     setWorkerTab(tab) {
@@ -1486,7 +1502,7 @@ const UI = {
             main.innerHTML = `<div id="workerNotes"></div>`;
             await WORKER_MODULES.renderNotes(document.getElementById('workerNotes'));
         } else if (tab === 'profile') {
-            main.innerHTML = `<div id="workerProfile"></div><div id="pushSettings"></div><div id="devicePanel"></div>`;
+            main.innerHTML = `<div id="workerProfile"></div><div id="corpusConsent"></div><div id="pushSettings"></div><div id="devicePanel"></div>`;
             this.renderWorkerProfile(document.getElementById('workerProfile'));
             // The push card is bound to its own host rather than the profile's: two
             // delegated listeners on one ancestor would both answer a tap, and the
@@ -1496,6 +1512,9 @@ const UI = {
                 pushHost.innerHTML = WORKER_MODULES.pushSettingsHtml();
                 WORKER_MODULES.bindPushSettings(pushHost);
             }
+            // Same host-per-card rule for the consent card, whose state is the worker's own
+            // decision rather than anything the account panel shows.
+            this.paintCorpusConsent();
             this.renderDevicePanel(document.getElementById('devicePanel'));
         } else {
             main.innerHTML = `<div id="workerDashboard"></div><div id="devicePanel"></div>`;

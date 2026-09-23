@@ -1894,5 +1894,115 @@ const WORKER_MODULES = {
         const host = document.getElementById('pushSettings');
         if (!host) return;
         host.innerHTML = this.pushSettingsHtml();
+    },
+
+    // -----------------------------------------------------------------------
+    // Calibration capture: the worker's own opt-in
+    // -----------------------------------------------------------------------
+    /**
+     * The face-matching photo card, on the profile tab.
+     *
+     * The corpus it feeds is a biometric store, and the consent that permits it is the
+     * worker's own. The backend has accepted that decision since migration 23 - recorded in
+     * an append-only table and in ``audit_log`` - but the only way to make it was an HTTP
+     * call, which for the person whose face is kept is the same as having no way at all.
+     *
+     * What this card must get right, and why each part is here rather than left implicit:
+     *
+     * * **The wording says what is kept.** A toggle labelled "help improve the service" is
+     *   not consent to keep somebody's photograph; the note names the photo, says who
+     *   cannot see the answer, and says it can be stopped.
+     * * **The current state is the server's, not the page's.** ``_corpusConsent`` holds what
+     *   ``GET /worker/me/corpus/consent`` answered, and the card is repainted from a fresh
+     *   read after every change - a switch that shows "on" from optimism is a switch that
+     *   lies about a consent record.
+     * * **One endpoint, both directions.** Withdrawal goes through the same call with
+     *   ``granted: false``, because a worker who wants out must not have to find another
+     *   screen for it.
+     */
+    _corpusConsent: null,
+
+    /**
+     * Read the worker's own capture consent once per session, quietly.
+     *
+     * Called from ``UI.init`` beside ``initPush``. A failure leaves ``_corpusConsent`` null,
+     * which the card renders as "checking…" and no control at all - deliberately: offering an
+     * "I agree" button whose write the page has not proven it can make is asking somebody to
+     * consent to something that may not be recorded, and a consent that might not be recorded
+     * is not a consent.
+     */
+    async initCorpusConsent() {
+        this._corpusConsent = await this.fetchCorpusConsent().catch(() => null);
+        return this._corpusConsent;
+    },
+
+    async fetchCorpusConsent() {
+        return API.request('/worker/me/corpus/consent');
+    },
+
+    corpusConsentHtml() {
+        const state = this._corpusConsent;
+        if (!state) {
+            return this.corpusCardHtml(I18n.__('corpusChecking'), null);
+        }
+        const on = !!state.granted;
+        return this.corpusCardHtml(
+            on ? I18n.__('corpusOnNote') : I18n.__('corpusOffNote'),
+            on
+        );
+    },
+
+    corpusCardHtml(note, granted) {
+        return `
+            <section class="hand-card" data-corpus-card>
+                <div class="hand-section-head">
+                    <h3 class="hand-section-title">${HAND_ICONS.camera}${this.escapeHtml(I18n.__('corpusTitle'))}</h3>
+                </div>
+                <p class="hand-section-note">${this.escapeHtml(I18n.__('corpusNote'))}</p>
+                <p class="hand-section-note">${this.escapeHtml(note)}</p>
+                ${granted !== null
+                    ? `<button type="button" data-corpus-consent="${granted ? 'withdraw' : 'grant'}" class="ui-btn ${granted ? '' : 'ui-btn-primary'}">
+                        ${this.escapeHtml(granted ? I18n.__('corpusWithdraw') : I18n.__('corpusEnable'))}
+                    </button>`
+                    : ''}
+            </section>`;
+    },
+
+    /** Bind the card's one control. The host is the profile container; re-binding is safe. */
+    bindCorpusConsent(host) {
+        if (!host || !host.addEventListener) return;
+        host.addEventListener('click', async (event) => {
+            const button = event.target.closest('[data-corpus-consent]');
+            if (!button) return;
+            const granting = button.getAttribute('data-corpus-consent') === 'grant';
+            button.disabled = true;
+            try {
+                await API.request('/worker/me/corpus/consent', {
+                    method: 'POST',
+                    body: { granted: granting }
+                });
+                if (granting) {
+                    Toast.success(I18n.__('corpusGranted'));
+                } else {
+                    Toast.info(I18n.__('corpusWithdrawn'));
+                }
+            } catch (err) {
+                Toast.error(err.message || I18n.__('corpusUnavailable'));
+            } finally {
+                // The server's answer, not the button's - a failed write must not leave the
+                // card saying "on" for a decision nobody recorded.
+                this._corpusConsent = await this.fetchCorpusConsent().catch(
+                    () => this._corpusConsent
+                );
+                this.refreshCorpusConsentCard();
+            }
+        });
+    },
+
+    /** Repaint just the consent card in place - the profile around it is untouched. */
+    refreshCorpusConsentCard() {
+        const host = document.getElementById('corpusConsent');
+        if (!host) return;
+        host.innerHTML = this.corpusConsentHtml();
     }
 };

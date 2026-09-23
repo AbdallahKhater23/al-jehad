@@ -205,6 +205,12 @@ A worker opts in — or out — in their own app, which records the decision in 
 * ``audit_log``: the same decision as ``corpus_capture_consent``, with the actor and
   provenance the audit trail already carries.
 
+The worker's way in is a card on their own **profile tab** ("Photos for face matching"), which
+reads the state from this endpoint and writes it back through the same one. It is the only path
+that has to exist: an operator cannot agree on a worker's behalf, and the card offers no control at
+all until the server's answer has landed — a consent button whose write the page cannot prove it can
+make is a button that records nothing.
+
 The endpoints, both for the signed-in worker themselves:
 
 ```bash
