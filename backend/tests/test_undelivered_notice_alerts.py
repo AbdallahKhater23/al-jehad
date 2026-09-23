@@ -227,6 +227,38 @@ def test_nothing_stranded_reads_as_nothing(app_module):
     assert push._stranded_report(reading).startswith("0 worker notification(s)")
 
 
+def test_a_notice_the_worker_has_read_is_no_longer_stranded(app_module):
+    """``read_at`` is the worker's own answer; an answered question is not an undelivered one.
+
+    This is the drain path a deployment switching push on for the first time needs: every
+    notice written before push existed is undelivered forever, and without this exclusion the
+    backlog stayed red until retention aged the rows out - 180 days of a warning nothing could
+    clear. The inbox is the record either way; what this reading is *for* is a channel that is
+    trying and cannot deliver.
+    """
+    _seed_notice(age_minutes=300)
+    # The same notice, but the worker opened the app and read it - undelivered, yet known.
+    with db(write=True) as conn:
+        conn.execute(
+            "INSERT INTO worker_notifications "
+            "(worker_id, kind, title, body, payload, created_at, delivered_at, delivery_attempts, read_at) "
+            "VALUES (?, ?, ?, ?, NULL, ?, NULL, 0, ?)",
+            (
+                str(WORKER),
+                "shift_auto_closed",
+                "Read in the inbox",
+                "8.00h payable.",
+                _stamp(ANCHOR - timedelta(minutes=300)),
+                _stamp(ANCHOR - timedelta(minutes=10)),
+            ),
+        )
+
+    reading = _reading()
+    assert reading["notices"] == 1, "a read notice still counted as stranded"
+    assert reading["oldest"] == _stamp(ANCHOR - timedelta(minutes=300))
+    assert reading["workers"] == 1
+
+
 def test_the_reading_never_touches_rows_it_should_not(app_module):
     """Delivered notices, and notices newer than the window, are not this alert's business."""
     _seed_notice(age_minutes=300)
