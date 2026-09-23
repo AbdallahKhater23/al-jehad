@@ -50,7 +50,7 @@ import hashlib
 import logging
 import os
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -97,6 +97,29 @@ ALIGNED_SIZE = 112
 
 #: Below this, a detection is noise. OpenCV's sample default is 0.5.
 SCORE_THRESHOLD = 0.6
+
+#: The narrowest detection that can be the person standing at the gate, in frame pixels.
+#:
+#: The alignment template is ``ALIGNED_SIZE`` (112 px) and the punch band (0.7-1.5 m, see the framing
+#: coach) puts a subject at 106-226 px in a 1280-wide frame, so a detection a quarter of the template
+#: is not a smaller subject - it is a *crop with no face in it*, upscaled from interpolation. YuNet at
+#: score 0.6 does return such detections: a poster, a photograph on a wall, a face on a phone screen
+#: across the room. They were being counted as people, and ``compare_faces_sync`` refuses a frame with
+#: more than one face - so a speck 12 px wide anywhere in the picture could stop a worker clocking in
+#: with "more than one face is in the photo". Named here because the number is about this pipeline's
+#: own crop, not about detectors in general.
+MIN_SUBJECT_PX = 24
+
+#: How much two boxes must overlap before they are the same face found twice.
+#:
+#: A detector run over a frame at an unusual scale - or over tiles that overlap - can emit two boxes
+#: for one face, and this deployment raises the punch frame ceiling to 1280 (YuNet's own heads are
+#: anchored for much smaller inputs), so it does happen. Two boxes over one face are one person; the
+#: caller that refuses "more than one face" must merge them first, or a close-up selfie is refused
+#: for being a crowd. IoU alone is not enough (a box nested inside a slightly larger one of the same
+#: face has a low IoU because the *union* is large), which is why containment is checked too.
+DUPLICATE_IOU = 0.45
+DUPLICATE_CONTAINMENT = 0.6
 
 #: The size the graph is driven at. It sat in the constructor as ``(320, 320)``, which is how this
 #: deployment's coverage failure stayed invisible: 320 is a *scale*, not a setting, and at that scale a
@@ -590,6 +613,127 @@ def detect_landmarks(image) -> list[dict[str, Any]]:
             {"landmarks": points, "facial_area": _facial_area(row), "confidence": score}
         )
     return faces
+
+
+def _box_of(area: Any) -> tuple[float, float, float, float] | None:
+    """``(x, y, w, h)`` from a ``facial_area`` mapping, or ``None`` when it is not one."""
+    if not isinstance(area, dict):
+        return None
+    try:
+        box = tuple(float(area[key]) for key in ("x", "y", "w", "h"))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if box[2] <= 0 or box[3] <= 0:
+        return None
+    return box  # type: ignore[return-value]
+
+
+def _overlap(
+    first: tuple[float, float, float, float], second: tuple[float, float, float, float]
+) -> tuple[float, float]:
+    """``(IoU, containment)`` for two boxes: the second is how much of the *smaller* sits inside."""
+    ax, ay, aw, ah = first
+    bx, by, bw, bh = second
+    left, top = max(ax, bx), max(ay, by)
+    right, bottom = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+    intersection = max(0.0, right - left) * max(0.0, bottom - top)
+    if intersection <= 0:
+        return 0.0, 0.0
+    smaller = min(aw * ah, bw * bh)
+    union = aw * ah + bw * bh - intersection
+    return intersection / union if union else 0.0, intersection / smaller if smaller else 0.0
+
+
+@dataclass
+class SubjectReport:
+    """What a frame's detections mean for the one-subject rule.
+
+    ``faces`` are the detections that could be the person at the gate, in the order a caller should
+    consider them (largest first). ``merged`` counts boxes that were the *same* face found twice,
+    and ``specks`` counts detections too small to be anybody - both are reported rather than
+    silently discarded, because "two faces" and "one face and a smudge" have different fixes.
+    """
+
+    faces: list[dict[str, Any]] = field(default_factory=list)
+    merged: int = 0
+    specks: list[int] = field(default_factory=list)
+
+    @property
+    def count(self) -> int:
+        return len(self.faces)
+
+    def summary(self) -> str:
+        widths = ", ".join(
+            str(int((_box_of(face.get("facial_area")) or (0, 0, 0, 0))[2])) for face in self.faces
+        )
+        parts = [f"{self.count} subject-sized face(s) [{widths}]" if self.count else "no subject-sized face"]
+        if self.merged:
+            parts.append(f"{self.merged} duplicate box(es) merged")
+        if self.specks:
+            parts.append(f"{len(self.specks)} speck(s) ignored {self.specks} px")
+        return "; ".join(parts)
+
+
+def subject_detections(
+    faces: list[dict[str, Any]],
+    *,
+    min_px: float = MIN_SUBJECT_PX,
+) -> SubjectReport:
+    """The people in a frame, from a detector's raw list - duplicates merged, specks dropped.
+
+    The rule the application enforces is "exactly one person at the gate", and it is enforced by
+    *counting detections*. Counting them naively makes two mistakes, and both of them cost a worker
+    their clock-in with a sentence that blames them:
+
+    * **one face, two boxes.** A detector driven at an unusual scale (this deployment raises the punch
+      ceiling to 1280) or over overlapping tiles can fire twice on one face. Merging overlapping
+      boxes and their nested twins is the cure; refusing the punch is not.
+    * **a speck counted as a person.** A face-shaped 12 px region of a poster, a wall photograph or a
+      phone screen is not the person standing at the gate, and cannot even be cropped into the
+      pipeline's own template (see ``MIN_SUBJECT_PX``). Under the old rule it refused the punch.
+
+    What is *not* relaxed: two detections that are both subject-sized are two people, and a caller
+    that requires one subject must still refuse - this function only stops the count lying. A frame
+    whose only detections are specks reports ``count == 0``, which is honest: there is no face here
+    that could be the worker's.
+    """
+    ranked = []
+    for index, face in enumerate(faces):
+        box = _box_of(face.get("facial_area")) if isinstance(face, dict) else None
+        if box is None:
+            # A caller that hands over detections with no geometry (a stub in a test, an older
+            # shape) counts as one subject each: unable to *improve* the answer, it must not
+            # silently drop a face that the caller meant to report.
+            ranked.append((index, face, None))
+        else:
+            ranked.append((index, face, box))
+    ranked.sort(key=lambda item: (-(item[2][2] * item[2][3]) if item[2] else 0.0, item[0]))
+
+    report = SubjectReport()
+    for _index, face, box in ranked:
+        if box is None:
+            report.faces.append(face)
+            continue
+        width = box[2]
+        merged_into = None
+        for kept_face in report.faces:
+            kept_box = _box_of(kept_face.get("facial_area"))
+            if kept_box is None:
+                continue
+            iou, containment = _overlap(kept_box, box)
+            if iou >= DUPLICATE_IOU or containment >= DUPLICATE_CONTAINMENT:
+                merged_into = kept_face
+                break
+        if merged_into is not None:
+            # The bigger box wins, which is the order this loop already walks in; the smaller one
+            # is the same face seen again, and counting it would refuse the punch.
+            report.merged += 1
+            continue
+        if width < min_px:
+            report.specks.append(int(round(width)))
+            continue
+        report.faces.append(face)
+    return report
 
 
 def _facial_area(row: np.ndarray) -> dict[str, int]:

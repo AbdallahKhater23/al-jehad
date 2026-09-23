@@ -1007,10 +1007,34 @@ def compare_faces_sync(reference_json_path: str, live_image_data) -> dict:
         # engine names, so a punch and an enrollment cannot drift onto different models.
         live_embedding_objs = face_engine.ENGINE.represent_direct(live_image_data)
 
-        if len(live_embedding_objs) > 1:
-            return {"verified": False, "distance": 99.9, "error": "Multiple faces detected."}
+        # The one-subject rule, counted honestly: boxes that are the *same* face found twice are
+        # merged, and detections too small to be a person (a face on a poster, a wall photograph, a
+        # phone screen across the room) are not counted as one. Both used to refuse the punch with
+        # "more than one face is in the photo", which is a sentence about a person that was not
+        # there - and a worker at the gate cannot act on it. Two detections that are each
+        # subject-sized are still two people, and this still refuses.
+        subjects = face_detector.subject_detections(live_embedding_objs)
+        if subjects.merged or subjects.specks:
+            log.info(
+                "face count for worker %s: %s",
+                current.id,
+                subjects.summary(),
+            )
 
-        live_embedding = live_embedding_objs[0]["embedding"]
+        if subjects.count > 1:
+            log.warning(
+                "refusing a punch for worker %s: %s (the frame holds more than one subject-sized face)",
+                current.id,
+                subjects.summary(),
+            )
+            return {"verified": False, "distance": 99.9, "error": "Multiple faces detected."}
+        if not subjects.count:
+            # Detections that are all too small to be a person: the frame has no usable face, and
+            # "no face was found" is what the worker can act on (step closer), where "more than one
+            # face" would be a lie about people who are not in the picture.
+            return {"verified": False, "distance": 99.9, "error": "No face detected."}
+
+        live_embedding = subjects.faces[0]["embedding"]
         if len(reference.embedding) != len(live_embedding):
             # A template of a different size cannot be compared at all: ``cosine`` would
             # raise on the shape mismatch and answer with "Internal processing error" - a
@@ -4495,8 +4519,14 @@ async def enroll_worker(
 
     try:
         embedding_objs = await face_engine.ENGINE.represent_async(enrollment.face_array(image))
-        if len(embedding_objs) > 1:
+        # Counted as subjects, not as detections: an administrator enrolling a worker is the coldest
+        # reader of "more than one face" - a speck on the wall behind the worker is not a person, and
+        # a box over the same face twice is not two people (see ``face_detector.subject_detections``).
+        enroll_subjects = face_detector.subject_detections(embedding_objs)
+        if enroll_subjects.count > 1:
             raise HTTPException(status_code=400, detail="Multiple faces detected in enrollment photo.")
+        if not enroll_subjects.count:
+            raise HTTPException(status_code=400, detail="No face detected in enrollment photo.")
 
         # Both files, atomically, under the account's immutable biometric id. This used to
         # write the selfie straight into ``worker_photos/<account id>.jpg``, embed from
@@ -4505,7 +4535,7 @@ async def enroll_worker(
         # tree whenever the process died mid-request. The image goes to the model from
         # memory, so there is no temporary file left to remove on either path.
         await run_in_threadpool(
-            biometrics.write_reference, worker_id, image, embedding_objs[0]["embedding"]
+            biometrics.write_reference, worker_id, image, enroll_subjects.faces[0]["embedding"]
         )
 
         with db(write=True) as conn:
@@ -4878,6 +4908,10 @@ async def api_status_detail(current: CurrentUser = Depends(admin_only)):
         "version": settings.app_version,
         "liveness": liveness.status(),
         "overtime_watcher": overtime.watcher_running(),
+        # The standing detector-coverage report is the third timer of this shape, and the same
+        # question applies to it: a measurement nobody asked for is invisible when it stops. The
+        # verdict it last reached is at ``/admin/coverage_report``; this is only whether it is up.
+        "coverage_report": coverage_report.watcher_running(),
         "offline_sync": {
             "signature_required": settings.offline_signature_required,
             "max_offline_hours": settings.offline_punch_max_age_hours,

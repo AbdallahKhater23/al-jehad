@@ -189,6 +189,12 @@ def _represent(image, *, enforce_detection: bool = True):
             {
                 "embedding": engine.embed_as_list(face.get("face", image)),
                 "face_confidence": float(face.get("confidence", 1.0)),
+                # The detection's geometry, carried so a caller can tell a *person* from a
+                # detection: the one-subject rule is enforced by counting these entries, and a
+                # count can only be honest if it can tell two boxes over one face from two people
+                # (see ``face_detector.subject_detections``). DeepFace's own shape did not include
+                # it, which is exactly why the count was taken naively for so long.
+                "facial_area": face.get("facial_area"),
             }
             for face in faces
         ]

@@ -54,6 +54,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPExcepti
 from pydantic import BaseModel, field_validator
 
 import biometrics
+import face_detector
 import face_engine
 import liveness
 import notifications
@@ -188,9 +189,17 @@ def _embed_image(image) -> list[float]:
     objects = face_engine.ENGINE.represent_direct(face_array(image))
     if not objects:
         raise ValueError("no face detected")
-    if len(objects) > 1:
+    # Counted the same way the punch path counts (``face_detector.subject_detections``): a template
+    # is written from the *subject*, so a second box over the same face, or a face too small to crop
+    # into the alignment template at all, must not turn a good enrollment photo into "multiple faces
+    # detected" - and two real people must still be refused, because this is what the reference is
+    # built from.
+    subjects = face_detector.subject_detections(objects)
+    if not subjects.count:
+        raise ValueError("no face detected")
+    if subjects.count > 1:
         raise ValueError("multiple faces detected")
-    return objects[0]["embedding"]
+    return subjects.faces[0]["embedding"]
 
 
 def _require_liveness(image, *, stage: str) -> liveness.GateDecision:

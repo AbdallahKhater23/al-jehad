@@ -74,6 +74,48 @@ Object.keys(ADVICE).forEach((name) => {
     results.advice[name] = env.evaluate('UI.framingAdvice(' + JSON.stringify(ADVICE[name]) + ')');
 });
 
+// 1b. who is actually in the frame, from the browser detector's raw boxes
+//
+// The advice above is only as good as its count, and the count is where this went wrong:
+// window.FaceDetector reports a box per detection *response*, so one worker standing alone
+// arrives as two overlapping boxes, and a face-shaped patch of wall arrives as a third.
+// Both used to read as "Only one person can be in the frame". These cases pin the counting
+// rule, and then the advice it produces.
+{
+    const box = (x, y, w, h) => ({ boundingBox: { x: x, y: y, width: w, height: h } });
+    const cases = {
+        one_worker: [box(120, 60, 90, 110)],
+        // The same face twice: nested (containment is what catches this - the union makes
+        // the IoU look moderate) and heavily overlapping.
+        duplicated_nested: [box(120, 60, 90, 110), box(126, 66, 82, 100)],
+        duplicated_overlapping: [box(120, 60, 90, 110), box(130, 64, 88, 106)],
+        // Two people whose boxes touch but are not one face: this must NOT be merged.
+        two_overlapping: [box(120, 60, 90, 110), box(170, 60, 90, 110)],
+        // A face-shaped speck of poster, 4x5 px of a 320x240 sample.
+        worker_and_speck: [box(120, 60, 90, 110), box(300, 20, 4, 5)],
+        specks_only: [box(10, 10, 4, 5), box(300, 20, 3, 4)],
+        // Two workers standing at the gate.
+        two_people: [box(40, 60, 90, 110), box(200, 60, 88, 108)],
+        none: []
+    };
+    results.subjects = {};
+    Object.keys(cases).forEach((name) => {
+        results.subjects[name] = env.evaluate(
+            'UI.framingSubjects(' + JSON.stringify(cases[name]) + ', 320, 240)'
+        );
+    });
+    // What the coach says about the two cases that used to be wrong, end to end.
+    results.subject_advice = {};
+    ['one_worker', 'duplicated_nested', 'worker_and_speck', 'specks_only', 'two_people'].forEach((name) => {
+        results.subject_advice[name] = env.evaluate(
+            'UI.framingAdvice(' +
+            JSON.stringify(frame({ face: results.subjects[name] })) +
+            ')'
+        );
+    });
+    results.sample_width = env.evaluate('UI.FRAMING_SAMPLE_WIDTH');
+}
+
 // Every key the rules can produce, and the tone it is painted in.
 results.keys = Object.keys(results.advice).map((name) => results.advice[name]).filter(Boolean);
 results.tones = env.evaluate('UI.FRAMING_TONES');

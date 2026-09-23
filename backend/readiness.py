@@ -641,6 +641,16 @@ def _check_worker_notice_backlog(ctx: dict) -> Check:
     sees from the outside, because from there a quiet channel and a quiet workforce look the
     same.
 
+    **What fails is a channel that was asked and did not deliver** - ``channel_failures``, i.e.
+    a notice that was attempted or that belongs to a worker whose device is registered, and
+    still did not arrive. A notice no channel was ever asked to deliver is reported, in the
+    same detail, as the adoption gap it is (``waiting_for_device``): a deployment whose workers
+    have not allowed notifications has a real, fixable state, but it is not a *failing channel*,
+    and an advisory that says so is an advisory with no action behind it - which is how a real
+    one gets ignored. It also cannot be cleared by any operator action, because the rows were
+    written before the channel existed and stay undelivered forever; the reading would have
+    been red for ``NOTIFICATION_RETENTION_DAYS`` (180) regardless of what anybody did.
+
     Read-only. An operator polling readiness must not be made to write, and the counts here
     are the same ones the alert row and ``push.stranded_notices`` report.
     """
@@ -670,26 +680,37 @@ def _check_worker_notice_backlog(ctx: dict) -> Check:
             f"could not read the push backlog: {type(exc).__name__}: {exc}",
             {"measured": False},
         )
-    stranded = reading["notices"]
-    detail = (
-        "no worker notice has been left behind by the push channel"
-        if not stranded
-        else (
-            f"{stranded} worker notification(s) passed the {reading['window_minutes']}-minute push "
-            f"window undelivered (oldest {reading['age']}); "
-            f"{reading['no_device']} have no live device, {reading['with_device']} have one and were "
-            "refused or failed. They are still in the workers' inboxes; the phones are not ringing"
+    failures = int(reading["channel_failures"])
+    waiting = int(reading["waiting_for_device"])
+    if not reading["notices"]:
+        detail = "no worker notice has been left behind by the push channel"
+    elif not failures:
+        detail = (
+            f"the push channel has not failed: {waiting} notice(s) are waiting in the workers' "
+            f"inboxes (oldest {reading['age']}) because no device is registered for them - "
+            f"nothing was sent, so nothing was refused. A worker who allows notifications in "
+            f"the app stops this; the inbox is the record until then"
         )
-    )
+    else:
+        detail = (
+            f"{reading['notices']} worker notification(s) passed the "
+            f"{reading['window_minutes']}-minute push window undelivered (oldest "
+            f"{reading['age']}); {failures} went to a worker the channel was asked to deliver "
+            f"to and did not arrive ({reading['with_device']} have a live device now, "
+            f"{reading['attempted']} were attempted), and {waiting} are waiting for a device. "
+            "They are still in the workers' inboxes; the phones are not ringing"
+        )
     return Check(
         "worker_notice_backlog",
         TIER_ADVISORY,
-        not stranded,
+        not failures,
         detail,
         {
             "measured": True,
             "window_minutes": reading["window_minutes"],
-            "notices": stranded,
+            "notices": reading["notices"],
+            "channel_failures": failures,
+            "waiting_for_device": waiting,
             "workers": reading["workers"],
             "oldest": reading["oldest"],
             "age_seconds": reading["age_seconds"],
@@ -1436,6 +1457,124 @@ def _check_retention_sweep(ctx: dict) -> Check:
     )
 
 
+def _check_coverage_report(ctx: dict) -> Check:
+    """Whether the standing detector-coverage report is still measuring anything.
+
+    The same shape of silent failure as retention's: the cadence is a setting, the timer is a
+    thread and the trigger is a frame count, and when any of the three stops being true the report
+    simply stops appearing. It has no other surface - nobody notices a measurement they did not
+    ask for - so this reads the state the timer writes and the folder it measures.
+
+    Advisory, never fatal, and it claims nothing at boot that it cannot know: a deployment whose
+    first measurement has not happened yet passes, because the first run deliberately waits past
+    the model preload and needs new frames to land. What it fails on is the state that matters -
+    new frames are waiting and no measurement has read them - and on the report that ran with
+    three lines where it should have four, which is the finding the whole feature exists for
+    (a detector comparison with SCRFD quietly left out is the paper-assumption this replaces).
+    """
+    try:
+        import coverage_report
+    except Exception as exc:  # noqa: BLE001 - a report must never fail on one check
+        return Check("coverage_report", TIER_ADVISORY, True, f"could not be checked: {exc}")
+
+    try:
+        standing = coverage_report.summary()
+    except Exception as exc:  # noqa: BLE001
+        return Check("coverage_report", TIER_ADVISORY, True, f"could not be checked: {exc}")
+
+    folder = Path(standing["corpus_dir"])
+    last_run = standing.get("last_run") or {}
+    verdict = last_run.get("verdict") or standing.get("verdict") or {}
+    value = {
+        "enabled": standing["enabled"],
+        "corpus_dir": str(folder),
+        "report_dir": standing["report_dir"],
+        "runs": standing["runs"],
+        "measured_at": standing["measured_at"],
+        "verdict": verdict or None,
+        "scheduler": {
+            "running": coverage_report.watcher_running(),
+            "interval_seconds": int(settings.standing_sweep_interval_seconds),
+            "sample": int(settings.standing_sweep_sample),
+        },
+    }
+    if not standing["enabled"]:
+        # A decision, said out loud, exactly like RETENTION_ENABLED=0: an operator who turned the
+        # timer off owns the schedule, and a deployment where nobody does owns a stale comparison.
+        return Check(
+            "coverage_report",
+            TIER_ADVISORY,
+            True,
+            "the in-process standing report is disabled (STANDING_SWEEP_ENABLED=0): run "
+            "'python -m coverage_report' on a schedule, or the detector comparison stops "
+            "being re-answered as the cameras change",
+            value,
+        )
+
+    measured_at = coverage_report.parse_time(last_run.get("measured_at") or standing.get("measured_at"))
+    if measured_at is None:
+        corpus = coverage_report.fingerprint(folder)
+        value["corpus_frames"] = corpus.frames
+        return Check(
+            "coverage_report",
+            TIER_ADVISORY,
+            True,
+            f"no measurement recorded yet: the first run waits "
+            f"{int(settings.standing_sweep_initial_delay_seconds)}s after boot and needs "
+            f"{int(settings.standing_sweep_min_new_frames)} new frame(s) in {folder}"
+            + ("" if corpus.frames else " (which holds none yet)"),
+            value,
+        )
+    if verdict.get("scrfd_measured") is False:
+        return Check(
+            "coverage_report",
+            TIER_ADVISORY,
+            False,
+            "the last measurement has no SCRFD line: the fourth configuration was not measured, so "
+            "the detector comparison has an answer for YuNet only. Fetch the SCRFD export into the "
+            "models directory (or accept the skip deliberately, which the report records)",
+            value,
+        )
+
+    corpus = coverage_report.fingerprint(folder)
+    baseline = int((standing.get("corpus") or {}).get("frames") or 0)
+    new_frames = max(0, corpus.frames - baseline)
+    age = (datetime.now() - measured_at).total_seconds()
+    # One cadence plus the startup delay: the same allowance retention's overdue threshold makes,
+    # because a restart is not a stopped timer and a measurement is not urgent by hours.
+    overdue_after = int(settings.standing_sweep_interval_seconds) + int(
+        settings.standing_sweep_initial_delay_seconds
+    )
+    value.update(
+        {
+            "corpus_frames": corpus.frames,
+            "new_frames_since_measurement": new_frames,
+            "seconds_since_measurement": int(age),
+            "overdue_after_seconds": overdue_after,
+        }
+    )
+    if new_frames >= int(settings.standing_sweep_min_new_frames) and age > overdue_after:
+        return Check(
+            "coverage_report",
+            TIER_ADVISORY,
+            False,
+            f"{new_frames} new frame(s) have landed in {folder} and the last measurement was "
+            f"{int(age // 3600)}h ago, past the {int(overdue_after // 3600)}h threshold: the "
+            "standing report is not keeping up, so the detector comparison describes the corpus "
+            "this deployment used to have",
+            value,
+        )
+    return Check(
+        "coverage_report",
+        TIER_ADVISORY,
+        True,
+        f"standing report: the last measurement was {int(age // 3600)}h ago over "
+        f"{int((last_run.get('sample') or {}).get('frames') or 0)} of {corpus.frames} frame(s); "
+        + coverage_report.verdict_line(verdict),
+        value,
+    )
+
+
 def _check_retention_residue(ctx: dict) -> Check:
     """Whether anything is still on disk that the policy says should be gone.
 
@@ -1856,6 +1995,7 @@ CHECKS = (
     _check_biometric_file_naming,
     _check_retention_sweep,
     _check_retention_residue,
+    _check_coverage_report,
     _check_metrics,
     _check_face_engine,
     _check_face_detector,
