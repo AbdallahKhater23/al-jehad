@@ -86,7 +86,7 @@ import math
 import os
 import secrets
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Final, Iterable, Sequence
 
@@ -1102,12 +1102,136 @@ LABEL_CARRYING_VERDICTS: Final = frozenset({"approved"})
 #: intent to collect and nothing about the person in the frame.
 LIVE_CONSENT: Final = "deployment: CALIBRATION_CAPTURE_ENABLED with worker notice"
 
+#: The detector input size a capture uses when the punch pipeline's own detector could not see the
+#: face. 640 is twice the pipeline's reach, and the reach is the whole point: a distant worker's
+#: punch is refused at the face check, and the reach that refused it is the reason the small-face
+#: regime was never in the corpus at all. Widening *only* on the capture path keeps the punch's own
+#: answer untouched (the same reason ``shadow``'s scorer does not move a verdict).
+WIDENED_REACH_INPUT_SIZE: Final = 640
+
+
+def _parse_instant(text: str | None) -> datetime | None:
+    """One instant from ISO-8601, ``Z`` accepted, naive read as UTC. ``None`` if unreadable."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+@dataclass(frozen=True)
+class CaptureWindow:
+    """When this deployment collects, and whether it still is.
+
+    Reported rather than merely enforced: "is capture on?" has a second half - *until when* - and an
+    operator who cannot see the end of a collection period is the same operator who leaves one
+    running. The states are deliberately not a boolean, because ``malformed`` and ``closed`` ask for
+    different actions: one is a typo to fix, the other is the end of a period.
+    """
+
+    #: The switch's own state, before any window is applied.
+    enabled: bool
+    #: The configured instant, as text (``""`` when unbounded).
+    until: str = ""
+    seconds_remaining: int | None = None
+
+    @property
+    def state(self) -> str:
+        if not self.enabled:
+            return "off"
+        if not self.until.strip():
+            return "open_ended"
+        return "open" if self.seconds_remaining and self.seconds_remaining > 0 else "closed"
+
+    @property
+    def open(self) -> bool:
+        """May a capture be taken now? A window that cannot be read is **not** open."""
+        if not self.enabled:
+            return False
+        if not self.until.strip():
+            return True
+        return self.seconds_remaining is not None and self.seconds_remaining > 0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": bool(self.enabled),
+            "state": self.state,
+            "until": self.until or None,
+            "seconds_remaining": self.seconds_remaining,
+        }
+
+
+def capture_window(now: datetime | None = None) -> CaptureWindow:
+    """The deployment's half of the consent, with its end attached.
+
+    A malformed ``CALIBRATION_CAPTURE_UNTIL`` answers **closed**, not "ignore the bound": an
+    unreadable end date has two readings and only one of them is safe when the thing being bounded
+    is a biometric store. The same rule ``worker_consent`` follows for a failed read.
+    """
+    enabled = bool(getattr(settings, "calibration_capture_enabled", False))
+    until = str(getattr(settings, "calibration_capture_until", "") or "")
+    mark = _parse_instant(until)
+    if until.strip() and mark is None:
+        return CaptureWindow(enabled=enabled, until=until, seconds_remaining=None)
+    if mark is None:
+        return CaptureWindow(enabled=enabled, until="", seconds_remaining=None)
+    moment = now or datetime.now()
+    if moment.tzinfo is not None:
+        moment = moment.astimezone(timezone.utc).replace(tzinfo=None)
+    return CaptureWindow(
+        enabled=enabled, until=until, seconds_remaining=int((mark - moment).total_seconds())
+    )
+
+
+def _widened_detection(frame: Image.Image) -> list[dict[str, Any]]:
+    """Detections at twice the punch pipeline's reach, in the stored frame's coordinates.
+
+    Returns the same shape ``face_detector.detect_landmarks`` does, so a caller cannot tell the two
+    apart except by the record's provenance - and that provenance is the point: a specimen found
+    only here is one the punch itself could not see, which is exactly the small-face regime.
+    """
+    import detector_640
+    import face_detector
+
+    detector = detector_640.build_detector(
+        "yunet", face_detector.model_path(), input_size=WIDENED_REACH_INPUT_SIZE
+    )
+    found = []
+    for row in detector(corpus_ingest_bgr(frame)):
+        box = [float(v) for v in row.box[:4]]
+        found.append(
+            {
+                "landmarks": [[float(x), float(y)] for x, y in row.landmarks],
+                "facial_area": {"x": box[0], "y": box[1], "w": box[2], "h": box[3]},
+                "confidence": float(row.score),
+            }
+        )
+    return found
+
+
+def corpus_ingest_bgr(frame: Image.Image):
+    """The BGR array the OpenCV detectors consume, from an already-prepared frame.
+
+    Imported lazily through ``corpus_ingest`` so this module keeps its one direction of dependency
+    (``corpus_ingest`` is written on top of ``corpus``, never the other way at import time).
+    """
+    import corpus_ingest
+
+    return corpus_ingest.as_bgr(frame)
+
+
 
 def maybe_capture_punch(
     image: Image.Image,
     *,
     worker_id: str | None,
     verdict: str | None,
+    refused_reason: str | None = None,
     site: str | None = None,
     camera: str | None = None,
     pipeline: str | None = None,
@@ -1136,8 +1260,26 @@ def maybe_capture_punch(
     It is judged by the same gate the camera puller uses, and a frame that gate *discards* is not stored
     at all. A punch capture that arrived with no assessment would read as "assessed and fine" to every
     downstream tool - the one frame source nobody looks at would be the one that never gets flagged.
+
+    Two things make this able to hold the small-face regime at all, and both were missing:
+
+    * **The reach.** The punch's own detector is what refused a distant frame, so a capture that
+      re-detected at the same input size could only ever store faces the punch already found - the
+      corpus of successful punches is *by construction* the regime above the detector's reach. When
+      the punch's detection is unusable (no face, several faces, or too small to align), the capture
+      looks again at ``WIDENED_REACH_INPUT_SIZE``, and the specimen it finds there is one the punch
+      could not see. The record's provenance names which pass found it.
+    * **The call site.** A punch refused at the face check never reached this function, so the very
+      frames the coverage question is about were never offered to it. The refusal path now calls in
+      with ``refused_reason`` set (see ``main.py``), which is what puts a distant frame in the corpus
+      at all.
     """
-    if not getattr(settings, "calibration_capture_enabled", False):
+    window = capture_window()
+    if not window.open:
+        # ``off`` and ``closed`` and a window that cannot be read all answer here, and the entry is
+        # logged once per state change rather than per punch: a deployment that was left collecting
+        # is a finding, not a per-frame complaint.
+        log.debug("corpus: capture is not open (state=%s)", window.state)
         return None
     # The worker's own half of the consent. A read per capture, through the same indexed lookup the
     # consent endpoint writes - and a *failed* read answers no, because the failure mode of a
@@ -1149,8 +1291,16 @@ def maybe_capture_punch(
 
         prepared = prepare(image)
         found = face_detector.detect_landmarks(prepared.frame)
+        reach = "punch"
         if len(found) != 1:
-            # None or several faces: both are unusable as a *labelled* capture, and a human cannot label
+            # The pipeline's own detector could not give a single usable face - which is what a
+            # distant worker's frame looks like, and what a refused punch is made of. Look again at
+            # twice the reach before giving up: this is the only place the small-face regime can
+            # enter the corpus, because a punch that *succeeded* never had a small face in it.
+            found = _widened_detection(prepared.frame)
+            reach = "widened"
+        if len(found) != 1:
+            # Still none or several faces: unusable as a *labelled* capture, and a human cannot label
             # what they cannot see, so it is not stored at all rather than stored unusably.
             log.debug("corpus: skipping a punch capture with %d faces", len(found))
             return None
@@ -1179,7 +1329,15 @@ def maybe_capture_punch(
                 kind=face_detector.DETECTOR_NAME,
                 model_fingerprint=face_detector.fingerprint(),
                 pipeline=pipeline or face_detector.active_pipeline(),
-                input_size=getattr(face_detector, "DETECTOR_INPUT_SIZE", 320),
+                # The size the pass that actually produced these landmarks ran at. A widened capture
+                # recorded as 320 would claim the punch's own detector found a face it did not, and
+                # the whole small-face argument is "what did the pipeline miss?" - a provenance that
+                # rounds that away answers the wrong question.
+                input_size=(
+                    WIDENED_REACH_INPUT_SIZE
+                    if reach == "widened"
+                    else getattr(face_detector, "DETECTOR_INPUT_SIZE", 320)
+                ),
                 tiles=1,
                 overlap=0.0,
             ),
@@ -1193,11 +1351,20 @@ def maybe_capture_punch(
             consent=WORKER_CONSENT,
             actor="system:punch",
             camera=camera or site,
-            note=f"verdict={verdict or 'unknown'}" + (f" site={site}" if site else ""),
+            note=(
+                f"verdict={verdict or 'unknown'}"
+                + (f" refused={refused_reason}" if refused_reason else "")
+                + (" reach=widened" if reach == "widened" else "")
+                + (f" site={site}" if site else "")
+            ),
         )
         return record.capture_id
     except Exception as exc:  # noqa: BLE001 - a punch must not fail over a measurement aid
-        log.warning("corpus: could not capture a punch frame for %s: %s", worker_id, exc)
+        # ``exc_info`` on purpose, unlike the rest of this module's warnings: this is the one line
+        # that explains "capture was on all week and nothing was stored", and a one-word message
+        # there costs the operator the whole collection period. Seen for real - a capture hook that
+        # raised ``NameError: name 'np' is not defined`` on every punch logged exactly that much.
+        log.warning("corpus: could not capture a punch frame for %s: %s", worker_id, exc, exc_info=True)
         return None
 
 
