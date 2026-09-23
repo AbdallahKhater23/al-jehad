@@ -228,6 +228,19 @@ def test_the_fingerprint_counts_frames_and_names_the_newest(tmp_path, jpeg):
     assert found.total_bytes == 3 * len(jpeg)
 
 
+def test_a_corpus_filed_one_folder_per_identity_is_counted_too(tmp_path, jpeg):
+    """The layout every corpus export uses - and the one a non-recursive count reported as empty."""
+    for identity in ("angela-merkel", "barack-obama"):
+        _write_frames(tmp_path / identity, 3, jpeg=jpeg)
+
+    found = coverage_report.fingerprint(tmp_path)
+    chosen = coverage_report.sample(tmp_path, 4)
+
+    assert found.frames == 6
+    assert len(chosen) == 4
+    assert all(Path(path).is_file() for path in chosen)
+
+
 def test_a_missing_or_empty_folder_fingerprints_as_nothing(tmp_path):
     assert coverage_report.fingerprint(tmp_path / "absent").frames == 0
     empty = tmp_path / "empty"
@@ -652,3 +665,87 @@ def test_the_watcher_runs_a_tick_and_then_stops(standing, stubbed, jpeg, app_mod
 def test_stopping_a_watcher_that_never_started_is_harmless(app_module):
     coverage_report.stop_watcher(timeout=0)
     assert coverage_report.watcher_running() is False
+
+
+# ---------------------------------------------------------------------------
+# 6. the readiness check: a standing report that stopped standing
+# ---------------------------------------------------------------------------
+#: The whole failure mode this check exists for: the report is silent by construction, so the
+#: only thing that can say it stopped measuring is a reading of the state it writes.
+import readiness  # noqa: E402
+
+
+def _check(name: str = "coverage_report"):
+    return {check.name: check for check in readiness.run_checks(None)[0]}[name]
+
+
+def test_readiness_reports_a_measurement_as_healthy(standing, stubbed, jpeg, app_module):
+    _write_frames(standing["folder"], 8, jpeg=jpeg)
+    coverage_report.tick()
+
+    check = _check()
+
+    assert check.ok is True
+    assert check.tier == "advisory"
+    assert check.value["corpus_frames"] == 8
+    assert "SCRFD is ahead by 2 frame(s)" in check.detail
+
+
+def test_readiness_does_not_call_a_report_that_never_ran_a_fault(standing, app_module):
+    """The first measurement is meant to be late, so boot must not read as a broken report."""
+    check = _check()
+    assert check.ok is True
+    assert check.tier == "advisory"
+    assert "no measurement recorded yet" in check.detail
+    assert "holds none yet" in check.detail, "an empty folder is said, not assumed"
+
+
+def test_readiness_reports_a_disabled_standing_report_as_a_decision(standing, stubbed, monkeypatch, app_module):
+    monkeypatch.setattr(coverage_report.settings, "standing_sweep_enabled", False)
+    check = _check()
+    assert check.ok is True
+    assert "STANDING_SWEEP_ENABLED=0" in check.detail
+    assert "python -m coverage_report" in check.detail, (
+        "the operator who turned the timer off owns the schedule, so the check names the command"
+    )
+
+
+def test_readiness_flags_a_measurement_with_no_scrfd_line(standing, stubbed, jpeg, app_module):
+    """Three configurations where the report promises four is the finding, not a footnote."""
+    stubbed.skipped = True
+    _write_frames(standing["folder"], 8, jpeg=jpeg)
+    coverage_report.tick()
+
+    check = _check()
+
+    assert check.ok is False
+    assert check.tier == "advisory"
+    assert "no SCRFD line" in check.detail
+    assert "models directory" in check.detail
+
+
+def test_readiness_flags_a_report_that_is_not_keeping_up(standing, stubbed, jpeg, app_module):
+    """Frames landed and nothing measured them: the comparison now describes the old corpus."""
+    _write_frames(standing["folder"], 8, jpeg=jpeg)
+    coverage_report.tick(now=datetime.now() - timedelta(days=3))
+    _write_frames(standing["folder"], 20, jpeg=jpeg)
+
+    check = _check()
+
+    assert check.ok is False
+    assert check.tier == "advisory"
+    assert "12 new frame(s)" in check.detail
+    assert "past the 24h threshold" in check.detail, check.detail
+    assert check.value["new_frames_since_measurement"] == 12
+    assert check.value["seconds_since_measurement"] >= 3 * 24 * 3600 - 60
+
+
+def test_readiness_tolerates_new_frames_inside_the_cadence(standing, stubbed, jpeg, app_module):
+    _write_frames(standing["folder"], 8, jpeg=jpeg)
+    coverage_report.tick()
+    _write_frames(standing["folder"], 20, jpeg=jpeg)
+
+    check = _check()
+
+    assert check.ok is True, "a report measured minutes ago is keeping up, whatever the folder does"
+    assert check.value["new_frames_since_measurement"] == 12

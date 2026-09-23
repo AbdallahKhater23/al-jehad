@@ -560,6 +560,55 @@ than a rewrite; until then this bounds the damage. `GET /api/v1/readiness` repor
 load (capacity, queued, in-flight, refusals, slowest) as an advisory check, so an operator
 can see a saturated engine without it failing the startup gate.
 
+## Keeping the detector comparison current
+
+Which detector settings find *these* faces, and whether SCRFD finds more of them than YuNet, is
+a measurement rather than a setting: `backend/tools/coverage_sweep.py` runs the four
+configurations (YuNet at 320, at 640, at 640 tiled, and SCRFD at 640) over a corpus and reports
+what each one loses. Run by hand, that answer belongs to the month somebody sampled a corpus -
+and the decision it supports (see `docs/RUNBOOK_EMBEDDER_MIGRATION.md`) is then argued months
+later from stale frames.
+
+`backend/coverage_report.py` is the same sweep, standing. It watches the gate's own frame folder
+(`PUNCH_FRAMES_DIR` by default - the frames a punch actually stored, not a curated export), and
+re-measures when **both** are true:
+
+* the folder has grown by at least `STANDING_SWEEP_MIN_NEW_FRAMES` frames since the last
+  measurement, and
+* a whole `STANDING_SWEEP_INTERVAL_SECONDS` has passed since it.
+
+A folder that *shrank* - retention erasing frames on its schedule - re-baselines the trigger
+instead of blocking it forever. Each measurement reads the **newest** `STANDING_SWEEP_SAMPLE`
+frames, which is the whole cost control: four configurations over a couple of hundred frames is a
+minute or two of CPU on the box that serves punches, so the cadence is daily and the first run
+waits past the model preload. The work runs on a daemon thread for the same reason the retention
+sweeper does - it is blocking CPU work, and as an asyncio task it would hold the event loop every
+punch shares.
+
+**What it writes.** `latest.json`, one `run-<timestamp>.json` snapshot per measurement
+(`STANDING_SWEEP_KEEP` of them kept), and `state.json` with the corpus baseline the trigger reads
+- all under `STANDING_SWEEP_DIR`. Put that on the volume (`/data/coverage_reports`) if the
+history is wanted across deploys. The verdict is SCRFD against the **best** YuNet configuration of
+that run, as a margin **in frames**: a one-frame margin is a tie in everything but arithmetic, so
+`STANDING_SWEEP_MIN_MARGIN_FRAMES` sets the step that counts.
+
+**When the answer moves, it says so.** SCRFD overtaking YuNet raises an administrator
+notification (`coverage_report`, warning, once per direction per day) - and so does SCRFD ceasing
+to be ahead, because both are the same finding: the cameras or the corpus changed and the
+comparison has to be re-read. A verdict that did not change raises nothing, and a run where SCRFD
+was not measured raises nothing at all (a comparison nobody ran cannot have overtaken anything).
+
+**And when it stops standing.** The report is silent by construction - nobody notices a
+measurement they did not ask for - so `GET /api/v1/readiness` carries an advisory
+`coverage_report` check: it fails when new frames are waiting and the last measurement is past a
+cadence plus the startup delay, and when the last measurement has three lines where it should
+have four (SCRFD left out, which is the paper-assumption the fourth configuration exists to
+replace). Advisory, never fatal: no punch depends on a detector comparison. The same verdict is
+readable live at `GET /api/v1/admin/coverage_report` (administrators only), and a deployment that
+would rather schedule it elsewhere sets `STANDING_SWEEP_ENABLED=0` and runs
+`python -m coverage_report` from cron - the check says so rather than letting a stopped
+timer look like a quiet one.
+
 ## Where a face match is decided
 
 A distance is not a verdict, and a threshold is not a number: it is a decision measured for

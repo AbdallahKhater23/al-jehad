@@ -374,6 +374,72 @@ Three honest caveats before this is read as a migration decision:
 
 
 
+### The report that keeps itself current
+
+The four-configuration sweep answers "does SCRFD reach more of *our* faces" for the day it is run.
+The cameras do not hold still - a site is added, a lamp is replaced, a worker starts parking at the
+far end of the yard - so `backend/coverage_report.py` runs the same sweep on a cadence and tells the
+administrators when the answer changes. It is the standing version of the command above, not a
+second measurement with its own rules: it imports the tool, so the four configurations, the gate and
+the verdict are the same object.
+
+**When it measures.** The corpus is the gate's own frame folder (`PUNCH_FRAMES_DIR`, on the volume:
+`/data/punch_frames`). One tick every `STANDING_SWEEP_INTERVAL_SECONDS` (default daily) asks two
+questions, and needs both:
+
+* has the folder grown by `STANDING_SWEEP_MIN_NEW_FRAMES` frames (default 25) since the last
+  measurement?
+* has a whole cadence passed since it?
+
+A folder that *shrank* re-baselines instead of blocking the trigger forever - retention erases punch
+frames at 30 days by default, and a count that only ever went up would turn a legitimate deletion
+into a permanently stuck report. Each measurement reads the newest `STANDING_SWEEP_SAMPLE` frames
+(default 200): that cap is the entire cost control, and it is why the report is a sample of the
+corpus rather than all of it. The report records both numbers, so a found-share is never read
+without the corpus it came from.
+
+```bash
+# what it is doing right now, without waiting for the timer
+railway run python backend/coverage_report.py            # one tick: decides and maybe measures
+railway run python backend/coverage_report.py --force    # measure now, whatever the trigger says
+railway run python backend/coverage_report.py --force --sample 500 --json /tmp/sweep.json
+```
+
+**What it writes, and where.** `STANDING_SWEEP_DIR` (put it on the volume:
+`/data/coverage_reports`) holds `latest.json` (the last verdict plus its full per-frame evidence),
+`run-<timestamp>.json` (one snapshot per measurement, newest `STANDING_SWEEP_KEEP` kept) and
+`state.json` (the corpus baseline the trigger reads). Nothing here is a database row: the report is
+derived evidence, and losing it costs one cadence.
+
+**When it is telling you something.** The verdict is SCRFD against the *best* YuNet configuration
+of that run, expressed as a margin **in frames**, because a share difference of 0.4% is not a
+migration argument. `STANDING_SWEEP_MIN_MARGIN_FRAMES` (default 1) sets the step that counts as an
+overtake; a tie is reported as a tie and is not one.
+
+* **SCRFD becomes ahead** - an administrator notification (`coverage_report`, warning). This is the
+  cue to re-read Phase 2 and Phase 3 below rather than to change anything on the spot: it says the
+  second network finds more of the frames this deployment actually stores.
+* **SCRFD stops being ahead** - the same notification, informational. Both are the same finding:
+  the cameras or the corpus moved.
+* **A run where SCRFD was not measured** raises nothing, and the readiness check below fails. An
+  absent model file must never read as "SCRFD was measured and lost".
+
+Read it live at `GET /api/v1/admin/coverage_report` (administrators only), or the whole evidence at
+`latest.json`. The readiness check `coverage_report` is advisory and never fatal: it fails when new
+frames are waiting past a cadence plus the startup delay ("the report is not keeping up"), and when
+the last measurement has no SCRFD line. It stays quiet for a deployment that has not measured yet,
+because the first run deliberately waits past the model preload.
+
+**Running it from cron instead.** `STANDING_SWEEP_ENABLED=0` turns the in-process timer off and
+`python -m coverage_report` does one tick from a scheduler - the same entry point, and the readiness
+check says the schedule is now somebody else's job rather than reporting a dead timer.
+
+**One honest limit.** On a small corpus a two-frame margin is noise. Below roughly a hundred
+sampled frames, read the margin as "asked again, no answer yet" and let the corpus grow before
+treating a crossing as a finding; the report prints the sample size beside every share for exactly
+this reason.
+
+
 ## Phase 2 - the contract, measured rather than assumed
 
 Nothing in a `.onnx` file says `RGB` or `BGR`, and nothing says `[0, 1]` or `[-1, 1]`. A graph fed

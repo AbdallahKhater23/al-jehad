@@ -619,6 +619,22 @@ def stranded_notices(conn: sqlite3.Connection, *, now: datetime | None = None) -
     nothing can be until they allow notifications in the app - while ``with_device`` notices
     went to a push service and did not arrive, which is the service's answer to give.
 
+    **``channel_failures`` is the half that is a finding; ``waiting_for_device`` is context.**
+    The two are complementary (they sum to ``notices``) and cut at a different line than
+    ``with_device`` does on purpose. A notice is a *channel* failure when the channel was
+    actually asked to deliver it - it was attempted (``delivery_attempts > 0``), or a live
+    subscription exists right now - and it still did not arrive. A notice nobody was ever asked
+    to deliver is not evidence about the channel at all: it is evidence about adoption, and
+    reporting it as a broken channel is a finding an operator can neither reproduce nor fix.
+
+    The distinction is not cosmetic on this deployment. With notifications enabled for the
+    first time, every notice written before that moment is undelivered forever - there was no
+    channel to deliver them - so a reading that counts them as failures reports a silent
+    channel where none exists, and keeps reporting it for ``NOTIFICATION_RETENTION_DAYS``
+    (180). ``attempted`` is what keeps the *revoked* case honest: a device that failed and was
+    retired stops appearing in ``with_device``, but its attempts are on the row, so the notice
+    stays a channel failure rather than sliding quietly into the adoption bucket.
+
     **A notice the worker has read is no longer stranded.** ``read_at`` is the worker's own
     answer to the notice, and an answered question is not an undelivered one: whatever the
     phone did, the person knows. Counting read rows kept this check red for exactly as long as
@@ -646,7 +662,12 @@ def stranded_notices(conn: sqlite3.Connection, *, now: datetime | None = None) -
                         SELECT 1 FROM worker_push_subscriptions s
                         WHERE s.worker_id = worker_notifications.worker_id
                           AND s.revoked_at IS NULL
-                    ) THEN 1 ELSE 0 END) AS with_device
+                    ) THEN 1 ELSE 0 END) AS with_device,
+               SUM(CASE WHEN delivery_attempts > 0 OR EXISTS (
+                        SELECT 1 FROM worker_push_subscriptions s
+                        WHERE s.worker_id = worker_notifications.worker_id
+                          AND s.revoked_at IS NULL
+                    ) THEN 1 ELSE 0 END) AS channel_failures
           FROM worker_notifications
          WHERE delivered_at IS NULL AND read_at IS NULL AND created_at < ?
         """,
@@ -667,9 +688,14 @@ def stranded_notices(conn: sqlite3.Connection, *, now: datetime | None = None) -
         except ValueError:  # pragma: no cover - a stamp this module did not write
             age = 0.0
     with_device = int(row["with_device"] or 0)
+    channel_failures = int(row["channel_failures"] or 0)
     return {
         "window_minutes": window,
         "notices": notices,
+        #: The finding: the channel was asked (attempted, or a live device) and did not deliver.
+        "channel_failures": channel_failures,
+        #: The context: nothing was ever asked to deliver these, so nothing failed.
+        "waiting_for_device": notices - channel_failures,
         "workers": int(row["workers"] or 0),
         "oldest": oldest,
         "age_seconds": int(age),
@@ -715,8 +741,22 @@ def _stranded_report(reading: dict) -> str:
 
 
 def _record_stranded(conn: sqlite3.Connection, reading: dict, *, now: datetime | None = None) -> bool:
-    """Write the operator alert for a backlog. Returns whether a new row was created."""
-    if not reading["notices"]:
+    """Write the operator alert for a *failing channel*. Returns whether a new row was created.
+
+    The trigger is ``channel_failures``, not ``notices``: an alert is a claim that something is
+    broken, and a notice no channel was ever asked to deliver is not evidence of that. Firing on
+    every undelivered notice also produces a row an hour, forever, for a state no alert can fix -
+    notices written before notifications were enabled belong to workers with no device, and they
+    stay undelivered no matter what the operator does. The adoption gap is reported where it can
+    act on it instead: the readiness detail names it in full, the workers' own inboxes hold every
+    notice, and each worker's app says whether their device is registered.
+
+    The revocation case is why ``channel_failures`` is a union rather than "has a device now": a
+    device that failed and was retired drops out of ``with_device``, but the attempts on the row
+    keep the notice a failure - so a channel that went quiet does not slide into the adoption
+    bucket and fall silent.
+    """
+    if not reading["channel_failures"]:
         return False
     moment = now or _now()
     return notifications.notify(
@@ -753,6 +793,13 @@ def alert_stranded_notices(*, now: datetime | None = None) -> dict:
     would produce a permanent alarm about a decision somebody made deliberately, and would
     drown the reading that matters: a deployment which *is* trying to deliver and cannot.
 
+    **And silent for notices nothing was asked to deliver.** A worker with no registered device
+    leaves notices undelivered without any channel failure, and an alert about that is an hourly
+    claim nobody can act on; the reading names it instead (``waiting_for_device``), and so does
+    readiness. The alert fires on ``channel_failures`` - a notice that was attempted or belongs
+    to a worker with a live device, and still did not arrive - which is the state this whole
+    module exists to surface.
+
     Two connections, in that order, and never the read inside the write: the reading is
     strictly read-only, and most passes find nothing to say and must not take SQLite's write
     lock from a watcher thread to say it.
@@ -766,6 +813,16 @@ def alert_stranded_notices(*, now: datetime | None = None) -> dict:
     result = {"checked": True, "alerted": False, "reason": "nothing was left behind"}
     if not reading["notices"]:
         return {**reading, **result}
+    if not reading["channel_failures"]:
+        # Undelivered, but nothing was ever asked to deliver them: an adoption gap, which is
+        # named in the reading and in readiness rather than alerted (see ``_record_stranded``).
+        # Said out loud here so a caller reading ``alerted: False`` knows which of the two
+        # silences it got - "nothing to report" and "nothing to *alert*" are different states.
+        return {
+            **reading,
+            **result,
+            "reason": "no channel failure: the backlog is waiting for a device",
+        }
     with db(write=True) as conn:
         alerted = _record_stranded(conn, reading, now=moment)
     return {

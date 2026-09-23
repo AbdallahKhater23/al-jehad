@@ -2102,10 +2102,31 @@ const UI = {
     /** Coarse enough to cost nothing on a phone, live enough to react to a step. */
     _framing: { timer: null, detector: undefined, busy: false },
 
-    //: How wide the sampled frame is. 160x120 grey is plenty to answer "is it dark?"
-    //: and to hand the face detector a picture, and it is ~1/40th of a camera frame.
-    FRAMING_SAMPLE_WIDTH: 160,
+    //: How wide the sampled frame is. It was 160, which is plenty to answer "is it dark?"
+    //: but *not* enough to ask the browser's detector about faces: 160x120 is a quarter of
+    //: the smallest input that detector is any good on, and a face downsampled that far
+    //: produces boxes that overlap each other and the edge - which is how one worker standing
+    //: alone was told "Only one person can be in the frame". 320x240 is still ~1/15th of a
+    //: camera frame and the luma loop below stays a few milliseconds on a phone.
+    FRAMING_SAMPLE_WIDTH: 320,
     FRAMING_SAMPLE_MS: 700,
+
+    //: The smallest part of the sample a *person* can be, before a detection is a speck.
+    //:
+    //: window.FaceDetector fires on face-shaped textures that are not people - a poster, a
+    //: photograph on a wall, a face on a phone screen across the room - and it reports
+    //: single-digit imprecision on a phone. The advice floors in `framingAdvice` say a face
+    //: past ~1.9 m is out of range (0.6% of the frame), so anything an order of magnitude
+    //: smaller than that is not the worker, nor the person standing behind them: it cannot be
+    //: the subject of a punch at all. Counting it produced `framingManyFaces` - advice about a
+    //: second person who was never there.
+    FRAMING_MIN_FACE_AREA: 0.001,
+
+    //: Two boxes this close together are one face seen twice, not two people.
+    //: The browser's detector does emit both, especially at low sample resolutions and on a
+    //: mirrored preview, and "someone else is in the frame" is the wrong sentence for it.
+    FRAMING_DUPLICATE_IOU: 0.45,
+    FRAMING_DUPLICATE_CONTAINMENT: 0.6,
 
     //: Green when the frame is usable, amber when the worker should adjust something,
     //: red when this photo cannot work as it is.
@@ -2175,6 +2196,69 @@ const UI = {
         return 'framingGood';
     },
 
+    /**
+     * The people the browser's detector found, from its raw boxes.
+     *
+     * Pure on purpose - boxes in, counts out - so the counting rule can be read and tested
+     * without a camera, exactly like `framingAdvice` above it. It exists because the raw count
+     * is not the number of people: the detector emits a box per *response*, not per person, so
+     * one face can arrive as two overlapping boxes, and a face-shaped patch of wall can arrive
+     * as a third. Both were reported as "more than one face is in the frame" - advice about a
+     * person who is not there, which sends a worker looking for somebody to move.
+     *
+     * `area` is the largest subject's share of the frame, not the sum of every box: the sum
+     * inflates when a bystander is behind the worker, and the advice that reads it (move closer,
+     * move further) is about the person being photographed.
+     */
+    framingSubjects(detections, width, height) {
+        const frameArea = Math.max(1, width * height);
+        const boxes = (detections || [])
+            .map((detection) => (detection && detection.boundingBox) || null)
+            .filter((box) => box && box.width > 0 && box.height > 0)
+            .map((box) => ({
+                x: box.x,
+                y: box.y,
+                width: box.width,
+                height: box.height,
+                area: (box.width * box.height) / frameArea
+            }))
+            .sort((a, b) => b.area - a.area);
+
+        const people = [];
+        let ignored = 0;
+        let merged = 0;
+        for (const box of boxes) {
+            if (box.area < this.FRAMING_MIN_FACE_AREA) {
+                ignored += 1;
+                continue;
+            }
+            const duplicate = people.some((kept) => {
+                const left = Math.max(kept.x, box.x);
+                const top = Math.max(kept.y, box.y);
+                const right = Math.min(kept.x + kept.width, box.x + box.width);
+                const bottom = Math.min(kept.y + kept.height, box.y + box.height);
+                const overlap = Math.max(0, right - left) * Math.max(0, bottom - top);
+                if (overlap <= 0) return false;
+                const union = kept.width * kept.height + box.width * box.height - overlap;
+                const smaller = Math.min(kept.width * kept.height, box.width * box.height);
+                return (union && overlap / union >= this.FRAMING_DUPLICATE_IOU)
+                    || (smaller && overlap / smaller >= this.FRAMING_DUPLICATE_CONTAINMENT);
+            });
+            if (duplicate) {
+                merged += 1;
+                continue;
+            }
+            people.push(box);
+        }
+        return {
+            count: people.length,
+            rawCount: boxes.length,
+            merged,
+            ignored,
+            area: people.length ? people[0].area : 0
+        };
+    },
+
     /** Light, contrast and the faces in one sampled frame of the live video. */
     async measureFraming(video, detector) {
         const height = Math.max(
@@ -2207,10 +2291,7 @@ const UI = {
         if (!detector) return metrics;
         try {
             const faces = await detector.detect(canvas);
-            const area = (faces || []).reduce(
-                (total, face) => total + face.boundingBox.width * face.boundingBox.height, 0
-            );
-            metrics.face = { count: (faces || []).length, area: area / (canvas.width * canvas.height) };
+            metrics.face = this.framingSubjects(faces, canvas.width, canvas.height);
         } catch (err) {
             // A detector that throws is not a detector: fall back to light and contrast
             // for the rest of this card rather than nagging the worker about faces.

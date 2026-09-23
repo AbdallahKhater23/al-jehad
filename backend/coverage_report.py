@@ -35,7 +35,7 @@ after boot is delayed past the model preload, and the work happens on a **thread
 rather than an asyncio task** - the same reasoning as the retention sweeper, because blocking CPU
 work in the event loop would stall every punch at the gate while it measured them. A deployment
 that would rather run it elsewhere sets ``STANDING_SWEEP_ENABLED=0`` and schedules
-``python -m coverage_report --once`` from cron, which is the same code path.
+``python -m coverage_report`` from cron, which is the same code path.
 """
 
 from __future__ import annotations
@@ -97,40 +97,64 @@ class CorpusFingerprint:
         }
 
 
-def fingerprint(folder: str | Path) -> CorpusFingerprint:
-    """Count the frames in a directory, without opening one.
+def frames_in(folder: str | Path) -> list[tuple[float, str, str]]:
+    """Every frame under a folder as ``(mtime, name, path)``, **recursively**.
 
-    One ``scandir``, no decode: this runs every tick, and a probe that costs a second per check
-    would cost more than the measurement it is deciding to take. A missing folder is zero frames
-    rather than an error - a deployment without gate frames yet is a state, not a fault, and the
-    watcher says so at startup rather than on every tick.
+    Recursive because the corpus a sweep is pointed at is routinely organised one folder per
+    identity (``angela-merkel/01.jpg``) - that is the layout the calibration store and every corpus
+    export use - so a non-recursive count would report a full nested corpus as empty and the
+    standing report would never measure it. It is also the contract ``DirectorySource`` reads with,
+    and a trigger that disagreed with its own source about what is in the folder would measure a
+    different corpus than it counted.
+
+    A missing or unreadable folder is an empty list rather than an error: a deployment without gate
+    frames yet is a state, not a fault, and the watcher says so once at startup instead of on every
+    tick. Names are the *basenames*, because they are for reading; every comparison of frames across
+    configurations joins on the path (see the sweep's flip table).
     """
     root = Path(folder)
-    count = 0
-    total = 0
-    newest: tuple[float, str] | None = None
+    found: list[tuple[float, str, str]] = []
     try:
-        with os.scandir(root) as entries:
-            for entry in entries:
-                if not entry.is_file() or not entry.name.lower().endswith(IMAGE_SUFFIXES):
+        for current, directories, filenames in os.walk(root):
+            directories.sort()
+            for name in sorted(filenames):
+                if not name.lower().endswith(IMAGE_SUFFIXES):
                     continue
-                stat = entry.stat()
-                count += 1
-                total += int(stat.st_size)
-                stamp = (stat.st_mtime, entry.name)
-                if newest is None or stamp > newest:
-                    newest = stamp
+                path = os.path.join(current, name)
+                try:
+                    stat = os.stat(path)
+                except OSError:  # a file that vanished between the walk and the stat
+                    continue
+                found.append((stat.st_mtime, name, path))
     except (FileNotFoundError, NotADirectoryError, PermissionError):
+        return []
+    return found
+
+
+def fingerprint(folder: str | Path) -> CorpusFingerprint:
+    """Count the frames under a directory, without opening one.
+
+    One walk, no decode: this runs every tick, and a probe that costs a second per check would cost
+    more than the measurement it is deciding to take. It is the cheapest honest description of a
+    folder of frames - how many, and how new - which is all the trigger needs.
+    """
+    found = frames_in(folder)
+    if not found:
         return CorpusFingerprint(frames=0, newest=None, newest_name=None, total_bytes=0)
-    newest_text = (
-        datetime.fromtimestamp(newest[0]).strftime("%Y-%m-%d %H:%M:%S") if newest else None
-    )
+    newest = max(found, key=lambda item: (item[0], item[2]))
     return CorpusFingerprint(
-        frames=count,
-        newest=newest_text,
-        newest_name=newest[1] if newest else None,
-        total_bytes=total,
+        frames=len(found),
+        newest=datetime.fromtimestamp(newest[0]).strftime("%Y-%m-%d %H:%M:%S"),
+        newest_name=newest[1],
+        total_bytes=sum(path_size(path) for _stamp, _name, path in found),
     )
+
+
+def path_size(path: str) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:  # pragma: no cover - a file removed mid-walk
+        return 0
 
 
 def sample(folder: str | Path, limit: int) -> list[str]:
@@ -139,21 +163,12 @@ def sample(folder: str | Path, limit: int) -> list[str]:
     Newest-first selection, then reversed, so the sweep reads them in capture order and the report's
     per-frame entries stay comparable between runs. The cap is what keeps a standing job from
     becoming a load test on a live gate; it is a *sample* and the report says so, with the corpus
-    size beside it.
+    size beside it. Ties on the timestamp break by path, so the same folder yields the same sample
+    twice - which is what makes two reports comparable at all.
     """
-    root = Path(folder)
-    try:
-        with os.scandir(root) as entries:
-            candidates = [
-                (entry.stat().st_mtime, entry.name, entry.path)
-                for entry in entries
-                if entry.is_file() and entry.name.lower().endswith(IMAGE_SUFFIXES)
-            ]
-    except (FileNotFoundError, NotADirectoryError, PermissionError):
-        return []
-    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    candidates = sorted(frames_in(folder), key=lambda item: (item[0], item[2]), reverse=True)
     chosen = candidates if limit <= 0 else candidates[: int(limit)]
-    return [path for _stamp, _name, path in sorted(chosen, key=lambda item: (item[0], item[1]))]
+    return [path for _stamp, _name, path in sorted(chosen, key=lambda item: (item[0], item[2]))]
 
 
 @dataclass
@@ -502,13 +517,21 @@ def tick(
     min_margin: int | None = None,
     keep: int | None = None,
     now: datetime | None = None,
+    force: bool = False,
     progress=None,
 ) -> dict[str, Any]:
     """One cadence: decide, maybe measure, notify on a change, remember. Safe to call by hand.
 
     Everything is injectable for the same reason the sweep's internals are: a test has to be able to
     ask "would this tick measure?" without a corpus, a model or a waiting period, and an operator has
-    to be able to run exactly this function once (``python -m coverage_report --once``).
+    to be able to run exactly this function once: ``python -m coverage_report`` is one tick of the
+    timer from a shell (``--force`` measures regardless of the trigger).
+
+    ``force`` measures whatever the trigger says - the manual override - and then does everything
+    else the same way, *including* moving the baseline. That is deliberate: a hand-run measurement
+    that left the trigger believing the frames were unmeasured would re-measure the same corpus
+    minutes later, and an operator who ran it by hand to answer one question would watch the gate's
+    CPU answer it twice.
     """
     moment = now or datetime.now()
     corpus_dir = Path(folder if folder is not None else settings.standing_sweep_corpus_dir)
@@ -542,7 +565,7 @@ def tick(
         "corpus": current.as_dict(),
         "corpus_dir": str(corpus_dir),
     }
-    if not decision.should_run:
+    if not decision.should_run and not force:
         # The baseline only moves when the corpus shrank: any other tick leaves it where the last
         # run left it, so "new frames since the last run" keeps meaning that.
         if decision.rebaseline or state.get("frames") is None:
@@ -553,6 +576,9 @@ def tick(
         summary["verdict"] = (state.get("last_run") or {}).get("verdict")
         return summary
 
+    if force and not decision.should_run:
+        summary["forced"] = True
+        _log.info("standing coverage report: measuring anyway (%s)", decision.reason)
     payload = measure(
         folder=corpus_dir,
         report_dir=target,
@@ -712,7 +738,7 @@ def stop_watcher(*, timeout: float = 2.0) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """``python -m coverage_report`` - one tick, or a single measurement, from a shell.
+    """``python -m coverage_report`` - one tick of the standing timer, from a shell.
 
     Present because a standing report nobody can run by hand is a standing report nobody trusts: the
     same entry point the timer uses is the one an operator schedules from cron (with the watcher
@@ -740,30 +766,18 @@ def main(argv: list[str] | None = None) -> int:
         common["limit"] = args.sample
 
     try:
-        if args.force:
-            target = Path(args.report_dir or settings.standing_sweep_dir)
-            payload = measure(
-                folder=args.corpus or settings.standing_sweep_corpus_dir,
-                report_dir=target,
-                limit=int(args.sample if args.sample is not None else settings.standing_sweep_sample),
-                min_score=float(settings.standing_sweep_min_score),
-                subject=settings.standing_sweep_subject,
-                min_margin=int(settings.standing_sweep_min_margin_frames),
-                keep=int(settings.standing_sweep_keep),
-                now=None,
-                progress=lambda name, index, total: print(
-                    f"\r  sweeping {index}/{total}: {name[:60]}", end="", flush=True
-                ),
-            )
-            print("\r" + " " * 79 + "\r", end="")
-            print(f"measured {payload['sample']['frames']} frame(s) at {payload['measured_at']}")
-            print(f"  {payload['summary']}")
-            result = {"ran": True, **payload}
-        else:
-            result = tick(**common)
-            print(f"ran: {result['ran']} - {result['reason']}")
-            if result.get("summary"):
-                print(f"  {result['summary']}")
+        progress = None
+        if args.verbose or args.force:
+            def progress(name: str, index: int, total: int) -> None:
+                print(f"\r  sweeping {index}/{total}: {name[:60]}", end="", flush=True)
+
+        result = tick(**common, force=args.force, progress=progress)
+        print("\r" + " " * 79 + "\r", end="")
+        print(f"ran: {result['ran']} - {result['reason']}")
+        if result.get("summary"):
+            print(f"  {result['summary']}")
+        if result.get("notified"):
+            print("  an administrator notification was raised: the verdict changed")
     except coverage_sweep.SweepError as exc:
         print(str(exc), file=sys.stderr)
         return 2
