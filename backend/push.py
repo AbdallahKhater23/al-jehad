@@ -619,6 +619,15 @@ def stranded_notices(conn: sqlite3.Connection, *, now: datetime | None = None) -
     nothing can be until they allow notifications in the app - while ``with_device`` notices
     went to a push service and did not arrive, which is the service's answer to give.
 
+    **A notice the worker has read is no longer stranded.** ``read_at`` is the worker's own
+    answer to the notice, and an answered question is not an undelivered one: whatever the
+    phone did, the person knows. Counting read rows kept this check red for exactly as long as
+    the deployment keeps history - every notice written before push existed, and every one a
+    worker dismissed without the phone ever ringing, counted for ``NOTIFICATION_RETENTION_DAYS``
+    (180) - and no operator action could ever clear it. The inbox is the record either way;
+    what this reading is *for* is a channel that is trying and cannot deliver, and a worker who
+    has read the notice is not that.
+
     Strictly read-only, and only what an operator needs: counts, the oldest stamp, a kind
     breakdown. No endpoint, no ``p256dh``, no ``auth`` - an endpoint is a capability to send
     to somebody's phone, and an alert is a row that gets logged, mailed and pasted into
@@ -639,13 +648,13 @@ def stranded_notices(conn: sqlite3.Connection, *, now: datetime | None = None) -
                           AND s.revoked_at IS NULL
                     ) THEN 1 ELSE 0 END) AS with_device
           FROM worker_notifications
-         WHERE delivered_at IS NULL AND created_at < ?
+         WHERE delivered_at IS NULL AND read_at IS NULL AND created_at < ?
         """,
         (cutoff,),
     ).fetchone()
     kinds = conn.execute(
         "SELECT kind, COUNT(*) AS notices FROM worker_notifications "
-        "WHERE delivered_at IS NULL AND created_at < ? "
+        "WHERE delivered_at IS NULL AND read_at IS NULL AND created_at < ? "
         "GROUP BY kind ORDER BY notices DESC, kind ASC",
         (cutoff,),
     ).fetchall()
