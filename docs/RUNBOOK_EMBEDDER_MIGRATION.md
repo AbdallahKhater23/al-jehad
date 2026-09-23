@@ -317,10 +317,27 @@ elsewhere). They are **not** in any checkout, and one trap is worth naming: the 
 sweeping it measures nothing but the placeholder. (It looks like data: 1511 files, real JPEGs, real
 names. Check the mean and the content hashes before trusting a folder as a corpus.)
 
+Two ways in, and the second is the one to prefer on the deployment:
+
 ```bash
-# beside the volume, or inside the service: `railway run python backend/tools/coverage_sweep.py ...`
+# 1. a folder of frames
 python backend/tools/coverage_sweep.py --corpus /data/punch_frames --json /tmp/sweep-gate.json
+
+# 2. the calibration corpus, in place - no export step, and no second copy of faces on disk
+python backend/tools/coverage_sweep.py --corpus-store --json /tmp/sweep-corpus.json
+
+# inside the service, where the volume is:
+railway run python backend/tools/coverage_sweep.py --corpus-store --json /tmp/sweep-corpus.json
 ```
+
+`--corpus-store` reads the calibration store directly (`<identity>/<capture>.jpg` plus its sidecar
+*is* the folder contract, so an export works — but an export is a duplicate of a biometric corpus,
+and the sweep is read-only by design). It includes the **hard cases and the unlabelled captures by
+default**, which is the opposite of the export's defaults and deliberately so: a band must not be
+fitted to flagged frames, but a coverage experiment is about exactly those frames. `--exclude-hard-cases`
+and `--exclude-unlabelled` narrow it. With no `--corpus` and no captures, the run **refuses** with
+the corpus root and the two variables that switch capture on, rather than printing four configurations
+that measured nothing.
 
 Until that run exists, the numbers below are a comparison of the two networks on *photographs* —
 useful for validating the plumbing and the decode, not for choosing a detector.
