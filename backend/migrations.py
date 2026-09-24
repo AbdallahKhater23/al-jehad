@@ -184,9 +184,26 @@ DEFAULT_SHIFT_RULES = {
     "break_minutes": 30.0,
     "break_after_hours": 4.0,
     #: Whether the system writes the clock-out itself when the paid hours reach
-    #: ``regular_hours``. On by default: the day ends at 8 paid hours, and the extra
-    #: hours a forgotten shift would otherwise accrue are the reason this exists.
-    "auto_close_at_regular": 1,
+    #: ``regular_hours``.
+    #:
+    #: **Off by default, and the default was on until it was noticed that on was not
+    #: true.** The shipped pair is ``overtime_notify_hours`` 8.1 against ``regular_hours``
+    #: 8.0, i.e. the alert line sits *above* the paid day - and ``shift_hours.day_end_rules``
+    #: resolves that pair by standing the close down, because a shift the close ended at 8 h
+    #: could never reach 8.1 h and the crossing would be unobservable. So the switch read
+    #: "on" on every fresh deployment while the close never once acted, which is exactly the
+    #: state ``readiness``'s ``overtime_close_deferred`` advisory exists to report - and a
+    #: fresh volume was born failing it. Shipping the value the behaviour already implies is
+    #: therefore both the fix and the honest description: nothing observable changes (nothing
+    #: was being closed), the console stops showing a switch that does nothing, and the
+    #: overtime workflow is explicitly the owner of the end of the day.
+    #:
+    #: The forgotten-shift case the close existed for is still covered: the crossing alert
+    #: fires at 8.1 h and keeps watching until somebody clocks out, and the hours past the
+    #: paid day go to overtime review. An operator who wants the close to *act* sets it back
+    #: on **and** moves the alert strictly below ``regular_hours`` - the two numbers are one
+    #: decision, and ``day_end_rules`` is where that is decided.
+    "auto_close_at_regular": 0,
 }
 
 
@@ -689,8 +706,18 @@ def migration_9_unpaid_break_and_auto_close(conn: sqlite3.Connection) -> None:
 
     ``break_minutes`` (30) is the unpaid break; ``break_after_hours`` (4) is how long a
     shift must run before one is assumed to have been taken, so a short part-shift is
-    not charged half an hour it never took; ``auto_close_at_regular`` (on) is whether
-    the system writes the clock-out when the paid hours reach ``regular_hours``.
+    not charged half an hour it never took; ``auto_close_at_regular`` is whether the
+    system writes the clock-out when the paid hours reach ``regular_hours``.
+
+    That last one is added **off**, and the DDL default below is what a fresh volume is
+    born with, so the value here is the whole of the shipped behaviour rather than a
+    starting point something later overrides. It was shipped on, against an overtime alert
+    line (8.1) above the paid day (8.0) - a pair ``shift_hours.day_end_rules`` resolves by
+    standing the close down. The switch was on and the close never acted, on every new
+    deployment, which ``readiness``'s ``overtime_close_deferred`` reports and which nothing
+    else in the application would have told an operator. Turning a rule *off* by default is
+    a policy change and this one is deliberate: it changes no shift that would have been
+    closed, because under these two figures none ever was.
 
     ``attendance_logs.break_hours`` is what the shift *recorded* as break. Without it
     the deduction would be invisible: a shift that ran 8.5 h on site and reads 8.0 h
@@ -706,7 +733,10 @@ def migration_9_unpaid_break_and_auto_close(conn: sqlite3.Connection) -> None:
     """
     add_column(conn, "shift_rules", "break_minutes", "REAL NOT NULL DEFAULT 30.0")
     add_column(conn, "shift_rules", "break_after_hours", "REAL NOT NULL DEFAULT 4.0")
-    add_column(conn, "shift_rules", "auto_close_at_regular", "INTEGER NOT NULL DEFAULT 1")
+    # Off: see the note on ``DEFAULT_SHIFT_RULES`` above and on this migration's docstring.
+    # ``add_column`` fills the existing single row with this default, so on a fresh database
+    # this literal - not the dict - is what the deployment is born with.
+    add_column(conn, "shift_rules", "auto_close_at_regular", "INTEGER NOT NULL DEFAULT 0")
     add_column(conn, "attendance_logs", "break_hours", "FLOAT")
 
 

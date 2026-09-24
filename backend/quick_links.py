@@ -67,6 +67,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Uplo
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, field_validator
 
+import face_detector
 import face_engine
 import liveness
 import notifications
@@ -275,22 +276,33 @@ def detect_faces_sync(image_array) -> list[dict]:
     return list(faces or [])
 
 
-def _face_count(faces: list[dict]) -> int:
-    """Faces above a low confidence floor, so detector noise is not a face.
+def _confidence(face: dict) -> float:
+    """One detection's confidence, above a low floor, so detector noise is not a face.
 
     ``extract_faces`` reports ``confidence`` while ``represent`` reports
     ``face_confidence``; both are read so this keeps working if the call ever moves to the
-    other half of the API.
+    other half of the API. An entry that carries neither is taken at face value rather than
+    dropped: unable to *lower* the answer, this must not quietly discard a face the detector
+    did report.
     """
-    count = 0
-    for face in faces:
-        try:
-            confidence = float(face.get("confidence", face.get("face_confidence", 1.0)))
-        except (AttributeError, TypeError, ValueError):
-            confidence = 1.0
-        if confidence >= 0.5:
-            count += 1
-    return count
+    try:
+        return float(face.get("confidence", face.get("face_confidence", 1.0)))
+    except (AttributeError, TypeError, ValueError):
+        return 1.0
+
+
+def _subject_report(faces: list[dict]) -> face_detector.SubjectReport:
+    """The people in a quick-link selfie, counted by the punch path's own rule.
+
+    The confidence floor is this path's; the count is ``face_detector.subject_detections``,
+    which is what the password punch uses. Both endpoints used to count *detections*, so a
+    detector that returns two boxes over one face - or a face-shaped speck on a nearby poster -
+    refused the worker with "more than one face is in the photo": a sentence about a person who
+    was not in the frame, and one the worker at the gate cannot act on. Two detections that are
+    each subject-sized are still two people, and this still refuses them.
+    """
+    confident = [face for face in faces if _confidence(face) >= 0.5]
+    return face_detector.subject_detections(confident)
 
 
 def _link_url(request: Request, token: str, override: str | None = None) -> str:
@@ -785,7 +797,10 @@ async def submit_quick_punch(
         faces = await face_engine.ENGINE.run_async(detect_faces_sync, img_array)
     except face_engine.FaceEngineBusy as exc:
         raise face_engine.busy_http_exception(exc) from None
-    face_count = _face_count(faces)
+    subjects = _subject_report(faces)
+    if subjects.merged or subjects.specks:
+        log.info("face detection on a clock-link selfie: %s", subjects.summary())
+    face_count = subjects.count
     if face_count == 0:
         raise HTTPException(
             status_code=400,

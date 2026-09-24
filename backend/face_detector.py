@@ -121,6 +121,30 @@ MIN_SUBJECT_PX = 24
 DUPLICATE_IOU = 0.45
 DUPLICATE_CONTAINMENT = 0.6
 
+#: The widest a subject can be, as a share of the frame's width, before the detector's own answer
+#: is no longer about one face.
+#:
+#: Measured on this repository's own corpus (35 single-face photographs, each driven to a chosen
+#: face width in a 720x1280 portrait frame - what a phone uploads): past half the frame the detector
+#: stops returning *a* face and starts returning *pieces* of one. At a 585 px face it answered two
+#: boxes of 482x621 and 592x615 - stacked, nearly the same size, overlapping only ~14% because each
+#: covers one half of the face - and 10 of 105 close-up frames were refused as "more than one face"
+#: while holding one person. Getting *closer* made it worse: 3 frames at 585 px, 6 at 660 px. The
+#: anchors are laid out for an input the size of ``DETECTOR_INPUT_SIZE``; a face that fills the
+#: frame has no single anchor that covers it, which is a property of the detector, not of the face.
+MAX_SUBJECT_FRAME_FRACTION = 0.5
+
+#: The working width a too-close frame is read at *again*, in pixels.
+#:
+#: The retry is not a blanket cap, and the numbers are why: reading every frame at 480 px fixed the
+#: close-ups (0 of 105 refused, against 10 of 105 at native) but cost 2 of 60 far-range frames, and
+#: at 320 px it cost 15 of 60 - the small-face regime commit 60bc460 exists to serve. So the native
+#: pass stays the answer for a normal frame, and only a frame that reports a face too large to be
+#: one is re-read here. 1.5x the detector's own input size: a face at this width lands on a scale
+#: the anchors were built for, while the 0.6%-of-frame floor the framing coach treats as "out of
+#: range" (~86 px in a 1280x960 frame) still arrives above 24 px.
+CLOSE_FRAME_RETRY_PX = 480
+
 #: The size the graph is driven at. It sat in the constructor as ``(320, 320)``, which is how this
 #: deployment's coverage failure stayed invisible: 320 is a *scale*, not a setting, and at that scale a
 #: face 60 native pixels wide arrives at the detector as 15 - below the anchor stride, so it is not
@@ -556,12 +580,59 @@ def _to_bgr(image) -> np.ndarray | None:
 
 
 def detect_raw(image) -> list[np.ndarray]:
-    """Raw YuNet rows for one image: ``[x, y, w, h, 5x(x,y), score]`` each."""
-    ok, _reason = _ensure()
-    if not ok or _detector is None:
-        return []
+    """Raw YuNet rows for one image: ``[x, y, w, h, 5x(x,y), score]`` each, in frame pixels.
+
+    The frame is read at its own size, and that is deliberate: it is what lets a *distant* subject
+    be found at all (a 60 px face is 15 px once the frame is squeezed to ``DETECTOR_INPUT_SIZE``,
+    which is below the anchor stride - the small-face regime commit 60bc460 serves). What that pass
+    cannot do is see a face that *fills* the frame: past ``MAX_SUBJECT_FRAME_FRACTION`` the detector
+    answers with the pieces of the face rather than the face, which reads downstream as two people
+    and refuses a worker who is standing alone. So when - and only when - the native pass reports
+    something too large to be a face, the frame is read again at a working width where the face is
+    a face, and *that* answer is the one the caller gets.
+    """
     frame = _to_bgr(image)
     if frame is None or frame.size == 0 or frame.shape[0] == 0 or frame.shape[1] == 0:
+        return []
+    rows = _detect_rows(frame)
+    width = float(frame.shape[1])
+    if width <= CLOSE_FRAME_RETRY_PX:
+        # Already at (or below) the working width the retry would ask for: there is nothing to
+        # resample and nothing to gain. Small frames are the far-range case by construction.
+        return rows
+    if not _too_close_to_read(rows, width):
+        return rows
+    back = width / float(CLOSE_FRAME_RETRY_PX)
+    try:
+        import cv2
+
+        reduced = cv2.resize(
+            frame,
+            (CLOSE_FRAME_RETRY_PX, max(1, int(round(frame.shape[0] / back)))),
+            interpolation=cv2.INTER_AREA,
+        )
+    except Exception:  # noqa: BLE001 - a frame that cannot be resampled keeps its own answer
+        log.debug("could not reduce a close-up frame for a second read", exc_info=True)
+        return rows
+    retry = _scale_rows(_detect_rows(reduced), back)
+    if not retry:
+        # The second read found nothing at all, which is a worse answer than a confused first one:
+        # keep what the native pass said rather than turning a close-up into "no face".
+        return rows
+    if len(retry) != len(rows):
+        log.info(
+            "re-read a close-up frame at %s px: %s box(es) became %s",
+            CLOSE_FRAME_RETRY_PX,
+            len(rows),
+            len(retry),
+        )
+    return retry
+
+
+def _detect_rows(frame: np.ndarray) -> list[np.ndarray]:
+    """One detection pass, at the frame's own size - the model call, and nothing else."""
+    ok, _reason = _ensure()
+    if not ok or _detector is None:
         return []
     height, width = frame.shape[:2]
     with _lock:
@@ -574,6 +645,37 @@ def detect_raw(image) -> list[np.ndarray]:
     if faces is None:
         return []
     return [row for row in faces]
+
+
+def _too_close_to_read(rows: list[np.ndarray], width: float) -> bool:
+    """Whether the native pass reported a face too large for its answer to be *about* one face."""
+    if width <= 0:
+        return False
+    for row in rows:
+        try:
+            if float(row[2]) > width * MAX_SUBJECT_FRAME_FRACTION:
+                return True
+        except (IndexError, TypeError, ValueError):
+            continue
+    return False
+
+
+def _scale_rows(rows: list[np.ndarray], back: float) -> list[np.ndarray]:
+    """Rows mapped from the reduced frame back into the frame the caller handed over.
+
+    Box **and** landmarks: ``align`` warps the five points, so scaling only the box would take a
+    correctly sized crop from the wrong place - and the geometry a caller keeps as provenance
+    (``corpus``, ``shadow_rollout``) has to be in the coordinates of the worker's own photo.
+    """
+    scaled = []
+    for row in rows:
+        try:
+            moved = np.asarray(row, dtype=np.float32).copy()
+        except (TypeError, ValueError):
+            continue
+        moved[:14] *= back
+        scaled.append(moved)
+    return scaled
 
 
 def landmarks_of(row: np.ndarray | None) -> np.ndarray:
@@ -663,15 +765,41 @@ class SubjectReport:
         return len(self.faces)
 
     def summary(self) -> str:
-        widths = ", ".join(
-            str(int((_box_of(face.get("facial_area")) or (0, 0, 0, 0))[2])) for face in self.faces
-        )
-        parts = [f"{self.count} subject-sized face(s) [{widths}]" if self.count else "no subject-sized face"]
+        """The count, and enough geometry to act on it - one line, for the refusal log.
+
+        The widths alone were not enough to read a real refusal with. The line that came back from
+        a deployment read ``2 subject-sized face(s) [585, 576]`` and left the question it was
+        written to answer open: two boxes of the *same* size, in a frame a phone captured in
+        portrait, are one face the detector could not represent whole (see
+        ``MAX_SUBJECT_FRAME_FRACTION``) - but ``[585, 576]`` reads exactly like two people, and a
+        bystander had to be ruled out by argument instead of by the record. Height separates the
+        two shapes at a glance, the score says whether the box was a confident face or a marginal
+        one, and the whole line is still short enough to sit in a log.
+        """
+        parts = [
+            f"{self.count} subject-sized face(s) [{', '.join(_describe(face) for face in self.faces)}]"
+            if self.count
+            else "no subject-sized face"
+        ]
         if self.merged:
             parts.append(f"{self.merged} duplicate box(es) merged")
         if self.specks:
             parts.append(f"{len(self.specks)} speck(s) ignored {self.specks} px")
         return "; ".join(parts)
+
+
+def _describe(face: Any) -> str:
+    """One detection as ``WxH@score``, for the refusal log - ``?`` where a field is missing."""
+    box = _box_of(face.get("facial_area")) if isinstance(face, dict) else None
+    shape = f"{int(box[2])}x{int(box[3])}" if box else "?"
+    score = ""
+    if isinstance(face, dict):
+        raw = face.get("confidence", face.get("face_confidence"))
+        try:
+            score = f"@{float(raw):.2f}" if raw is not None else ""
+        except (TypeError, ValueError):
+            score = ""
+    return f"{shape}{score}"
 
 
 def subject_detections(

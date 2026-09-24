@@ -519,26 +519,42 @@ def _stub_available() -> tuple[bool, str]:
     return True, ""
 
 
+def _stub_boxes() -> list[dict]:
+    """One box per stub face, laid out so that *two really are two people*.
+
+    The alignment template's own size (``ALIGNED_SIZE``), at full scale: the stub models a face the
+    pipeline could actually crop and embed. It used to report a 10 px box, which is the one geometry
+    a face cannot have - a 10 px detection is below the template's usable floor, and the production
+    code now says so (``face_detector.MIN_SUBJECT_PX``) - so a fixture that kept 10 px would be
+    asserting that a speck is a person, and every punch would be refused for having no face in it.
+
+    The boxes are then **spaced apart** rather than stacked at the origin, and that is the other
+    half of the same honesty: two identical boxes over one origin are what a detector reports when
+    it finds one face twice, which is precisely what ``face_detector.subject_detections`` merges. A
+    fixture that reused one box for ``FACE_COUNT = 2`` would therefore be testing the two-face
+    *refusal* with a picture of one face, and pass only while the guard was naive.
+    """
+    side = _face_detector.ALIGNED_SIZE
+    return [
+        {"x": index * (side + side // 4), "y": 0, "w": side, "h": side}
+        for index in range(FAKE_ENGINE.FACE_COUNT)
+    ]
+
+
 def _stub_detect_landmarks(image):
     """The detector's geometry, in the shape ``face_detector.detect_landmarks`` returns.
 
     Stubbed for the same reason ``detect_and_align`` is: the capture path (``corpus``) must not run
     ONNX over a synthetic JPEG, and the coordinates it stores have to be *some* geometry rather than
-    a real face's. The five points sit inside the same 10x10 area the align stub reports, so a test
-    can reason about the box and the landmarks together.
+    a real face's. The five points sit inside the same box the align stub reports, so a test can
+    reason about the box and the landmarks together.
     """
     if FAKE_ENGINE.FACE_MODE == "none":
         return []
-    # A real 112-template scaled into the stub's 10x10 detection - the same landmarks a YuNet row
-    # would carry for a face that size, so `face_px` and the crop are consistent with each other.
-    template = np.asarray(_face_detector._ALIGN_TEMPLATE, dtype=np.float32) * (10.0 / 112.0)
+    template = np.asarray(_face_detector._ALIGN_TEMPLATE, dtype=np.float32)
     return [
-        {
-            "landmarks": template.copy(),
-            "facial_area": {"x": 0, "y": 0, "w": 10, "h": 10},
-            "confidence": 0.99,
-        }
-        for _ in range(FAKE_ENGINE.FACE_COUNT)
+        {"landmarks": template.copy(), "facial_area": box, "confidence": 0.99}
+        for box in _stub_boxes()
     ]
 
 
@@ -557,8 +573,7 @@ def _stub_detect_and_align(image):
     if FAKE_ENGINE.FACE_MODE == "none":
         return []
     return [
-        {"face": image, "facial_area": {"x": 0, "y": 0, "w": 10, "h": 10}, "confidence": 0.99}
-        for _ in range(FAKE_ENGINE.FACE_COUNT)
+        {"face": image, "facial_area": box, "confidence": 0.99} for box in _stub_boxes()
     ]
 
 
@@ -1399,12 +1414,16 @@ def send(client, method: str, path: str, *, headers: dict | None = None, json_bo
 def use_auto_close(client, *, notify_hours: float = 7.5) -> dict:
     """Put the shift rules into the arrangement where the automatic close ends the day.
 
-    The close stands down when the overtime line sits above the paid day, because a shift
-    closed at 8 h could never be observed crossing a line at 8.1 h (see
-    ``shift_hours.day_end_rules``). So a test of the close has to say which arrangement it
-    means, and the shipped one is not it. 7.5 h is *below* the 8 h paid day: the alert fires
-    first for anyone who ran long, and the close then ends the standard day - the two rules
-    cooperating, which is the arrangement the close tests are about.
+    TWO SETTINGS, AND NEITHER OF THEM IS THE SHIPPED ONE, because both have to move for the
+    close to act at all. The close stands down when the overtime line sits above the paid day
+    (a shift closed at 8 h could never be observed crossing a line at 8.1 h), *and* the close
+    itself now ships **off** - a fresh deployment is not born with a switch that contradicts
+    its own alert line. So a test of the close says which arrangement it means, and the
+    shipped pair is not it.
+
+    7.5 h is *below* the 8 h paid day: the alert fires first for anyone who ran long, and the
+    close then ends the standard day - the two rules cooperating, which is the arrangement the
+    close tests are about.
 
     Applied through the same endpoint the console posts to, so the rules the scans read are
     the rules an operator would have stored.
@@ -1412,13 +1431,15 @@ def use_auto_close(client, *, notify_hours: float = 7.5) -> dict:
     response = client.post(
         "/api/v1/admin/shift_rules",
         headers=bearer(ADMIN),
-        json={"overtime_notify_hours": notify_hours},
+        json={"overtime_notify_hours": notify_hours, "auto_close_at_regular": 1},
     )
     assert response.status_code == 200, response.text[:300]
     rules = response.json()["rules"]
     assert rules["day_end"]["close_defers"] is False, (
-        "the helper means to configure the arrangement where the close acts"
+        "the helper means to configure the arrangement where the close acts: the close on and "
+        "the alert line below the paid day"
     )
+    assert rules["day_end"]["close_at_paid_hours"] == 8.0, rules["day_end"]
     return rules
 
 

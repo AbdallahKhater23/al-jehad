@@ -34,7 +34,9 @@ function frame(overrides) {
         luminance: 120,
         contrast: 30,
         faceDetection: true,
-        face: { count: 1, area: 0.4 }
+        // Inside the good window by default, so a scenario states only its point: a fixture
+        // default that is itself "too close" hides the rule being tested behind another one.
+        face: { count: 1, area: 0.05 }
     }, overrides || {});
 }
 
@@ -44,7 +46,12 @@ const ADVICE = {
     // A covered lens or a blank wall: nothing in the frame to match a face against.
     flat: frame({ luminance: 120, contrast: 3 }),
     no_face: frame({ face: { count: 0, area: 0 } }),
-    many_faces: frame({ face: { count: 2, area: 0.5 } }),
+    // Two people at a sensible distance: the count is the complaint, not the size.
+    many_faces: frame({ face: { count: 2, area: 0.05 } }),
+    // The deployment's own case, from its own numbers: a face filling the frame comes back
+    // from the detector as the *pieces* of one face - two boxes of 0.5 of a frame's area each
+    // - and the worker was told to get somebody else out of a frame that held only them.
+    too_close_split: frame({ face: { count: 2, area: 0.5 } }),
     // "Move closer" is for a genuinely marginal face only: below 1% of the frame is
     // past ~1.9 m on a 66° phone camera. 0.05 (≈0.7 m) and 0.03 (≈0.9 m) are IN the
     // good window now — the old 12% floor demanded an arm's-length selfie.
@@ -197,6 +204,7 @@ def test_the_advice_for_a_frame(results):
         "flat": "framingFlat",
         "no_face": "framingNoFace",
         "many_faces": "framingManyFaces",
+        "too_close_split": "framingFurther",
         "closer": "framingCloser",
         "further": "framingFurther",
         "good": "framingGood",
@@ -209,6 +217,24 @@ def test_the_advice_for_a_frame(results):
         "no_detector": None,
         "no_detector_dark": "framingDark",
     }, results["advice"]
+
+
+def test_being_too_close_outranks_the_count(results):
+    """The deployment's report, end to end: one face at the lens is not two people.
+
+    A worker got "there is multiple faces" while holding one face close to the phone, and the
+    server agreed with the phone: it logged ``2 subject-sized face(s) [585, 576]`` on a frame a
+    phone captures in portrait. Both were reading the pieces of one face. The advice that is true
+    in *both* readings is the distance, so it is decided before the count - and that ordering is
+    the thing this pins, not the words.
+    """
+    assert results["advice"]["too_close_split"] == "framingFurther", (
+        "a face that overfills the frame gets the distance advice whatever the count says"
+    )
+    assert results["advice"]["many_faces"] == "framingManyFaces", (
+        "two people at a distance must still be told about the second person"
+    )
+    assert results["advice"]["too_close"] == "framingFurther"
 
 
 def test_every_piece_of_advice_has_a_tone_and_is_translated(results):

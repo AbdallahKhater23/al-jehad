@@ -207,7 +207,13 @@ DEFAULT_SHIFT_RULES: dict[str, Any] = {
     # turns those numbers into money, and every path that closes a shift asks it.
     "break_minutes": 30.0,
     "break_after_hours": 4.0,
-    "auto_close_at_regular": 1,
+    # Off, to match ``migrations.DEFAULT_SHIFT_RULES`` and the column default a fresh database
+    # is born with. It read ``1`` while the shipped overtime pair (alert 8.1, paid day 8.0)
+    # made ``shift_hours.day_end_rules`` stand the close down - so this fallback and the stored
+    # row agreed that the close never acted, and disagreed about the switch saying so. The
+    # overtime workflow owns the end of the day until an operator moves the alert line below
+    # the paid day *and* turns this back on; see ``shift_hours`` for the rule.
+    "auto_close_at_regular": 0,
 }
 
 ACTION_CLOCK_IN = "Clock In"

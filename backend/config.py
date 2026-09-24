@@ -248,6 +248,32 @@ class Settings(BaseModel):
     facenet_model_path: Path = Path("backend/models/facenet128.onnx")
     facenet_model_sha256: str | None = None
 
+    # -- the FaceNet-512 shadow encoder (see ``shadow_rollout``) ------------
+    #  The migration instrument from docs/RUNBOOK_EMBEDDER_MIGRATION.md phase 3: a second
+    #  encoder fed the *same* crop, whose opinion is logged and can never change a punch.
+    #
+    #  Off by default, and it has to be, for two reasons. The graph is a ~90 MiB artifact
+    #  that does not ship (``backend/models/README.md``: large weights are fetched per host),
+    #  so a deployment that has not fetched it is the normal state rather than a misconfigured
+    #  one - and ``shadow_rollout`` reports the absence instead of failing anything. And the
+    #  second session costs real memory on a small container, which is a decision an operator
+    #  makes rather than one they inherit.
+    #
+    #  The path is a *drop-in*: put the graph there (or point FACENET_SHADOW_MODEL_PATH at it)
+    #  and the migration can start. Nothing else needs to change, because ``facenet_ort`` reads
+    #  the embedding width out of the graph rather than assuming it.
+    facenet_shadow_model_path: Path = Path("backend/models/facenet512.onnx")
+    facenet_shadow_model_sha256: str | None = None
+    #  The input contract the shadow graph is fed. Stated as configuration rather than assumed,
+    #  because ``shadow_rollout`` feeds one tensor to both encoders - and a graph fed a tensor
+    #  it did not ask for returns a plausible vector in the right range while recognising
+    #  nobody. It is refused when it differs from the incumbent's; see that module.
+    facenet_shadow_contract: str = "bgr:0_1"
+    #  The paired log (``shadow_scores``). Its own SQLite file, deliberately: it is migration
+    #  instrumentation with a defined end, and it must be droppable without touching a shift.
+    #  Empty means "beside the database", which is the volume in a deployment.
+    shadow_log_path: str | None = None
+
     # -- face verification capacity (see ``face_engine``) -------------------
     #  Every punch and every enrollment is an embedding plus a detection, which together are
     #  still the most expensive thing this app does. These bound how much of it can run at
@@ -593,6 +619,10 @@ class Settings(BaseModel):
             # Printed because it is a decision an operator made (or accepted), and the first
             # question asked of a slow gate is what this process is allowing itself to run.
             "facenet_model_path": str(self.facenet_model_path),
+            # The shadow encoder is reported for the same reason, and one more: whether this
+            # path exists is what decides whether a 128-to-512 migration has begun at all.
+            "facenet_shadow_model_path": str(self.facenet_shadow_model_path),
+            "facenet_shadow_contract": self.facenet_shadow_contract,
             # Printed because it is a decision an operator made (or accepted), and the first
             # question asked of a slow gate is what this process is allowing itself to run.
             "face_inference_concurrency": self.face_inference_concurrency,
@@ -721,6 +751,12 @@ def build_settings(*, env_file: Path | None = None) -> Settings:
             "FACENET_MODEL_PATH", PROJECT_ROOT / "backend/models/facenet128.onnx"
         ),
         facenet_model_sha256=_env_str("FACENET_MODEL_SHA256"),
+        facenet_shadow_model_path=_env_path(
+            "FACENET_SHADOW_MODEL_PATH", PROJECT_ROOT / "backend/models/facenet512.onnx"
+        ),
+        facenet_shadow_model_sha256=_env_str("FACENET_SHADOW_MODEL_SHA256"),
+        facenet_shadow_contract=_env_str("FACENET_SHADOW_CONTRACT") or "bgr:0_1",
+        shadow_log_path=_env_str("SHADOW_LOG_PATH"),
         liveness_input_size=_env_int("LIVENESS_INPUT_SIZE", 80),
         liveness_accept_threshold=_env_float("LIVENESS_ACCEPT_THRESHOLD", 0.70),
         liveness_reject_threshold=_env_float("LIVENESS_REJECT_THRESHOLD", 0.55),

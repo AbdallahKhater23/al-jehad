@@ -54,3 +54,9 @@ backend/venv/
 # Freebuff's own worktrees live here, and a git worktree inside a worktree is not a
 # thing to commit.
 .freebuff/
+# A scratch file holding a live administrator JWT, written by hand while probing the deployed
+# service. It is a session credential for the head admin: whoever holds it can act as them
+# until it expires, and unlike ``.env`` it is not regenerated - it is rescued by ``git add -A``
+# in a checkout where somebody pasted a token. One was committed in b317677 and is in history;
+# this line exists so the next one is not.
+backend/_live_token.txt
