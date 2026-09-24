@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import face_detector
 import harness
-from harness import MOALLEM, WORKER
+from harness import MOALLEM
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +126,7 @@ def test_the_summary_names_what_was_ignored():
         [_face(200, 240), _face(196, 236, 6, 6), _face(11, 13, 900, 40)]
     )
     text = report.summary()
-    assert "1 subject-sized face(s) [200]" in text
+    assert "1 subject-sized face(s) [200x240@0.90]" in text
     assert "1 duplicate box(es) merged" in text
     assert "1 speck(s) ignored [11]" in text
 
@@ -190,7 +190,9 @@ def test_a_punch_with_two_real_faces_is_still_refused(app_module, monkeypatch):
         "two subject-sized faces is two people, and the punch must not be scored"
     )
     assert result["faces"] == 2
-    assert "2 subject-sized face(s) [200, 180]" in result["face_count_detail"]
+    assert "2 subject-sized face(s) [200x240@0.90, 180x210@0.90]" in result["face_count_detail"], (
+        "the record carries the shape and the score, so a logged refusal can be read without the frame"
+    )
 
 
 def test_a_punch_whose_only_detections_are_specks_asks_for_a_face(app_module, monkeypatch):
@@ -305,4 +307,4 @@ def test_a_second_person_at_the_gate_is_still_refused_end_to_end(
 
     text = "\n".join(record.getMessage() for record in caplog.records)
     assert f"frame refused for worker {MOALLEM}" in text, text
-    assert "2 subject-sized face(s) [200, 180]" in text, text
+    assert "2 subject-sized face(s) [200x240@0.90, 180x210@0.90]" in text, text

@@ -507,6 +507,38 @@ Three properties the module enforces rather than documents:
 python -c "import shadow; print(shadow.dump_report(shadow.rollout_report(scorer, total_workers=N, rollout=cfg)))"
 ```
 
+### Beginning it, offline
+
+`backend/shadow_rollout.py` and `tools/shadow_migration.py` are the wiring for the above, and they
+run **outside the request path** - not by convention but by construction, so a shadow that fails, or
+that is simply slow, cannot touch a punch. Four commands:
+
+```bash
+python backend/tools/shadow_migration.py status          # can it start, and with which graphs?
+python backend/tools/shadow_migration.py backfill \
+    --shadow-approve 0.42 --evidence "measured 2026-09-24"
+python backend/tools/shadow_migration.py score --limit 500 \
+    --shadow-approve 0.42 --evidence "measured 2026-09-24"
+python backend/tools/shadow_migration.py report --shadow-approve 0.42
+```
+
+Three things about it are worth knowing before it is run.
+
+* **The graph is a drop-in.** Nothing ships a 512-D export, so `status` reporting `not fetched` is
+the normal state rather than a fault: put a FaceNet graph at `backend/models/facenet512.onnx`, or
+point `FACENET_SHADOW_MODEL_PATH` at one, and the backfill can run. `facenet_ort` reads the width
+out of the graph, so a 1792-D export is the same migration.
+* **The evidence from stored frames is weaker than live traffic, in one direction.** Those frames
+are overwhelmingly punches the incumbent already approved, so both encoders agree on most of them
+and `verdict_agreement` reads near 1.0 - which the gate already treats as suspicious. Coverage,
+volume, shadow health and permissiveness are all still meaningful; a claim that the shadow is *more
+accurate* is not, and the report says which source its probes came from.
+* **`--shadow-approve` has no default, deliberately.** A line measured in a 128-D space is not a
+line in a 512-D one - not even the same units - so the shadow needs its own measured line, and a
+tool that supplied a plausible default would be handing out an unmeasured access-control decision.
+The bands stay keyed by `(pipeline, model_id, contract_id)` as the contract runbook requires, and
+the tool refuses a cached gallery built by a different graph rather than scoring against it.
+
 Rollback is a configuration change, not a data migration: the enforced encoder and the band table
 are read from configuration, both bands stay installed, and `shadow_scores` is instrumentation that
 can be dropped without touching a shift. That table is also the audit of what the old band decided

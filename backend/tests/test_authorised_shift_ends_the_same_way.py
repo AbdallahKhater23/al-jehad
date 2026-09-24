@@ -119,13 +119,19 @@ def _rules() -> dict:
 
 
 def _set_rules(**overrides) -> dict:
-    """The shipped rules with the named ones replaced, written where ``overtime.rules`` reads.
+    """The shipped rules, *with the automatic close switched on*, and the named ones replaced.
+
+    The close has to be switched on explicitly because it now ships off (see
+    ``shift_hours.day_end_rules``): every case in this file's close section asks what the close
+    does when it acts, so the baseline here is the close acting. An override of
+    ``auto_close_at_regular`` still wins.
 
     Written as a row rather than through ``POST /admin/shift_rules`` because this file's
     subject is what the *watcher* does with a rule, not the route that stores one - and the
     route is pinned by its own suite.
     """
     values = dict(migrations.DEFAULT_SHIFT_RULES)
+    values["auto_close_at_regular"] = 1
     values.update(overrides)
     with db(write=True) as conn:
         cursor = conn.execute(
@@ -503,9 +509,10 @@ def test_the_auto_close_waits_while_the_shift_is_inside_the_window(app_module):
     unilaterally whether a shift may run past the paid day. An answer is a permission to run on,
     and the close waits inside it instead of ending the day at eight hours anyway.
 
-    The rules here are the ones that give the close the end of the day at all (``7.5`` is below
-    the 8 h paid day, so ``close_defers`` is false) - without that, the shipped pair has the
-    close standing down and this window would never be consulted.
+    The rules here are the ones that give the close the end of the day at all (the switch on,
+    and ``7.5`` below the 8 h paid day, so ``close_defers`` is false) - with the close off, or
+    with its alert line above the paid day, the close stands down and this window would never be
+    consulted.
     """
     _set_rules(overtime_notify_hours=7.5)
     clock_in = _plant_open_shift(hours_on_site=9.5)

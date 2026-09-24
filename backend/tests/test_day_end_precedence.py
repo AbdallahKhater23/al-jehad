@@ -18,21 +18,24 @@ Which rule acts is decided in one place, ``shift_hours.day_end_rules``:
 
 * alert **below** the paid day -> the crossing is reported while the shift is open, so the
   close still owns the end of the day;
-* alert **above** the paid day (the shipped pair) -> a shift closed at 8 h could never
-  reach 8.1 h, so the **close stands down**: the shift runs on, the crossing is reported,
-  and the hours past the paid day are clocked out into overtime review. Nothing is
-  auto-closed at 8 h;
+* alert **above** the paid day -> a shift closed at 8 h could never reach 8.1 h, so the
+  **close stands down** (``close_defers``): the shift runs on, the crossing is reported, and
+  the hours past the paid day are clocked out into overtime review. Nothing is auto-closed at
+  8 h. That is what the shipped alert line (8.1 h) asks of a close, so the close itself now
+  ships **off**: the same arrangement, stated honestly rather than as a switch that reads as
+  *on* while nothing is ever closed;
 * alert **on** the paid day -> nothing to observe ("crossed the limit and is still
   working" is false at that figure, and alerting on every full day is not a crossing), so
   the close acts and the scans report that the alert cannot fire;
-* close **off** -> a clock-out ends the day and the alert always fires.
+* close **off** (the shipped state) -> a clock-out ends the day and the alert always fires.
 
 So this suite pins four things:
 
 1. **the precedence**, as a table, including the equality case;
-2. **the behaviour**, through the two scans in the order the timer really calls them:
-   shipping defaults observe the crossing and do not close the day; putting the alert
-   below the paid day gets the close back;
+2. **the behaviour**, through the two scans in the order the timer really calls them: the
+   shipped defaults observe the crossing and leave the day to a clock-out; switching the close
+   on with its alert line above the paid day stands it down; putting the alert below the paid
+   day gets the close back;
 3. **the reporting** - the scan summary, ``GET/POST /admin/shift_rules`` and readiness, so
    an operator is told which rule wins instead of having to read two modules to find out;
 4. **the money**, for the deferral: the shift is clocked out by the worker, and the hours
@@ -59,12 +62,17 @@ import shift_hours
 
 TS = "%Y-%m-%d %H:%M:%S"
 
+#: The rules a fresh deployment is born with, key for key with ``main.DEFAULT_SHIFT_RULES``.
+#: The automatic close is **off**: with the alert line above the paid day the close would stand
+#: down anyway, so shipping it on was shipping a switch that reads as *on* while nothing is
+#: closed - and a new volume was born failing the ``overtime_close_deferred`` advisory.
+#: A case about a close that acts says so, by passing ``auto_close_at_regular=1``.
 SHIPPED = {
     "regular_hours": 8.0,
     "overtime_notify_hours": 8.1,
     "break_minutes": 30.0,
     "break_after_hours": 4.0,
-    "auto_close_at_regular": 1,
+    "auto_close_at_regular": 0,
 }
 
 
@@ -118,8 +126,9 @@ def _open_shift_count(worker_id: str = MOALLEM) -> int:
         # close still ends the standard day. The two rules cooperate.
         (7.5, True, True, False, 8.0, shift_hours.DAY_ENDED_BY_CLOSE),
         (0.5, True, True, False, 8.0, shift_hours.DAY_ENDED_BY_CLOSE),
-        # The shipped pair: the close would end the day before the alert could fire, so it
-        # stands down and the overtime workflow owns the end of the day.
+        # The close switched on with its alert line above the paid day: it would end the day
+        # before the alert could fire, so it stands down and the overtime workflow owns the
+        # end of the day.
         (8.1, True, True, True, None, shift_hours.DAY_ENDED_BY_OVERTIME),
         (8.03, True, True, True, None, shift_hours.DAY_ENDED_BY_OVERTIME),
         (12.0, True, True, True, None, shift_hours.DAY_ENDED_BY_OVERTIME),
@@ -145,11 +154,14 @@ def test_the_resolver_says_who_ends_the_day(notify, close_on, reachable, defers,
 
 def test_the_detail_names_both_numbers_and_the_way_out():
     """The sentence is the fix, not just the diagnosis: it names both settings to change."""
-    deferred = shift_hours.day_end_rules(_rules())["detail"]
+    # The deferral's sentence: the close on, its alert line above the paid day.
+    deferred = shift_hours.day_end_rules(_rules(auto_close_at_regular=1))["detail"]
     assert "8.1" in deferred and "8" in deferred, deferred
     assert "stand" in deferred.lower() and "below" in deferred.lower(), deferred
 
-    on_the_line = shift_hours.day_end_rules(_rules(overtime_notify_hours=8.0))["detail"]
+    on_the_line = shift_hours.day_end_rules(
+        _rules(overtime_notify_hours=8.0, auto_close_at_regular=1)
+    )["detail"]
     assert "8" in on_the_line, on_the_line
     assert "strictly" in on_the_line.lower(), on_the_line
 
@@ -158,29 +170,42 @@ def test_a_deferral_is_not_an_unreachable_alert():
     """They are different states and must not be reported as each other.
 
     Under the deferral the crossing *is* observed - that is the whole point of standing the
-    close down. Only the equality case leaves nothing to see.
+    close down. Only the equality case leaves nothing to see. The shipped pair adds a third: the
+    close is off, so it has not stood down to anything, and the alert is reachable because a
+    clock-out is what ends the day.
     """
-    shipped = shift_hours.day_end_rules(_rules())
-    assert shipped["close_defers"] is True
-    assert shipped["alert_reachable"] is True
+    deferring = shift_hours.day_end_rules(_rules(auto_close_at_regular=1))
+    assert deferring["close_defers"] is True
+    assert deferring["alert_reachable"] is True
 
-    on_the_line = shift_hours.day_end_rules(_rules(overtime_notify_hours=8.0))
+    on_the_line = shift_hours.day_end_rules(
+        _rules(overtime_notify_hours=8.0, auto_close_at_regular=1)
+    )
     assert on_the_line["close_defers"] is False
     assert on_the_line["alert_reachable"] is False
+
+    shipped = shift_hours.day_end_rules(_rules())
+    assert shipped["close_defers"] is False
+    assert shipped["alert_reachable"] is True
 
 
 # ---------------------------------------------------------------------------
 # 2. the behaviour, through the scans in the order the timer calls them
 # ---------------------------------------------------------------------------
-def test_the_shipped_settings_let_the_crossing_be_observed(client):
+def test_the_close_stands_down_when_its_alert_line_sits_above_the_paid_day(client):
     """The reconciliation, at the level of what actually happens to a shift.
 
     Nine paid hours is well past both lines. Before this change the close ended the day at
-    the 8 h boundary and the crossing was never reported; now the close stands down, the
-    alert fires while the worker is still on site, and the shift is still open afterwards -
-    the alert observes a shift, it does not end one.
+    the 8 h boundary and the crossing was never reported; with the close switched on and the
+    alert line above it, the close stands down, the alert fires while the worker is still on
+    site, and the shift is still open afterwards - the alert observes a shift, it does not end
+    one.
+
+    The close ships *off*, which is the shipped pair's own reconciliation (see
+    ``test_the_shipped_defaults_leave_the_day_to_a_clock_out`` below), so this is the case an
+    operator lands on by switching it back on without moving the alert line.
     """
-    _set_rules(client)  # the shipped pair, applied explicitly: 8.1 above 8.0
+    _set_rules(client, auto_close_at_regular=1)  # the close on: 8.1 above 8.0
     _plant_open_session(MOALLEM, 9.5)
 
     closed = overtime.scan_auto_close()
@@ -305,7 +330,7 @@ def test_the_close_owes_the_worker_no_crossing_notice(client):
 
 def test_an_alert_line_on_the_paid_day_cannot_be_observed(client):
     """The one genuinely unreachable case: the close acts, and the scan says why."""
-    _set_rules(client, overtime_notify_hours=8.0)
+    _set_rules(client, overtime_notify_hours=8.0, auto_close_at_regular=1)
     _plant_open_session(MOALLEM, 9.5)
 
     closed = overtime.scan_auto_close()
@@ -321,10 +346,22 @@ def test_an_alert_line_on_the_paid_day_cannot_be_observed(client):
     assert alerted["alert_reachable"] is False, "and the scan says so rather than looking quiet"
 
 
-def test_with_the_close_off_the_alert_is_the_only_thing_watching(client):
-    _set_rules(client, auto_close_at_regular=0)
-    _plant_open_session(MOALLEM, 9.5)
+def test_the_shipped_defaults_leave_the_day_to_a_clock_out(client):
+    """Out of the box, and the arrangement a fresh volume is born in.
 
+    The close ships *off*, which is the honest form of what the alert line already asked for:
+    with 8.1 above the paid day the close would stand down anyway, so the switch was shipped as
+    *on* while closing nothing. What ends a day here is the worker's clock-out - and the hours
+    past the alert line then wait for an administrator rather than being paid automatically.
+    """
+    stored = _set_rules(client)["day_end"]  # exactly the shipped rules
+    assert stored["auto_close"] is False, stored
+    assert stored["close_defers"] is False, stored
+    assert stored["close_at_paid_hours"] is None, stored
+    assert stored["day_ended_by"] == shift_hours.DAY_ENDED_BY_HUMAN, stored
+    assert stored["alert_reachable"] is True, stored
+
+    _plant_open_session(MOALLEM, 9.5)
     closed = overtime.scan_auto_close()
     assert closed["enabled"] is False, "the close is off"
     assert closed["closed"] == 0 and closed["deferred"] is False
@@ -335,6 +372,20 @@ def test_with_the_close_off_the_alert_is_the_only_thing_watching(client):
     assert _open_shift_count() == 1, (
         "the shift is still open - the alert observes it, it does not end it"
     )
+    item = next(row for row in overtime.open_crossings() if row["worker_id"] == MOALLEM)
+    assert item["close_defers"] is False, "and no close is coming for it either"
+
+    # A clock-out ends the day: the standard day is paid and the hours past the line wait for an
+    # administrator - the same end of the day the deferral produces, reached by a person instead
+    # of by a rule standing aside.
+    response = harness.clock_in(client, MOALLEM, action="Clock Out", headers=bearer(MOALLEM))
+    assert response.status_code == 200, response.text[:300]
+    assert response.json()["hours"] == pytest.approx(9.0, abs=0.05)
+    row = client.get(
+        f"/api/v1/admin/reports/shifts?worker_id={MOALLEM}", headers=bearer(ADMIN)
+    ).json()["rows"][0]
+    assert row["status_code"] == "pending_overtime", row
+    assert row["awaiting_approval"] is True, row
 
 
 def test_a_shift_that_survives_past_the_line_is_still_reported(client):
@@ -343,9 +394,9 @@ def test_a_shift_that_survives_past_the_line_is_still_reported(client):
     Reachability is about a shift that has yet to cross, so a session already past both
     lines is still reported rather than silently left alone.
     """
-    _set_rules(client, overtime_notify_hours=7.5)
+    _set_rules(client, overtime_notify_hours=7.5, auto_close_at_regular=1)
     _plant_open_session(MOALLEM, 9.0)
-    _set_rules(client, overtime_notify_hours=8.0)  # the line moved onto the paid day
+    _set_rules(client, overtime_notify_hours=8.0, auto_close_at_regular=1)  # the line on the paid day
     alerted = overtime.scan_overtime()
     assert alerted["notified"] == 1, alerted
     assert alerted["alert_reachable"] is False, "with these rules no new crossing could happen"
@@ -355,7 +406,7 @@ def test_a_shift_that_survives_past_the_line_is_still_reported(client):
 # 3. the reporting: the summary, the console and readiness
 # ---------------------------------------------------------------------------
 def test_the_scan_summary_carries_the_verdict(client):
-    _set_rules(client)
+    _set_rules(client, auto_close_at_regular=1)
     summary = overtime.scan_overtime()
     assert summary["alert_reachable"] is True
     day_end = summary["day_end"]
@@ -367,7 +418,7 @@ def test_the_scan_summary_carries_the_verdict(client):
 
 def test_the_console_can_see_which_rule_wins(client):
     """``day_end`` travels with the rules, so the panel can warn where they are typed."""
-    stored = _set_rules(client)["day_end"]
+    stored = _set_rules(client, auto_close_at_regular=1)["day_end"]
     assert stored["close_defers"] is True
     assert stored["regular_hours"] == 8.0
     assert stored["notify_hours"] == pytest.approx(8.1)
@@ -380,23 +431,46 @@ def test_the_console_can_see_which_rule_wins(client):
     assert float(read["overtime_notify_hours"]) == pytest.approx(8.1)
 
     # And it follows the settings, so an operator who fixes the pair sees it fixed.
-    fixed = _set_rules(client, overtime_notify_hours=7.5)["day_end"]
+    fixed = _set_rules(client, overtime_notify_hours=7.5, auto_close_at_regular=1)["day_end"]
     assert fixed["close_defers"] is False
     assert fixed["close_at_paid_hours"] == 8.0
     assert fixed["day_ended_by"] == shift_hours.DAY_ENDED_BY_CLOSE
 
 
 def test_readiness_reports_the_deferral_and_the_unreachable_alert(client):
-    """Two advisories, and never a repair: the settings are the operator's."""
+    """The advisories, and never a repair: the settings are the operator's.
+
+    Three states, in the order an operator meets them. The shipped pair first, because it is the
+    one a deployment boots on: both advisories have to pass on a fresh volume, and that is what
+    shipping the close off bought - the pair these checks were written about (the close on, its
+    own alert line above it) used to *be* the shipped pair, so every new deployment was born
+    reporting ``overtime_close_deferred``. Then the deferral, which is now a setting an operator
+    reaches by switching the close back on; then the alert line exactly on the paid day, where
+    there is nothing to observe at all.
+    """
     import readiness
 
     def check_for(name):
         checks, _ = readiness.run_checks()
         return next(check for check in checks if check.name == name)
 
-    # The shipped pair: the crossing is observable (the close stands down), but the switch
-    # that reads as "on" is no longer closing anything, which is worth saying out loud.
+    # The shipped pair: nothing contradicts anything, so nothing is reported. This is the state
+    # every fresh volume starts in, and it is green.
     _set_rules(client)
+    fresh = check_for("overtime_close_deferred")
+    assert fresh.tier == readiness.TIER_ADVISORY
+    assert fresh.ok is True, fresh.detail
+    # ``None`` with ``close_defers`` false is the close being *off* rather than standing down:
+    # the deferral carries its own flag, and the two are reported as each other by nothing.
+    assert fresh.value["close_defers"] is False, fresh.value
+    assert fresh.value["close_at_paid_hours"] is None, fresh.value
+    assert fresh.value["day_ended_by"] == shift_hours.DAY_ENDED_BY_HUMAN, fresh.value
+    assert check_for("overtime_alert_reachable").ok is True
+
+    # An operator who switches the close back on under the shipped alert line lands on the
+    # deferral: the crossing is observable (the close stands down), but the switch that reads as
+    # "on" is no longer closing anything, which is worth saying out loud.
+    _set_rules(client, auto_close_at_regular=1)
     assert check_for("overtime_alert_reachable").ok is True
     deferred = check_for("overtime_close_deferred")
     assert deferred.tier == readiness.TIER_ADVISORY
@@ -405,14 +479,14 @@ def test_readiness_reports_the_deferral_and_the_unreachable_alert(client):
     assert "stand" in deferred.detail.lower(), deferred.detail
 
     # Putting the line below the paid day brings the close back...
-    _set_rules(client, overtime_notify_hours=7.5)
+    _set_rules(client, overtime_notify_hours=7.5, auto_close_at_regular=1)
     assert check_for("overtime_close_deferred").ok is True
     assert check_for("overtime_close_deferred").value["close_at_paid_hours"] == 8.0
     assert check_for("overtime_alert_reachable").ok is True
 
     # ... and putting it exactly on the paid day leaves nothing to observe, whichever way
     # the operator meant it.
-    _set_rules(client, overtime_notify_hours=8.0)
+    _set_rules(client, overtime_notify_hours=8.0, auto_close_at_regular=1)
     assert check_for("overtime_alert_reachable").ok is False
     assert check_for("overtime_close_deferred").ok is True
 

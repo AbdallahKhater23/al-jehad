@@ -377,3 +377,93 @@ def test_the_recorded_pipeline_is_in_the_template_a_person_is_enrolled_with():
     assert payload["pipeline"] == face_detector.active_pipeline()
     assert payload["dimensions"] == len(payload["embedding"])
     assert payload["model"], "the recognition model is recorded beside the detector"
+
+
+# ---------------------------------------------------------------------------
+# 1b. the close-up regime: a face too large for the detector to answer about
+# ---------------------------------------------------------------------------
+# Measured on this repository's own corpus (35 single-face photographs, each driven to a chosen
+# face width in a 720x1280 portrait frame): at native resolution a face wider than half the frame
+# comes back as *pieces* of one face - 10 of 105 close-up frames reported two subject-sized boxes
+# while holding one person - and a worker four times closer than the band the pipeline was derived
+# for is refused for "more than one face". Reading every frame at a smaller width instead fixes the
+# close-ups but costs the far range (2 of 60 at 480 px, 15 of 60 at 320 px), which is the regime
+# commit 60bc460 exists to serve. So the second read is conditional, and these pin the condition.
+
+def _fake_passes(monkeypatch, *, native, reduced, seen=None):
+    """``_detect_rows`` replaced by a fake that answers per *input width*, and counts its calls."""
+    def fake(frame):
+        if seen is not None:
+            seen.append(frame.shape[1])
+        return reduced if frame.shape[1] <= face_detector.CLOSE_FRAME_RETRY_PX else native
+
+    monkeypatch.setattr(face_detector, "_detect_rows", fake)
+
+
+def test_the_retry_width_is_a_scale_this_detector_was_built_for():
+    """Not a round number somebody liked: tied to the input the anchors are laid out for."""
+    assert face_detector.CLOSE_FRAME_RETRY_PX > face_detector.DETECTOR_INPUT_SIZE
+    assert face_detector.CLOSE_FRAME_RETRY_PX <= 2 * face_detector.DETECTOR_INPUT_SIZE
+    assert 0 < face_detector.MAX_SUBJECT_FRAME_FRACTION < 1
+
+
+def test_a_normal_frame_is_read_once_and_handed_on_untouched(real_detector, monkeypatch):
+    seen = []
+    _fake_passes(monkeypatch, native=[_row(x=10, y=20, w=80, h=90)], reduced=[], seen=seen)
+
+    rows = face_detector.detect_raw(np.zeros((960, 1280, 3), dtype=np.uint8))
+
+    assert seen == [1280], "one pass: a frame whose faces are face-sized costs one model call"
+    assert len(rows) == 1
+    assert (float(rows[0][0]), float(rows[0][2])) == (10.0, 80.0), "the row is not rescaled"
+
+
+def test_a_face_too_close_to_be_one_face_is_read_again_smaller(real_detector, monkeypatch):
+    """The refusal the deployment actually produced: one person, two boxes of the same size."""
+    seen = []
+    native = [_row(x=110, y=150, w=482, h=621), _row(x=111, y=735, w=592, h=615)]
+    _fake_passes(monkeypatch, native=native, reduced=[_row(x=60, y=200, w=300, h=380)], seen=seen)
+
+    rows = face_detector.detect_raw(np.zeros((1280, 720, 3), dtype=np.uint8))
+
+    assert seen == [720, face_detector.CLOSE_FRAME_RETRY_PX], (
+        "a frame that reports a face too large to be one is read again at the retry width"
+    )
+    assert len(rows) == 1, "the second read's answer is the one that survives"
+
+
+def test_the_second_read_answers_in_the_frames_own_pixels(real_detector, monkeypatch):
+    """Box *and* landmarks: a crop taken from the reduced frame's coordinates is the wrong crop."""
+    _fake_passes(
+        monkeypatch,
+        native=[_row(x=100, y=100, w=600, h=700)],
+        reduced=[_row(x=60, y=200, w=300, h=380, landmarks=[(70, 210)] * 5)],
+    )
+
+    rows = face_detector.detect_raw(np.zeros((1280, 960, 3), dtype=np.uint8))
+
+    back = 960 / face_detector.CLOSE_FRAME_RETRY_PX
+    assert len(rows) == 1
+    assert float(rows[0][2]) == pytest.approx(300 * back, rel=1e-6), "the box is mapped back"
+    assert float(rows[0][4]) == pytest.approx(70 * back, rel=1e-6), "so is the first landmark"
+
+
+def test_a_second_read_that_finds_nothing_keeps_the_first_answer(real_detector, monkeypatch):
+    """Turning a close-up into "no face" would be a worse answer than a confused first pass."""
+    native = [_row(x=110, y=150, w=482, h=621)]
+    _fake_passes(monkeypatch, native=native, reduced=[])
+
+    rows = face_detector.detect_raw(np.zeros((1280, 720, 3), dtype=np.uint8))
+
+    assert len(rows) == 1 and float(rows[0][2]) == 482.0
+
+
+def test_a_frame_already_at_the_retry_width_is_not_resampled(real_detector, monkeypatch):
+    """A small frame is the far-range case by construction: nothing to resample, nothing to gain."""
+    seen = []
+    width = face_detector.CLOSE_FRAME_RETRY_PX
+    _fake_passes(monkeypatch, native=[_row(x=0, y=0, w=width - 10, h=width)], reduced=[], seen=seen)
+
+    face_detector.detect_raw(np.zeros((960, width, 3), dtype=np.uint8))
+
+    assert seen == [width], "a frame no wider than the retry width is read exactly once"

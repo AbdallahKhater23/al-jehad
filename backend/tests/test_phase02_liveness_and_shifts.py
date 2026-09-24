@@ -277,7 +277,12 @@ def test_default_shift_rules_are_the_documented_ones():
         # site; the break is charged only to a shift long enough to have contained one.
         "break_minutes": 30.0,
         "break_after_hours": 4.0,
-        "auto_close_at_regular": 1,
+        # Off. The shipped alert line (8.1) sits *above* the paid day (8), so a shipped close
+        # would stand down (``shift_hours.day_end_rules``) and the switch would read as "on"
+        # while nothing was ever closed - which is also what made a fresh volume fail the
+        # ``overtime_close_deferred`` advisory on its first boot. Switching it on is one
+        # setting, and it is the operator's to make.
+        "auto_close_at_regular": 0,
     }
     assert "hard_cutoff_hours" not in DEFAULT_SHIFT_RULES, (
         "the 11 h cap was removed: the only automatic close is the paid-day boundary, "
@@ -473,9 +478,10 @@ def test_a_forgotten_shift_ends_at_the_paid_limit_and_is_reported(app_module, cl
     alert names the time that was still on the clock when the watcher got there.
 
     The close only ends the day in the arrangement where the crossing is observable before
-    it does: the alert line is put *below* the paid day (see ``harness.use_auto_close``),
-    so the pair cooperates - the alert first, the close after. Under the shipped numbers
-    the close stands down instead, which is ``test_day_end_precedence.py``'s subject.
+    it does: the close is switched on *and* the alert line is put below the paid day (see
+    ``harness.use_auto_close``), so the pair cooperates - the alert first, the close after.
+    The shipped numbers have the close off, so nothing is auto-closed out of the box; that
+    is ``test_day_end_precedence.py``'s subject.
     """
     harness.use_auto_close(client)
     _plant_open_session(MOALLEM, 12.0)

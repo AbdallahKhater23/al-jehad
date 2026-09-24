@@ -2128,6 +2128,19 @@ const UI = {
     FRAMING_DUPLICATE_IOU: 0.45,
     FRAMING_DUPLICATE_CONTAINMENT: 0.6,
 
+    //: Where the face has stopped fitting the frame, as a share of the frame's area.
+    //:
+    //: Above this the *count* stops being evidence about people, which is why the advice below
+    //: asks for distance before it reads it. Measured on the server's own detector, which the
+    //: browser's detector imitates: paste one real face in at 81% of the frame's width and it
+    //: comes back as two boxes of 482x621 and 592x615 - the pieces of one face, overlapping ~14%,
+    //: too far apart for any duplicate rule to merge and too large to be two people standing a
+    //: step from the lens. A worker saw exactly that as "there is multiple faces" while holding
+    //: one face at the lens. "Move back" is the instruction that fits both readings, so it comes
+    //: first; the same threshold then also stops the old advice from asking a worker at 0.2 m to
+    //: move further only *after* it had accused them of standing next to somebody.
+    FRAMING_TOO_CLOSE_AREA: 0.35,
+
     //: Green when the frame is usable, amber when the worker should adjust something,
     //: red when this photo cannot work as it is.
     FRAMING_TONES: {
@@ -2181,6 +2194,13 @@ const UI = {
         if (metrics.contrast < 10) return 'framingFlat';
         if (!metrics.faceDetection || !metrics.face) return null;
         if (!metrics.face.count) return 'framingNoFace';
+        // Too close is read before the count, deliberately. At this size the detector is answering
+        // with the pieces of one face rather than the face (see FRAMING_TOO_CLOSE_AREA), so its
+        // count is not evidence about how many people are in the frame - and a worker holding the
+        // phone at the lens, alone, was told "only one person can be in the frame" and went looking
+        // for the second person. The distance advice is true either way, which is what lets it be
+        // decided first.
+        if (metrics.face.area > this.FRAMING_TOO_CLOSE_AREA) return 'framingFurther';
         if (metrics.face.count > 1) return 'framingManyFaces';
         //: The good window, in real distances. Face width is ~0.16 m; on a ~66° phone
         //: front camera the face's share of the frame is (0.16 / (2·d·tan 33°))², which
@@ -2192,7 +2212,6 @@ const UI = {
         //: 35% (~0.21 m, where the face no longer fits the alignment template's margins).
         //: The warn floor is 0.6% (~1.6 m): genuinely out of range, not merely far.
         if (metrics.face.area < 0.006) return 'framingCloser';
-        if (metrics.face.area > 0.35) return 'framingFurther';
         return 'framingGood';
     },
 

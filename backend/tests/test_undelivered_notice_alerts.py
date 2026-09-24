@@ -499,6 +499,34 @@ def test_a_backlog_waiting_for_a_device_is_reported_but_is_not_a_failure(push_re
     assert _alerts() == []
 
 
+def test_a_notice_a_retired_device_never_received_is_still_a_channel_failure(push_ready, app_module):
+    """The case that decides whether ``channel_failures`` may be read as "has a device now".
+
+    A push service answers 404/410 for a subscription that is gone, and ``deliver`` retires it -
+    so the *same* notice, read a moment later, has no live device to point at. If that moved it
+    into the adoption bucket, a channel that died would report itself as a workforce that never
+    enabled notifications: the failure would be invisible at exactly the moment it matters, and
+    the alert would go quiet while the phones stayed silent. The attempts on the row are what
+    keep it a failure, which is why the count is a union rather than a device check.
+    """
+    now = datetime.now()
+    _seed_device(WORKER, revoked_at=_stamp(now - timedelta(minutes=1)))
+    _seed_notice(WORKER, age_minutes=45, now=now, attempts=1)
+
+    reading = _reading(now)
+    assert reading["with_device"] == 0, "premise: the device was retired after the failure"
+    assert reading["no_device"] == 1
+    assert reading["channel_failures"] == 1, (
+        "an attempted notice whose device was retired is a channel failure, not an adoption gap"
+    )
+    assert reading["waiting_for_device"] == 0
+
+    check = readiness._check_worker_notice_backlog({})
+    assert check.ok is False, check.detail
+    assert push.alert_stranded_notices(now=now)["alerted"] is True
+    assert len(_alerts()) == 1
+
+
 def test_the_public_probe_carries_it_so_a_quiet_channel_is_visible_from_outside(
     push_ready, client, app_module
 ):
