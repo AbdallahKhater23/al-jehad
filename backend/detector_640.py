@@ -668,6 +668,33 @@ class ScrfdDetector:
         return merge_detections(found, iou_threshold=self.nms_threshold)
 
 
+#: The backends that feed a square canvas whatever the caller asked for.
+#:
+#: A fact about each backend, not a preference: SCRFD's head grids are ``(input/stride)**2`` (and
+#: the 10G export's are declared statically), so a square canvas is the only geometry whose cells
+#: can be decoded at all - ``ScrfdDetector.detect`` pads to it without consulting the flag.
+ALWAYS_SQUARE: Final = frozenset({"scrfd"})
+
+
+def canvas_is_square(kind: str, square: bool = False) -> bool:
+    """Whether a detector of this kind feeds a square canvas - the *geometry*, not the request.
+
+    They differ for exactly one backend. The flag is honoured by YuNet (``Letterbox.fit(...,
+    square=square)``) and ignored by SCRFD, so a specification that records the request rather
+    than the fact gives the *same* detector two identities: a corpus ingested with ``--square`` and
+    one ingested without would look like two configurations to every comparison that keys on the
+    fingerprint - the A/B tool's "the configuration changed, refusing to reinterpret these crops"
+    firing on two runs of one geometry, and a stored crop refusing to be reused. Recording the
+    fact keeps one detector to one fingerprint.
+
+    An unknown kind raises instead of defaulting to the request: a backend added later has to
+    state its answer here, rather than inheriting a plausible-looking one nobody checked.
+    """
+    if kind not in ("yunet", "scrfd"):
+        raise DetectorError(f"unknown detector kind {kind!r}; expected 'yunet' or 'scrfd'")
+    return True if kind in ALWAYS_SQUARE else bool(square)
+
+
 def build_detector(
     kind: str,
     model_path: str | Path,
@@ -686,13 +713,16 @@ def build_detector(
 
     ``square`` is named here rather than left in ``**kwargs`` because the two backends do not
     agree on it: YuNet takes it (a fixed-shape TensorRT engine needs a square input), and SCRFD
-    does not have the mode at all - it fits its input to the frame's aspect. Left in ``**kwargs``
-    it was forwarded to whichever backend was being built, so *every* SCRFD construction through
-    this factory died with ``ScrfdDetector.__init__() got an unexpected keyword argument
-    'square'`` - which is how the coverage sweep's fourth configuration found it. Requesting a
-    square input for SCRFD is now refused by name instead of ignored: an operator asking for a
-    fixed-shape engine profile and silently getting an aspect-fitted input has a model whose
-    geometry is not the one they designed for.
+    has no such mode - it pads to a square canvas *always*, because its published exports declare
+    their head grids as ``(input/stride)**2``. Left in ``**kwargs`` it was forwarded to whichever
+    backend was being built, so *every* SCRFD construction through this factory died with
+    ``ScrfdDetector.__init__() got an unexpected keyword argument 'square'`` - which is how the
+    coverage sweep's fourth configuration found it.
+
+    For SCRFD the flag is therefore ignored rather than refused: the backend already feeds the
+    square input the request asks for, so a refusal would reject a caller for requesting what it
+    is being given. What it must not do is *mean* something in the record that it does not mean in
+    the geometry, which is what ``canvas_is_square`` is for.
     """
     if kind == "yunet":
         detector: Any = YuNetDetector(model_path, input_size=input_size, square=square, **kwargs)

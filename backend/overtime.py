@@ -655,10 +655,15 @@ def open_crossings(*, now: datetime | None = None) -> list[dict]:
                         "regular_hours": assessment["regular_hours"],
                         "overtime_hours": round(float(assessment["overtime_hours"]), 4),
                         "basis": assessment["basis"],
-                        # Whether anything but a human will end this shift. With the close
-                        # standing down, the answer is no - and an open shift refuses the next
+                        # Whether anything but a human will end this shift. Two ways the answer
+                        # is no, and they read the same on the wire: the close standing down
+                        # under an alert line above the paid day, and the close being switched
+                        # off - which is what a fresh deployment ships (a shipped-on close there
+                        # would stand down anyway, and a switch that closes nothing is the
+                        # contradiction the default was changed for). Either way the shift is
+                        # left to a clock-out, and an open shift refuses the worker's next
                         # clock-in, so the operator is told rather than left to discover it.
-                        "close_defers": bool(day_end["close_defers"]),
+                        "close_defers": bool(day_end["close_defers"] or not day_end["auto_close"]),
                         "decision": _decision_payload(decision, conn),
                         # Whether this row is a question right now. A crossing with a decision that
                         # still covers the shift is information rather than a decision, and the two

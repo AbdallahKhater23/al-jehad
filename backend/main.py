@@ -1330,14 +1330,21 @@ async def get_worker_stats(worker_id: str, current: CurrentUser = Depends(admin_
     # The clock panel ticks up from the clock-in time and has to know when the *paid*
     # day ends: with a 30-minute unpaid break, that is 8.5 h on site, not 8. The two
     # numbers travel together so the panel never has to guess the policy.
+    #
+    # The on-site figure is that paid day *expressed in on-site hours*, so the break is in it
+    # whenever the rules say a break is charged - it is not the moment the automatic close
+    # acts. It used to drop the break whenever ``auto_close_at_regular`` was off, which made
+    # the payload contradict itself: ``break_minutes`` said half an hour while
+    # ``on_site_day_hours`` said 8.0 for an 8 h paid day, i.e. that a worker could be on site
+    # for 8 h and be paid 8 - where the unpaid break pays 7.5. Whether anything ends the day
+    # at that boundary is the switch beside it, and the close now shipping *off* is exactly
+    # the case that made the two numbers disagree on a fresh deployment.
     break_for_panel = {
         "break_minutes": float(rules["break_minutes"]),
         "break_after_hours": float(rules["break_after_hours"]),
         "paid_day_hours": shift_hours.regular_hours(rules),
         "on_site_day_hours": round(
-            shift_hours.regular_hours(rules)
-            + (shift_hours.break_hours(rules) if shift_hours.auto_close_enabled(rules) else 0.0),
-            4,
+            shift_hours.regular_hours(rules) + shift_hours.break_hours(rules), 4
         ),
         "auto_close_at_regular": 1 if shift_hours.auto_close_enabled(rules) else 0,
     }

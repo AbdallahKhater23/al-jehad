@@ -14,7 +14,7 @@ separate on purpose:
   "the system says so";
 * ``auto_close_at_regular`` decides whether the system closes the shift when the paid
   hours reach ``regular_hours``, or leaves it open for a human (see
-  ``overtime.scan_auto_close``);
+  ``overtime.scan_auto_close``). It ships **off**, and ``day_end_rules`` below is why;
 * ``overtime_notify_hours`` is the overtime **line**, and it counts the same paid hours
   ``regular_hours`` does (see ``OVERTIME_BASIS``) - not time on site, which is the same
   number plus the break. It is resolved once, in seconds, by :func:`overtime_rule` /
@@ -64,9 +64,13 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any
 
-#: Shipped defaults, mirrored in ``migrations.DEFAULT_SHIFT_RULES``. An operator can
-#: change all three from the console; these are what a database that has never been
-#: configured runs with.
+#: Fallbacks for a caller that hands this module a mapping without the key - **not** the shipped
+#: policy. The shipped rules live in ``migrations.DEFAULT_SHIFT_RULES``, mirrored in ``main`` and
+#: seeded from the console onwards; an operator can change all of their keys, and a database that
+#: has never been configured runs on them. The automatic close is *off* there, so none of these
+#: three numbers is the shipped answer for it: ``DEFAULT_AUTO_CLOSE`` is ``True`` because a
+#: mapping that does not carry the key at all is an unreadable one, and ``auto_close_enabled``
+#: must not quietly turn a policy off on the strength of that.
 DEFAULT_BREAK_MINUTES = 30.0
 DEFAULT_BREAK_AFTER_HOURS = 4.0
 DEFAULT_AUTO_CLOSE = True
@@ -138,10 +142,11 @@ def day_end_rules(values: dict | None) -> dict[str, Any]:
     ``overtime_notify_hours`` (8.1). They run in one pass, and the close deletes the session
     it closed - so a shift the close has ended can no longer be observed crossing the alert
     line. Whichever rule is allowed to act first therefore decides whether the crossing is
-    ever reported at all, and with the shipped numbers (8.1 > 8.0) the close acting first
+    ever reported at all, and with the shipped thresholds (8.1 > 8.0) the close acting first
     made the alert **unreachable**: the day ended 0.1 h before the alert was due, and the
     watcher was indistinguishable from one with nothing to report. This function is that
-    decision, stated once, for both scans to read.
+    decision, stated once, for both scans to read - and the close is *shipped off* (8.1/8.0) so
+    that a new deployment is not born with a switch that reads as on while standing down.
 
     The precedence, and why each case is what it is:
 
@@ -153,18 +158,19 @@ def day_end_rules(values: dict | None) -> dict[str, Any]:
       ended at 8 h could never reach 8.1 h, so the crossing would never be observed. The
       close therefore **stands down** (``close_defers``): the shift runs on, the alert fires
       at the threshold while the worker is still working, and the hours past ``regular_hours``
-      are clocked out into overtime review rather than being truncated at the boundary. This
-      is what the shipped 8.1/8.0 pair asks for, and it is why nothing is auto-closed at 8 h
-      under those numbers - the overtime workflow owns the end of the day.
+      are clocked out into overtime review rather than being truncated at the boundary. An
+      operator who switches the close on under the shipped 8.1/8.0 thresholds lands here, and
+      it is why nothing is auto-closed at 8 h on those numbers - the overtime workflow owns the
+      end of the day.
     * **the alert is on the paid day** (``notify == regular``) - there is nothing to observe:
       the alert says a shift has crossed the paid limit and is *still working*, and at that
       figure the day is ending, so it would page the manager for every ordinary full day.
       The close acts at the boundary and the alert cannot fire, which every scan reports.
       Set the line strictly below 8 h to be warned before the day ends, or strictly above it
       to let the day run into overtime.
-    * ``auto_close_at_regular`` off - **a human ends the day** (or nobody does, which is the
-      documented cost of switching the close off). The alert is the only thing watching, and
-      it always fires.
+    * ``auto_close_at_regular`` off - **the shipped state**: a human ends the day (or nobody
+      does, which is the documented cost of switching the close off). The alert is the only
+      thing watching, and it always fires.
 
     ``close_defers`` is the field a caller should branch on when it means "will this shift be
     closed by the system?", and ``day_ended_by`` names the owner of the day in one word.

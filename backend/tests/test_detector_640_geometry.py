@@ -235,3 +235,144 @@ def test_the_square_flag_is_accepted_for_the_backend_that_is_always_square(tmp_p
         message = str(excinfo.value)
         assert "SCRFD model not found" in message, (square, message)
         assert "unexpected keyword argument" not in message, (square, message)
+
+
+# ---------------------------------------------------------------------------
+# the audit: every keyword every call site sends, to every backend it can reach
+# ---------------------------------------------------------------------------
+# The factory takes ``**kwargs``, so a call site can hand a backend a keyword that backend does not
+# have - and the failure mode is a bare ``TypeError`` from argument binding, which says nothing
+# about who sent it. That is how ``square`` was found: it lived in ``**kwargs`` and was therefore
+# forwarded to whichever backend was being built, so *every* SCRFD construction through the factory
+# died, and the coverage sweep's fourth configuration was the only place that ever noticed.
+#
+# The keyword set below is not invented: it is the union of what the production call sites actually
+# pass, read from ``corpus_ingest.DetectorSpec.build``, ``tools/corpus_admin`` (which builds a spec),
+# ``tools/contract_ab`` and ``corpus.widened_reach_detector``. Each backend is then built for real
+# with that whole set - YuNet against the model that ships with the checkout, SCRFD against a stub
+# session - so this pins construction rather than argument binding alone.
+CALL_SITE_KEYWORDS = {"input_size": 640, "tiles": 2, "overlap": 0.2, "square": True, "score_threshold": 0.6}
+
+
+class _FakeOutput:
+    def __init__(self, name: str, shape: list) -> None:
+        self.name = name
+        self.shape = shape
+
+
+#: The head families and their widths, in the order the outputs are declared.
+_HEADS = tuple((kind, width) for kind, width in (("score", 1), ("bbox", 4), ("kps", 10)) for _ in (8, 16, 32))
+
+
+class _FakeSession:
+    """A named-convention SCRFD session: enough for the constructor *and* for one inference.
+
+    ``run`` answers zero-filled heads sized from the canvas it is handed, so the factory's product
+    can be called end to end - decoding, thresholds, an empty result - without an ONNX runtime in
+    the test. That matters for this audit: argument binding was never the whole claim, since the
+    defect being guarded against let a detector be *constructed* and never run.
+    """
+
+    def __init__(self) -> None:
+        self.ran: int = 0
+
+    def get_inputs(self) -> list:
+        return [_FakeOutput("input.1", [1, 3, "?", "?"])]
+
+    def get_outputs(self) -> list:
+        return [
+            _FakeOutput(f"{kind}_{stride}", ["?", width])
+            for kind, width in (("score", 1), ("bbox", 4), ("kps", 10))
+            for stride in (8, 16, 32)
+        ]
+
+    def run(self, _outputs, feeds) -> list:
+        self.ran += 1
+        canvas = np.asarray(next(iter(feeds.values()))).shape[2:]
+        heads = []
+        for kind, width in ((kind, width) for kind, width in (("score", 1), ("bbox", 4), ("kps", 10)) for _ in (8, 16, 32)):
+            stride = (8, 16, 32)[len(heads) % 3]
+            cells = (canvas[0] // stride) * (canvas[1] // stride)
+            heads.append(np.zeros((1, cells * width), dtype=np.float32))
+        return heads
+
+
+@pytest.mark.parametrize("square", [False, True])
+def test_scrfd_is_built_with_the_whole_keyword_set_the_call_sites_send(tmp_path, square):
+    """Both spellings reach the backend and construct: the defect was here and nowhere else."""
+    model = tmp_path / "scrfd.onnx"
+    model.write_bytes(b"stubbed: the session is handed in, nothing loads it")
+    session = _FakeSession()
+    options = dict(CALL_SITE_KEYWORDS, square=square, session=session)
+
+    built = detector_640.build_detector("scrfd", str(model), **options)
+
+    detector = built.detector
+    assert isinstance(detector, detector_640.ScrfdDetector)
+    assert detector.input_size == 640
+    assert detector.score_threshold == 0.6
+    assert detector.nms_threshold == 0.4, "the base set is not silently overridden"
+    # Constructed *and* run: the tiling policy the factory binds is part of the same surface, and a
+    # zero-scoring head set is enough to prove the whole path executes and decodes to nothing.
+    assert built(np.zeros((720, 1280, 3), dtype=np.uint8)) == []
+    assert session.ran >= 1, "the factory's product never reached the session"
+
+
+def test_yunet_is_built_with_the_whole_keyword_set_the_call_sites_send():
+    """The other half: the same set must not have grown a keyword only SCRFD has."""
+    model = Path(__file__).resolve().parent.parent / "models" / "face_detection_yunet_2023mar.onnx"
+    assert model.exists(), "the YuNet model ships with the checkout"
+
+    built = detector_640.build_detector("yunet", str(model), **CALL_SITE_KEYWORDS)
+
+    assert isinstance(built.detector, detector_640.YuNetDetector)
+    assert built.detector.input_size == 640
+    assert built.detector.square is True, "the flag is honoured by the backend that has the mode"
+    assert built.detector.nms_threshold == 0.3
+
+
+def test_a_keyword_no_backend_accepts_is_refused_by_the_factory_and_not_by_python():
+    """``**kwargs`` is a shovel: the audit is that nothing in the application loads it."""
+    import inspect
+
+    options = set()
+    for module, name in (
+        ("corpus_ingest", "DetectorSpec"),
+        ("detector_640", "build_detector"),
+    ):
+        import importlib
+
+        source = importlib.import_module(module)
+        target = getattr(source, name)
+        options |= set(getattr(target, "__dataclass_fields__", {}) or {})
+        if name == "build_detector":
+            options |= set(inspect.signature(target).parameters)
+    assert {"square", "tiles", "overlap", "input_size", "score_threshold"} <= options, sorted(options)
+
+
+def test_the_square_a_spec_records_is_the_canvas_the_backend_feeds(tmp_path):
+    """One detector, one fingerprint: the flag is a request, the fingerprint is a geometry.
+
+    SCRFD pads to a square canvas whatever it is asked for, so ``--square`` and its absence are the
+    *same* configuration. Recording the request instead of the fact gave that one detector two
+    identities, which is the kind of difference the A/B tool refuses a corpus over.
+    """
+    assert detector_640.canvas_is_square("yunet", False) is False
+    assert detector_640.canvas_is_square("yunet", True) is True
+    assert detector_640.canvas_is_square("scrfd", False) is True, (
+        "SCRFD pads to a square canvas without consulting the flag"
+    )
+    assert detector_640.canvas_is_square("scrfd", True) is True
+    with pytest.raises(DetectorError):
+        detector_640.canvas_is_square("retinaface", False)
+
+    import corpus_ingest
+
+    model = tmp_path / "scrfd.onnx"
+    model.write_bytes(b"stub")
+    asked = corpus_ingest.DetectorSpec(kind="scrfd", model_path=model, input_size=640, square=True)
+    unasked = corpus_ingest.DetectorSpec(kind="scrfd", model_path=model, input_size=640, square=False)
+    assert asked.fingerprint() == unasked.fingerprint(), (
+        "the same detector must not fingerprint as two configurations"
+    )
+    assert asked.fingerprint()["square"] is True

@@ -213,7 +213,13 @@ def test_the_console_refuses_shift_rules_that_would_pay_nobody(client):
 
 
 def test_the_worker_panel_is_told_where_the_paid_day_ends(client):
-    """The clock panel ticks up from the clock-in time, so it needs the 8.5, not the 8."""
+    """The clock panel ticks up from the clock-in time, so it needs the 8.5, not the 8.
+
+    The on-site figure is the paid day with the unpaid break in it, and it is that whether or not
+    anything ends the shift at that boundary - the switch travels beside it for exactly that
+    reason. It used to lose the break whenever the close was off, which said "8 h on site is a
+    paid day" while ``break_minutes`` in the same payload said half an hour.
+    """
     stats = client.get("/api/v1/worker/me/stats", headers=bearer(MOALLEM))
     assert stats.status_code == 200, stats.text[:200]
     body = stats.json()
@@ -221,15 +227,26 @@ def test_the_worker_panel_is_told_where_the_paid_day_ends(client):
     assert body["break_after_hours"] == 4
     assert body["paid_day_hours"] == 8.0
     assert body["on_site_day_hours"] == pytest.approx(8.5, abs=0.001)
-    assert body["auto_close_at_regular"] == 1
+    # The switch as the panel would draw it, and it is what a deployment ships: off, because a
+    # close switched on under the 8.1 alert line would stand down and close nothing.
+    assert body["auto_close_at_regular"] == 0
+
+    # Moving the switch does not move the day: the two figures are policy, the flag is whether
+    # the policy acts by itself.
+    harness.use_auto_close(client)
+    switched = client.get("/api/v1/worker/me/stats", headers=bearer(MOALLEM)).json()
+    assert switched["auto_close_at_regular"] == 1
+    assert switched["paid_day_hours"] == 8.0
+    assert switched["on_site_day_hours"] == pytest.approx(8.5, abs=0.001)
 
 
 # ---------------------------------------------------------------------------
 # the automatic close
 # ---------------------------------------------------------------------------
 def test_a_forgotten_shift_is_closed_at_the_boundary(client):
-    # The arrangement this test is about: the close ends the day. Under the shipped pair the
-    # close stands down so the crossing can be reported (see ``use_auto_close``).
+    # The arrangement this test is about: the close ends the day. Under the shipped rules it
+    # is off altogether, and the 8.1-over-8 alert line would stand it down even if it were on
+    # (see ``use_auto_close``).
     harness.use_auto_close(client)
     clock_in_time = plant_open_session(MOALLEM, 12.0)
 
@@ -325,13 +342,17 @@ def test_closing_twice_is_impossible(client):
     ) == 1, "and the worker is told once, not once per tick"
 
 
-def test_an_operator_can_turn_the_close_off(client):
-    """The alert is then the only thing watching a forgotten shift - which is what it is for."""
-    updated = client.post(
-        "/api/v1/admin/shift_rules", headers=bearer(ADMIN), json={"auto_close_at_regular": 0}
-    )
-    assert updated.status_code == 200, updated.text[:200]
-    assert updated.json()["rules"]["auto_close_at_regular"] == 0
+def test_the_close_ships_off_and_an_operator_can_switch_it_back_on(client):
+    """Out of the box nothing ends a forgotten shift, and the alert is the only thing watching.
+
+    It ships off because the alert line ships *above* the paid day: a close switched on there
+    stands down (``shift_hours.day_end_rules``) and the switch reads as "on" while closing
+    nothing - the contradiction the default was changed for. The cost is the one the docs name:
+    a shift nobody remembers to clock out stays open until somebody does. The second half is the
+    price of getting the close back - one setting, plus an alert line it can act under.
+    """
+    fresh = client.get("/api/v1/admin/shift_rules", headers=bearer(ADMIN)).json()
+    assert fresh["auto_close_at_regular"] == 0, "a fresh deployment does not ship a standing close"
 
     plant_open_session(MOALLEM, 12.0)
     summary = overtime.scan_auto_close()
@@ -340,6 +361,22 @@ def test_an_operator_can_turn_the_close_off(client):
 
     alert = overtime.scan_overtime()
     assert alert["notified"] == 1, "with the close off, the administrator still has to be told"
+
+    # ... and an operator who wants the automatic end of the day back gets it, by moving the
+    # alert line below the paid day and switching the close on - the same pair
+    # ``harness.use_auto_close`` arranges.
+    updated = client.post(
+        "/api/v1/admin/shift_rules",
+        headers=bearer(ADMIN),
+        json={"auto_close_at_regular": 1, "overtime_notify_hours": 7.5},
+    )
+    assert updated.status_code == 200, updated.text[:200]
+    assert updated.json()["rules"]["auto_close_at_regular"] == 1
+
+    closed = overtime.scan_auto_close()
+    assert closed["enabled"] is True, closed
+    assert closed["closed"] == 1, closed
+    assert db_scalar("SELECT COUNT(*) FROM active_sessions WHERE worker_id = ?", (MOALLEM,)) == 0
 
 
 def test_the_worker_who_comes_back_is_told_what_happened(client):
