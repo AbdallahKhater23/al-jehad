@@ -191,6 +191,52 @@ def test_schema_guard_reports_no_blocking_drift_on_the_migrated_database():
     assert report.expected_schema_version == migrations.SCHEMA_VERSION
 
 
+def test_a_fresh_database_is_born_with_the_close_off_and_green_on_the_advisory(tmp_path):
+    """What a *new* volume starts as: the schema's own default, and readiness on that volume.
+
+    ``DEFAULT_SHIFT_RULES`` is only half of the answer, and not the half a fresh database reads.
+    The single ``shift_rules`` row is created by migration 1, which writes nothing but ``id`` and
+    ``updated_at``; ``auto_close_at_regular`` arrives in migration 9, and ``add_column`` fills the
+    row it finds with *that* DDL default. Runtime overlays the stored row on the dict, so a
+    disagreement between the two halves is invisible until somebody audits a new deployment - and
+    that is how a fresh volume came to boot with the close **on** under an alert line (8.1) above
+    the paid day (8.0): the close stood down (``shift_hours.day_end_rules``), nothing was ever
+    auto-closed, the console showed the switch as on, and ``overtime_close_deferred`` was red from
+    the first start. Both halves, and the verdict a new volume gets, are pinned here.
+    """
+    path = tmp_path / "fresh.db"
+    conn = sqlite3.connect(str(path), isolation_level=None)
+    try:
+        migrations.initialize(conn)
+        columns = {row[1]: row for row in conn.execute("PRAGMA table_info(shift_rules)")}
+        assert "auto_close_at_regular" in columns, "the close's own column never reached the table"
+        column_default = columns["auto_close_at_regular"][4]
+        shipped = migrations.DEFAULT_SHIFT_RULES["auto_close_at_regular"]
+        assert str(column_default) == str(int(shipped)), (
+            f"the column default is {column_default!r} while the dict says {shipped!r}: an existing "
+            "database reads the dict and a fresh one reads this, so the two are one value"
+        )
+        stored = conn.execute(
+            "SELECT auto_close_at_regular FROM shift_rules WHERE id = 1"
+        ).fetchone()
+        assert stored is not None, "a migrated database has no shift_rules row"
+        assert stored[0] == 0, f"a fresh volume is born with the close on: {stored[0]!r}"
+    finally:
+        conn.close()
+
+    import readiness
+
+    deferred = readiness._check_overtime_close_deferred({"db_path": path})
+    assert deferred.tier == readiness.TIER_ADVISORY
+    assert deferred.ok is True, f"a fresh volume reports the deferral: {deferred.detail}"
+    assert deferred.value["close_defers"] is False, deferred.value
+    assert deferred.value["close_at_paid_hours"] is None, deferred.value
+    reachable = readiness._check_overtime_alert(
+        {"db_path": path}
+    )  # the other half of the same pair
+    assert reachable.ok is True, reachable.detail
+
+
 def test_a_column_the_code_writes_is_never_declared_inside_an_older_migration():
     """The specific defect that broke every clock-out, stated as a rule.
 

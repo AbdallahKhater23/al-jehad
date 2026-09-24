@@ -382,7 +382,16 @@ def detector_fingerprint(
 
     The digest is of the model *file*, so swapping two YuNet exports - same name, same input size,
     different weights - is a mismatch rather than a silent reinterpretation of every stored crop.
+
+    ``square`` is the geometry the backend *feeds*, not the flag the caller passed: SCRFD pads to a
+    square canvas whatever it is asked for, so recording ``False`` for a SCRFD run would describe a
+    crop nobody produced and split one detector across two identities (see
+    ``detector_640.canvas_is_square``). Everything the fingerprint is compared against - the A/B
+    tool's sidecar check, the migration band derivation, ``DetectorSpec.fingerprint`` - goes through
+    here, which is why the normalisation lives here rather than at each call site.
     """
+    import detector_640  # local: this module is imported by the corpus CLI's --help path
+
     digest = model_fingerprint
     if digest is None and model_path is not None:
         digest = _file_digest(Path(model_path))
@@ -392,7 +401,7 @@ def detector_fingerprint(
         "model": Path(model_path).name if model_path else None,
         "model_fingerprint": digest or None,
         "input_size": int(input_size),
-        "square": bool(square),
+        "square": detector_640.canvas_is_square(str(kind), bool(square)),
         "tiles": int(tiles),
         "overlap": round(float(overlap), 4),
     }

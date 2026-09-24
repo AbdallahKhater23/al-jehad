@@ -486,7 +486,7 @@ Key settings (all optional except `SECRET_KEY`, full list in `backend/config.py`
 | `LIVENESS_MODE` | `advisory` | `off` / `advisory` (record + notify, never block) / `enforce` (refuse a spoofed frame before face matching) |
 | `LIVENESS_MODEL_PATH` | `backend/models/minifasnet.onnx` | MiniFASNet ONNX file; see `backend/models/README.md` |
 | `ENROLLMENT_LIVENESS_MODE` | `inherit` | liveness policy used when a *new reference template* is enrolled |
-| `OVERTIME_WATCHER_ENABLED` | `1` | the background timer that ends a shift at the paid day and alerts past it - which of the two acts, and whether the close stands down, is decided by the thresholds below; read *Which rule ends the day* before retuning either one; `0` stops both rules |
+| `OVERTIME_WATCHER_ENABLED` | `1` | the background timer that ends a shift at the paid day and alerts past it - which of the two acts, whether the close acts at all, and whether it stands down, is decided by the switch and the thresholds below; read *Which rule ends the day* before retuning either; `0` stops both rules |
 | `OFFLINE_PUNCH_MAX_AGE_HOURS` | `72` | how far back an offline punch may be anchored |
 | `NOTES_MAX_OPEN_PER_WORKER` | `20` | how many notes by one worker may be waiting for an answer at once |
 | `UPLOAD_MAX_PHOTO_BYTES` | `5242880` (5 MB) | ceiling for **every** photo upload in the app |
@@ -732,7 +732,7 @@ One timer, two rules, and only one of them can end a day. `overtime.py` runs bot
 
 | Rule | Acts at | What it does |
 | --- | --- | --- |
-| **Automatic close** (`auto_close_at_regular`) | `regular_hours` **paid** - 8 by default | Writes the clock-out itself *at the boundary*, marks the shift `Auto-Closed (8h Limit)` / `auto_closed_8h`, and notifies the administrator **and the worker whose day it ended**. |
+| **Automatic close** (`auto_close_at_regular`) | `regular_hours` **paid** - 8 by default | Writes the clock-out itself *at the boundary*, marks the shift `Auto-Closed (8h Limit)` / `auto_closed_8h`, and notifies the administrator **and the worker whose day it ended**. It ships **off** - see *which rule ends the day* below. |
 | **Overtime crossing alert** (`overtime_notify_hours`) | 8.1 **paid** by default | Alerts the administrator that a shift is **still open** past the threshold. |
 
 They run in the same pass, and the close deletes the session it closed - so a shift the close
@@ -743,22 +743,29 @@ decides whether a crossing is reported at all. **Which rule wins is decided in o
 | Settings (close on) | Who ends the day | Why |
 | --- | --- | --- |
 | alert **below** the paid day (`8.1`? no - `7.5` < `8.0`) | the **close**, at 8 h | the crossing is reported at 7.5 h while the shift is open, then the standard day still ends at 8 h. |
-| alert **above** the paid day (`8.1` > `8.0`, the shipped pair) | the **overtime workflow** | a shift closed at 8 h could never reach 8.1 h, so the close **stands down**: the shift runs on, the crossing is reported at 8.1 h, and hours past 8 h are clocked out into overtime review. **Nothing is auto-closed at 8 paid hours.** |
+| alert **above** the paid day (`8.1` > `8.0`) | the **overtime workflow** | a shift closed at 8 h could never reach 8.1 h, so the close **stands down**: the shift runs on, the crossing is reported at 8.1 h, and hours past 8 h are clocked out into overtime review. **Nothing is auto-closed at 8 paid hours.** |
 | alert **on** the paid day (`8.0`) | the **close**, at 8 h | there is nothing to observe: "crossed the paid limit and is still working" is false at that figure, and the alternative is paging the manager on every ordinary full day. |
-| close **off** | a **clock-out** (or nobody) | the alert is then the only thing watching, and it always fires. |
+| close **off** - the shipped default | a **clock-out** (or nobody) | the alert is then the only thing watching, and it always fires. |
 
-The shipped pair is the deferral row, and that is deliberate: an alert line above the paid
-day only means anything if shifts are allowed to reach it. To get the automatic close back,
-set the overtime line **strictly below** the paid day - that is also what being warned
-*before* the day ends looks like. `OVERTIME_WATCHER_ENABLED=0` stops *both* rules.
+The shipped pair is the **last row**: `auto_close_at_regular` is off, and that is the honest
+form of what the shipped alert line already asked for. With 8.1 above 8.0 a switched-on close
+stands down, so a deployment that shipped it on switched nothing while the console showed it as
+*on* - and every fresh volume was born reporting `overtime_close_deferred`. An alert line above
+the paid day only means anything if shifts are allowed to reach it, so what ships is the
+arrangement with nothing standing down: the close is off, the alert is the rule that acts.
+
+To get the automatic close back, do **both** halves of the pair - switch it on *and* set the
+overtime line **strictly below** the paid day (7.5 h). That is also what being warned *before*
+the day ends looks like. `OVERTIME_WATCHER_ENABLED=0` stops *both* rules.
 
 A deferral is never silent, and neither is the one unreachable case (the alert on the paid
-day). The verdict travels in four places:
+day). A deployment that has not been reconfigured reports neither: the close ships off, so both
+advisories come back green on a new volume. The verdict travels in four places:
 
 * a **startup log line** from `overtime.start_watcher()` - `WARNING` when the close has stood
 down or the alert cannot fire, naming both numbers and the way out;
 * `GET /api/v1/admin/shift_rules` returns a `day_end` block (`regular_hours`, `notify_hours`,
-`close_at_paid_hours` - `null` when the close has stood down - `close_defers`,
+`close_at_paid_hours` - `null` when the close is off, or has stood down - `close_defers`,
 `alert_reachable`, `day_ended_by`, and the sentence explaining it); the console's **Shift
 rules** panel warns from it on the screen where the numbers are typed;
 * `GET /api/v1/readiness` reports both halves as advisory checks - `overtime_alert_reachable`
@@ -767,8 +774,8 @@ down, so a switch that still reads as *on* is no longer closing anything);
 * `overtime.scan_auto_close()` returns `deferred: true` with the reason instead of a quiet
 zero, and the watcher logs each pass where it stands down.
 
-**The cost of the deferral** is the same one that was already documented for switching the
-close off, and it now applies to the shipped settings: **nothing ends a forgotten shift.**
+**The cost of shipping the close off** is the one that was already documented for switching it
+off, and it is now what a deployment starts with: **nothing ends a forgotten shift.**
 Two consequences, and the second one is easy to miss:
 
 1. a worker who never clocks out keeps accruing hours that wait for approval, and the alert
@@ -777,9 +784,9 @@ Two consequences, and the second one is easy to miss:
    cannot start the next day until somebody ends it. The alert says so, and *Force clock
    out* in the console is how an administrator ends it.
 
-If you want the system to end the day for you, put the overtime line below the paid day - and
-accept the alert that comes with it, because a crossing the close can see is a crossing the
-manager is told about.
+If you want the system to end the day for you, switch the close on and put the overtime line
+below the paid day - and accept the alert that comes with it, because a crossing the close can
+see is a crossing the manager is told about.
 
 ## The overtime line, and what it counts
 

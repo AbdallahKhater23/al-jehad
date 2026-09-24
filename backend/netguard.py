@@ -666,25 +666,62 @@ def security_headers(
     peer_trusted: bool,
     is_document: bool,
 ) -> list[tuple[bytes, bytes]]:
+    """The header set for one response.
+
+    ``is_document`` splits the CSP in two: a page gets a policy that names the resources it
+    uses, and an API response gets one that denies everything (a JSON body has no business
+    loading a script or being framed).
+
+    HSTS is sent only when the connection really is TLS from our point of view: the request
+    scheme is ``https``, or a *trusted* proxy says it terminated TLS
+    (``X-Forwarded-Proto: https``). Pinning a host to HTTPS from a plain-HTTP deployment
+    would lock out exactly the worker whose phone is talking to a site server over HTTP,
+    and the header is ignored by browsers on HTTP anyway - so sending it blind is all risk.
+
+    **No CORS header here, and this paragraph is why it keeps coming back.** The CORS answer
+    depends on the request's ``Origin``, its path and its peer, so it is computed per request
+    from the origin classes - ``_cors_pairs`` for a real response, ``_preflight`` for an
+    ``OPTIONS`` - and merged into the response in one place (see the middleware below). A
+    baseline that also emitted ``access-control-allow-origin`` is a *second* answer to the
+    same question, and it is the one that wins: it grants every origin on every path,
+    ``/admin/*`` included, including origins this policy has just refused, and for an origin
+    the policy *does* allow it replaces the echoed origin with ``*`` - which is exactly the
+    value a browser refuses to combine with ``access-control-allow-credentials``, so the
+    grant it hands out is at once wider and less useful than the one it overwrote. It was
+    added that way for a frontend hosted off the API's origin. This deployment does not have
+    one: the Cloudflare Worker serves the frontend and proxies ``/api``, ``/static``,
+    ``/enroll`` and ``/q`` to the backend, so the browser sees a single origin and
+    ``CORS_WORKER_ORIGINS`` stays empty on purpose - see ``deploy/cloudflare/worker.mjs``,
+    "No CORS. The browser sees one origin, so there is nothing to allow". A deployment with a
+    genuinely separate console names it in ``CORS_ADMIN_ORIGINS``, and that path is exercised
+    by ``tests/test_network_hardening.py`` rather than by a wildcard here.
+    """
     headers: list[tuple[bytes, bytes]] = [
         (b"x-content-type-options", b"nosniff"),
         (b"x-frame-options", b"DENY"),
+        #: A document gets ``strict-origin-when-cross-origin`` - the browser default that
+        #: still sends the origin on a cross-origin navigation and nothing at all on a
+        #: downgrade to HTTP, which is what a page at a site needs when it is opened from a
+        #: tunnel or a LAN address. A JSON response gets ``no-referrer``, because a JSON
+        #: body is not a navigation source and cannot be one: the stricter value is free
+        #: there, and it stops an error payload from ever being quoted as a referrer.
         (
             b"referrer-policy",
             b"strict-origin-when-cross-origin" if is_document else b"no-referrer",
         ),
         (b"cross-origin-opener-policy", b"same-origin"),
-
-        # Changed from same-origin to cross-origin so external frontends can read responses:
-        (b"cross-origin-resource-policy", b"cross-origin"),
-
-        # CORS headers:
-        (b"access-control-allow-origin", b"*"),
-        (b"access-control-allow-methods", b"GET, POST, PUT, DELETE, OPTIONS"),
-        (b"access-control-allow-headers", b"Content-Type, Authorization, ngrok-skip-browser-warning"),
-
+        #: ``same-origin``, not ``cross-origin``. Every photograph here is fetched by an
+        #: authorised ``fetch`` and painted from a blob URL - deliberately not an
+        #: ``<img src>``, so that a worker's face is never readable by embedding the response
+        #: (see ``showLinkPhoto`` in ``admin_modules.js``). ``cross-origin`` would permit
+        #: precisely what that avoids, for the sake of a cross-origin frontend this
+        #: deployment does not have.
+        (b"cross-origin-resource-policy", b"same-origin"),
         (
             b"permissions-policy",
+            # Camera and location are the two the app legitimately asks for; everything
+            # listed as denied is a capability this application never uses, closed off
+            # before somebody adds a third-party widget that does.
             b"camera=(self), geolocation=(self), microphone=(), display-capture=(), "
             b"payment=(), usb=(), serial=()",
         ),

@@ -84,6 +84,25 @@ def _rules() -> dict:
         return overtime.rules(conn)
 
 
+def _set_rules(**overrides) -> dict:
+    """The shipped rules with the named ones replaced, written where the queue reads them.
+
+    Written as a row rather than through ``POST /admin/shift_rules`` because the subject here is
+    what the *queue* reports about a rule, not the route that stores one - and that route is
+    pinned by its own suite.
+    """
+    values = dict(migrations.DEFAULT_SHIFT_RULES)
+    values.update(overrides)
+    with db(write=True) as conn:
+        cursor = conn.execute(
+            "UPDATE shift_rules SET overtime_notify_hours = ?, auto_close_at_regular = ? "
+            "WHERE id = 1",
+            (values["overtime_notify_hours"], values["auto_close_at_regular"]),
+        )
+        assert cursor.rowcount == 1, "there is no shift_rules row to set"
+    return values
+
+
 def _plant_open_shift(worker_id: str = WORKER, *, hours_on_site: float = HOURS_ON_SITE) -> str:
     """An open shift, as the application leaves it mid-shift: the session row and the clock-in.
 
@@ -214,8 +233,9 @@ def test_the_approvals_queue_lists_the_open_crossing_with_the_gates_own_figures(
     assert item["threshold_hours"] == _rules()["overtime_notify_hours"], item
     assert item["crossed_at"] <= datetime.now().strftime(TS), item
     assert item["decision"] is None, "the queue reports a decision nobody has made"
-    # Nothing else will end this shift under the shipped rules (the alert sits above the paid
-    # day, so the close stands down) - the queue has to say so or the operator leaves it open.
+    # Nothing else will end this shift under the shipped rules - the close is off, and it would
+    # stand down under the 8.1-over-8 line even if it were on - so the queue has to say so, or
+    # the operator leaves the shift open.
     assert item["close_defers"] is True, item
 
     # A worker or a lead worker cannot see the queue at all, and an anonymous caller cannot
@@ -223,6 +243,43 @@ def test_the_approvals_queue_lists_the_open_crossing_with_the_gates_own_figures(
     for role in (WORKER, MOALLEM):
         assert client.get("/api/v1/admin/overtime/crossings", headers=bearer(role)).status_code == 403
     assert client.get("/api/v1/admin/overtime/crossings").status_code == 401
+
+
+def test_the_queue_says_whether_anything_automatic_will_end_the_shift(client):
+    """``close_defers`` on a crossing is the queue's question, and it answers it both ways.
+
+    The field was written for the deferral - the close standing down under an alert line above
+    the paid day - and a deployment now ships with the close *off*, which leaves the shift just as
+    free of automatic ends. Read as "will anything but a human end this shift?", the two states
+    have one answer, and the note the console draws from it ("clock it out when they finish, or
+    use Force clock out") is owed in both. Read as the resolver's own flag, a fresh deployment
+    would go quiet on every crossing and lose the warning it was added for.
+    """
+    _plant_open_shift()
+
+    def will_something_close_it() -> bool:
+        items = client.get("/api/v1/admin/overtime/crossings", headers=bearer(ADMIN)).json()
+        return next(item for item in items if item["worker_id"] == WORKER)["close_defers"]
+
+    # The shipped rules: the close is off, so nothing ends this shift by itself.
+    _set_rules(auto_close_at_regular=0)
+    assert will_something_close_it() is True
+
+    # Switched back on above its own alert line, it stands down - and the answer is the same.
+    _set_rules(auto_close_at_regular=1)
+    assert will_something_close_it() is True
+
+    # With the line below the paid day the close is coming, so the note must not appear.
+    _set_rules(auto_close_at_regular=1, overtime_notify_hours=7.5)
+    assert will_something_close_it() is False
+
+    # And the two readings are not the same reading: with the close off, the queue says "nothing
+    # will end this" while the resolver says "not deferring" - the flag that means the *latter*
+    # stays on the day-end verdict, where the shift-rules panel reads it.
+    _set_rules(auto_close_at_regular=0)
+    day_end = shift_hours.day_end_rules(_rules())
+    assert day_end["close_defers"] is False and day_end["close_at_paid_hours"] is None, day_end
+    assert will_something_close_it() is True
 
 
 def test_a_shift_past_the_line_only_appears_while_it_is_open(client, app_module):

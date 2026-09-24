@@ -24,7 +24,7 @@ python deploy/railway/verify_readiness.py --token "$JWT"     # + the failing che
 | Check | Tier | What it means | What clears it |
 | --- | --- | --- | --- |
 | `worker_push_delivery` | advisory | `PUSH_ENABLED` is on and the channel still cannot send | §1 (the package) **and** §2 (the key pair) |
-| `overtime_close_deferred` | advisory | the close is standing down: the stored alert line (8.1 h) sits *above* the paid day (8 h), so nothing is auto-closed at 8 h and the setting that says it is, no longer does that | §3 |
+| `overtime_close_deferred` | advisory | the close is switched on and standing down: the stored alert line (8.1 h) sits *above* the paid day (8 h), so nothing is auto-closed at 8 h and the setting that says it is, no longer does that. **Not reachable out of the box** — the close ships off (§3) — so this is a state somebody switched into | §3 |
 | `network_policy` | advisory | `X-Forwarded-For` is arriving from a peer that is not declared, so the admin allowlist is checking Railway's edge instead of the caller | §2, `TRUSTED_PROXIES` |
 
 ## 1. The image has to be able to send (why a rebuild is part of this)
@@ -77,32 +77,41 @@ variable change (which redeploys) is also what clears it.
 
 ## 3. The day-end line is a database setting, not a variable
 
-`overtime_close_deferred` is not about a missing value: it is about a *pair* of them disagreeing.
-`overtime.scan_auto_close` closes a day when its paid hours reach `regular_hours` (8 by default),
-and `overtime.scan_overtime` alerts at `overtime_notify_hours` (8.1 as shipped). The close deletes
-the session it closed, so a shift the close ended can never be observed crossing the alert line —
-which is why `shift_hours.day_end_rules` stands the close down when the line sits above the paid
-day. The stored row on this deployment is `8.1 / 8.0`, so the close owns nothing:
+`overtime_close_deferred` is not about a missing value: it is about a *pair* of them disagreeing,
+and about a switch. `overtime.scan_auto_close` closes a day when its paid hours reach
+`regular_hours` (8 by default), and `overtime.scan_overtime` alerts at `overtime_notify_hours`
+(8.1 as shipped). The close deletes the session it closed, so a shift the close ended can never be
+observed crossing the alert line — which is why `shift_hours.day_end_rules` stands the close down
+when the line sits above the paid day.
 
-* `overtime_alert_reachable` **passes** (the crossing is reported, at 8.1 h);
-* `overtime_close_deferred` **fails**, because the rule an operator typed — *close the shift at 8
-  paid hours* — no longer does that, and nothing else in the application would say so.
+**The close ships off**, so a deployment cannot land in that state by doing nothing:
+`auto_close_at_regular` is 0 by default (the column default in migration 9 and
+`migrations.DEFAULT_SHIFT_RULES`), and with 8.1 above 8.0 a switched-on close would stand down
+anyway. The three states, as `day_end` reports them:
 
-Move the alert line strictly below the paid day — **7.5 h**: the alert fires with half an hour left
-of the standard day, and the close keeps owning the end of it. Through the console's shift-rules
+| Stored rules | `day_ended_by` | The two checks |
+| --- | --- | --- |
+| close **off** (the shipped default) | `clock_out` | both pass — the alert is the only rule watching, and it always fires |
+| close **on**, 8.1 above 8.0 | `overtime_review` | `overtime_alert_reachable` passes, `overtime_close_deferred` **fails** — the rule an operator typed (*close the shift at 8 paid hours*) no longer does that, and nothing else in the application would say so |
+| close **on**, line strictly below the paid day (7.5 h) | `auto_close` | both pass — the alert fires with half an hour of the standard day left, and the close keeps owning the end of it |
+
+To get the automatic close back — to move from either of the first two rows to the third — make
+both changes, because one without the other is the second row. Through the console's shift-rules
 screen, or the endpoint the console uses (the change is audited either way):
 
 ```bash
 curl -sS -X POST https://al-jehad-production.up.railway.app/api/v1/admin/shift_rules \
   -H "Authorization: Bearer $ADMIN_JWT" -H "Content-Type: application/json" \
-  -d '{"overtime_notify_hours": 7.5}'
+  -d '{"auto_close_at_regular": 1, "overtime_notify_hours": 7.5}'
 ```
 
 `GET /api/v1/admin/shift_rules` echoes the rules back with a `day_end` block — the same verdict the
 two checks read — so the console, the API and readiness cannot disagree about it.
 
 The stored row wins over `migrations.DEFAULT_SHIFT_RULES` per column, and the row is what both
-checks read: a fresh deployment with no row inherits 8.1/8.0 and gets the same advisory.
+checks read. A deployment with no row yet inherits the shipped pair, which is the first row: the
+close off and both checks green. This deployment's own row is set to it — the close off, 8.1 line —
+which is why `overtime_close_deferred` passes here.
 
 ## 4. The advisory the keys can switch *on* — read this before the first restart
 

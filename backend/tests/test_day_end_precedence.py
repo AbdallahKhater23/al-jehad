@@ -372,8 +372,11 @@ def test_the_shipped_defaults_leave_the_day_to_a_clock_out(client):
     assert _open_shift_count() == 1, (
         "the shift is still open - the alert observes it, it does not end it"
     )
+    # The queue is asked whether anything automatic will end this shift, and with the close off
+    # the answer is no however the resolver words it: the switch is not deferring to the overtime
+    # workflow, it is simply not there.
     item = next(row for row in overtime.open_crossings() if row["worker_id"] == MOALLEM)
-    assert item["close_defers"] is False, "and no close is coming for it either"
+    assert item["close_defers"] is True, "no close is coming for it either"
 
     # A clock-out ends the day: the standard day is paid and the hours past the line wait for an
     # administrator - the same end of the day the deferral produces, reached by a person instead

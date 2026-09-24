@@ -145,13 +145,25 @@ MAX_SUBJECT_FRAME_FRACTION = 0.5
 #: range" (~86 px in a 1280x960 frame) still arrives above 24 px.
 CLOSE_FRAME_RETRY_PX = 480
 
-#: The size the graph is driven at. It sat in the constructor as ``(320, 320)``, which is how this
-#: deployment's coverage failure stayed invisible: 320 is a *scale*, not a setting, and at that scale a
-#: face 60 native pixels wide arrives at the detector as 15 - below the anchor stride, so it is not
-#: found at all. Named, because anything that records or reasons about "which crop is this" needs the
-#: number, and a literal in a constructor is not a number anybody can cite. See
-#: ``detector_640.min_detectable_width`` for the arithmetic and ``corpus`` for the provenance that
-#: travels with every stored crop.
+#: The size the graph is *created* with: the scale its anchors are laid out for. **Not** the size a
+#: pass runs at.
+#:
+#: It sat in the constructor as a literal ``(320, 320)``, which is how this deployment's coverage
+#: failure stayed invisible: 320 is a *scale*, not a setting, and at that scale a face 60 native
+#: pixels wide arrives at the detector as 15 - below the anchor stride, so it is not found at all.
+#: Named, because anything that reasons about "which crop is this" needs the number, and a literal
+#: in a constructor is not a number anybody can cite. See ``detector_640.min_detectable_width`` for
+#: the arithmetic.
+#:
+#: Read the first sentence as exactly what it says, though, because it is easy to read it as the
+#: second: ``_detect_rows`` calls ``setInputSize`` with the *frame's* dimensions on every pass, and
+#: ``detect_raw`` re-reads a too-close frame at ``CLOSE_FRAME_RETRY_PX``. So a pass runs at the
+#: frame's own size or at the retry width, and at this constant never. That is a real mismatch with
+#: ``corpus.detector_fingerprint``, which records this number as "the size the pass that actually
+#: produced these landmarks ran at" on every stored crop: the field describes the constructor rather
+#: than the pass, so two runs at genuinely different working resolutions fingerprint identically.
+#: Left as it is here rather than changed unilaterally - the fix is a data-format decision for
+#: corpora already on disk - but the comment should not be the thing that hides it.
 DETECTOR_INPUT_SIZE = 320
 
 _lock = threading.Lock()

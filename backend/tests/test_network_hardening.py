@@ -228,6 +228,106 @@ def test_a_wildcard_worker_origin_drops_credentials(client, monkeypatch):
     assert any("'*'" in remark for remark in active.remarks)
 
 
+#: The two addresses this application is actually deployed at: the Cloudflare Worker that serves
+#: the frontend (and proxies ``/api``, ``/static``, ``/enroll`` and ``/q`` to the backend) and the
+#: Railway service behind it. Named here because the decision this section pins is about *them*.
+WORKER_HOST = "https://al-jehad1.abdallahtamet281.workers.dev"
+RAILWAY_HOST = "https://al-jehad-production.up.railway.app"
+
+
+def test_the_deployment_needs_no_wildcard_because_the_browser_sees_one_origin(client, monkeypatch):
+    """The reasoning the deployment's own Worker states, asserted on the policy.
+
+    ``deploy/cloudflare/worker.mjs``: "No CORS. The browser sees one origin, so there is nothing to
+    allow. ``CORS_WORKER_ORIGINS`` stays empty on the backend and the document CSP's
+    ``connect-src 'self'`` keeps holding." The frontend agrees by construction -
+    ``API.resolveBaseURL`` answers *page origin + /api/v1* for every host that is not a static dev
+    server, so a page served by the Worker calls the Worker and a page served by Railway calls
+    Railway. There is no cross-origin call to permit, and the empty lists are the correct
+    production configuration rather than an omission.
+
+    What this guards is the temptation that produced the wildcard: seeing no CORS configured and
+    concluding the deployment needs one.
+    """
+    install(monkeypatch)  # the deployed configuration: nothing named
+    same_origin = client.get("/api/v1/status", headers={"Origin": RAILWAY_HOST})
+    assert same_origin.status_code == 200
+    assert "access-control-allow-origin" not in same_origin.headers, (
+        "an unnamed origin gets no grant - the same-origin case needs none, and the browser "
+        "never enforces CORS on a request to its own page's host"
+    )
+
+
+def test_the_worker_and_railway_origins_are_served_by_configuration_not_by_a_wildcard(
+    client, monkeypatch
+):
+    """An operator who *does* need the cross-origin pair names it in the existing settings.
+
+    The one cross-origin path this app has is diagnostic: ``API.useFallback()`` moves a session's
+    traffic straight to Railway, so a page on the Worker reads the Railway origin. That is what the
+    origin classes are for, and it needs one line of configuration - not a baseline header that
+    grants every origin, on every path, to everyone else as well.
+    """
+    install(monkeypatch, worker_origins=[WORKER_HOST, RAILWAY_HOST])
+
+    page_on_railway_calls_the_worker = client.get("/api/v1/status", headers={"Origin": RAILWAY_HOST})
+    assert page_on_railway_calls_the_worker.headers["access-control-allow-origin"] == RAILWAY_HOST
+    # Exactly one grant, and it is the origin that asked - not an additional ``*`` alongside it.
+    assert page_on_railway_calls_the_worker.headers.get_list("access-control-allow-origin") == [
+        RAILWAY_HOST
+    ]
+
+    # A worker origin reaches worker routes only: naming it must not open the console.
+    console = client.get(
+        "/api/v1/admin/users", headers={"Origin": WORKER_HOST, **bearer(ADMIN)}
+    )
+    assert console.status_code == 200
+    assert "access-control-allow-origin" not in console.headers
+
+
+def test_the_security_baseline_carries_no_cors_answer_of_its_own(monkeypatch):
+    """The precise defect, pinned where it was: a grant that never consults the policy.
+
+    ``security_headers`` has no ``Origin``, no path and no peer, so it cannot answer a CORS
+    question - and a baseline that answers anyway wins, because it is merged after the computed
+    one. In the commit this guards, it emitted ``access-control-allow-origin: *`` on every
+    response including ``/admin/*``, and for an *allowed* origin it replaced the echoed origin
+    with ``*`` (the one value a browser will not combine with ``allow-credentials``). The
+    end-to-end tests above catch that for the paths and origins they exercise; this catches it
+    for a policy wide enough that every one of them would still pass.
+    """
+    for kwargs in (
+        {"worker_origins": ["*"]},
+        {"worker_origins": [WORKER_HOST], "admin_origins": [RAILWAY_HOST]},
+        {},
+    ):
+        policy = netguard.build_policy(**kwargs)
+        sent = netguard.security_headers(
+            policy,
+            scheme="https",
+            forwarded_proto="https",
+            peer_trusted=True,
+            is_document=True,
+        ) + netguard.security_headers(
+            policy,
+            scheme="http",
+            forwarded_proto=None,
+            peer_trusted=False,
+            is_document=False,
+        )
+        keys = {key.decode() for key, _value in sent}
+        assert not any(key.startswith("access-control-") for key in keys), (
+            f"the baseline granted CORS on its own for {kwargs}: {sorted(keys)}"
+        )
+        #: ``same-origin``, because the console reads every photo through an authorised fetch and
+        #: a blob URL rather than an ``<img src>``. ``cross-origin`` would let any page embed a
+        #: worker's face, which is the thing that design avoids.
+        resource_policy = [
+            value for key, value in sent if key == b"cross-origin-resource-policy"
+        ]
+        assert resource_policy == [b"same-origin", b"same-origin"], resource_policy
+
+
 def test_an_admin_wildcard_is_a_problem_not_a_policy():
     """A list that means "anybody's page" cannot answer "which console may drive payroll"."""
     active = netguard.build_policy(admin_origins=["*"])
