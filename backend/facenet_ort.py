@@ -25,9 +25,11 @@ SESSION POLICY, AND WHY
 -----------------------
 * ``ORT_ENABLE_ALL``: Conv+BN folding and constant folding are what make the measured 32.4 ms -> 11.0 ms
   scaling possible; without them the graph executes the unfused form it was exported in.
-* ``intra_op_num_threads = physical cores``, ``inter_op_num_threads = 1``: one request at a time is
-  *latency*-bound, and inter-op parallelism only helps when several nodes can run concurrently - here
-  the graph is a chain.
+* ``intra_op_num_threads = 1`` (a caller may override), ``inter_op_num_threads = 1``: one request at a
+  time is *latency*-bound, and inter-op parallelism only helps when several nodes can run concurrently -
+  here the graph is a chain. The intra-op default used to be ``os.cpu_count()``, which inside a container
+  reports the *host's* cores rather than the cgroup quota, so a 1 vCPU instance opened 32 threads that the
+  scheduler then throttled - oversubscription that reads as latency on every other request.
 * ``enable_mem_pattern`` is disabled when IOBinding is used: bound buffers bypass arena planning, and
   leaving it on makes ORT plan an arena it will not use.
 * warmup: the arena is sized on the first ``run()``; a 91 MB graph's first inference is otherwise a
@@ -179,12 +181,26 @@ class FaceNetORT:
         warmup: bool = True,
         optimization: str = "all",
         device_id: int = 0,
+        expected_sha256: str | None = None,
     ) -> None:
         path = Path(model_path)
         if not path.exists():
             raise EmbeddingError(f"ONNX graph not found: {path}")
         self.path = str(path)
         self.model_id = sha256_of(path)
+        # The pin, and the reason it is checked *here* rather than at the call site: a band is keyed
+        # by the graph's digest, so a file that is not the one that was measured produces distances
+        # against thresholds derived from another model - plausible numbers, wrong decisions. This
+        # mirrors ``OnnxFaceNetEngine``'s ``FACENET_MODEL_SHA256``, and like that one it is optional:
+        # an unset pin means "any graph at this path", which is the deliberate default for a local
+        # checkout and never the recommendation for a deployment.
+        if expected_sha256:
+            expected = str(expected_sha256).strip().lower()
+            if self.model_id.lower() != expected:
+                raise EmbeddingError(
+                    f"{path.name} is sha256 {self.model_id} but the configured digest is "
+                    f"{expected}: the file is not the graph the band was measured against"
+                )
         self.device_id = int(device_id)
 
         options = ort.SessionOptions()
@@ -196,7 +212,10 @@ class FaceNetORT:
         if optimization not in levels:
             raise EmbeddingError(f"unknown optimization level {optimization!r}; expected {sorted(levels)}")
         options.graph_optimization_level = levels[optimization]
-        options.intra_op_num_threads = int(intra_threads or max(1, (os.cpu_count() or 2)))
+        # One thread by default - see the session policy at the top of the file. ``intra_threads``
+        # still overrides it, so a benchmark that wants the host's own parallelism
+        # (``tools/test_facenet_onnx_eval.py``) has to ask for it explicitly.
+        options.intra_op_num_threads = int(intra_threads or 1)
         options.inter_op_num_threads = 1
         options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         options.enable_mem_pattern = not use_iobinding
