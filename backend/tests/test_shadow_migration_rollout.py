@@ -501,3 +501,77 @@ def test_the_migration_never_writes_a_template(app_module):
     text = open(shadow_rollout.__file__, encoding="utf-8").read()
     for forbidden in ("write_reference", "remove_files", "quarantine_legacy"):
         assert forbidden not in text, f"the migration calls {forbidden}"
+
+
+# ---------------------------------------------------------------------------
+# 10. the load path itself, which a stand-in cannot pin
+# ---------------------------------------------------------------------------
+def _tiny_graph(path, width: int, *, size: int = 160):
+    """A real, loadable ONNX graph of the requested width - a handful of nodes, no weights.
+
+    Every other test here hands ``Encoders`` a stand-in, which pins the wiring's *decisions* and
+    cannot pin the one line that actually builds a session. That gap is not hypothetical: the call
+    in ``load_encoders`` passed an argument ``FaceNetORT`` did not accept, so every refusal above
+    was tested while the migration could not start at all - the failure surfaced only when a real
+    graph was placed on disk. Two graphs whose shapes are right is the cheapest way to close it, and
+    the mean-over-spatial + matmul body is deliberately trivial: nothing here is about accuracy.
+    """
+    onnx = pytest.importorskip("onnx")
+    from onnx import TensorProto, helper
+
+    nodes = [
+        helper.make_node("ReduceMean", ["input"], ["pooled"], axes=[1, 2], keepdims=0),
+        helper.make_node("MatMul", ["pooled", "w"], ["embedding"]),
+    ]
+    weight = helper.make_tensor(
+        "w", TensorProto.FLOAT, [3, width], np.arange(3 * width, dtype=np.float32)
+    )
+    graph = helper.make_graph(
+        nodes,
+        f"tiny_{width}",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, ["batch", size, size, 3])],
+        [helper.make_tensor_value_info("embedding", TensorProto.FLOAT, ["batch", width])],
+        [weight],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    # ``onnx`` writes the IR version its own release defines (14 as of 1.23), which is ahead of what
+    # the pinned onnxruntime accepts. Lowered rather than left, so the fixture fails for a reason
+    # about the tests' graphs instead of a version skew between two dev dependencies.
+    model.ir_version = 13
+    onnx.checker.check_model(model)
+    onnx.save(model, str(path))
+    return path
+
+
+def test_load_encoders_builds_a_pair_from_two_real_graphs(settings, tmp_path, monkeypatch):
+    incumbent = _tiny_graph(tmp_path / "facenet128.onnx", 128)
+    candidate = _tiny_graph(tmp_path / "facenet512.onnx", 512)
+    monkeypatch.setattr(shadow_rollout, "enforced_model_path", lambda: incumbent)
+    monkeypatch.setattr(shadow_rollout, "shadow_model_path", lambda: candidate)
+
+    encoders = shadow_rollout.load_encoders()
+
+    assert (encoders.enforced_width, encoders.shadow_width) == (128, 512)
+    assert encoders.enforced.input_size == encoders.shadow.input_size == 160
+    assert shadow_rollout.status()["started"] is True
+
+
+def test_load_encoders_honours_the_configured_digest(settings, tmp_path, monkeypatch):
+    """``FACENET_SHADOW_MODEL_SHA256`` is the operator's pin, and it has to be checked.
+
+    A band is keyed by the digest, so an unpinned path means a re-fetch silently re-baselines the
+    migration while the report still reads as comparable.
+    """
+    import facenet_ort
+
+    candidate = _tiny_graph(tmp_path / "facenet512.onnx", 512)
+    monkeypatch.setattr(shadow_rollout, "enforced_model_path", lambda: _tiny_graph(tmp_path / "f128.onnx", 128))
+    monkeypatch.setattr(shadow_rollout, "shadow_model_path", lambda: candidate)
+
+    settings.facenet_shadow_model_sha256 = facenet_ort.sha256_of(candidate)
+    assert shadow_rollout.load_encoders().shadow_width == 512
+
+    settings.facenet_shadow_model_sha256 = "0" * 64
+    with pytest.raises(ShadowUnavailable) as raised:
+        shadow_rollout.load_encoders()
+    assert "digest" in str(raised.value), raised.value
