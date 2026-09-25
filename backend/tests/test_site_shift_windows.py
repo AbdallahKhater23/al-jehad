@@ -469,8 +469,13 @@ def test_the_schema_version_names_the_newest_migration():
     # worker notification tables, 15 ``users.report_columns``, 16 ``company_settings`` - the
     # company's own name and mark, which the login panel and every printed sheet read - 17
     # ``punch_queue.photo_scored_at``, which is how a queued selfie is scored exactly once, and
-    # 18 ``attendance_logs.punch_frame``, the review card's evidence frame.)
-    assert migrations.SCHEMA_VERSION == 18
+    # 18 ``attendance_logs.punch_frame``, the review card's evidence frame. 19 added
+    # ``admin_notifications.acknowledged_*``, an operator's own answer to an alert plus the reason
+    # for it rather than merely that somebody looked, 20 the developer-operations tables - runtime
+    # configuration and the root tier's private alert hub - 21 the overtime-authorisation records,
+    # the mid-shift decision on a crossing, 22 ``refused_punches``, the score, reason and frame of
+    # a punch the band rejected, and 23 the corpus-capture consent records.)
+    assert migrations.SCHEMA_VERSION == 23
 
 
 def test_the_migration_is_replayable_and_idempotent():
