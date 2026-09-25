@@ -48,8 +48,10 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Iterable
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+import punch_frames
 from database import db, slow_queries as _slow_query_ring, connection_stats
 from security import (
     DEVELOPER_ROLE,
@@ -282,6 +284,15 @@ SEVERITIES = ("info", "warning", "critical")
 #: kind nothing raises is a filter that silently matches nothing, and a reader cannot tell
 #: that from a quiet system.
 ALERT_KINDS: dict[str, str] = {
+    # The deployment's own events. These were written to ``admin_notifications`` until the
+    # split below: a forced start, a schema repair, a retention sweep and a coverage report
+    # are the *host's* log lines, addressed to whoever runs the deployment, and a site
+    # administrator has no action to take on any of them. They live here now, and the
+    # administrator's queue no longer carries them (``notifications.DEPLOYMENT_KINDS``).
+    "startup_degraded": "The deployment started with advisory checks failing.",
+    "schema_repair": "The schema was repaired rather than refused, at startup.",
+    "retention_sweep": "An automated retention sweep erased data, or could not.",
+    "coverage_report": "The standing detector-coverage comparison changed verdict.",
     "db_pool_saturation": "Connections or lock waits past what this deployment is sized for.",
     "db_lock_contention": "SQLite refused a write after busy_timeout: a punch may have failed.",
     "slow_query": "One statement took longer than the configured threshold.",
@@ -865,3 +876,138 @@ async def read_audit_stream(
         actor_id=actor_id,
         since=since or (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S"),
     )
+
+
+# ---------------------------------------------------------------------------
+# the refused punches: the band's own diagnostics, not a site's queue
+# ---------------------------------------------------------------------------
+#: The window the list defaults to, and its ceiling. A day of refusals is a triage queue; a
+#: fortnight of them is a table nobody reads.
+REFUSED_PUNCH_MAX_DAYS = 7
+
+
+def _audit_refusal_clear(
+    conn: sqlite3.Connection, *, actor: CurrentUser, refusal_id: int, worker_id: Any, ip: str | None
+) -> None:
+    """Append the one decision this surface makes. Never raises, like every audit write."""
+    try:
+        conn.execute(
+            "INSERT INTO audit_log (actor_id, actor_role, action, entity, entity_id, after_json, ip, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                actor.id,
+                actor.role,
+                "refused_punch_clear",
+                "refused_punches",
+                str(refusal_id),
+                json.dumps({"worker_id": worker_id}, default=str),
+                ip,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            ),
+        )
+    except sqlite3.Error:  # pragma: no cover - the trail must not cost the decision
+        pass
+
+
+@router.get("/developer/refused-punches")
+async def list_refused_punches(
+    current: CurrentUser = Depends(require_developer), days: int = 1
+):
+    """What the band refused, with the score and the frame beside it.
+
+    The triage surface the deployment needed and never had: a worker who keeps being told "we
+    could not confirm that is you" used to leave no record at all, so an operator whose band
+    was derived from the wrong corpus could see neither the scores nor the faces. Newest first,
+    ``days`` back (default today, capped at a week), each row carrying the distance, the reason
+    and whether a frame is waiting.
+
+    **This was an administrator route until it moved here.** The call it serves - "is the band
+    refusing honest workers, and at what distance" - is a question about the *model*, not about
+    a site's attendance: recognising a face in it is a judgement about a model's calibration,
+    and the only person who can act on the answer is the one who can change the band. A site
+    administrator reading a wall of refusals has no lever, and a face in a triage list is a
+    worker's biometric in front of a reader who has no reason to hold it. Read-only evidence in
+    either case - there is no approve path, because a refused punch was never attendance - and
+    retention sweeps the rows and their frames on the frame window.
+    """
+    window = max(0, min(int(days), REFUSED_PUNCH_MAX_DAYS))
+    with db() as conn:
+        if window == 0:
+            rows = conn.execute(
+                """
+                SELECT r.id, r.worker_id, u.name, r.site_name, r.action, r.error_code,
+                       r.score, r.pipeline, r.source, r.punch_frame, r.created_at
+                FROM refused_punches r
+                LEFT JOIN users u ON r.worker_id = u.id
+                ORDER BY r.id DESC
+                """
+            ).fetchall()
+        else:
+            cutoff = (datetime.now() - timedelta(days=window)).strftime("%Y-%m-%d 00:00:00")
+            rows = conn.execute(
+                """
+                SELECT r.id, r.worker_id, u.name, r.site_name, r.action, r.error_code,
+                       r.score, r.pipeline, r.source, r.punch_frame, r.created_at
+                FROM refused_punches r
+                LEFT JOIN users u ON r.worker_id = u.id
+                WHERE r.created_at >= ?
+                ORDER BY r.id DESC
+                """,
+                (cutoff,),
+            ).fetchall()
+    items = []
+    for row in rows:
+        item = dict(row)
+        frame = item.pop("punch_frame", None)
+        item["frame_url"] = f"/api/v1/developer/refused-punches/{item['id']}/frame" if frame else None
+        items.append(item)
+    return items
+
+
+@router.get("/developer/refused-punches/{refusal_id}/frame")
+async def refused_punch_frame(
+    refusal_id: int, current: CurrentUser = Depends(require_developer)
+):
+    """The downscaled frame one refused punch was measured from. Root tier only.
+
+    The same contract as the review frame: ``resolve_stored`` proves the path is inside the
+    frame directory before anything is opened, and a row whose frame was never stored or has
+    been swept answers 404 rather than pretending to have a picture.
+    """
+    with db() as conn:
+        row = conn.execute(
+            "SELECT punch_frame FROM refused_punches WHERE id = ?", (refusal_id,)
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="This refusal has no record.")
+    path = punch_frames.resolve_stored(row["punch_frame"])
+    if path is None:
+        raise HTTPException(status_code=404, detail="No frame was stored for this refusal.")
+    return FileResponse(path, media_type="image/jpeg")
+
+
+@router.post("/developer/refused-punches/{refusal_id}/clear")
+async def clear_refused_punch(
+    refusal_id: int, request: Request, current: CurrentUser = Depends(require_developer)
+):
+    """Drop one refusal from the list, so a triaged list is what still needs looking at.
+
+    Deliberately a clear and not a *decision*: the evidence stays on disk until retention sweeps
+    it, and the audit trail says who judged it needed nothing further. A refusal is not
+    attendance and cannot become one.
+    """
+    with db(write=True) as conn:
+        row = conn.execute(
+            "SELECT id, worker_id FROM refused_punches WHERE id = ?", (refusal_id,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="This refusal has no record.")
+        conn.execute("DELETE FROM refused_punches WHERE id = ?", (refusal_id,))
+        _audit_refusal_clear(
+            conn,
+            actor=current,
+            refusal_id=refusal_id,
+            worker_id=row["worker_id"],
+            ip=request.client.host if request.client else None,
+        )
+    return {"status": "success", "message": "Refusal cleared."}

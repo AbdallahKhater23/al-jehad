@@ -432,10 +432,7 @@ const UI_MODULES = {
                     ${this.liveOpsProgressHtml(facts)}
                 </td>
                 <td><div class="ops-badges">${this.liveOpsBadgesHtml(facts)}</div></td>
-                <td class="is-end">
-                    <button type="button" class="ops-btn ops-btn-danger" data-force-out="${this.escapeHtml(session.worker_id)}"
-                            onclick="UI.forceOutModal('${this.liveOpsInlineString(session.worker_id)}', '${this.liveOpsInlineString(session.worker_name || session.worker_id)}', '${this.liveOpsInlineString(session.clock_in_time || '')}')">${this.escapeHtml(I18n.__('forceOut'))}</button>
-                </td>
+                <td class="is-end">${this.mayActOnAccount(session) ? this.forceOutButtonHtml(session) : ''}</td>
             </tr>`;
     },
 
@@ -462,11 +459,21 @@ const UI_MODULES = {
                 </div>
                 ${this.liveOpsProgressHtml(facts)}
                 <p class="ops-note">${this.liveOpsPaidLineHtml(facts)}</p>
-                <div class="ops-card-foot">
-                    <button type="button" class="ops-btn ops-btn-danger" data-force-out="${this.escapeHtml(session.worker_id)}"
-                            onclick="UI.forceOutModal('${this.liveOpsInlineString(session.worker_id)}', '${this.liveOpsInlineString(session.worker_name || session.worker_id)}', '${this.liveOpsInlineString(session.clock_in_time || '')}')">${this.escapeHtml(I18n.__('forceOut'))}</button>
-                </div>
+                ${this.mayActOnAccount(session)
+                    ? `<div class="ops-card-foot">${this.forceOutButtonHtml(session)}</div>`
+                    : ''}
             </article>`;
+    },
+
+    /**
+     * The control that ends a session, or nothing where this admin may not end it.
+     *
+     * One string rather than the same button written into the row and the card: the two
+     * layouts differ in everything but this, and a second copy is where they would drift.
+     */
+    forceOutButtonHtml(session) {
+        return `<button type="button" class="ops-btn ops-btn-danger" data-force-out="${this.escapeHtml(session.worker_id)}"
+                            onclick="UI.forceOutModal('${this.liveOpsInlineString(session.worker_id)}', '${this.liveOpsInlineString(session.worker_name || session.worker_id)}', '${this.liveOpsInlineString(session.clock_in_time || '')}')">${this.escapeHtml(I18n.__('forceOut'))}</button>`;
     },
 
     liveOpsTableHtml(rows) {
@@ -988,6 +995,24 @@ const UI_MODULES = {
                     </div>
                 </div>
                 ${this.approvalsEvidenceHtml(log)}
+                ${this.approvalsDecisionHtml(log, idArg)}
+            </article>`;
+    },
+
+    /**
+     * The decision - the reason box and the two answers - or nothing for a reader who may not
+     * make it.
+     *
+     * An administrator's own long shift reaches this queue like anybody else's and waits like
+     * anybody else's (``test_admin_shift_visibility``). Who *decides* it is the one place the
+     * role matters: authorising a peer's overtime is the escalation ``_guard_standard_admin``
+     * exists to refuse, so for a standard admin reading an administrator's row this renders
+     * as evidence - the face, the verdict, the hours - and no box to type a decision into.
+     */
+    approvalsDecisionHtml(log, idArg) {
+        if (!this.mayActOnAccount(log)) return '';
+        const id = this.escapeHtml(log.id);
+        return `
                 <label class="ui-label" for="note-${id}" style="margin-top:16px">${this.escapeHtml(I18n.__('approvalsNote'))}</label>
                 <textarea id="note-${id}" class="ui-field" rows="2"
                           placeholder="${this.escapeHtml(I18n.__('approvalsNotePlaceholder'))}"></textarea>
@@ -997,8 +1022,7 @@ const UI_MODULES = {
                             onclick="UI_MODULES.handleApproval(${idArg}, 'approve')">${this.OPS_ICONS.check}${this.escapeHtml(I18n.__('approvalsApprove'))}</button>
                     <button type="button" class="ui-btn ui-btn-danger" data-reject="${id}"
                             onclick="UI_MODULES.handleApproval(${idArg}, 'reject')">${this.OPS_ICONS.close}${this.escapeHtml(I18n.__('approvalsReject'))}</button>
-                </div>
-            </article>`;
+                </div>`;
     },
 
     approvalsHtml(logs) {
@@ -1035,7 +1059,16 @@ const UI_MODULES = {
         const crossingsRead = API.request('/admin/overtime/crossings').catch(() => []);
         // The refusals read is separately fatal too: it is triage evidence, not the queue's
         // primary content, and a read that fails leaves its own section empty.
-        const refusalsRead = API.request('/admin/refused_punches?days=1').catch(() => []);
+        //
+        // Asked for by the root tier only, and asked at the route it now lives on. The surface
+        // left the administrator's queue - a refusal is a verdict about the *band*, not about a
+        // site's attendance - so a console that requested it for every operator would be a
+        // screenful of 403s for the audience the tab belongs to, and a section that never
+        // paints. The server refuses it either way; this is the console agreeing with the
+        // server rather than a second, weaker rule.
+        const refusalsRead = this.isDeveloper()
+            ? API.request('/developer/refused-punches?days=1').catch(() => [])
+            : Promise.resolve([]);
         let logs;
         try {
             logs = await API.request('/admin/pending_reviews');
@@ -1112,13 +1145,23 @@ const UI_MODULES = {
      * what the rest of it is paid for. Reading a queue row is a step towards deciding it;
      * reading a crossing decided nothing at all, which is why it does not live in Alerts.
      */
+    /** Is the reader the root tier - the role that reads the deployment's own business? */
+    isDeveloper() {
+        return !!State.user && State.user.role === 'developer';
+    },
+
     /**
      * The refused punches: today's face-check refusals, the frame beside the score.
      *
      * A refusal is evidence about the system as much as the worker - a band derived from the
      * wrong corpus refuses honest workers all day at scores just past the line, and the only
-     * way to see that is the scores and the faces together. Read-only: there is no approve
-     * path (a refusal was never attendance), only a clear so the triaged list shrinks.
+     * way to see that is the scores and the faces together. That makes it a question about the
+     * model rather than about a site's attendance, which is why it is the **root tier's** and
+     * why an administrator's Approvals tab no longer carries it: the list, the frame and the
+     * clear all live on ``/developer/refused-punches``, and the server refuses the old paths.
+     *
+     * Read-only: there is no approve path (a refusal was never attendance), only a clear so the
+     * triaged list shrinks.
      */
     refusalsSectionHtml(items) {
         if (!Array.isArray(items) || items.length === 0) return '';
@@ -1178,7 +1221,7 @@ const UI_MODULES = {
         if (State.token) headers['Authorization'] = `Bearer ${State.token}`;
         if (button) button.disabled = true;
         try {
-            const response = await fetch(`${API.baseURL}/admin/refused_punch_frame/${encodeURIComponent(id)}`, { headers });
+            const response = await fetch(`${API.baseURL}/developer/refused-punches/${encodeURIComponent(id)}/frame`, { headers });
             if (!response.ok) throw new Error(I18n.__('approvalsScoreFailed'));
             const blob = await response.blob();
             if (image) {
@@ -1195,7 +1238,7 @@ const UI_MODULES = {
     async handleRefusalClear(refusalId) {
         const id = String(refusalId);
         try {
-            await API.request(`/admin/refused_punches/${encodeURIComponent(id)}/clear`, { method: 'POST' });
+            await API.request(`/developer/refused-punches/${encodeURIComponent(id)}/clear`, { method: 'POST' });
             Toast.success(I18n.__('refusalsCleared'));
             this.renderAdminTab('Approvals');
         } catch (err) {
@@ -1266,7 +1309,10 @@ const UI_MODULES = {
                       )
                   )}</p>`
                 : '';
-        const controls = needsAnswer
+        // The decision, or nothing where this reader is not the one who may make it: an
+        // administrator's own crossing is a head admin's answer (``mayActOnAccount``), and the
+        // live queue asks the same question the Approvals list does.
+        const controls = needsAnswer && this.mayActOnAccount(item)
             ? `
                 <label class="ui-label" for="crossingHours-${id}" style="margin-top:16px">${this.escapeHtml(I18n.__('crossingsCeiling'))}</label>
                 <input id="crossingHours-${id}" class="ui-field" type="number" min="0" step="0.25"
@@ -2112,7 +2158,16 @@ const UI_MODULES = {
     PHOTO_POLICY: {
         maxBytes: 5 * 1024 * 1024,
         maxMb: 5,
-        accepted: ['image/jpeg', 'image/png', 'image/webp']
+        accepted: ['image/jpeg', 'image/png', 'image/webp'],
+        // The server's ingestion boundary (``uploads.face_frame_max_pixels`` and
+        // ``face_frame_max_edge_px``), the same numbers the link pages read from
+        // ``photo_policy``. Mirrored for the same reason ``maxBytes`` is - but this one is not
+        // a refusal: above it the file is *resized* rather than rejected, because the photo an
+        // admin has on their phone is 12 MP as a matter of course, and refusing it would break
+        // the ordinary way a worker gets enrolled. ``test_frontend_photo_downscale`` fails if
+        // this mirror stops matching the backend.
+        face_frame_max_pixels: 4000000,
+        face_frame_max_edge_px: 2048
     },
 
     credentialsQuery() {
@@ -2824,6 +2879,25 @@ const UI_MODULES = {
         return this.canSetCredentials(user);
     },
 
+    /**
+     * Whether this admin may act on somebody's own record.
+     *
+     * The server's ``_guard_standard_admin``, said in the rail: a standard admin may not
+     * reach over an administrator - not their name, not their password, not their face, and
+     * not the shift or the overtime decision this rule was extended to. An action that
+     * always answers 403 is not a control, it is a trap, so the ones this refuses are
+     * absent rather than present-and-refused. The enforcement is on the server, because a
+     * hidden button has never stopped anybody.
+     *
+     * ``head_admin`` is deliberately not restricted: the role owns the deployment, and a
+     * rule that also bound it would leave an administrator's own record decidable by nobody.
+     */
+    mayActOnAccount(account) {
+        const actor = State.user || {};
+        const privileged = !!account && (account.role === 'admin' || account.role === 'head_admin');
+        return !(actor.role === 'admin' && privileged);
+    },
+
     /** ``active`` / ``inactive`` as the row publishes it, so a test reads no Tailwind. */
     accountStatus(user) {
         return String(user.status || 'active').trim().toLowerCase() === 'active'
@@ -3405,7 +3479,35 @@ const UI_MODULES = {
         this._credentialsEditPhotoError = problem || '';
         this._credentialsEditPhoto = problem ? null : chosen;
         if (problem) Toast.error(problem);
+        if (problem) return this.repaintCredentialsFromCache();
+        this.shrinkFacePhoto(chosen, (small) => {
+            // Guarded: a resize takes a moment, and the admin may have chosen another photo -
+            // or cleared this one - while it was running. The slower answer must not win.
+            if (this._credentialsEditPhoto === chosen) {
+                this._credentialsEditPhoto = small;
+                this.repaintCredentialsFromCache();
+            }
+        });
         return this.repaintCredentialsFromCache();
+    },
+
+    /**
+     * A chosen *face* photo, reduced to the deployment's ingestion boundary before it is sent.
+     *
+     * Enrolling somebody usually starts with a photograph on the admin's own phone, which its
+     * camera app wrote at 12 MP - above the boundary that protects the punch path. Resizing
+     * here is what keeps that boundary from refusing the ordinary way a worker gets enrolled;
+     * the server still checks the bytes it receives, and ``checkPhotoFile`` has already refused
+     * size and type. The logo picker deliberately does not come through here: a mark is not a
+     * face frame and the boundary does not apply to it.
+     */
+    shrinkFacePhoto(file, done) {
+        // ``UI``, not ``Capture``: this module is fetched by the app shell, which does not carry
+        // ``capture.js`` (that is the link pages' camera, and the shell's eager script list is
+        // pinned to what *every* session needs). One implementation per page world, with the
+        // boundary's numbers pinned against the backend by ``test_frontend_photo_downscale``.
+        if (!file || typeof UI === 'undefined' || !UI.shrinkPhoto) return done(file);
+        return UI.shrinkPhoto(file, done);
     },
 
     clearEditPhoto() {
@@ -3692,6 +3794,13 @@ const UI_MODULES = {
         this._credentialsPhotoError = problem || '';
         this._credentialsNewPhoto = problem ? null : chosen;
         if (problem) Toast.error(problem);
+        if (problem) return this.repaintCredentialsFromCache();
+        this.shrinkFacePhoto(chosen, (small) => {
+            if (this._credentialsNewPhoto === chosen) {
+                this._credentialsNewPhoto = small;
+                this.repaintCredentialsFromCache();
+            }
+        });
         return this.repaintCredentialsFromCache();
     },
 
@@ -5851,10 +5960,54 @@ const UI_MODULES = {
     },
 
     async renderNotes(content) {
+        // Two questions on one screen, and the reader's own comes first. An administrator
+        // works a shift of their own (``handsetRoles``, and ``SELF_ENROLL_ROLES`` beside it),
+        // and the note a worker writes to ask for something is a note they have to be able to
+        // write too - but this tab used to offer only the mailbox side of it: every note as a
+        // reviewer, and no way to open one of their own. It is the *worker's* card, painted
+        // here by ``WORKER_MODULES.renderNotes``, because two copies of "my notes" would
+        // disagree the first time one of them changed.
+        content.innerHTML = this.notesMineHtml() + `<div id="notesInbox"></div>`;
+        this.paintMyNotes();
+        // The inbox is painted into its own host so the card above survives a search, a
+        // repaint and an error line: the two are separate questions and the second must not
+        // be able to take the first off the screen.
+        const inbox = this.notesRegion() || content;
         // Toolbar first: the list can be slow from site, and an admin should see the
         // filter they are about to use rather than a blank tab.
-        this.paintNotes(content, this.notesToolbarHtml() + UI.loadingHtml());
-        await this.loadNotes(content);
+        this.paintNotes(inbox, this.notesToolbarHtml() + UI.loadingHtml());
+        await this.loadNotes(inbox);
+    },
+
+    /** The host the administrator's own notes paint into, above the mailbox. */
+    notesMineHtml() {
+        return `<section class="ui-card" data-my-notes="true"><div id="adminMyNotes"></div></section>`;
+    },
+
+    /**
+     * Where the mailbox paints: its own region, or the tab when nothing has painted yet.
+     *
+     * One function because four call sites have to agree - the queue, the thread it opens
+     * into, the repaint that keeps a revealed password readable, and the dismissal that
+     * forgets it. A reader who reaches this screen from somewhere other than the tab itself
+     * (a notification, a reload) still has a target.
+     */
+    notesRegion() {
+        return document.getElementById('notesInbox') || document.getElementById('adminContent');
+    },
+
+    /**
+     * The signed-in administrator's own notes, in the worker's own words.
+     *
+     * The same request and the same cards a worker gets on the handset, because an
+     * administrator asking for a password reset or reporting a missing delivery is the same
+     * person making the same request. A failure is left to that module's own error line
+     * rather than raised here - the mailbox below is a different question.
+     */
+    paintMyNotes() {
+        const host = document.getElementById('adminMyNotes');
+        if (!host || typeof WORKER_MODULES === 'undefined' || !WORKER_MODULES.renderNotes) return;
+        Promise.resolve(WORKER_MODULES.renderNotes(host)).catch(() => {});
     },
 
     async loadNotes(content) {
@@ -5882,7 +6035,9 @@ const UI_MODULES = {
     },
 
     repaintNotesFromCache() {
-        const content = document.getElementById('adminContent');
+        // The inbox, not the tab: repainting the whole screen would take "my notes" down
+        // with it, and the reader who is searching the mailbox is not done with their own.
+        const content = this.notesRegion();
         if (!content || !this._notes) return UI.renderAdminTab('Notes');
         this.paintNotes(content, this.notesToolbarHtml() + this.notesListHtml(this._notes));
         return Promise.resolve();
@@ -6068,7 +6223,10 @@ const UI_MODULES = {
     },
 
     async loadNote(noteId) {
-        const content = document.getElementById('adminContent');
+        // The mailbox region, beside the caller's own notes rather than over them: opening a
+        // note is a move *within* the queue, and a reader who came here to file something of
+        // their own has not finished with the card above.
+        const content = this.notesRegion();
         if (!content) return;
         content.innerHTML = UI.loadingHtml();
         let note;
@@ -6302,7 +6460,7 @@ const UI_MODULES = {
     /** Forgetting the password here is the whole of the cleanup - it is stored nowhere. */
     async dismissNotePassword() {
         this._noteRevealed = null;
-        const content = document.getElementById('adminContent');
+        const content = this.notesRegion();
         if (!content || !this._noteThread) {
             return UI.renderAdminTab('Notes');
         }

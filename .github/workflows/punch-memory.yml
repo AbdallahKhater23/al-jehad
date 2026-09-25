@@ -1,0 +1,81 @@
+# The 512 MB budget, enforced on every push instead of remembered.
+#
+# `backend/tools/punch_saturation.py` runs this application from the checkout with the
+# deployment's own memory profile, drives eight simultaneous punches per round past its
+# capacity of two for four rounds, and fails when the peak crossed `--ceiling-mib`. It is the
+# fast half of the memory work: no docker, no cgroup, no cap - a prediction of the container's
+# OOM rather than the kill itself. `backend/tools/capacity_test.py` is the other half, and it
+# needs a docker daemon and several minutes of real inference: run it before a release, not on
+# every push.
+#
+# Two things about the load, said here rather than discovered from a green tick:
+#
+#   * no face is committed to this repository (by design), so the punches send a frame with no
+#     face in it. The upload policy, the spooled file, the decode, the detector and the queue
+#     are all exercised; the embedding is skipped, and the report says so in its own note. Run
+#     the tool by hand with `--selfie <a real face>` for the run whose numbers are the
+#     deployment's, or point it at one on a private runner.
+#   * the thresholds are the deployment's line, not this runner's: 400 MiB of resident set and
+#     384 MiB of anonymous set against a 512 MiB instance with swap off. They were developed
+#     against a Windows working set (203 MiB at rest, 284 MiB peak on the honouring run), which
+#     counts file-backed pages as resident - a Linux runner's anonymous set is normally lower,
+#     but if a runner's floor differs, these two flags are where that is adjusted, next to the
+#     report the run uploads.
+
+name: Punch memory budget
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: punch-memory-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  punch-saturation:
+    name: peak RSS under the ceiling
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            backend/requirements-dev.txt
+
+      - name: Install the deployment's dependencies and the tooling
+        run: pip install -r requirements.txt -r backend/requirements-dev.txt
+
+      # The test suite into which the gate logic is collected clones the working database for
+      # its schema and refuses to run without one (README, "Tests"): an empty file is enough,
+      # a missing one is a failure. It is gitignored, so it has to be made here.
+      - name: Give the suite its empty database
+        run: touch times.db
+
+      - name: The gate logic, with no server and no models
+        working-directory: backend
+        run: python -m pytest tests/test_punch_saturation_gates.py -q
+
+      - name: Saturate the punch endpoint and gate the peak RSS
+        working-directory: backend
+        run: |
+          python tools/punch_saturation.py \
+            --clients 8 --rounds 4 \
+            --ceiling-mib 400 --anon-ceiling-mib 384 \
+            --report punch-memory.json
+
+      # Whatever the verdict: a red run whose numbers were thrown away is a red run somebody
+      # has to reproduce by hand before they can believe it.
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: punch-memory-report
+          path: backend/punch-memory.json
+          if-no-files-found: warn

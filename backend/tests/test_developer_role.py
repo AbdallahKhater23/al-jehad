@@ -45,6 +45,7 @@ DEV_PASSWORD = "root-credential-for-the-test-0001"
 DEVELOPER_ROUTES = (
     "/api/v1/developer/runtime",
     "/api/v1/developer/alerts",
+    "/api/v1/developer/refused-punches",
     "/api/v1/developer/diagnostics/pool",
     "/api/v1/developer/diagnostics/slow-queries",
     "/api/v1/developer/audit",
@@ -76,6 +77,23 @@ def _rows(sql: str, params: tuple = ()) -> list[dict]:
 def _user(user_id: str) -> dict | None:
     rows = _rows("SELECT * FROM users WHERE id = ?", (user_id,))
     return rows[0] if rows else None
+
+
+def _remove_the_root_row() -> None:
+    """Take the root account back out of the fixture, so a first seed is a first seed.
+
+    ``harness`` clones the *live* database (``harness.LIVE_DB``) into every test's generation,
+    and a deployment that has ever run the seeder carries the account in it - which is the
+    intended end state, not a leak. The subject here is what the seeder does to a database that
+    has no root account yet, so that state has to be *made* rather than assumed: without this,
+    the assertions below describe whichever checkout happens to be running the suite.
+
+    Only the ``users`` row is removed. The root tier's own hub (``developer_alerts``) is keyed
+    by nothing, and no table carries a foreign key onto ``users`` (the connection never turns
+    ``PRAGMA foreign_keys`` on), so a bare delete leaves the rest of the fixture intact.
+    """
+    with db(write=True) as conn:
+        conn.execute("DELETE FROM users WHERE id = ?", (DEV_ID,))
 
 
 def _plant_audit_row(*, actor_id: str, entity_id: str | None, action: str = "user_edit") -> int:
@@ -260,6 +278,7 @@ def test_a_registration_link_cannot_carry_the_root_role(client, app_module):
 # the seed
 # ---------------------------------------------------------------------------
 def test_the_seed_is_idempotent_and_never_restores_an_operators_password():
+    _remove_the_root_row()
     first = _seed()
     assert first["created"] is True and first["rotated"] is True
     stored = _user(DEV_ID)

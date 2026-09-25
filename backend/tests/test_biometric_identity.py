@@ -508,6 +508,12 @@ def test_a_template_from_the_old_pipeline_is_refused_not_scored(client):
         assert response.status_code == 400, response.text[:300]
         detail = response.json()["detail"]
         assert detail["error_code"] == "reference_stale", detail
+        # Machine-readable, beside the sentence: a client has to route this worker to a
+        # different screen than "retake your photo", and the bare template records no
+        # provenance at all, so the diagnosis is the *crop* kind.
+        assert detail["status"] == biometrics.STATUS_NEEDS_REENROLLMENT, detail
+        assert detail["reason"] == biometrics.REASON_STALE_TEMPLATE_PIPELINE, detail
+        assert detail["stale_reason"] == biometrics.STALE_NO_PROVENANCE, detail
         assert "administrator" in detail["message"].lower(), detail
         assert "enroll" in detail["message"].lower(), detail
         assert "internal" not in detail["message"].lower(), (
@@ -543,7 +549,15 @@ def test_a_template_of_the_wrong_size_is_refused_rather_than_500(client):
         response = harness.clock_in(client, STALE_WORKER, headers=bearer(STALE_WORKER))
 
         assert response.status_code == 400, response.text[:300]
-        assert response.json()["detail"]["error_code"] == "reference_stale"
+        detail = response.json()["detail"]
+        assert detail["error_code"] == "reference_stale"
+        # The legacy-template case this whole section exists for: a vector of a different
+        # width (a 4096-float VGG-Face template on a FaceNet deployment, here 512 so the test
+        # does not carry a 16 KB fixture) is a *version* problem rather than a crop one, and
+        # the refusal says which - without raising anything on the way to saying it.
+        assert detail["status"] == biometrics.STATUS_NEEDS_REENROLLMENT, detail
+        assert detail["reason"] == biometrics.REASON_STALE_TEMPLATE_VERSION, detail
+        assert detail["stale_reason"] == biometrics.STALE_UNREADABLE, detail
     finally:
         planted.unlink(missing_ok=True)
 

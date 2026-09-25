@@ -87,6 +87,38 @@ KIND_WORKER_PUSH_UNDELIVERED = "push_undelivered"
 #: punch-level fault.
 KIND_COVERAGE_REPORT = "coverage_report"
 
+#: The deployment's own events, and the reason they are named once here.
+#:
+#: Every one of these is a log line about the *host*: a start that bypassed a failing
+#: self-test, a schema that was repaired rather than refused, an automated retention sweep that
+#: erased data, a detector-coverage verdict that changed. They are written into
+#: ``admin_notifications`` because that is where this application's durable event log has always
+#: been, and they are withheld from every reader who is not the root tier - a site administrator
+#: has no action to take on any of them, and the console's Alerts tab is not the deploy log.
+#:
+#: A named set rather than a comment, because both halves of the rule read it: the read paths
+#: below, so a new kind cannot be added to one and forgotten in the other, and the developer
+#: hub's ``ALERT_KINDS``, which is where these events belong when they are raised for an
+#: operator (``developer.raise_alert``).
+DEPLOYMENT_KINDS: frozenset[str] = frozenset(
+    {
+        KIND_STARTUP_DEGRADED,
+        KIND_STARTUP_OVERRIDE,
+        KIND_SCHEMA_REPAIR,
+        KIND_RETENTION_SWEEP,
+        KIND_COVERAGE_REPORT,
+    }
+)
+
+
+def is_deployment_event(row) -> bool:
+    """Whether one notification row is the deployment talking about itself."""
+    try:
+        return str(row["kind"]) in DEPLOYMENT_KINDS
+    except (KeyError, IndexError, TypeError):
+        return False
+
+
 SEVERITY_INFO = "info"
 SEVERITY_WARNING = "warning"
 SEVERITY_CRITICAL = "critical"
@@ -180,8 +212,22 @@ def notify_worker(
         return False
 
 
-def unread_count(conn: sqlite3.Connection) -> int:
+def unread_count(conn: sqlite3.Connection, *, exclude_deployment: bool = False) -> int:
+    """Unread alerts. ``exclude_deployment`` is how a non-developer's badge is counted.
+
+    The exclusion is here rather than at the call site for the same reason the whole set is:
+    a badge counted without it says four are waiting while the screen below shows none, and a
+    count that cannot be reconciled with the list is worse than no count at all.
+    """
     try:
+        if exclude_deployment:
+            return int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM admin_notifications WHERE read_at IS NULL "
+                    "AND kind NOT IN (%s)" % ",".join("?" * len(DEPLOYMENT_KINDS)),
+                    tuple(sorted(DEPLOYMENT_KINDS)),
+                ).fetchone()[0]
+            )
         return int(conn.execute("SELECT COUNT(*) FROM admin_notifications WHERE read_at IS NULL").fetchone()[0])
     except sqlite3.Error:
         return 0
@@ -217,9 +263,22 @@ def acknowledge(
     return cursor.rowcount > 0
 
 
-def unacknowledged_count(conn: sqlite3.Connection) -> int:
-    """How many alerts on this deployment are still waiting for a human to answer."""
+def unacknowledged_count(conn: sqlite3.Connection, *, exclude_deployment: bool = False) -> int:
+    """How many alerts on this deployment are still waiting for a human to answer.
+
+    ``exclude_deployment`` follows ``unread_count``: a question only the root tier can answer
+    (a forced start is acknowledged by whoever owns the deployment) must not be counted as
+    outstanding work on an administrator's screen.
+    """
     try:
+        if exclude_deployment:
+            return int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM admin_notifications WHERE acknowledged_at IS NULL "
+                    "AND kind NOT IN (%s)" % ",".join("?" * len(DEPLOYMENT_KINDS)),
+                    tuple(sorted(DEPLOYMENT_KINDS)),
+                ).fetchone()[0]
+            )
         return int(
             conn.execute(
                 "SELECT COUNT(*) FROM admin_notifications WHERE acknowledged_at IS NULL"

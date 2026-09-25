@@ -255,6 +255,148 @@ def test_the_page_a_link_opens_reaches_a_script_the_browser_will_run(client):
             )
 
 
+#: Every page the frontend ships, and the way it has to ask for the company's mark.
+#: ``index.html`` is served from the site root, so a bare name is right; the two link pages
+#: are served one segment deep under a token, so theirs climb a level. The difference is why
+#: this is a table and not one shared expectation: a single expectation is what let the mark
+#: go missing on the two pages a worker actually opens.
+MARK_PAGES = (("index.html", "icon.svg"), ("quick.html", "../icon.svg"), ("enroll.html", "../icon.svg"))
+
+
+def test_every_page_hands_the_browser_the_company_mark(client):
+    """The tab and the home screen showed the browser's default globe on the pages that matter most.
+
+    ``index.html`` has carried the mark since it was added. ``quick.html`` and
+    ``enroll.html`` never did, and the reason is the trap the script test above describes:
+    both are served at ``/<prefix>/<token>``, so a bare ``href="icon.svg"`` asks the *token
+    route* for ``/q/icon.svg``, which matches and answers with the page itself. HTML behind
+    ``rel="icon"`` is an icon the browser discards without a word, so the tab fell back to
+    the default globe - and a worker who kept the punch button on their home screen got a
+    grey page snapshot for a tile instead of the company's column. Nothing failed, nothing
+    was logged, and no test could see it: the pages were not broken, they were unbranded.
+
+    Both halves are pinned: the direction each page asks in, and what the browser is given
+    back when it follows that href from the page's own URL.
+    """
+    for page, href in MARK_PAGES:
+        body = (harness.PROJECT_ROOT / "frontend" / page).read_text(encoding="utf-8")
+        for rel, why in (
+            ("icon", "the browser tab"),
+            ("apple-touch-icon", "the home-screen tile"),
+        ):
+            found = re.findall(rf'<link[^>]*\brel="{rel}"[^>]*\bhref="([^"]+)"', body)
+            assert found == [href], (
+                f'{page} asks for {found or "no icon at all"} for {why}; expected "{href}". '
+                f"The page is served from a URL of a different depth than its own file name, "
+                f"and an href that does not account for that reaches the token route, which "
+                f"answers with the page - and a page is not an icon"
+            )
+
+    # What the browser will follow that href to, and what it has to be handed back.
+    served = client.get("/icon.svg")
+    assert served.status_code == 200, f"/icon.svg is not served: {served.status_code}"
+    content_type = served.headers.get("content-type", "")
+    assert "svg" in content_type, (
+        f"/icon.svg answered as {content_type!r}; an icon served as anything else is an icon "
+        "the browser will not draw"
+    )
+    # Deliberately the whole body and not its opening: this file leads with a long comment
+    # explaining the artwork, so the element is a few hundred characters in.
+    assert "<svg" in served.text and "viewBox=" in served.text, (
+        "/icon.svg did not come back as SVG markup"
+    )
+    assert "<!DOCTYPE html>" not in served.text[:200], (
+        "/icon.svg answered with a page rather than the mark"
+    )
+
+
+def test_the_badge_is_the_same_column_as_the_mark():
+    """One drawing, two files, kept equal by this test rather than by good intentions.
+
+    ``icon.svg`` is the mark scaled into a badge, and it cannot *reference*
+    ``logo-mark.svg`` - an ``<img>``-loaded SVG has no way to reach into another file - so
+    the geometry is copied, and the file's own comment asks the next person to change a
+    point in both. A copy is a promise to keep two places in step, and the tile a browser
+    draws is a small enough surface that the drift would go unnoticed for months.
+
+    The numbers are compared, not the files. The badge is allowed its own viewBox, its green
+    ground and its shortened gradient; it is not allowed a different column.
+    """
+
+    def geometry(name: str) -> set[str]:
+        body = (harness.PROJECT_ROOT / "frontend" / name).read_text(encoding="utf-8")
+        shapes = re.findall(
+            r'<path d="([^"]+)"'
+            r'|<rect x="([^"]+)" y="([^"]+)" width="([^"]+)" height="([^"]+)"'
+            r'|<circle cx="([^"]+)" cy="([^"]+)" r="([^"]+)"',
+            body,
+        )
+        return {part for shape in shapes for part in shape if part}
+
+    mark = geometry("logo-mark.svg")
+    badge = geometry("icon.svg")
+    assert mark, "logo-mark.svg has no geometry left to compare"
+    assert badge == mark, (
+        "the badge and the mark are no longer the same column. "
+        f"Only in logo-mark.svg: {sorted(mark - badge)}. "
+        f"Only in icon.svg: {sorted(badge - mark)}"
+    )
+
+
+#: The colour the console paints its own chrome with - the same #162F29 the brand block in
+#: style.css hands the rail, the sign-in panel and the mark.
+COMPANY_GREEN = "#162F29"
+
+#: The slate these two pages shipped on before they had a brand: the blue-grey of a default
+#: dark theme, chosen for the job and never for the company.
+SLATE = "#0f172a"
+
+
+def test_every_page_paints_the_phone_the_company_green():
+    """The first thing the brand touches on a phone, and the last thing anybody notices is missing.
+
+    ``theme-color`` is what an installed app paints its status bar with, and it is decided
+    before the page has painted anything at all - so on the punch page it was a slate bar
+    over a slate page, on a screen whose whole job is to belong to Al-Jehad. It is the same
+    value on all three pages because it is the same app.
+    """
+    for page in ("index.html", "quick.html", "enroll.html"):
+        body = (harness.PROJECT_ROOT / "frontend" / page).read_text(encoding="utf-8")
+        theme = re.findall(r'<meta name="theme-color" content="([^"]+)"', body)
+        assert theme == [COMPANY_GREEN], (
+            f"{page} tells the phone to paint its status bar {theme or 'nothing'}, and the "
+            f"console paints {COMPANY_GREEN}. A status bar in a third colour over a page in "
+            f"the company's is the seam this is here to keep shut"
+        )
+
+
+def test_the_link_pages_draw_the_mark_and_the_brand_palette_in_their_own_head():
+    """Both link pages are standalone, so neither can inherit the console's styling.
+
+    They load no stylesheet - deliberately, because a worker opens them from a link on site
+    cellular and the page has to paint on the first frame - so the palette is written into
+    each page's own ``<style>`` and the mark is an ``<img>`` one level up. That copying is
+    the price of the two pages standing alone, and it is exactly the sort of thing that gets
+    half-done: the mark was on the console's rail and the tab and nowhere a worker looked,
+    and the pages kept the slate palette for the whole life of the feature.
+    """
+    for page, _ in LINK_PAGES:
+        body = (harness.PROJECT_ROOT / "frontend" / page).read_text(encoding="utf-8")
+        assert f"--brand-green: {COMPANY_GREEN}" in body, (
+            f"{page} does not define the brand palette it paints itself with. These pages "
+            "load no stylesheet, so a colour that is not in this file is not on the page"
+        )
+        assert re.search(r'<img src="\.\./logo-mark\.svg"[^>]*>', body), (
+            f"{page} does not draw the company mark. It has to be one level up, like every "
+            "other asset on these pages"
+        )
+        assert SLATE not in body.lower(), (
+            f"{page} is back on the slate palette ({SLATE}). It was replaced by the "
+            f"company's green and the mark for a reason: these are the two pages a worker "
+            "opens, and they were the only unbranded screens in the app"
+        )
+
+
 def test_both_link_pages_carry_every_element_the_shared_module_reaches_for():
     """One capture module, two pages, and it reaches into their markup by id.
 

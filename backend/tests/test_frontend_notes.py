@@ -102,7 +102,35 @@ function threadOf(id) {
     });
 }
 
+// The signed-in administrator's *own* note, filed through the worker's endpoints - the same
+// request a worker's handset makes, because an administrator with something missing on site
+// is the same person making the same request. It is deliberately not one of ``NOTES``: the
+// mailbox below is other people's requests, and this is the reader's own.
+const ADMIN_OWN_NOTE = {
+    id: 31, worker_id: '1000', category: 'missing_item', category_label: 'Missing item or material',
+    subject: 'Rebar for tower B', body: 'The rebar for tower B never arrived.',
+    status: 'open', priority: 'normal', created_at: '2026-09-15 06:30:00',
+    updated_at: '2026-09-15 06:30:00', last_reply_at: null, resolved_at: null,
+    resolved_by: null, closed_at: null, closed_by: null, admin_unread: 0, worker_unread: 0, open: true,
+    last_message: {
+        id: 41, author_id: '1000', author_role: 'admin', from_admin: false, internal: false,
+        body: 'The rebar for tower B never arrived.', created_at: '2026-09-15 06:30:00'
+    }
+};
+
 function responders(url, init) {
+    // The administrator's own notes, answered before the mailbox patterns above: both live
+    // under /worker/notes and /admin/notes, and this is the reader's column.
+    if (/\/worker\/notes\/\d+$/.test(url)) return { status: 200, body: ADMIN_OWN_NOTE };
+    if (url.indexOf('/worker/notes') >= 0) {
+        return {
+            status: 200,
+            body: {
+                notes: [ADMIN_OWN_NOTE], open: 1, unread: 0, max_open: 20,
+                categories: ['missing_item', 'other']
+            }
+        };
+    }
     if (url.indexOf('/admin/users/edit_password') >= 0) {
         resets.push(JSON.parse(init.body));
         return { status: 200, body: { status: 'success', message: 'Password successfully updated.' } };
@@ -211,8 +239,18 @@ function toasts(env) {
     return env.evaluate("(document.getElementById('toastRoot').__children || []).map((el) => el.textContent)");
 }
 
+/**
+ * The mailbox region of the Notes screen, read where it is painted.
+ *
+ * The tab is two regions: the signed-in administrator's own notes above, the queue below -
+ * and the stub DOM does not nest one ``innerHTML`` string inside another, so reading the
+ * tab's markup would hand back the two host elements and none of the rows. The queue, its
+ * thread, its error line and its empty state all live in the second region, which is what
+ * every assertion below is about; section 10 reads the worker's own host for the same
+ * reason.
+ */
 function render(env) {
-    return env.evaluate("document.getElementById('adminContent').innerHTML");
+    return env.evaluate("document.getElementById('notesInbox').innerHTML");
 }
 
 function inboxEnv() {
@@ -550,6 +588,52 @@ const results = {};
     results.code_labels.arabic_unknown = labels("WORKER_MODULES.noteCategoryLabel('tool_allowance')");
     env.evaluate("I18n.setLang('en')");
 }
+
+// 14. the administrator's own notes, above the mailbox they read
+//
+// An administrator works a shift of their own (``handsetRoles``, ``SELF_ENROLL_ROLES``), and
+// the note a worker writes to ask for something is a note they have to be able to write -
+// but this tab offered only the mailbox: every note as a reviewer, and no way to open one of
+// their own, which is what "open notes like a worker" means. The card above is the *worker's*
+// own view, rendered here rather than copied, so the two cannot drift apart.
+{
+    const env = inboxEnv();
+    // The reader this is for: an administrator who also works the site, not the head admin
+    // the other console blocks sign in as.
+    env.evaluate("State.saveUser(" + JSON.stringify({
+        id: '1000', name: 'Site Admin', role: 'admin', token: 'tok-1000'
+    }) + ")");
+    await env.evaluate("UI.renderAdminTab('Notes')");
+    const card = env.evaluate("document.getElementById('adminMyNotes').innerHTML");
+    results.my_notes = {
+        region_on_the_tab: env.evaluate("document.getElementById('adminContent').innerHTML")
+            .indexOf('data-my-notes') >= 0,
+        // Painted by the worker's own module, into the console's host: one implementation of
+        // "my notes", not a second one that would answer the same question differently.
+        host_is_the_one_rendered_into:
+            env.evaluate("WORKER_MODULES._notesHost === document.getElementById('adminMyNotes')"),
+        heading: card.indexOf(env.evaluate("I18n.__('notesMine')")) >= 0,
+        has_new_note: card.indexOf('data-new-note') >= 0,
+        own_note_ids: (card.match(/data-note="[0-9]+"/g) || []).map((a) => a.replace(/[^0-9]/g, '')),
+        own_reads: env.requests.filter((r) => r.url.indexOf('/worker/notes') >= 0).length,
+        // The mailbox below is untouched by any of this.
+        mailbox_ids: rowsOf(render(env)).map((row) => row.id)
+    };
+
+    await env.evaluate("WORKER_MODULES.openNote(31)");
+    results.my_notes.thread_in_the_card =
+        env.evaluate("document.getElementById('adminMyNotes').innerHTML").indexOf('Rebar') >= 0;
+    results.my_notes.thread_read = env.requests.filter((r) => /\/worker\/notes\/31$/.test(r.url)).length;
+
+    // ... and filing one is the worker's composer, not a form this tab grew on its own.
+    await env.evaluate("WORKER_MODULES.startNote()");
+    env.evaluate("document.getElementById('noteSubject').value = 'Cement for tower B'");
+    env.evaluate("document.getElementById('noteBody').value = 'It never arrived.'");
+    await env.evaluate("WORKER_MODULES.submitNote(null)");
+    results.my_notes.filed = env.requests
+        .filter((r) => r.method === 'POST' && r.url.indexOf('/worker/notes') >= 0)
+        .length;
+}
 """
 
 
@@ -676,6 +760,34 @@ def test_a_dead_server_says_so(results):
     assert dead["rows"] == 0
     assert dead["has_search_box"] is True, "the filter stays usable instead of the tab going blank"
     assert dead["cached"] is None, "nothing may be reused from an empty response"
+
+
+def test_an_administrator_can_open_notes_of_their_own(results):
+    """The tab is two regions: the reader's own notes, and the mailbox they work through.
+
+    Without the first, an administrator who works a site could only *review* notes - no way to
+    open one of their own from the console they are already in - which is the gap this closes.
+    The card is ``WORKER_MODULES.renderNotes`` painting into the console's own host, so there
+    is one "my notes" in the codebase rather than two that disagree.
+    """
+    own = results["my_notes"]
+    assert own["region_on_the_tab"], "the console has nowhere to put the reader's own notes"
+    assert own["heading"], "the region does not say what it is"
+    assert own["has_new_note"], "there is no way to open a note of your own"
+    assert own["host_is_the_one_rendered_into"], (
+        "the console painted the worker's view into a host the module does not re-render into, "
+        "so the next reply would land somewhere else"
+    )
+    assert own["own_note_ids"] == ["31"], own["own_note_ids"]
+    assert own["own_reads"] >= 1, "the card never asked the server for the reader's own notes"
+    # Opening it, and filing a new one, both go through the worker's own endpoints - the note a
+    # worker writes is the note an administrator writes.
+    assert own["thread_in_the_card"], "the reader's own note does not open in place"
+    assert own["thread_read"] >= 1, own["thread_read"]
+    assert own["filed"] == 1, "opening a note of your own posts nowhere"
+
+    # And the mailbox is exactly where it was: two questions on one screen, neither sacrificed.
+    assert own["mailbox_ids"] == ["11", "12", "13"], own["mailbox_ids"]
 
 
 def test_the_worker_has_a_notes_tab_and_a_queue_that_says_what_is_waiting(results):

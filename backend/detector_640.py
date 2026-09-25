@@ -41,7 +41,6 @@ from __future__ import annotations
 
 import logging
 import math
-import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,6 +48,15 @@ from typing import Any, Final, Iterable, Protocol, Sequence, runtime_checkable
 
 import cv2
 import numpy as np
+
+#: OpenCV's thread pool is process-global and sized from the cores it can see, which inside a
+#: container is the *host's* count rather than the cgroup quota - so on a 1 vCPU instance
+#: every cv2 operation (detect, resize, warp) could fan out to 32 threads and hand the CFS
+#: scheduler a queue of work it then throttles, which reads as latency on every other request.
+#: One thread is the honest number for one core; each call here processes a single small frame.
+#: ``face_detector`` states the same cap where the runtime YuNet path loads cv2, so it holds
+#: whichever module reaches OpenCV first (the setting is global, not per-module).
+cv2.setNumThreads(1)
 
 log = logging.getLogger("attendance.detector")
 
@@ -454,7 +462,13 @@ class ScrfdDetector:
         if session is None:
             options = ort.SessionOptions()
             options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            options.intra_op_num_threads = int(intra_threads or max(1, (os.cpu_count() or 2)))
+            # One thread unless the caller says otherwise. This used to be ``os.cpu_count()``,
+            # which inside a container reports the host's cores rather than the cgroup quota -
+            # a 1 vCPU instance answered 32, so ONNX Runtime opened 32 intra-op threads that
+            # the scheduler then throttled. The session spent more time context switching than
+            # running the graph, and the oversubscription surfaced as latency on every other
+            # request. ``intra_threads`` still overrides this for a benchmark that wants it.
+            options.intra_op_num_threads = int(intra_threads or 1)
             options.inter_op_num_threads = 1
             try:
                 session = ort.InferenceSession(

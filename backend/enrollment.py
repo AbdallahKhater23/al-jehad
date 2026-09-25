@@ -149,14 +149,17 @@ def _audit(
 # ---------------------------------------------------------------------------
 # biometric helpers
 # ---------------------------------------------------------------------------
-def _decode_image(file_bytes: bytes):
-    """Decode already-validated photo bytes, through the shared upload policy.
+def _face_frame(file_bytes: bytes):
+    """The frame a face model sees, for already-validated photo bytes.
 
-    Every caller reaches this after ``uploads.read_photo`` / ``validate_photo_bytes``,
-    so the size, the type and the pixel count have been checked by the time an image is
-    actually decoded - one implementation for the whole application.
+    Every caller reaches this after ``uploads.read_photo`` / ``validate_photo_bytes``, so
+    the size, the type and the pixel count have been checked by the time an image is
+    actually decoded - one implementation for the whole application. What comes back is
+    the *frame*, not the decoded photo: ``uploads.face_frame`` applies the same decode hint
+    and the same resize every punch uses, because a photo enrolled here becomes the
+    template that punch is later measured against.
     """
-    return uploads.decode_photo(file_bytes, field="photo")
+    return uploads.face_frame(file_bytes, field="photo")
 
 
 def face_array(image):
@@ -761,7 +764,9 @@ async def submit_registration(
         )
 
     file_bytes = await uploads.read_photo(photo, field="photo")
-    image = uploads.decode_photo(file_bytes, field="photo")
+    # The same frame chain a punch uses (``uploads.face_frame``): what is embedded here is
+    # the reference every future punch is compared against.
+    image = uploads.face_frame(file_bytes, field="photo")
     # Advisory by default, ``enforce`` when an operator says so - the same setting the
     # self-service capture answers to, because the camera situation is identical. The
     # embedding is computed here and written after the account exists: a photo that
@@ -907,7 +912,9 @@ async def submit_enrollment(
     # bytes, pixel ceiling before decoding. It replaced a bare ``photo.read()`` followed
     # by a length check, which spent the memory before it decided the file was too big.
     file_bytes = await uploads.read_photo(photo, field="photo")
-    image = uploads.decode_photo(file_bytes, field="photo")
+    # The same frame chain a punch uses (``uploads.face_frame``) - see the note on the
+    # registration-link handler above.
+    image = uploads.face_frame(file_bytes, field="photo")
 
     worker_id = str(row["worker_id"])
     try:
@@ -1211,7 +1218,7 @@ def _process_item(job_id: int, item: sqlite3.Row, *, archive, photos: dict[str, 
         return "failed"
 
     try:
-        image = _decode_image(file_bytes)
+        image = _face_frame(file_bytes)
     except Exception as exc:
         with db(write=True) as conn:
             finish(conn, ITEM_FAILED, "decode_failed", f"{type(exc).__name__}: {exc}")

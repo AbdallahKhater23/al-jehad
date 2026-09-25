@@ -558,13 +558,130 @@
     //: What the server will accept, until its own answer says otherwise. The numbers match
     //: the server's, so a link whose response has not landed yet still refuses a 40 MB
     //: video rather than uploading it over a phone tether.
-    var policy = { max_bytes: 5 * 1024 * 1024, accepted: ["image/jpeg", "image/png", "image/webp"] };
+    //:
+    //: ``face_frame_max_pixels`` / ``face_frame_max_edge_px`` are the server's *ingestion
+    //: boundary* (``uploads.policy()``, mirrored in ``backend/config.py``). They are not a
+    //: refusal the browser has to phrase - they are the size a photo is *resized to* before
+    //: it is held, because a phone's own camera app produces 12 MP and the server refuses
+    //: anything above this with a 422. A file picked from the gallery or taken by the native
+    //: camera is the normal way a worker enrolls, so without this the boundary would refuse
+    //: the ordinary case; with it, the browser sends what the deployment can use.
+    var policy = {
+        max_bytes: 5 * 1024 * 1024,
+        accepted: ["image/jpeg", "image/png", "image/webp"],
+        face_frame_max_pixels: 4000000,
+        face_frame_max_edge_px: 2048
+    };
 
     function setPolicy(next) {
         if (!next) return policy;
         if (next.max_bytes) policy.max_bytes = next.max_bytes;
         if (next.accepted && next.accepted.length) policy.accepted = next.accepted;
+        if (next.face_frame_max_pixels) policy.face_frame_max_pixels = Number(next.face_frame_max_pixels);
+        if (next.face_frame_max_edge_px) policy.face_frame_max_edge_px = Number(next.face_frame_max_edge_px);
         return policy;
+    }
+
+    /**
+     * The size to send, for a photo of a given size. Pure, and the arithmetic both halves use.
+     *
+     * Both rules apply - the area ceiling and the long edge - and the smaller scale wins, so
+     * "this photo is above the boundary" and "the browser resized it" are one question rather
+     * than two. Never enlarges: ``scale`` is capped at 1, because upscaling adds no detail and
+     * would change what the detector sees for every phone in the field.
+     *
+     * A function rather than an inline calculation in the resize below, because it is the part
+     * worth testing: the suite calls it with numbers instead of needing a camera and a canvas.
+     */
+    function fitToLimits(width, height, limits) {
+        var box = limits || policy;
+        var w = Number(width || 0);
+        var h = Number(height || 0);
+        if (!(w > 0) || !(h > 0)) return { width: w, height: h, scale: 1 };
+        var scale = 1;
+        var maxEdge = Number(box.face_frame_max_edge_px || 0);
+        if (maxEdge > 0) scale = Math.min(scale, maxEdge / Math.max(w, h));
+        var maxPixels = Number(box.face_frame_max_pixels || 0);
+        if (maxPixels > 0) scale = Math.min(scale, Math.sqrt(maxPixels / (w * h)));
+        if (!(scale < 1)) return { width: w, height: h, scale: 1 };
+        return {
+            width: Math.max(1, Math.floor(w * scale)),
+            height: Math.max(1, Math.floor(h * scale)),
+            scale: scale
+        };
+    }
+
+    /** The resized blob as a named JPEG. */
+    function renameToJpeg(blob, file) {
+        var name = String((file && file.name) || "photo").replace(/\.[a-z0-9]+$/i, "") + ".jpg";
+        try {
+            return new File([blob], name, { type: "image/jpeg" });
+        } catch (e) {
+            // A browser without ``File``: a Blob cannot carry a name, and the server reads the
+            // *bytes*, so the upload is still correct - only the filename a log shows is not.
+            try { blob.name = name; } catch (e2) {}
+            return blob;
+        }
+    }
+
+    /**
+     * ``file`` reduced to the policy's boundary, or ``file`` itself when it already fits.
+     *
+     * ``done(small, resized)`` is called once, always, and a failure comes back as the original
+     * file rather than as nothing: the server is the authority on what it will accept, and its
+     * refusal names the problem in the worker's own language. The browser's job here is only to
+     * not spend a phone tether sending something that will be refused.
+     */
+    function shrinkPhoto(file, done, limits) {
+        var finish = done || function () {};
+        var box = limits || policy;
+        // No decoder, no resize. Feature-detected rather than assumed, which also keeps this a
+        // pass-through under a test harness that models a DOM but not an image decoder.
+        if (!file || typeof Image === "undefined" || typeof document === "undefined") {
+            return finish(file, false);
+        }
+        var url = null;
+        var settled = false;
+        function settle(small, resized) {
+            if (settled) return;
+            settled = true;
+            if (url && typeof URL !== "undefined" && URL.revokeObjectURL) {
+                try { URL.revokeObjectURL(url); } catch (e) {}
+            }
+            finish(small, resized);
+        }
+        try {
+            url = URL.createObjectURL(file);
+        } catch (e) {
+            return settle(file, false);
+        }
+        var image = new Image();
+        image.onload = function () {
+            var fit = fitToLimits(
+                image.naturalWidth || image.width,
+                image.naturalHeight || image.height,
+                box
+            );
+            if (!(fit.scale < 1)) return settle(file, false);
+            try {
+                var canvas = document.createElement("canvas");
+                canvas.width = fit.width;
+                canvas.height = fit.height;
+                canvas.getContext("2d").drawImage(
+                    image, 0, 0, image.naturalWidth || image.width, image.naturalHeight || image.height,
+                    0, 0, fit.width, fit.height
+                );
+                canvas.toBlob(function (blob) {
+                    if (!blob) return settle(file, false);
+                    settle(renameToJpeg(blob, file), true);
+                }, "image/jpeg", 0.92);
+            } catch (e) {
+                settle(file, false);
+            }
+        };
+        image.onerror = function () { settle(file, false); };
+        image.src = url;
+        return undefined;
     }
 
     function mb(bytes) {
@@ -664,25 +781,33 @@
         /** Takes a file the browser handed us - a capture, or one from the gallery. */
         function accept(file, ready) {
             var found = photoProblem(file, opts.family);
-            showProblem(found);
             if (found) {
+                showProblem(found);
                 photo = null;
                 arm(false);
                 return null;
             }
-            photo = file;
-            if (preview) {
-                preview.src = URL.createObjectURL(file);
-                preview.alt = t("camera.preview." + (opts.family === "photo" ? "photo" : "selfie"));
-            }
-            hide("preview", false);
-            hide("video", true);
-            arm(allowed());
-            if (opts.readyKey && ready) {
-                var button = opts.primary ? el(opts.primary) : null;
-                if (button) button.textContent = t(opts.readyKey);
-            }
-            if (opts.onPhoto) opts.onPhoto(file);
+            showProblem("");
+            // Held only once it fits the server's boundary, and the primary stays disabled
+            // until then: a tap in that window would submit the full-size original, which is
+            // exactly the failure this removes. With no decoder available (an old browser, or
+            // a test harness) this is the synchronous flow it always was.
+            arm(false);
+            shrinkPhoto(file, function (small) {
+                photo = small;
+                if (preview) {
+                    preview.src = URL.createObjectURL(small);
+                    preview.alt = t("camera.preview." + (opts.family === "photo" ? "photo" : "selfie"));
+                }
+                hide("preview", false);
+                hide("video", true);
+                arm(allowed());
+                if (opts.readyKey && ready) {
+                    var button = opts.primary ? el(opts.primary) : null;
+                    if (button) button.textContent = t(opts.readyKey);
+                }
+                if (opts.onPhoto) opts.onPhoto(small);
+            });
             return file;
         }
 
@@ -712,8 +837,13 @@
 
         function shoot() {
             if (!video || !canvas) return;
-            canvas.width = video.videoWidth || 720;
-            canvas.height = video.videoHeight || 960;
+            // The frame is drawn at the size the boundary allows, not blindly at the stream's:
+            // a browser that hands the page a 4K track would otherwise put an 8 MP frame on the
+            // wire, and the server would refuse the worker's own selfie with a sentence about
+            // their photo being too big. The aspect ratio is the stream's, unchanged.
+            var fit = fitToLimits(video.videoWidth || 720, video.videoHeight || 960);
+            canvas.width = fit.width;
+            canvas.height = fit.height;
             canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
             canvas.toBlob(function (blob) {
                 accept(blob, true);
@@ -839,6 +969,8 @@
         policy: function () { return policy; },
         mb: mb,
         photoProblem: photoProblem,
+        fitToLimits: fitToLimits,
+        shrinkPhoto: shrinkPhoto,
         applyPolicy: applyPolicy,
         createCamera: createCamera,
         locate: locate,

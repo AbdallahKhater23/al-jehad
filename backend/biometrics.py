@@ -262,6 +262,55 @@ STALE_NO_PROVENANCE = "no_provenance"
 STALE_OTHER_PIPELINE = "other_pipeline"
 STALE_OTHER_MODEL = "other_model"
 
+# ---------------------------------------------------------------------------
+# the re-enrollment contract (machine-readable, for a client rather than a worker)
+# ---------------------------------------------------------------------------
+#: The status a verification answers with when the *template* is the problem and not the
+#: photo. Uppercase and frozen because a client switches on it: "show the re-enrollment
+#: screen" and "tell the worker to take another photo" are different screens, and a client
+#: that has to read an English sentence to tell them apart gets it wrong in the language it
+#: was not written for.
+STATUS_NEEDS_REENROLLMENT = "NEEDS_REENROLLMENT"
+
+#: A template from a different *version* of the embedding: a different dimension (the
+#: 4096-float ``VGG-Face`` vectors this pipeline replaced with 128-float FaceNet ones), or a
+#: different model by name. No distance computed here would mean anything - the two are not
+#: comparable at all - and the fix is one new photograph.
+REASON_STALE_TEMPLATE_VERSION = "stale_template_version"
+
+#: A template made from a different *crop*: written before the detector was replaced, or
+#: carrying no provenance at all. The same fix, a different diagnosis - the vector may be
+#: the right width and still describe a different part of the face.
+REASON_STALE_TEMPLATE_PIPELINE = "stale_template_pipeline"
+
+#: Every :func:`stale_reason` as the pair a client keys on. A table rather than a chain of
+#: comparisons, so a reason cannot be added without deciding which of the two it is - and so
+#: the answer is in one place for the punch endpoint, the roster and an operator's script.
+REENROLLMENT_STATUSES: dict[str, tuple[str, str]] = {
+    STALE_UNREADABLE: (STATUS_NEEDS_REENROLLMENT, REASON_STALE_TEMPLATE_VERSION),
+    STALE_OTHER_MODEL: (STATUS_NEEDS_REENROLLMENT, REASON_STALE_TEMPLATE_VERSION),
+    STALE_NO_PROVENANCE: (STATUS_NEEDS_REENROLLMENT, REASON_STALE_TEMPLATE_PIPELINE),
+    STALE_OTHER_PIPELINE: (STATUS_NEEDS_REENROLLMENT, REASON_STALE_TEMPLATE_PIPELINE),
+}
+
+
+def reenrollment_status(reason: str | None) -> dict[str, str]:
+    """``{status, reason, stale_reason}`` for a template that cannot be scored.
+
+    Empty when there is nothing stale to report, so a caller can merge this into a response
+    body unconditionally. An unrecognised reason is answered as the *version* problem rather
+    than dropped: as far as the caller who has to act can tell, a template this build cannot
+    score is a template to replace, and a missing entry must not read as "nothing wrong".
+    """
+    if reason is None:
+        return {}
+    status, code = REENROLLMENT_STATUSES.get(
+        reason, (STATUS_NEEDS_REENROLLMENT, REASON_STALE_TEMPLATE_VERSION)
+    )
+    # The diagnosis travels beside the routing code: an operator clearing a worklist needs
+    # "4096-float legacy vector" and "made before the detector changed" to be tellable apart.
+    return {"status": status, "reason": code, "stale_reason": reason}
+
 
 @dataclass(frozen=True)
 class Reference:

@@ -1,29 +1,60 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   The browser-tab / home-screen icon.
-  The capital only, and on the company's green rather than on nothing: a gold
-  outline on a white browser tab is nearly invisible, and on a dark one it is the
-  green that disappears. The mark itself is the same geometry as logo-mark.svg -
-  duplicated deliberately, because an <img>-loaded SVG cannot reach into another
-  file, and one badge icon is a smaller cost than a sprite pipeline.
+
+  The company's column, whole (capital, shaft and base) on the company's green
+  rather than on nothing: a gold outline on a white browser tab is nearly
+  invisible, and on a dark one it is the green that disappears.
+
+  WHAT WAS WRONG WITH IT BEFORE.
+  This file used to carry only the *capital* of the mark: the abacus, the echinus,
+  the volutes and their eyes, stopping at the necking ring. Scaled into the badge
+  that put a 56x15 band across the middle of a 64px square, so three quarters of
+  the company's mark were missing and what was left read as a squiggle rather than
+  as a column. The mark is one silhouette from top to bottom; a crop of it is not a
+  smaller logo, it is a different one.
+
+  WHY THE PATHS ARE REPEATED.
+  An <img>-loaded SVG cannot reach into another file, so the geometry is duplicated
+  from ``logo-mark.svg`` deliberately: one badge icon is a smaller cost than a
+  sprite pipeline. The numbers below are the same numbers, in the same order, as
+  that file's, so change a point in one and change it in the other. The badge
+  differs in three ways only, and each is about being an icon rather than about the
+  mark: a green ground (nothing controls the surface behind a browser tab), a
+  shortened gradient (there are 64 units to spend, not 264), and one uniform scale
+  that fits the whole mark into the square.
+
+  The mark's own geometry spans x 12..188 and y 10..262 in its 200x264 viewBox.
+  A scale of 0.2063 puts that at 36.3 x 52 units inside the 64px square, leaving a
+  6-unit margin top and bottom: as large as the mark can be drawn without the base
+  slab and the abacus touching the badge's rounded corners.
 -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Al-Jehad International Co.">
     <defs>
-        <linearGradient id="badgeGold" gradientUnits="userSpaceOnUse" x1="0" y1="10" x2="0" y2="56">
+        <linearGradient id="badgeGold" gradientUnits="userSpaceOnUse" x1="0" y1="6" x2="0" y2="58">
             <stop offset="0" stop-color="#FBF0CB"/>
             <stop offset="0.5" stop-color="#DFC68C"/>
             <stop offset="1" stop-color="#B9945A"/>
+        </linearGradient>
+        <linearGradient id="badgeLit" gradientUnits="userSpaceOnUse" x1="0" y1="6" x2="0" y2="12">
+            <stop offset="0" stop-color="#FFF8DF"/>
+            <stop offset="1" stop-color="#EEDCAB"/>
         </linearGradient>
     </defs>
 
     <rect width="64" height="64" rx="12" fill="#162F29"/>
 
-    <g transform="translate(4 16) scale(0.28)">
+    <g transform="translate(11.36 3.94) scale(0.2063)">
+        <!-- The capital: abacus, echinus, necking ring. The abacus is lit because it is
+             the face the light lands on. -->
         <g fill="url(#badgeGold)">
-            <path d="M12 10 H188 L180 26 H20 Z"/>
+            <path d="M12 10 H188 L180 26 H20 Z" fill="url(#badgeLit)"/>
             <path d="M70 26 H130 V44 H70 Z"/>
             <path d="M64 44 H136 V52 H64 Z"/>
         </g>
+
+        <!-- The volutes: an arm out to each end that curls down and back in on itself,
+             with the eye of the scroll left open. -->
         <g fill="none" stroke="url(#badgeGold)" stroke-width="8" stroke-linecap="round" stroke-linejoin="round">
             <path d="M60 34 H36 a15 15 0 0 0 0 30 h6"/>
             <path d="M140 34 H164 a15 15 0 0 1 0 30 h-6"/>
@@ -31,6 +62,17 @@
         <g fill="url(#badgeGold)">
             <circle cx="30" cy="49" r="3.5"/>
             <circle cx="170" cy="49" r="3.5"/>
+        </g>
+
+        <!-- The shaft, in three flutes, and the base slab. The ground shows through the
+             gaps, so the column reads as fluted on any surface instead of carrying a
+             second colour. -->
+        <g fill="url(#badgeGold)">
+            <rect x="70" y="54" width="18" height="192"/>
+            <rect x="91" y="54" width="18" height="192"/>
+            <rect x="112" y="54" width="18" height="192"/>
+            <path d="M62 246 H138 V252 H62 Z"/>
+            <path d="M54 252 H146 V262 H54 Z"/>
         </g>
     </g>
 </svg>

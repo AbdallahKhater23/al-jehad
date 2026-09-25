@@ -44,12 +44,17 @@ SERVE = PROJECT_ROOT / "backend" / "serve.py"
 
 #: Imported by the application or by ``serve.py`` at runtime. Each one is a feature that
 #: disappears - or a start that fails - if the host does not install it.
+#:
+#: ``scipy`` used to be listed here, for one call: ``main.compare_faces_sync`` scored punches
+#: with ``scipy.spatial.distance.cosine``. That is a numpy dot product now (``main.cosine``),
+#: so the application imports SciPy nowhere - and dropping it takes ~35 MB of RSS (measured)
+#: off a 512 MB instance. The tools and the contract test that still score with SciPy pin it
+#: in ``backend/requirements-dev.txt``, which is not installed on a host.
 RUNTIME_PINS = (
     "fastapi",
     "uvicorn",
     "onnxruntime",
     "numpy",
-    "scipy",
     "pydantic",
     "starlette",
     "slowapi",

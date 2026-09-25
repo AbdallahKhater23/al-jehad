@@ -1023,16 +1023,15 @@ _MATCH_PHRASES = {
 
 
 def _frame_arrays(blob: bytes) -> tuple[np.ndarray, np.ndarray]:
-    """``(rgb, bgr)`` for one selfie: the same ceiling and channel order as a live punch.
+    """``(rgb, bgr)`` for one selfie: a live punch's frame and channel order, exactly.
 
-    ``main.py`` thumbnails to ``settings.punch_selfie_max_px`` before either model sees the
-    frame, and hands the liveness model RGB while DeepFace expects BGR. A scoring path that
-    skipped either would print a number beside the online one that was measured on different
-    pixels - which is also why the ceiling is the *same* setting, not a private 640: the
-    offline score must be measured on the same pixels the online one would have been.
+    The frame comes from ``uploads.face_frame`` - the same chain ``main.py`` builds its punch
+    frame with, from the same setting - and the liveness model is handed RGB while DeepFace
+    expects BGR. A scoring path that skipped either would print a number beside the online
+    one that was measured on *different pixels*: an offline score is only meaningful next
+    to the online one if it is the score this punch would have received at the gate.
     """
-    image = uploads.decode_photo(blob, field="selfie")
-    image.thumbnail((settings.punch_selfie_max_px, settings.punch_selfie_max_px))
+    image = uploads.face_frame(blob, field="selfie")
     rgb = np.array(image)
     return rgb, rgb[:, :, ::-1]
 
@@ -1284,12 +1283,15 @@ async def upload_sync_photo(
     attention = _selfie_attention(scored)
     now_str = datetime.now().strftime(_TS)
     # The frame the score was measured from, kept as the log row's evidence - the same copy
-    # the online punch keeps (see ``punch_frames``), stored before the write transaction so a
-    # decode or disk problem here cannot abort a scoring that already ran. Best-effort like
-    # the online path: evidence lost to a full disk is not hours lost.
+    # the online punch keeps (see ``punch_frames``), which is why this is ``face_frame`` and
+    # not a bare decode: the scoring path builds its frame with exactly this chain (see
+    # ``_frame_arrays``), so the evidence is the frame that was judged rather than a
+    # full-resolution one that only *looks* like it. Stored before the write transaction so
+    # a decode or disk problem here cannot abort a scoring that already ran; best-effort
+    # like the online path, because evidence lost to a full disk is not hours lost.
     frame_name: str | None = None
     try:
-        frame_name = punch_frames.store_frame(uploads.decode_photo(blob, field="selfie"))
+        frame_name = punch_frames.store_frame(uploads.face_frame(blob, field="selfie"))
     except (OSError, ValueError) as exc:  # decode failure cannot be far: the models just read these bytes
         log.warning("could not store the offline punch frame for worker %s", current.id, exc_info=True)
     with db(write=True) as conn:
