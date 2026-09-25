@@ -35,6 +35,8 @@ from __future__ import annotations
 import json
 import sqlite3
 
+import developer
+import harness
 import migrations
 import notifications
 import pytest
@@ -354,17 +356,25 @@ def test_answering_the_forced_start_closes_it_until_the_reason_changes(
     assert before.value["reason"] == OVERRIDE_REASON
     alert_id = before.value["alert_id"]
 
+    # The queue is the root tier's, and an override is the deployment's own business - so the
+    # acceptance is the root tier's to give (an administrator is refused the route entirely).
+    root = harness.root_bearer()
     answered = client.post(
-        f"/api/v1/admin/notifications/{alert_id}/acknowledge",
+        f"/api/v1/developer/notifications/{alert_id}/acknowledge",
         json={"note": "Read the ledger by hand: the column is there, the row is not."},
-        headers=bearer(ADMIN),
+        headers=root,
     )
     assert answered.status_code == 200, answered.text
+    assert client.post(
+        f"/api/v1/developer/notifications/{alert_id}/read", headers=bearer(ADMIN)
+    ).status_code == 403, "an administrator could act on the forced start's alert"
 
     after = readiness._check_startup_override_acknowledged({})
     assert after.ok is True, after.detail
-    assert after.value["acknowledged_by"] == ADMIN
-    assert ADMIN in after.detail, "the accepted override does not say who accepted it"
+    assert after.value["acknowledged_by"] == developer.DEVELOPER_ID_DEFAULT
+    assert developer.DEVELOPER_ID_DEFAULT in after.detail, (
+        "the accepted override does not say who accepted it"
+    )
     assert "startup_override_acknowledged" not in client.get("/api/v1/readiness").json()[
         "degraded_checks"
     ]

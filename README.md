@@ -322,8 +322,10 @@ open the hatch, and an **acknowledgement** is required to settle it. `STARTUP_OV
 writes one `admin_notifications` row per reason - critical, unread, carrying the failing checks
 and the operator's own words - and `startup_override_acknowledged` reports it as an open
 question on the readiness surfaces until somebody answers it. Answering is
-`POST /api/v1/admin/notifications/{id}/acknowledge` with a note, from the console's **Alerts**
-tab or the API: the note is required and vetted as plain text, the actor and their reason go into
+`POST /api/v1/developer/notifications/{id}/acknowledge` with a note, from the console's
+**Alerts** tab or the API - the alert queue is the root tier's, so both the console's Alerts
+tab and the route behind it answer that tier and nobody else. The note is required and vetted
+as plain text, the actor and their reason go into
 the append-only `audit_log` (with the request's address and user agent), the alert is marked
 read with it, and a second answer is refused with a `409` naming who answered first - because
 the first acceptance is the one that was actually made. Two acts stay distinct the whole way

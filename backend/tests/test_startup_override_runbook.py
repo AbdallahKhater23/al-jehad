@@ -421,7 +421,7 @@ def test_the_acknowledgement_surface_it_describes_is_the_one_the_code_writes(run
     assert check.ok is False, check.detail
     assert check.value["alert_id"] == alert_id, check.value
     assert check.value["reason"] == reason, check.value
-    assert f"/api/v1/admin/notifications/{alert_id}/acknowledge" in check.detail, (
+    assert f"/api/v1/developer/notifications/{alert_id}/acknowledge" in check.detail, (
         f"the readiness sentence no longer names the endpoint with the alert's own id in it, so "
         f"the runbook's quickest-way-to-get-it-right instruction sends an operator to build the "
         f"URL by hand: {check.detail}"

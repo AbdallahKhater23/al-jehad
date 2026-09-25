@@ -517,10 +517,11 @@ def _check_startup_override_acknowledged(ctx: dict) -> Check:
     looked, and the audit trail had no acknowledgement at all, so "who decided this was
     acceptable, and why" was answerable only by asking around.
 
-    Advisory, read-only, and answered by ``POST /admin/notifications/{id}/acknowledge``. It
-    fails while the newest ``startup_override`` alert has no acknowledgement and passes as soon
-    as one is written; a deployment that has never been forced up has nothing to answer and
-    passes too, with a detail that says so rather than staying silent.
+    Advisory, read-only, and answered by ``POST /developer/notifications/{id}/acknowledge`` -
+    the alert queue is the root tier's, so the acknowledgement an override needs is the root
+    tier's to give. It fails while the newest ``startup_override`` alert has no acknowledgement
+    and passes as soon as one is written; a deployment that has never been forced up has
+    nothing to answer and passes too, with a detail that says so rather than staying silent.
 
     The *newest* alert is the one that counts: alerts are keyed per reason, so an
     acknowledgement given for last month's reason must not answer this month's override.
@@ -577,9 +578,10 @@ def _check_startup_override_acknowledged(ctx: dict) -> Check:
         TIER_ADVISORY,
         False,
         f"this deployment was forced up past a failing self-test on {row['created_at']} "
-        f"(reason given: {payload.get('reason') or 'not recorded'}) and no administrator has "
-        f"accepted it: POST /api/v1/admin/notifications/{int(row['id'])}/acknowledge with a note, "
-        "or remove STARTUP_OVERRIDE_REASON and fix the check that failed",
+        f"(reason given: {payload.get('reason') or 'not recorded'}) and nobody has accepted "
+        f"it: POST /api/v1/developer/notifications/{int(row['id'])}/acknowledge with a note "
+        "(the root tier's route, and the root tier's decision), or remove "
+        "STARTUP_OVERRIDE_REASON and fix the check that failed",
         value,
     )
 

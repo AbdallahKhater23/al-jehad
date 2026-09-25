@@ -100,7 +100,7 @@ function responders(url, init) {
         }
         return { status: 200, body: RULES };
     }
-    if (url.indexOf('/admin/notifications') >= 0) return { status: 200, body: { unread: 0, notifications: [] } };
+    if (url.indexOf('/developer/notifications') >= 0) return { status: 200, body: { unread: 0, notifications: [] } };
     if (url.indexOf('/admin/active_sessions') >= 0) return { status: 200, body: [] };
     return { status: 200, body: {} };
 }

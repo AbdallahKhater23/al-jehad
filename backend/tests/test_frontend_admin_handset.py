@@ -156,7 +156,7 @@ function responders(url, init) {
     }
     if (url.includes('/worker/notes')) return { status: 200, body: { notes: [], open: 0 } };
     // The console's own board, so an administrator's first paint is not an error screen.
-    if (url.includes('/admin/notifications')) return { status: 200, body: { unread: 0, notifications: [] } };
+    if (url.includes('/developer/notifications')) return { status: 200, body: { unread: 0, notifications: [] } };
     if (url.includes('/admin/')) return { status: 200, body: [] };
     return { status: 200, body: [] };
 }

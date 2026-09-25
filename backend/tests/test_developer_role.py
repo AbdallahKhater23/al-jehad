@@ -45,6 +45,10 @@ DEV_PASSWORD = "root-credential-for-the-test-0001"
 DEVELOPER_ROUTES = (
     "/api/v1/developer/runtime",
     "/api/v1/developer/alerts",
+    # The alert queue: the administrators' screen until it moved tiers, so it belongs in this
+    # list on its own account - a route that stopped answering administrators is exactly the
+    # kind of move that leaves a second door behind.
+    "/api/v1/developer/notifications",
     "/api/v1/developer/refused-punches",
     "/api/v1/developer/diagnostics/pool",
     "/api/v1/developer/diagnostics/slow-queries",
@@ -222,9 +226,15 @@ def test_the_private_hub_is_a_table_no_administrator_facing_query_names(client, 
     # must not bleed into each other, or an infrastructure alert becomes visible to the audience
     # it was hidden from.
     assert not _rows("SELECT id FROM developer_alerts WHERE kind = 'startup_override'")
-    admin_inbox = client.get("/api/v1/admin/notifications", headers=bearer(HEAD_ADMIN)).json()
-    titles = str(admin_inbox)
-    assert DEV_ID not in titles, "the administrator's inbox carries the root account's id"
+    # An administrator cannot open the queue at all any more, so the concat the two stores must
+    # not do is asserted against the reader that *can* open it.
+    refused = client.get("/api/v1/admin/notifications", headers=bearer(HEAD_ADMIN))
+    assert refused.status_code == 404, (
+        f"the old administrator path still answers: {refused.status_code}"
+    )
+    inbox = client.get("/api/v1/developer/notifications", headers=_bearer_as_developer())
+    assert inbox.status_code == 200, inbox.text
+    assert DEV_ID not in str(inbox.json()), "the alert queue carries the root account's id"
 
 
 # ---------------------------------------------------------------------------

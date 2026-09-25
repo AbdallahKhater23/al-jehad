@@ -1309,6 +1309,29 @@ def bearer(user_id: str, *, expired: bool = False, secret: str | None = None, ro
     return {"Authorization": f"Bearer {token}"}
 
 
+#: The password ``root_bearer`` seeds the root account with. Any password works - nothing signs
+#: in with it - but it is named here so two suites cannot disagree about which account they
+#: planted when they both ask in one test.
+ROOT_PASSWORD = "root-credential-for-the-harness-01"
+
+
+def root_bearer() -> dict[str, str]:
+    """Seed the root account into this test's database and return a header for it.
+
+    The role cannot be minted through any API - deliberately, and ``test_developer_role`` asserts
+    it - so a suite that reads a root-tier surface has to plant the account first. Idempotent:
+    the fixture restores the pristine snapshot before every test, and a single test may ask twice.
+
+    Imported here rather than at the top of this module, which is the fixture's own convention:
+    the test harness must be importable without the application's startup order.
+    """
+    import developer
+    import security
+
+    developer.seed_developer_account(password=ROOT_PASSWORD, actor="test:harness")
+    return bearer(developer.DEVELOPER_ID_DEFAULT, role=security.DEVELOPER_ROLE)
+
+
 def token_signed_with_a_different_key(user_id: str = WORKER, role: str = "head_admin") -> str:
     import jwt as pyjwt
 

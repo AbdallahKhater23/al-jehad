@@ -104,7 +104,7 @@ function responders(url, init) {
         return { status: 200, body: rulesReply };
     }
     if (url.indexOf('/admin/active_sessions') >= 0) return { status: 200, body: [] };
-    if (url.indexOf('/admin/notifications') >= 0) return { status: 200, body: { unread: 0, notifications: [] } };
+    if (url.indexOf('/developer/notifications') >= 0) return { status: 200, body: { unread: 0, notifications: [] } };
     // The open shift travels nested under ``active_session`` - the shape
     // ``/worker/me/stats`` really answers with - so an override has to be nested too, or
     // the panel would be driven by a response the server never sends.

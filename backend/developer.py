@@ -284,11 +284,12 @@ SEVERITIES = ("info", "warning", "critical")
 #: kind nothing raises is a filter that silently matches nothing, and a reader cannot tell
 #: that from a quiet system.
 ALERT_KINDS: dict[str, str] = {
-    # The deployment's own events. These were written to ``admin_notifications`` until the
-    # split below: a forced start, a schema repair, a retention sweep and a coverage report
-    # are the *host's* log lines, addressed to whoever runs the deployment, and a site
-    # administrator has no action to take on any of them. They live here now, and the
-    # administrator's queue no longer carries them (``notifications.DEPLOYMENT_KINDS``).
+    # The deployment's own events. These were written to ``admin_notifications`` as well as
+    # here: a forced start, a schema repair, a retention sweep and a coverage report are the
+    # *host's* log lines, addressed to whoever runs the deployment, and a site administrator
+    # has no action to take on any of them. They live here as alerts, and the durable rows of
+    # the same events sit in ``admin_notifications`` - whose queue is this tier's too now
+    # (``/developer/notifications``), so there is no audience left to withhold one from.
     "startup_degraded": "The deployment started with advisory checks failing.",
     "schema_repair": "The schema was repaired rather than refused, at startup.",
     "retention_sweep": "An automated retention sweep erased data, or could not.",

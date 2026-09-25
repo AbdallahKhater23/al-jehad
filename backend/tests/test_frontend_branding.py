@@ -179,7 +179,7 @@ function responders(url, init) {
                     overtime_notify_hours: 8.1, auto_close_at_regular: 1, day_end: {} }
         };
     }
-    if (path.includes('/admin/notifications')) return { status: 200, body: { unread: 0, notifications: [] } };
+    if (path.includes('/developer/notifications')) return { status: 200, body: { unread: 0, notifications: [] } };
     if (path.includes('/admin/')) return { status: 200, body: [] };
     return { status: 200, body: {} };
 }

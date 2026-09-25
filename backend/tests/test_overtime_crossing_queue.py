@@ -43,6 +43,7 @@ from pathlib import Path
 import pytest
 from database import db
 from fastapi.testclient import TestClient
+import harness
 from harness import ADMIN, HEAD_ADMIN, MOALLEM, WORKER, bearer, current_db_path
 
 import main
@@ -179,13 +180,15 @@ def test_a_crossing_no_longer_writes_an_administrator_notification(client, app_m
     detected = _audit("overtime_detected")
     assert detected, "the crossing is no longer recorded in the audit trail"
     assert detected[-1]["actor_role"] == "system"
-    # The list an administrator reads is still served - it is simply not where the crossing is.
-    listed = client.get("/api/v1/admin/notifications", headers=bearer(ADMIN))
+    # The alert queue is still served - it is simply not where the crossing is. Asked as the
+    # root tier, which is the only reader it has now; an administrator is refused the route
+    # entirely, and that refusal is asserted in ``test_notification_acknowledgement``.
+    listed = client.get("/api/v1/developer/notifications", headers=harness.root_bearer())
     assert listed.status_code == 200, listed.text
     # Asked as text rather than by walking the payload: the list's own shape is not this file's
     # subject, and an assertion that enumerates it would be the thing that drifts.
     assert notifications.KIND_OVERTIME_EXCEEDED not in listed.text, (
-        "the Alerts list still serves the crossing"
+        "the alert queue still serves the crossing"
     )
 
 

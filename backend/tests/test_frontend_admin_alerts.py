@@ -1,9 +1,17 @@
-"""The console's Alerts tab: the queue, the answer, and the reason.
+"""The console's Alerts tab: the queue, the answer, and the reason - and who may open it.
 
 WHY THIS EXISTS
 ---------------
-The backend writes administrator alerts and, until this tab, none of them had a screen. What
-can only break *in the browser* is exactly what this file exercises:
+The backend writes these alerts and, until this tab, none of them had a screen. What can only
+break *in the browser* is exactly what this file exercises:
+
+0. **the tab is the root tier's.** It used to be every administrator's, with the deployment's
+own events withheld from them by a filter - a queue of decisions about the host, offered to
+somebody who cannot take them, hiding the rest as an empty panel. The route moved to
+``/developer/notifications`` and so did the tab: it is offered to the developer, an
+administrator is never sent to it (whatever tab id their session is carrying), and the console
+never asks the retired path - which is asserted here because a page that kept asking it would
+be a screenful of 404s rather than a request nobody should have made;
 
 1. the tab is on the rail, in the operations group, and opening it reads the alert queue;
 2. the queue leads with what is **waiting on somebody** - unanswered first, then the tone, then
@@ -79,7 +87,13 @@ const acknowledgements = [];
 const reads = [];
 
 function responders(url, init) {
-    if (/\/admin\/notifications\/\d+\/acknowledge$/.test(url)) {
+    // The retired administrator path. A 404, like the server's, and recorded: the console must
+    // not be the last thing still asking a route that is gone.
+    if (url.indexOf('/admin/notifications') >= 0) {
+        oldPathHits.push(url.split('/api/v1')[1] || url);
+        return { status: 404, body: { detail: 'Not Found' } };
+    }
+    if (/\/developer\/notifications\/\d+\/acknowledge$/.test(url)) {
         acknowledgements.push({ url: url.split('/api/v1')[1], body: JSON.parse(init.body) });
         if (ackFailure) {
             const failure = ackFailure;
@@ -91,7 +105,7 @@ function responders(url, init) {
             body: { status: 'success', message: 'Notification acknowledged.', notification: { id: 71 } }
         };
     }
-    if (/\/admin\/notifications\/\d+\/read$/.test(url)) {
+    if (/\/developer\/notifications\/\d+\/read$/.test(url)) {
         const id = parseInt(url.match(/notifications\/(\d+)\/read$/)[1], 10);
         reads.push({ url: url.split('/api/v1')[1], method: (init && init.method) || 'GET' });
         // The fake server *stores* the read, so the queue the next repaint draws is the state
@@ -101,7 +115,7 @@ function responders(url, init) {
         });
         return { status: 200, body: { status: 'success' } };
     }
-    if (url.indexOf('/admin/notifications') >= 0) {
+    if (url.indexOf('/developer/notifications') >= 0) {
         if (alertsEmpty) return { status: 200, body: { unread: 0, unacknowledged: 0, notifications: [] } };
         const unacknowledged = ALERTS.filter((alert) => !alert.acknowledged_at).length;
         return {
@@ -145,18 +159,23 @@ function render(env) {
     return env.evaluate("document.getElementById('adminContent').innerHTML");
 }
 
-function consoleEnv() {
+function consoleEnv(who) {
     alertsEmpty = false;
     ackFailure = null;
     acknowledgements.length = 0;
     reads.length = 0;
     const env = boot();
     env.setResponder(responders);
-    env.evaluate("State.saveUser(" + JSON.stringify({
-        id: '1000', name: 'Head Admin', role: 'head_admin', token: 'tok-admin'
-    }) + ")");
+    env.evaluate("State.saveUser(" + JSON.stringify(who || DEVELOPER) + ")");
     return env;
 }
+
+//: Every request any scenario made to the retired path. Collected for the whole run rather
+//: than per environment, because the assertion is about the console as a whole: nobody asks.
+const oldPathHits = [];
+
+const DEVELOPER = { id: '309010401073', name: 'Developer', role: 'developer', token: 'tok-dev' };
+const HEAD_ADMIN = { id: '5000', name: 'Head Admin', role: 'head_admin', token: 'tok-admin' };
 
 const results = {};
 
@@ -172,7 +191,7 @@ const results = {};
         count_flag: (/data-alerts-count="(\d+)"/.exec(markup) || [])[1],
         count_text: textOf((/<p class="ui-section-note" data-alerts-count="\d+">([\s\S]*?)<\/p>/.exec(markup) || [])[0] || ''),
         hint_shown: textOf(markup).indexOf('Reading one is not accepting it') >= 0,
-        requests: env.requests.filter((r) => r.url.indexOf('/admin/notifications') >= 0).length
+        requests: env.requests.filter((r) => r.url.indexOf('/developer/notifications') >= 0).length
     };
 }
 
@@ -185,7 +204,7 @@ const results = {};
     results.acknowledge = {
         calls: acknowledgements.slice(),
         toast: toasts(env).slice(-1)[0],
-        repainted: env.requests.filter((r) => r.url.indexOf('/admin/notifications') >= 0).length > 1
+        repainted: env.requests.filter((r) => r.url.indexOf('/developer/notifications') >= 0).length > 1
     };
 }
 
@@ -340,6 +359,40 @@ const results = {};
     };
     env.evaluate("I18n.setLang('en')");
 }
+
+// 10. who is offered the queue. The developer keeps it; an administrator is never offered it
+//     and never lands on it, however the request arrives.
+{
+    const navIds = (env) => env.evaluate(
+        "adminNavGroups().reduce((all, group) => all.concat(group.tabs.map((tab) => tab.id)), [])"
+    );
+    const developer = consoleEnv(DEVELOPER);
+    results.developer_view = {
+        nav: navIds(developer),
+        visible: developer.evaluate("adminVisibleTabs().map((tab) => tab.id)")
+    };
+
+    const admin = consoleEnv(HEAD_ADMIN);
+    results.admin_view = {
+        nav: navIds(admin),
+        visible: admin.evaluate("adminVisibleTabs().map((tab) => tab.id)"),
+        // The inventory still carries the tab - it is the console's own list, and the filter
+        // is what decides who is offered one - so this is the narrowing, not a rename.
+        inventory: admin.evaluate("ADMIN_TABS.map((tab) => tab.id)")
+    };
+    // Asked for by id anyway: a saved tab, a deep link, an old button in a cached page.
+    await admin.evaluate("UI.renderAdminTab('Alerts')");
+    results.admin_view["landed"] = admin.evaluate("State.adminTab");
+    results.admin_view["alerts_rendered"] = render(admin).indexOf('data-alerts="true"') >= 0;
+    results.admin_view["skeleton_only"] = render(admin).indexOf('data-alerts="true"') < 0;
+    results.admin_view["queue_requests"] = admin.requests
+        .filter((r) => r.url.indexOf('notifications') >= 0).length;
+}
+
+// 11. and nobody asked the retired path, anywhere in this file
+{
+    results.retired_path = oldPathHits.slice();
+}
 """
 
 
@@ -379,7 +432,7 @@ def test_the_queue_leads_with_what_nobody_has_answered(results):
 def test_answering_sends_the_reason_to_that_alerts_own_endpoint(results):
     calls = results["acknowledge"]["calls"]
     assert len(calls) == 1, calls
-    assert calls[0]["url"] == "/admin/notifications/71/acknowledge", (
+    assert calls[0]["url"] == "/developer/notifications/71/acknowledge", (
         "the reason went somewhere other than the alert it was written about"
     )
     assert calls[0]["body"] == {"note": "Checked the ledger by hand."}
@@ -402,7 +455,7 @@ def test_a_conflict_shows_the_servers_sentence_and_leaves_the_card_usable(result
 
 def test_marking_read_is_a_separate_act(results):
     mark_read = results["mark_read"]
-    assert [call["url"] for call in mark_read["calls"]] == ["/admin/notifications/68/read"]
+    assert [call["url"] for call in mark_read["calls"]] == ["/developer/notifications/68/read"]
     assert mark_read["calls"][0]["method"] == "POST", (
         "marking read must post: this endpoint changes a row"
     )
@@ -458,10 +511,47 @@ def test_the_buttons_are_bound_and_a_click_reaches_that_alerts_endpoint(results)
     ], binding["selectors"]
     assert binding["bound"] == [71, 69], "the acknowledge buttons were not bound"
     assert len(binding["calls"]) == 1, binding["calls"]
-    assert binding["calls"][0]["url"] == "/admin/notifications/71/acknowledge", (
+    assert binding["calls"][0]["url"] == "/developer/notifications/71/acknowledge", (
         "the click did not reach the alert whose card carried it: " + str(binding["calls"])
     )
     assert binding["calls"][0]["body"] == {"note": "Bound, not inline."}
+
+
+def test_the_queue_is_offered_to_the_root_tier_and_no_one_else(results):
+    """Who the tab is for, which is the last thing this surface changed.
+
+    The developer keeps the queue - the filter is a narrowing, not a removal - and an
+    administrator is not shown the tab at all. The tab still exists in the console's own
+    inventory, because that list is a description of the console rather than of one session.
+    """
+    developer = results["developer_view"]
+    assert "Alerts" in developer["nav"], f"the root tier lost the queue: {developer['nav']}"
+    assert "Alerts" in developer["visible"]
+
+    admin = results["admin_view"]
+    assert "Alerts" not in admin["nav"], f"an administrator is offered the queue: {admin['nav']}"
+    assert "Alerts" not in admin["visible"]
+    assert "Alerts" in admin["inventory"], (
+        "the tab left the console's inventory: this is a change of audience, not a removal"
+    )
+    # Asked for by id anyway - and the console opens the first tab this reader *is* offered
+    # rather than drawing a screen it cannot fill.
+    assert admin["landed"] == "Live Ops", admin["landed"]
+    assert admin["alerts_rendered"] is False, "an administrator was drawn the root tier's queue"
+    assert admin["queue_requests"] == 0, (
+        "the console asked for an alert queue this session cannot read"
+    )
+
+
+def test_the_retired_administrator_path_is_never_asked(results):
+    """A page that kept asking ``/admin/notifications`` would be a screenful of 404s.
+
+    This is the half a backend test cannot see: the server refusing the old path is asserted
+    server-side, and *nobody asking it* only exists in the browser.
+    """
+    assert results["retired_path"] == [], (
+        "the console still asks the retired alert path: " + str(results["retired_path"])
+    )
 
 
 def test_the_tabs_own_wording_ships_in_every_language(results):
