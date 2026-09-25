@@ -398,6 +398,18 @@ def main() -> None:
     forwarded_allow_ips = trusted_proxies_for_uvicorn()
     print(f"  Trusted proxies for X-Forwarded-For: {forwarded_allow_ips}")
 
+    # Bounded concurrency, because the alternative is unbounded queueing. The application's
+    # real capacity lives in the face engine (two workers, a short queue, 503 + Retry-After
+    # past it); what uvicorn adds is a ceiling on requests *in flight*, so a burst cannot hold
+    # thousands of decoded frames and request contexts open at once on a 512 MB instance. A
+    # request over the line is refused immediately rather than parked - the same answer the
+    # engine gives, and one the client already knows how to retry.
+    #
+    # ``timeout_keep_alive`` is short on purpose: this runs behind a platform proxy that opens
+    # its own connections, and a long idle keep-alive is that many sockets and their buffers
+    # held for nothing. Access logging is off in tunnel mode (the deployment), where the
+    # platform already logs every request and a second line per punch is disk and CPU the
+    # instance cannot spare; it stays on for a local run, where the log is the only record.
     uvicorn.run(
         APP_IMPORT,
         host=args.host,
@@ -405,6 +417,9 @@ def main() -> None:
         reload=args.reload,
         proxy_headers=True,
         forwarded_allow_ips=forwarded_allow_ips,
+        limit_concurrency=64,
+        timeout_keep_alive=5,
+        access_log=not args.tunnel,
         **ssl_kwargs,
     )
 

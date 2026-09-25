@@ -6,6 +6,13 @@
 # and keep this file for the tooling the test suite needs on top of it.
 
 pytest==9.1.1
+
+# SciPy is no longer a runtime dependency: ``main.cosine`` replaced the single call that
+# needed it, and removing it from requirements.txt keeps ~35 MB of RSS (measured) off the
+# deployment. What still scores with ``scipy.spatial.distance.cosine`` is the analysis
+# tooling under ``tools/`` and ``tests/test_fake_face_contract.py`` - the reference the
+# production number is checked against - so the suite keeps installing it here.
+scipy==1.18.1
 # starlette 1.6's TestClient prefers httpx2 and warns when falling back to httpx
 httpx2==2.12.0
 

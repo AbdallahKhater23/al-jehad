@@ -21,11 +21,8 @@ It needs the environment the app uses (``.env`` at the project root) and reads t
 without modifying anything except the template files it writes.
 """
 
-import io
 import os
 import sys
-
-from PIL import Image, ImageOps
 
 INPUT_PHOTOS_DIR = "../worker_photos"
 VALID_EXTENSIONS = (".jpg", ".jpeg", ".png")
@@ -46,19 +43,22 @@ def _accounts_by_photo_stem() -> dict[str, str]:
     return {str(row["biometric_id"]): str(row["id"]) for row in rows}
 
 
-def _normalised(image_path: str) -> Image.Image:
-    """The photo as a decoded image: EXIF-rotated, RGB, capped at 800 px - in memory.
+def _normalised(image_path: str):
+    """The frame a face model sees, read from one photo file on this machine.
 
     It used to be written back to the working directory as ``./temp_enroll_<filename>``, a
     full-size JPEG of a worker's face sitting beside the source tree under a name derived
-    from theirs, and removed only on the paths that remembered to.
+    from theirs, and removed only on the paths that remembered to. The bytes now go straight
+    into the shared chain instead - ``uploads.face_frame``, the same decode hint and resize
+    every enrollment endpoint and every punch uses, so a template derived by this script is
+    embedded from the same kind of frame as the template the app would have written, and is
+    comparable to the punches it will be checked against. It also used to cap itself at 800
+    px, a smaller face than the frame it would be matched against.
     """
+    import uploads
+
     with open(image_path, "rb") as handle:
-        image = Image.open(io.BytesIO(handle.read()))
-    image = ImageOps.exif_transpose(image)
-    image = image.convert("RGB")
-    image.thumbnail((800, 800))
-    return image
+        return uploads.face_frame(handle.read(), field=os.path.basename(image_path))
 
 
 def main() -> int:

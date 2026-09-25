@@ -103,7 +103,8 @@ function responders(url) {
         return { status: 200, body: [
             { id: 'w1', name: 'Youssef Adel', role: 'worker', status: 'active' },
             { id: 'w9', name: 'Layla Hassan', role: 'worker', status: 'active' },
-            { id: 'a1', name: 'Seed Admin', role: 'head_admin', status: 'active' }
+            { id: 'a1', name: 'Seed Admin', role: 'head_admin', status: 'active' },
+            { id: 'a2', name: 'Site Admin', role: 'admin', status: 'active' }
         ] };
     }
     if (url.indexOf('/admin/sites') >= 0) {
@@ -121,7 +122,11 @@ function bootBoard(options) {
     renamed = !!opts.renamed;
     const env = boot();
     env.setResponder(responders);
-    env.evaluate('State.saveUser(' + JSON.stringify({ ...ADMIN, token: 'tok-5000' }) + ')');
+    // ``actorRole`` because the panel is not the same panel for every reader: an administrator's
+    // own record is offered to a head admin and to nobody else (``mayActOnAccount``).
+    env.evaluate('State.saveUser(' + JSON.stringify({
+        ...ADMIN, role: opts.actorRole || ADMIN.role, token: 'tok-5000'
+    }) + ')');
     return env;
 }
 
@@ -217,7 +222,22 @@ const results = {};
         panel_has_note: markup.indexOf('data-force-in-note') >= 0,
         panel_offers_the_free_worker: markup.indexOf('<option value="w9">') >= 0,
         panel_hides_the_one_on_shift: markup.indexOf('<option value="w1">') < 0,
-        panel_hides_the_admin: markup.indexOf('<option value="a1">') < 0
+        panel_hides_the_admin: markup.indexOf('<option value="a1">') < 0,
+        // An `admin`-role account is a different question from the `head_admin` above, and this
+        // reader is a head admin: a peer is offered to them, and only to them.
+        panel_offers_the_peer_administrator: markup.indexOf('<option value="a2">') >= 0
+    };
+}
+
+// 1b. the same panel, read by a standard admin: a peer's own record is not theirs to touch
+{
+    const peer = bootBoard({ actorRole: 'admin' });
+    await peer.evaluate("UI.renderAdminTab('Live Ops')");
+    const markup = rendered(peer);
+    results.peer_panel = {
+        hides_the_administrator: markup.indexOf('<option value="a2">') < 0,
+        offers_the_worker: markup.indexOf('<option value="w9">') >= 0,
+        has_the_panel: markup.indexOf('data-force-in-note') >= 0
     };
 }
 
@@ -684,7 +704,21 @@ def test_the_force_in_panel_is_a_disclosure_that_stays_in_the_document(results):
     assert board["panel_hides_the_one_on_shift"], (
         "someone already on shift is on the board; the panel is for the ones who are not"
     )
-    assert board["panel_hides_the_admin"], "an administrator cannot be forced onto a site"
+    assert board["panel_hides_the_admin"], (
+        "a head admin owns the deployment rather than a rota: no punch card, so no shift of "
+        "theirs to be forced onto one"
+    )
+    assert board["panel_offers_the_peer_administrator"], (
+        "an administrator who works a site is put on shift by a head admin - it used to be "
+        "nobody at all"
+    )
+    peer = results["peer_panel"]
+    assert peer["hides_the_administrator"], (
+        "a standard admin may not force a peer onto a site: the server refuses it"
+    )
+    assert peer["offers_the_worker"] and peer["has_the_panel"], (
+        "and everything else about the panel is where it was"
+    )
 
 
 def test_every_new_string_exists_in_all_three_languages(results):

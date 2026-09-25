@@ -28,6 +28,7 @@ hardcoded demo value on every single start.
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import math
@@ -48,7 +49,6 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
-from scipy.spatial.distance import cosine
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
@@ -369,7 +369,8 @@ def _record_refused_punch(
 
     The refusal path has the frame and the score in hand and, before this table, discarded
     both: an operator whose workers were refused all day could see neither. This is the
-    write-half of that surface (the read-half is ``/admin/refused_punches``).
+    write-half of that surface (the read-half is ``/developer/refused-punches``, in
+    ``developer.py`` - the band's calibration is the root tier's question, not a site's).
 
     ``conn=None`` (the punch path's call) opens its own short write transaction, because the
     caller is raising a 422 and has no open transaction to lend. With a connection the row
@@ -929,6 +930,12 @@ def site_at(conn: sqlite3.Connection, lat: float, lon: float) -> sqlite3.Row | N
 #: somebody to read a log. Keys the mapping below, so it is a constant and not a literal.
 FACE_REFERENCE_STALE = "Reference face template predates the current face pipeline."
 
+#: The error code the stale-template refusal answers with (the key in
+#: ``FACE_FRAME_REFUSALS`` below). Named rather than written at the one call site that
+#: switches on it, because that call site is what adds the machine-readable re-enrollment
+#: status to the response, and a literal there would be a second place to keep in step.
+REFERENCE_STALE_CODE = "reference_stale"
+
 FACE_FRAME_REFUSALS: dict[str, tuple[str, str]] = {
     "No face detected.": (
         "face_not_found",
@@ -945,7 +952,7 @@ FACE_FRAME_REFUSALS: dict[str, tuple[str, str]] = {
         "administrator to enroll you.",
     ),
     FACE_REFERENCE_STALE: (
-        "reference_stale",
+        REFERENCE_STALE_CODE,
         "Your face records were taken before a change to the face check, so this photo "
         "cannot be compared with them. Ask your administrator to enroll you again - it "
         "takes one photo.",
@@ -966,6 +973,30 @@ def _frame_refusal(error: str) -> tuple[str, str]:
     return FACE_FRAME_REFUSALS.get(error, FACE_CHECK_FAILED)
 
 
+def cosine(u, v) -> float:
+    """``1 - cos`` between two templates - the metric ``compare_faces_sync`` scores with.
+
+    This used to be ``scipy.spatial.distance.cosine``, and SciPy was the only reason the
+    deployment image carried a numerical package: importing it costs ~35 MB of RSS (measured)
+    to run one dot product over a few hundred floats. The arithmetic is identical - a
+    float64 accumulation, so the digit the band classifier reads is the digit it read
+    before - which ``facenet_ort.cosine_distance`` documents as well, having already made
+    the same substitution for the shadow scorer.
+
+    The zero-norm case returns ``nan`` explicitly. SciPy answered with a ``nan`` and a
+    ``RuntimeWarning`` there; a template or a probe with no direction to compare is refused
+    by the band classifier either way, and raising instead would turn a refused punch into
+    an "Internal processing error" on the worker's phone. A dimension mismatch cannot reach
+    this function: ``compare_faces_sync`` answers ``FACE_REFERENCE_STALE`` first.
+    """
+    a = np.asarray(u, dtype=np.float64).reshape(-1)
+    b = np.asarray(v, dtype=np.float64).reshape(-1)
+    denominator = float(np.linalg.norm(a)) * float(np.linalg.norm(b))
+    if denominator == 0.0:
+        return float("nan")
+    return float(1.0 - float(a @ b) / denominator)
+
+
 def compare_faces_sync(reference_json_path: str, live_image_data) -> dict:
     # The template is read *before* the model runs, on purpose: an unusable template is a
     # fact about the file, and spending a VGG-Face embedding to discover it would put a
@@ -978,8 +1009,14 @@ def compare_faces_sync(reference_json_path: str, live_image_data) -> dict:
     except Exception:
         # Unreadable is answered as stale rather than as a server fault: the fix is the
         # same photograph, and two names for one fix is how a worker gets sent round a
-        # loop. The detailed reason is in ``biometrics.stale_references`` for an admin.
-        return {"verified": False, "distance": 99.9, "error": FACE_REFERENCE_STALE}
+        # loop. The detailed reason is in ``biometrics.stale_references`` for an admin, and
+        # it travels back here too so the response can say *which* kind of unusable it is.
+        return {
+            "verified": False,
+            "distance": 99.9,
+            "error": FACE_REFERENCE_STALE,
+            "stale_reason": biometrics.STALE_UNREADABLE,
+        }
 
     reason = biometrics.stale_reason(reference)
     if reason is not None:
@@ -988,7 +1025,12 @@ def compare_faces_sync(reference_json_path: str, live_image_data) -> dict:
             reason,
             os.path.basename(reference_json_path),
         )
-        return {"verified": False, "distance": 99.9, "error": FACE_REFERENCE_STALE}
+        return {
+            "verified": False,
+            "distance": 99.9,
+            "error": FACE_REFERENCE_STALE,
+            "stale_reason": reason,
+        }
 
     try:
         # The decision lines, from the pipeline that produced this embedding rather than from
@@ -1051,7 +1093,16 @@ def compare_faces_sync(reference_json_path: str, live_image_data) -> dict:
                 len(reference.embedding),
                 len(live_embedding),
             )
-            return {"verified": False, "distance": 99.9, "error": FACE_REFERENCE_STALE}
+            # Reported as the *version* kind of stale, which is what a dimension mismatch is:
+            # a 4096-float VGG-Face vector is a template from another embedder, and the client
+            # is told NEEDS_REENROLLMENT / stale_template_version rather than being handed a
+            # 500 it can do nothing with.
+            return {
+                "verified": False,
+                "distance": 99.9,
+                "error": FACE_REFERENCE_STALE,
+                "stale_reason": biometrics.STALE_UNREADABLE,
+            }
 
         # The comparison itself, timed apart from the embedding that fed it: one is a numpy dot
         # product over 4096 floats and the other is half a second of TensorFlow, and reporting
@@ -1079,6 +1130,52 @@ def compare_faces_sync(reference_json_path: str, live_image_data) -> dict:
         return {"verified": False, "distance": 99.9, "error": "Reference embedding not found."}
     except Exception as exc:
         return {"verified": False, "distance": 99.9, "error": f"Internal processing error: {exc}"}
+
+
+def judge_punch_frame(reference_json_path: str | None, photo_path: str) -> tuple:
+    """Decode, screen for liveness and score one punch - as **one** unit of engine work.
+
+    WHY THE WHOLE PUNCH IS ONE JOB
+    ------------------------------
+    It used to be two, submitted by the endpoint: first the liveness check, then the
+    comparison, with a frame the *request* had decoded in between. So a punch that was waiting
+    for capacity was holding its upload (up to 5 MB) and its decoded pixels (~10 MB at 1280 px
+    once the RGB and BGR views existed), and a burst of ten punches held ten of those while
+    needing twenty queue slots. Decoding is the part that costs memory, and this is the change
+    that moves it to where the capacity is: the job is handed a *path*, decodes inside the
+    worker, and at most ``capacity`` frames are alive at once no matter how many punches are
+    waiting.
+
+    ORDER IS UNCHANGED, AND SO IS WHAT IT COSTS
+    -------------------------------------------
+    Liveness runs first and a presentation attack returns without an embedding, which is the
+    property that keeps a flood of spoofs cheap. The comparison then runs only when there is a
+    template to compare against: ``reference_json_path`` is ``None`` for a worker with nothing
+    enrolled, and the caller answers its own 404 for that *after* this returns - which is where
+    that refusal has always been, after the liveness one rather than before it.
+
+    WHAT COMES BACK
+    ---------------
+    ``(decision, face_data, frame)``. The frame is handed back on purpose: the evidence stored
+    with the row and the calibration capture are both taken from **this** frame - the one the
+    models judged - and it is a few megabytes alive for a few milliseconds of local work, not
+    for the length of a queue wait. ``face_data`` is ``None`` whenever the punch was not scored,
+    so a caller that ignores the liveness decision cannot mistake a refusal for a score.
+    """
+    # The one decode, in the worker, from the path the request spooled. The same chain every
+    # enrollment path uses (``uploads.face_frame``): a template is only comparable to this frame
+    # if both sides went through the same resampler.
+    image = uploads.face_frame(photo_path, field="selfie")
+    # ``rgb_array`` feeds the liveness model, which was trained on RGB crops; the BGR view the
+    # detector and the embedding contract expect is taken from it below - see ``face_onnx``,
+    # which does not convert channels anywhere. Both are built here so the two consumers cannot
+    # silently swap channel order, and neither outlives the job.
+    rgb_array = np.array(image)
+    decision = liveness.inspect(rgb_array)
+    if not decision.allowed or reference_json_path is None:
+        return decision, None, image
+    face_data = compare_faces_sync(reference_json_path, rgb_array[:, :, ::-1])
+    return decision, face_data, image
 
 
 def send_whatsapp_alert(worker_id: str, worker_name: str, site_name: str, score: float, *, conn=None) -> bool:  # noqa: ARG001
@@ -1124,9 +1221,26 @@ def _validate_id_and_role(user_id: str, role: str) -> None:
 # ``/admin/users/edit_password`` already enforced, generalized from the password to the
 # whole account - a standard admin resetting an administrator's password and a standard
 # admin *deleting* one are the same privilege escalation wearing a different verb.
+#
+# The rule is about the *account*, not about the field, so it is asked wherever an
+# administrator's record is acted on rather than only where its columns are written: a
+# face enrolled for one (``/admin/enroll``), a shift forced onto one or closed for one,
+# and a decision recorded about one's own overtime. Each of those is the same question -
+# may this administrator reach over a peer - and the answer has to be the same in all of
+# them or the odd one out is the way round the rule.
 # ---------------------------------------------------------------------------
 def _guard_standard_admin(actor: CurrentUser, target: sqlite3.Row, action: str) -> None:
-    """A standard admin may not act on an administrator's account at all."""
+    """A standard admin may not act on an administrator's account at all.
+
+    ``target`` is any row carrying a ``role``: a ``users`` row, or an attendance or
+    session row joined to one. ``None`` for a role never matches, which is what an
+    orphaned attendance row (its account deleted) reads as - the guard stays out of the
+    way and the rest of the endpoint answers for that row as it always did.
+
+    A ``head_admin`` is deliberately not subject to this: the role exists to own the
+    deployment, and a rule that also bound the head admin would leave an administrator's
+    own record, and their own overtime, decidably by nobody at all.
+    """
     if actor.role == "admin" and target["role"] in ("admin", "head_admin"):
         raise HTTPException(
             status_code=403,
@@ -1664,11 +1778,13 @@ async def enroll_my_face(
     """
     file_bytes = await uploads.read_photo(photo, field="enrollment photo")
     try:
-        image = uploads.decode_photo(file_bytes, field="enrollment photo")
-        # 800 px is what the console's other enrollment path embeds and stores; the detector
-        # gains nothing from more, and the reference selfie beside the template is a
-        # thumbnail.
-        image.thumbnail((800, 800))
+        # The same chain a punch uses, from the same setting (``uploads.face_frame``): this
+        # frame becomes the template every future punch is measured against, so it is the
+        # one frame in the application that must not be resampled differently from the
+        # other side of the comparison. The reference selfie stored beside the template is
+        # thumbnailed separately (``biometrics.PHOTO_MAX_EDGE``), so this size costs the
+        # disk nothing.
+        image = uploads.face_frame(file_bytes, field="enrollment photo")
     except Exception:
         raise HTTPException(status_code=400, detail="Image processing failed.")
 
@@ -2060,31 +2176,41 @@ async def verify_worker(
     # bytes, pixel ceiling): see ``uploads.py``. This endpoint used to read the body
     # with no limit at all and hand it to PIL, so an oversized POST was a way to make
     # the server allocate its own size in memory.
-    file_bytes = await uploads.read_photo(selfie, field="selfie")
-    image = uploads.decode_photo(file_bytes, field="selfie")
-    # The pixel ceiling for the frame the detector sees. 640 used to be the number; the
-    # working-distance band (0.7-1.5 m, see the framing coach) puts a face at 53-113 px in
-    # a 640-wide frame, and the alignment template wants ~112 - so beyond ~0.7 m the crop
-    # was being upscaled before it was embedded, and every extra metre cost match score.
-    # 1280 keeps the crop at native scale through ~1.5 m. Latency scales with frame area,
-    # not linearly: YuNet on a 1280x960 frame costs ~55 ms against ~15 ms at 640, and the
-    # embedding itself is size-independent (always a 112x112 crop).
-    image.thumbnail((settings.punch_selfie_max_px, settings.punch_selfie_max_px))
-    # ``rgb_array`` feeds the liveness model, which was trained on RGB crops;
-    # ``img_array`` is the BGR view the detector and the embedding contract expect - see
-    # ``face_onnx``, which does not convert channels anywhere. Computing both here keeps
-    # the two consumers from silently swapping channel order.
-    rgb_array = np.array(image)
-    img_array = rgb_array[:, :, ::-1]
-
+    #
+    # ``spool_photo``, not ``read_photo``: the same policy with the body going to a temporary
+    # file instead of bytes, because this photo has to survive a wait for engine capacity (see
+    # ``judge_punch_frame``). Held as bytes it would be megabytes per *waiting* punch, which is
+    # what made a burst a memory event rather than a slow answer.
+    photo = await uploads.spool_photo(selfie, field="selfie")
+    # Resolved before the job because the job needs the path it is scoring against - and the
+    # 404 for a missing one is still raised below, where it has always been: after a liveness
+    # refusal, not in front of it. An enrolled-looking worker whose template file is gone must
+    # still be told their presentation attack was refused rather than sent to re-enroll.
+    reference_filepath = biometrics.resolve_reference(current.id, biometrics.id_from(user_row))
+    has_reference = os.path.exists(reference_filepath)
+    # --- the whole face check: one queue slot, decoded inside the worker -------
+    # A full queue is answered with 503 + Retry-After rather than an invisible pile-up, and a
+    # photo the policy refuses (an unreadable image, a declared pixel count over the ceiling)
+    # answers with the same coded refusal it did before the decode moved - the refusal is raised
+    # by ``uploads`` inside the job and travels out of it unchanged.
+    try:
+        liveness_decision, face_data, image = await face_engine.ENGINE.run_async(
+            judge_punch_frame, reference_filepath if has_reference else None, photo.path
+        )
+    except face_engine.FaceEngineBusy as exc:
+        raise face_engine.busy_http_exception(exc) from None
+    finally:
+        # The upload has done its job: the frame the models judged is in memory now, and nothing
+        # below reads the file again. Removed on *every* path - a full queue, a photo that would
+        # not decode, a model that raised, a client that hung up - because a refusal that leaves
+        # a worker's face on disk is not a refusal. A process that dies in that window is what
+        # ``uploads.sweep_spool_dir`` collects at startup.
+        photo.discard()
     # --- passive liveness, BEFORE any face embedding --------------------------
     # MiniFASNet at 80x80 costs a fraction of a VGG-Face embedding with an MTCNN
     # detector, so a presentation attack is refused without paying for the expensive
-    # path - and without giving an attacker a CPU exhaustion lever.
-    try:
-        liveness_decision = await face_engine.ENGINE.run_async(liveness.inspect, rgb_array)
-    except face_engine.FaceEngineBusy as exc:
-        raise face_engine.busy_http_exception(exc) from None
+    # path - and without giving an attacker a CPU exhaustion lever. The job above already
+    # stopped at that refusal, so ``face_data`` is ``None`` whenever this is raised.
     liveness_class, liveness_score = liveness_decision.log_fields()
     liveness_flag = None
     if not liveness_decision.allowed:
@@ -2148,13 +2274,16 @@ async def verify_worker(
                 dedupe_key=f"liveness_advisory:{current.id}:{datetime.now().strftime('%Y-%m-%d %H:%M')}",
             )
 
-    reference_filepath = biometrics.resolve_reference(current.id, biometrics.id_from(user_row))
-    if not os.path.exists(reference_filepath):
+    if not has_reference:
         # One wall, two audiences. A worker cannot register a template for themselves - that
         # is the company's act, through an enrollment link or an administrator - so they are
         # told to ask. An administrator can, from the console (``/worker/me/enroll``), and
         # telling them to contact their administrator when they are one is a dead end with a
         # phone number in it.
+        #
+        # The job above returned without comparing anything (it is handed ``None`` rather than
+        # a path when there is no template), so this refusal costs a liveness check and not an
+        # embedding - the same work it cost when the comparison was a second submission.
         raise HTTPException(
             status_code=404,
             detail=(
@@ -2165,16 +2294,6 @@ async def verify_worker(
             ),
         )
 
-    try:
-        # One pool slot for the comparison. This used to run on anyio's shared thread pool,
-        # where forty simultaneous punches were forty simultaneous TensorFlow calls with
-        # nothing bounding them; the engine owns that capacity now, and a full queue is
-        # answered with 503 + Retry-After instead of an invisible pile-up.
-        face_data = await face_engine.ENGINE.run_async(
-            compare_faces_sync, reference_filepath, img_array
-        )
-    except face_engine.FaceEngineBusy as exc:
-        raise face_engine.busy_http_exception(exc) from None
     if face_data.get("error"):
         # A photo the check cannot use (no face, two faces, no reference) is the worker's
         # to fix and answers 400 with the sentence that says how. Anything else is ours,
@@ -2206,10 +2325,24 @@ async def verify_worker(
         # "no face in the frame" and "that is not this worker" have different causes and
         # different fixes, and a review queue built from the sum of them cannot be acted on.
         telemetry.observe_verification("frame_refused")
+        # A stale or legacy template is the one refusal with a different *screen* behind it:
+        # "ask your administrator to enroll you again" is not "take another photo". The
+        # worker's sentence is unchanged, and the machine-readable status is added beside it
+        # for a client that has to route the worker somewhere (see
+        # ``biometrics.STATUS_NEEDS_REENROLLMENT``). The diagnosis travels too, so an operator
+        # reading a log can tell a 4096-float legacy vector from a template whose crop
+        # predates the detector - the two have the same fix and different causes.
+        detail: dict = {"error_code": error_code, "message": message}
+        if error_code == REFERENCE_STALE_CODE:
+            detail.update(
+                biometrics.reenrollment_status(
+                    face_data.get("stale_reason") or biometrics.STALE_UNREADABLE
+                )
+            )
         if error_code == FACE_CHECK_FAILED[0]:
             log.warning("face check failed for worker %s: %s", current.id, reason)
-            raise HTTPException(status_code=500, detail={"error_code": error_code, "message": message})
-        raise HTTPException(status_code=400, detail={"error_code": error_code, "message": message})
+            raise HTTPException(status_code=500, detail=detail)
+        raise HTTPException(status_code=400, detail=detail)
 
     similarity_score = face_data["distance"]
     # The band, resolved here rather than read off ``face_data`` above: a caller is free to
@@ -2747,7 +2880,9 @@ async def create_user(
     decision = None
     if photo is not None:
         file_bytes = await uploads.read_photo(photo, field="photo")
-        image = uploads.decode_photo(file_bytes, field="photo")
+        # Same chain as a punch (``uploads.face_frame``), because this image becomes the
+        # template that punch is measured against.
+        image = uploads.face_frame(file_bytes, field="photo")
         try:
             # Model work goes through the engine even here: this call used to run on the
             # event loop, so one administrator uploading a photo froze every other request
@@ -3540,7 +3675,16 @@ async def _answer_crossing(
     (``overtime.decide_crossing``, same rule as the forced-start acknowledgement). An answer that
     supersedes one the shift has outgrown *is* new, and its event says which decision it replaced -
     the row carries the chain, but "why is this 12 h now" is a question about the trail.
+
+    A standard admin may answer a *worker's* crossing and not an administrator's: the live queue
+    is the same decision as the one in the Approvals list, asked while the shift is still running,
+    and a rule that held in one and not the other would be a way to authorise the same hours by
+    waiting for them to accumulate.
     """
+    with db() as conn:
+        person = conn.execute("SELECT role FROM users WHERE id = ?", (worker_id,)).fetchone()
+    if person is not None:
+        _guard_standard_admin(current, person, "review")
     try:
         with db(write=True) as conn:
             result = overtime.decide_crossing(
@@ -3665,104 +3809,11 @@ def _pending_review_row(row) -> dict:
     return item
 
 
-@router.get("/admin/refused_punches")
-async def list_refused_punches(
-    current: CurrentUser = Depends(admin_only),
-    days: int = 1,
-):
-    """The refused punches: what the band refused, with the score and the frame beside it.
-
-    The triage surface the deployment needed and never had: a worker who keeps being told
-    "we could not confirm that is you" used to leave no record at all, so an operator whose
-    band was derived from the wrong corpus could see neither the scores nor the faces. This
-    lists them - newest first, ``days`` back (default today, capped at 7) - each row carrying
-    the distance, the reason the punch was refused, and whether a frame is waiting
-    (``frame_url``, served by :func:`admin_refused_punch_frame`).
-
-    The frame is a link rather than inline data, for the same reason the review queue does
-    it this way: a day of refusals would otherwise carry every picture whether or not
-    anybody looked. Rows are read-only evidence - there is no approve path, because a
-    refused punch was never attendance - and retention sweeps them on the frame window.
-    """
-    window = max(0, min(int(days), 7))
-    with db() as conn:
-        if window == 0:
-            rows = conn.execute(
-                """
-                SELECT r.id, r.worker_id, u.name, r.site_name, r.action, r.error_code,
-                       r.score, r.pipeline, r.source, r.punch_frame, r.created_at
-                FROM refused_punches r
-                LEFT JOIN users u ON r.worker_id = u.id
-                ORDER BY r.id DESC
-                """
-            ).fetchall()
-        else:
-            cutoff = (datetime.now() - timedelta(days=window)).strftime("%Y-%m-%d 00:00:00")
-            rows = conn.execute(
-                """
-                SELECT r.id, r.worker_id, u.name, r.site_name, r.action, r.error_code,
-                       r.score, r.pipeline, r.source, r.punch_frame, r.created_at
-                FROM refused_punches r
-                LEFT JOIN users u ON r.worker_id = u.id
-                WHERE r.created_at >= ?
-                ORDER BY r.id DESC
-                """,
-                (cutoff,),
-            ).fetchall()
-    items = []
-    for row in rows:
-        item = dict(row)
-        frame = item.pop("punch_frame", None)
-        item["frame_url"] = f"/api/v1/admin/refused_punch_frame/{item['id']}" if frame else None
-        items.append(item)
-    return _json(items)
-
-
-@router.get("/admin/refused_punch_frame/{refusal_id}")
-async def admin_refused_punch_frame(refusal_id: int, current: CurrentUser = Depends(admin_only)):
-    """The downscaled frame one refused punch was measured from. Administrator-only.
-
-    The same contract as the review frame: ``resolve_stored`` proves the path is inside the
-    frame directory before anything is opened, and a row whose frame was never stored or has
-    been swept answers 404 rather than pretending to have a picture.
-    """
-    with db() as conn:
-        row = conn.execute(
-            "SELECT punch_frame FROM refused_punches WHERE id = ?", (refusal_id,)
-        ).fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="This refusal has no record.")
-    path = punch_frames.resolve_stored(row["punch_frame"])
-    if path is None:
-        raise HTTPException(status_code=404, detail="No frame was stored for this refusal.")
-    return FileResponse(path, media_type="image/jpeg")
-
-
-@router.post("/admin/refused_punches/{refusal_id}/clear")
-async def clear_refused_punch(refusal_id: int, current: CurrentUser = Depends(admin_only)):
-    """Mark one refusal as seen, so a triaged list stays a list of what still needs looking at.
-
-    Deliberately a *clear* and not a delete: the evidence stays on disk until retention
-    sweeps it, and the audit trail says who decided it needed nothing further. A refusal is
-    not attendance and cannot become one - there is no approve path here, only a way for the
-    list to shrink once somebody has looked.
-    """
-    with db(write=True) as conn:
-        row = conn.execute(
-            "SELECT id, worker_id FROM refused_punches WHERE id = ?", (refusal_id,)
-        ).fetchone()
-        if row is None:
-            raise HTTPException(status_code=404, detail="This refusal has no record.")
-        conn.execute("DELETE FROM refused_punches WHERE id = ?", (refusal_id,))
-        _audit(
-            conn,
-            action="refused_punch_clear",
-            actor=current,
-            entity="refused_punches",
-            entity_id=refusal_id,
-            after={"worker_id": row["worker_id"]},
-        )
-    return {"status": "success", "message": "Refusal cleared."}
+# The refused-punch triage surface (list, frame, clear) is the root tier's: it answers "is the
+# band refusing honest workers, and at what distance", which is a question about the model
+# rather than about a site's attendance. It lives in ``developer.py`` as
+# ``/developer/refused-punches``. What stays here is the write half - ``_record_refused_punch``
+# above - because the punch path is the only thing that can produce a refusal.
 
 
 @router.get("/admin/pending_review_frame/{log_id}")
@@ -3795,13 +3846,19 @@ async def approve_review(
     """Clear a review flag, optionally adjusting the payable hours."""
     with db(write=True) as conn:
         row = conn.execute(
-            "SELECT worker_id, hours, status, status_code FROM attendance_logs WHERE id = ?",
+            "SELECT l.worker_id, u.role, l.hours, l.status, l.status_code FROM attendance_logs l "
+            "LEFT JOIN users u ON u.id = l.worker_id WHERE l.id = ?",
             (req.log_id,),
         ).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="Attendance log record not found.")
         if row["status"] != STATUS_PENDING_REVIEW and row["status_code"] != "pending_overtime":
             raise HTTPException(status_code=400, detail="This log is not marked as pending review.")
+        # An administrator's own long shift is a shift like anybody else's - it reaches
+        # this queue, its hours stay out of the approved figure while it waits
+        # (``test_admin_shift_visibility``) - and deciding it is the escalation: the
+        # reviewer would be authorising overtime for a peer, on their own say-so.
+        _guard_standard_admin(current, row, "review")
 
         approved = req.approved_hours if req.approved_hours is not None else row["hours"]
         if approved < 0:
@@ -3876,8 +3933,9 @@ async def reject_review(
     """
     with db(write=True) as conn:
         row = conn.execute(
-            "SELECT worker_id, hours, status, status_code, overtime_hours, approved_hours, flag_reason "
-            "FROM attendance_logs WHERE id = ?",
+            "SELECT l.worker_id, u.role, l.hours, l.status, l.status_code, l.overtime_hours, "
+            "l.approved_hours, l.flag_reason "
+            "FROM attendance_logs l LEFT JOIN users u ON u.id = l.worker_id WHERE l.id = ?",
             (req.log_id,),
         ).fetchone()
         if row is None:
@@ -3885,6 +3943,10 @@ async def reject_review(
         code = str(row["status_code"] or "")
         if row["status"] != STATUS_PENDING_REVIEW and code != "pending_overtime":
             raise HTTPException(status_code=400, detail="This log is not marked as pending review.")
+        # Refusing an administrator's overtime is the same reach as approving it - see
+        # ``approve_review`` - and the second answer is the one somebody would reach for
+        # having been told the first is not theirs.
+        _guard_standard_admin(current, row, "review")
 
         recorded = float(row["hours"] or 0.0)
         if code == "pending_overtime":
@@ -4055,10 +4117,20 @@ async def edit_worked_shift_hours(
 async def force_clock_in(
     request: Request, req: ForceClockRequest, current: CurrentUser = Depends(admin_only)
 ):
+    """Put somebody who is not on shift onto one, with an administrator's name on the row.
+
+    Any administrator may do this for a **worker**: standing behind a punch the gate refused
+    is the same authority as reading their timesheet, and it is the answer on the day a
+    phone is dead at the gate. Over an **administrator's** account it is a standard admin's
+    escalation - a forced clock-in is the account's own attendance, and it is also how a
+    peer is put on site without a face match or a geofence - so ``_guard_standard_admin``
+    refuses it, exactly as it does for that account's name, its password and its face.
+    """
     with db(write=True) as conn:
         worker = conn.execute("SELECT name, role FROM users WHERE id = ?", (req.worker_id,)).fetchone()
         if worker is None:
             raise HTTPException(status_code=404, detail="Worker ID not found.")
+        _guard_standard_admin(current, worker, "force clock in")
 
         if conn.execute("SELECT worker_id FROM active_sessions WHERE worker_id = ?", (req.worker_id,)).fetchone():
             raise HTTPException(status_code=400, detail="Worker is already clocked in.")
@@ -4106,13 +4178,22 @@ async def force_clock_in(
 async def force_clock_out(
     request: Request, req: ForceClockRequest, current: CurrentUser = Depends(admin_only)
 ):
+    """End somebody's shift from the console, optionally at hours an administrator names.
+
+    Refused for an **administrator's** account under the same rule as the forced clock-in: the
+    figures this writes are the shift's payable hours, so a standard admin closing a peer's
+    shift - or their own - is authorising their overtime by another route. A head admin is the
+    role that owns the deployment and is the one that answers for it.
+    """
     now = datetime.now()
     with db(write=True) as conn:
         session = conn.execute(
-            "SELECT site_name, clock_in_time FROM active_sessions WHERE worker_id = ?", (req.worker_id,)
+            "SELECT s.site_name, s.clock_in_time, u.role FROM active_sessions s "
+            "LEFT JOIN users u ON u.id = s.worker_id WHERE s.worker_id = ?", (req.worker_id,)
         ).fetchone()
         if session is None:
             raise HTTPException(status_code=404, detail="Worker is not currently clocked in.")
+        _guard_standard_admin(current, session, "force clock out")
 
         clock_in_time = _parse_ts(session["clock_in_time"]) or now
         seconds_on_site = shift_hours.elapsed_seconds(clock_in_time, now)
@@ -4341,16 +4422,43 @@ async def get_logs(limit: int = 500, worker_id: str | None = None, current: Curr
 async def list_notifications(
     unread_only: int = 0, limit: int = 100, current: CurrentUser = Depends(admin_only)
 ):
+    """The administrator's alert queue. The deployment's own events are not in it.
+
+    ``admin_notifications`` carries two different audiences, and the difference is not the
+    severity but *who can act*: a note nobody has answered and a shift past its paid day are a
+    site's work, while a forced start, a schema repair, a retention sweep and a coverage verdict
+    are the host's own log lines (``notifications.DEPLOYMENT_KINDS``). The second group is
+    withheld here rather than at the screen, because the screen is not the only reader - a
+    filter that lived in the console would leave the JSON readable by the role the events are
+    being moved away from.
+
+    The developer sees everything, and does not need a second endpoint to: the root tier is a
+    superset of the administrators by ``require_role``'s wildcard, so opening this route as the
+    developer is how the deployment's own events are read from the console. The withheld rows
+    are excluded in the *query* and in the counts below, so the badge cannot claim work the list
+    underneath will not show.
+    """
     limit = max(1, min(int(limit), 500))
+    hiding = not current.is_developer
+    clause = ""
+    params: list[Any] = []
+    if hiding:
+        clause = "AND kind NOT IN (%s)" % ",".join("?" * len(notifications.DEPLOYMENT_KINDS))
+        params = sorted(notifications.DEPLOYMENT_KINDS)
     with db() as conn:
         if unread_only:
             rows = conn.execute(
-                "SELECT * FROM admin_notifications WHERE read_at IS NULL ORDER BY id DESC LIMIT ?", (limit,)
+                f"SELECT * FROM admin_notifications WHERE read_at IS NULL {clause} "
+                "ORDER BY id DESC LIMIT ?",
+                (*params, limit),
             ).fetchall()
         else:
-            rows = conn.execute("SELECT * FROM admin_notifications ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-        unread = notifications.unread_count(conn)
-        unacknowledged = notifications.unacknowledged_count(conn)
+            rows = conn.execute(
+                f"SELECT * FROM admin_notifications WHERE 1 = 1 {clause} ORDER BY id DESC LIMIT ?",
+                (*params, limit),
+            ).fetchall()
+        unread = notifications.unread_count(conn, exclude_deployment=hiding)
+        unacknowledged = notifications.unacknowledged_count(conn, exclude_deployment=hiding)
     return _json(
         {
             "unread": unread,
@@ -4358,6 +4466,25 @@ async def list_notifications(
             "notifications": [dict(row) for row in rows],
         }
     )
+
+
+def _refuse_a_concealed_alert(
+    conn: sqlite3.Connection, notification_id: int, current: CurrentUser
+) -> None:
+    """An administrator may not act on an alert that is not theirs to read.
+
+    The developer's events are withheld from this role's queue, and a withheld row that a
+    guessed id could still be read or acknowledged would be a filter in name only - the one
+    answer readiness treats as "somebody owns this forced start" is worth guessing an id for.
+    Answers exactly as a missing row does, so the two are indistinguishable from outside.
+    """
+    if current.is_developer:
+        return
+    row = conn.execute(
+        "SELECT kind FROM admin_notifications WHERE id = ?", (int(notification_id),)
+    ).fetchone()
+    if row is not None and notifications.is_deployment_event(row):
+        raise HTTPException(status_code=404, detail="Notification not found.")
 
 
 class NotificationAcknowledgement(BaseModel):
@@ -4403,6 +4530,7 @@ async def acknowledge_notification(
     needed anyway.
     """
     with db(write=True) as conn:
+        _refuse_a_concealed_alert(conn, notification_id, current)
         row = conn.execute(
             "SELECT * FROM admin_notifications WHERE id = ?", (int(notification_id),)
         ).fetchone()
@@ -4459,7 +4587,13 @@ async def acknowledge_notification(
 
 @router.post("/admin/notifications/{notification_id}/read")
 async def mark_notification_read(notification_id: int, current: CurrentUser = Depends(admin_only)):
+    """Mark one alert seen, which is all this route decides.
+
+    ``acknowledge`` is the route that records a decision; this one only moves a row out of the
+    unread badge, and is refused for a withheld row for the same reason ``acknowledge`` is.
+    """
     with db(write=True) as conn:
+        _refuse_a_concealed_alert(conn, notification_id, current)
         exists = conn.execute(
             "SELECT id FROM admin_notifications WHERE id = ?", (notification_id,)
         ).fetchone()
@@ -4534,10 +4668,10 @@ async def enroll_worker(
 
     file_bytes = await uploads.read_photo(photo, field="enrollment photo")
     try:
-        image = uploads.decode_photo(file_bytes, field="enrollment photo")
-        # 800 px is what this endpoint has always embedded and stored; the detector gains
-        # nothing from more, and the reference selfie beside the row is a thumbnail.
-        image.thumbnail((800, 800))
+        # Same chain as the punch this template will be matched against - see
+        # ``uploads.face_frame``. The reference selfie beside the row is a separate, smaller
+        # thumbnail (``biometrics.PHOTO_MAX_EDGE``).
+        image = uploads.face_frame(file_bytes, field="enrollment photo")
     except Exception:
         raise HTTPException(status_code=400, detail="Image processing failed.")
 
@@ -5136,6 +5270,20 @@ async def lifespan(application: FastAPI):
     # detectors, which is exactly the blocking CPU work the overtime watcher's comment above
     # warns about. ``python -m coverage_report --once`` is the cron-shaped entry point.
     application.state.coverage_reporter = coverage_report.start_watcher()
+    # Everything the interpreter will ever need is loaded by now: the models, the SQLite
+    # connection factory, the route table. ``gc.freeze()`` moves every object alive at this
+    # moment into a permanent generation the collector never scans again, so a cycle that
+    # fires while a punch is being verified cannot walk the whole import graph - it is the
+    # difference between a collection that costs a few milliseconds and one that costs a
+    # frame at the gate. ``collect()`` runs first, so nothing reachable is frozen mid-cycle.
+    gc.collect()
+    gc.freeze()
+    # The other kind of leftover: a request that was killed between spooling an upload and
+    # discarding it (a redeploy, the OOM killer, a SIGKILL) leaves its temporary file behind,
+    # and every path that can remove it normally belongs to the request that died. One pass is
+    # enough - the file means nothing after its request - and it only touches files far older
+    # than any live request (see ``uploads.SPOOL_STALE_SECONDS``).
+    uploads.sweep_spool_dir()
     try:
         yield
     finally:

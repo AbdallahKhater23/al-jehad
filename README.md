@@ -551,6 +551,26 @@ the problem when the server is merely busy goes and gets re-enrolled. The offlin
 queue covers a worker whose phone retried into a full server. A refusal writes nothing -
 no session, no log row.
 
+**The memory ceiling, and who checks it.** The queue above is what absorbs a burst, and the
+thing that actually took the 512 MB instance down was memory rather than time: a punch used
+to decode its frame *before* taking a queue slot, so every waiting punch held about 11 MB of
+pixels and the busiest minute's high-water mark became the process's. The frame is now
+decoded inside the worker that scores it, and a waiting punch holds a spooled file instead.
+That is checked rather than assumed: `backend/tools/punch_saturation.py` starts this
+application from the checkout, drives eight simultaneous punches per round for four rounds
+past its capacity of two, samples the process the models actually live in, and fails when the
+peak crossed its ceiling (400 MiB resident, 384 MiB anonymous) or the memory did not come back
+down after the burst. `.github/workflows/punch-memory.yml` runs it on every push and pull
+request, so the budget is a gate and not a habit.
+
+It is the fast half, and it is honest about that: there is no cgroup here, so nothing kills
+the process at the line - the gate is a prediction of the container's behaviour. The other
+half is `backend/tools/capacity_test.py`, which runs the real image in the capped container
+shape (`--memory 512m --memory-swap 512m --cpus 1`, swap off) and reads the kernel's own
+counters - `memory.current` and `memory.stat anon`, `memory.peak`, `memory.events`
+(`oom_kill`), and `cpu.stat` throttling - with a pass/fail table and an exit code. Run that
+one before a release; it needs docker and a few minutes of real inference.
+
 **What this does *not* isolate.** The models still run inside the API process: a crash
 inside native TensorFlow (an out-of-memory kill, a corrupt image reaching a half-loaded
 model) takes the API process with it, and a saturated pool still competes for the same

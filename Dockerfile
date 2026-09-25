@@ -32,14 +32,56 @@ WORKDIR /app
 
 # System libraries the runtime manifest cannot name:
 #   libgl1, libglib2.0-0 — what ``import cv2`` dynamically loads (see above);
+#   libjemalloc2         — the allocator this deployment runs on (see below);
 #   curl                 — the container HEALTHCHECK probe (Railway uses its own
 #                          healthcheckPath and ignores this one; it is for local runs).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         libgl1 \
         libglib2.0-0 \
+        libjemalloc2 \
         curl \
  && rm -rf /var/lib/apt/lists/*
+
+# Allocator: jemalloc, not glibc's malloc.
+#
+# WHY THE ALLOCATOR IS THE MEMORY FIX
+# -----------------------------------
+# The workload is a spike, not a steady state: a shift arrives at once, so the process
+# allocates several large, short-lived buffers together (a decoded frame per queued job,
+# an ONNX arena, a PIL bitmap) and drops them all within a second. glibc's malloc keeps a
+# large share of that freed memory on its arenas instead of returning it to the kernel, so
+# RSS sits at the high-water mark of the busiest minute forever - the spike the box *just
+# survived* becomes the level it then *runs at*, and it is the next spike that gets the
+# OOM kill. jemalloc's decay settings below hand dirty and muzzy pages back promptly, so
+# the resident set tracks live data rather than the peak it once had.
+#
+# LD_PRELOAD is an image ENV rather than something the entrypoint exports because
+# docker-entrypoint.sh re-execs the server through ``setpriv``: an environment variable set
+# in the image crosses that exec (setpriv preserves the environment unless --reset-env), so
+# the allocator is in place for the process that actually serves traffic. ``muzzy_decay_ms:0``
+# is what makes the reclaim prompt; ``background_thread`` moves it off the request path.
+ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
+    MALLOC_CONF=background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0
+
+# The 512 MB instance profile. These are not the defaults - the defaults are the measured
+# single-worker values that ``backend/tests/test_face_engine.py`` pins - they are what this
+# *deployment* overrides, and each one is a trade this instance has already lost:
+#
+#   FACE_INFERENCE_QUEUE=8    - at 64, every queued punch holds its decoded frame in memory
+#                               while it waits (~10 MB a job, measured), so the queue alone
+#                               could ask for ~640 MB against this app's ~290 MB floor. Eight
+#                               deep is still far more arrival-burst than two workers drain,
+#                               and a job that will not fit is answered 503 + Retry-After
+#                               instead of being stacked up invisibly.
+#   STANDING_SWEEP_ENABLED=0  - the standing coverage report runs *detectors* on a timer
+#                               (a thread, not a task: it is blocking CPU work). On 1 vCPU
+#                               that is the sweep competing with the gate for the only core,
+#                               and it is a measurement tool, not something the site needs to
+#                               clock in. ``python -m coverage_report --once`` is the
+#                               cron-shaped way to keep the report current off-box.
+ENV FACE_INFERENCE_QUEUE=8 \
+    STANDING_SWEEP_ENABLED=0
 
 # Dependencies first, so an application-only change does not re-download the wheels.
 #

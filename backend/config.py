@@ -365,16 +365,45 @@ class Settings(BaseModel):
     #  link, and every photo inside a bulk ZIP. 5 MB is comfortably above a phone
     #  camera JPEG (2-4 MB) and far below anything an incident report needs to be.
     upload_max_photo_bytes: int = 5 * 1024 * 1024
-    #  Long edge of the frame the face pipeline sees on a punch (clock-in/out, quick
-    #  link, offline sync - one number everywhere, see the punch endpoints). 640 used
-    #  to be the number; the working-distance band (0.7-1.5 m, see the framing coach)
-    #  puts a face at 53-113 px in a 640-wide frame, and the alignment template wants
-    #  ~112 - so beyond ~0.7 m the crop was being upscaled before it was embedded, and
-    #  every extra metre cost match score. 1280 keeps the crop at native scale through
+    #  Long edge of the frame the face pipeline sees - on a punch (clock-in/out, quick
+    #  link, offline sync) *and* on every enrollment path, because the template and the
+    #  live frame are compared to each other and ``uploads.face_frame`` makes both with
+    #  this one number (see that function for why one chain matters more than the value).
+    #  640 used to be the number; the working-distance band (0.7-1.5 m, see the framing
+    #  coach) puts a face at 53-113 px in a 640-wide frame, and the alignment template
+    #  wants ~112 - so beyond ~0.7 m the crop was being upscaled before it was embedded,
+    #  and every extra metre cost match score. 1280 keeps the crop at native scale through
     #  ~1.5 m. Latency scales with frame area, not linearly: YuNet on a 1280x960 frame
     #  costs ~55 ms against ~15 ms at 640, and the embedding itself is size-independent
     #  (always a 112x112 crop).
-    punch_selfie_max_px: int = 1280
+    #
+    #  Enrollment used to cap itself at 800, which was worse than it looked: the template
+    #  is the *reference* side of every future comparison, so it was the one frame that
+    #  could least afford a smaller face than the punch it would be matched against.
+    face_frame_max_px: int = 1280
+
+    # -- the ingestion boundary (how big a photo may be before it is refused) --------
+    #  ``face_frame_max_px`` above is a *ceiling on the frame a model sees*; these two
+    #  are a ceiling on what may be uploaded at all, and they exist because the two are
+    #  not the same question.
+    #
+    #  A frame built from a large photo is not merely slower, it is *different*: the
+    #  decode hint that keeps a 12 MP JPEG from becoming a 36 MB bitmap makes libjpeg
+    #  resample on a power-of-two grid, so a 4032x3024 photo arrives at the detector as
+    #  ~1008 px and a 1280x960 one as 1280 - two different resamplings of the same face,
+    #  which the pipeline then measures against a decision margin of ~0.0036. The drift
+    #  was measured at up to ~0.0088 on the live pipeline: larger than the margin it is
+    #  being compared with, so a punch can cross the line because of the *size of the
+    #  photo* rather than the face in it.
+    #
+    #  Bounding the input bounds that drift, and (with the hint gone) leaves one decode
+    #  path for every accepted upload. 4 MP / 2048 px: above the ~1.2 MP a browser canvas
+    #  capture produces, below the 12 MP a phone's own camera app produces - so an upload
+    #  from the file picker has to be downscaled by the client first, and the refusal says
+    #  so. Both are checked; a 3000x1200 photo fails the edge rule while sitting under the
+    #  pixel limit, and a 2048x2048 one fails the pixel rule while sitting on the edge.
+    face_frame_max_pixels: int = 4_000_000
+    face_frame_max_edge_px: int = 2048
 
     # -- worker notes (the written channel between a worker and the admin) ---
     #  A note is cheap to write and expensive to ignore, so the two controls are a
@@ -780,7 +809,15 @@ def build_settings(*, env_file: Path | None = None) -> Settings:
         offline_batch_max=_env_int("OFFLINE_BATCH_MAX", 50),
         offline_duplicate_window_seconds=_env_int("OFFLINE_DUPLICATE_WINDOW_SECONDS", 90),
         upload_max_photo_bytes=_env_int("UPLOAD_MAX_PHOTO_BYTES", 5 * 1024 * 1024),
-        punch_selfie_max_px=_env_int("PUNCH_SELFIE_MAX_PX", 1280),
+        face_frame_max_px=_env_int(
+            # ``PUNCH_SELFIE_MAX_PX`` is what this was called when it only sized punches. It
+            # is still read as the fallback so a deployment that set it keeps the value it
+            # chose instead of silently reverting to the default.
+            "FACE_FRAME_MAX_PX",
+            _env_int("PUNCH_SELFIE_MAX_PX", 1280),
+        ),
+        face_frame_max_pixels=_env_int("FACE_FRAME_MAX_PIXELS", 4_000_000),
+        face_frame_max_edge_px=_env_int("FACE_FRAME_MAX_EDGE_PX", 2048),
         notes_rate_limit=_env_str("NOTES_RATE_LIMIT", "30/minute") or "30/minute",
         notes_max_open_per_worker=_env_int("NOTES_MAX_OPEN_PER_WORKER", 20),
         notes_max_subject_chars=_env_int("NOTES_MAX_SUBJECT_CHARS", 120),

@@ -50,7 +50,7 @@ bug hides inside a normalisation change.
 
 L2 NORMALISATION IS FREE FOR THE APPLICATION AND USEFUL AFTERWARDS
 ------------------------------------------------------------------
-``main.compare_faces_sync`` scores with ``scipy.spatial.distance.cosine``, which is
+``main.compare_faces_sync`` scores with ``main.cosine``, which is
 invariant to a vector's magnitude - so normalising changes no distance and no decision
 line by even one bit of the comparison. It is done anyway because a unit-length template
 is what a 1-to-N search, an approximate index, or an on-device comparison needs, and the
@@ -100,13 +100,18 @@ INPUT_SIZE = 160
 #: path is what the code depends on.
 DEFAULT_MODEL_PATH = Path(__file__).resolve().parent / "models" / "facenet128.onnx"
 
-#: Concurrency settings, chosen against the measured behaviour of the application's pool.
-#: ``face_engine`` runs two face calls at a time; giving each of them four or more intra-op
-#: threads oversubscribes a 16-core box and makes every call slower, which is the same
-#: oversubscription that made TensorFlow's throughput fall as callers stacked up. Two
-#: threads per session, one inter-op thread (there is nothing to pipeline - a face graph is
-#: a chain), and sequential execution so that two concurrent sessions cannot each fan out.
-DEFAULT_INTRA_OP_THREADS = 2
+#: Concurrency settings, chosen against the *deployment* rather than against a development
+#: box. The instance this runs on is **one vCPU**, and ``face_engine`` runs two face calls at
+#: a time - so two intra-op threads per session would put four compute threads on one core.
+#: There is no idle core for the second thread to use, so it buys no throughput and costs
+#: context switching plus the per-thread scratch an ONNX session allocates on a host with
+#: 512 MB to spend. One intra-op thread, one inter-op thread (there is nothing to pipeline -
+#: a face graph is a chain), and sequential execution so two concurrent sessions cannot each
+#: fan out.
+#:
+#: The constructor still takes ``intra_op_threads``, so a host with cores to spare can be
+#: measured rather than assumed; the default stays where the deployment is.
+DEFAULT_INTRA_OP_THREADS = 1
 DEFAULT_INTER_OP_THREADS = 1
 
 #: Graph optimisation at session build time. ORT fuses the batch norms into the convolution
@@ -204,6 +209,14 @@ def letterbox(image, size: int = INPUT_SIZE) -> np.ndarray:
     # cv2 is imported here rather than at module scope so that importing the application
     # does not pull in OpenCV on a path that never embeds anything.
     import cv2
+
+    # OpenCV's own thread pool is a *process-wide* setting, and this is the one place in
+    # this module that can touch it without defeating the lazy import above. The detector
+    # modules pin it too, but a tool that imports only this one must not be the exception:
+    # OpenCV fanning a resize across four threads competes with the ONNX session for the
+    # same single core. Called per embed rather than guarded by a flag - it is one store to
+    # a global, against a resize of a 160 px canvas.
+    cv2.setNumThreads(1)
 
     resized = cv2.resize(array, (width, height), interpolation=cv2.INTER_LINEAR)
 
@@ -357,6 +370,15 @@ class OnnxFaceNetEngine:
                 # way the measurements show hurts.
                 options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
                 options.log_severity_level = 3
+                # The CPU memory arena stays **enabled**. It is ORT's default, and it is
+                # written out here because the opposite is the obvious-looking change on a
+                # 512 MB host - and the benchmark already rejected it: with the arena off,
+                # every intermediate buffer is handed back to the system allocator and
+                # asked for again on the next run, so the process pays for it in allocator
+                # churn rather than in peak, and peak is what the ceiling is about. The
+                # arena also keeps the allocation pattern flat across a burst, which is the
+                # property the punch path depends on after a whole site arrives at once.
+                options.enable_cpu_mem_arena = True
 
                 import time as _time
 

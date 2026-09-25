@@ -49,6 +49,15 @@ const APPROVALS = [
         action: 'Clock In', timestamp: '2026-09-12 07:00:00', hours: 0.0, score: 0.5,
         status: 'pending_review', status_code: 'pending_review',
         flag_reason: 'outside every site', overtime_hours: null
+    },
+    // The signed-in administrator's own long shift - ``worker_id`` is the reader's own id on
+    // purpose. It is on the queue like anybody else's (``test_admin_shift_visibility``), and it
+    // is the one row on this page whose decision is not the reader's to make.
+    {
+        id: 77, worker_id: '1000', name: 'Site Admin', role: 'admin', site_name: 'Downtown Tower A',
+        action: 'Clock Out', timestamp: '2026-09-12 19:00:00', hours: 10.0, score: 0.2,
+        status: 'Pending Overtime Approval', status_code: 'pending_overtime',
+        flag_reason: null, overtime_hours: 2.0
     }
 ];
 
@@ -112,7 +121,13 @@ const results = {};
         reject_wired: /handleApproval\(12, 'reject'\)/.test(markup),
         approve_wired: /handleApproval\(12, 'approve'\)/.test(markup),
         // Both kinds of review are on the board.
-        both_kinds: markup.indexOf('data-review="900001"') >= 0
+        both_kinds: markup.indexOf('data-review="900001"') >= 0,
+        // An administrator's own shift: drawn, and undecidable here. The reader *is* that
+        // administrator, which is the sharper case of the same rule.
+        peer_on_the_board: markup.indexOf('data-review="77"') >= 0,
+        peer_has_approve: markup.indexOf('data-approve="77"') >= 0,
+        peer_has_reject: markup.indexOf('data-reject="77"') >= 0,
+        peer_has_note_box: markup.indexOf('id="note-77"') >= 0
     };
 }
 
@@ -188,6 +203,25 @@ const results = {};
 @pytest.fixture(scope="module")
 def results():
     return frontend_vm.run(HARNESS)
+
+
+def test_an_administrators_own_shift_is_drawn_without_a_decision_on_it(results):
+    """``_guard_standard_admin``, one level out: the queue shows the row, the reader cannot settle it.
+
+    Overtime for a peer is a standard admin's escalation, so this card is evidence - the face, the
+    verdict, the hours - and there is nothing on it to type a decision into. The alternative, a
+    button that always answers 403, is the trap the credentials screen already refuses to draw.
+    The server enforces it (``approve_review``/``reject_review``); this is the surface agreeing.
+    """
+    card = results["card"]
+    assert card["peer_on_the_board"], "the shift is on the queue like anybody else's"
+    assert not card["peer_has_approve"], "approving a peer's overtime is not this admin's"
+    assert not card["peer_has_reject"], "and refusing it is the same reach"
+    assert not card["peer_has_note_box"], (
+        "no reason box either: a decision that cannot be sent is not a decision"
+    )
+    # ... and the rows that *are* this admin's keep exactly what they had.
+    assert card["has_approve"] and card["has_reject"] and card["note_box"]
 
 
 def test_the_card_offers_both_answers(results):

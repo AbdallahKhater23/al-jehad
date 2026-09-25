@@ -97,7 +97,12 @@ requests==2.34.2
 retina-face==0.0.18
 rich==15.0.0
 scikit-learn==1.9.0
-scipy==1.18.1
+# scipy used to be pinned here and is deliberately gone. It was imported for one call -
+# ``scipy.spatial.distance.cosine`` in ``main.compare_faces_sync`` - and importing it costs
+# ~35 MB of RSS (measured) to run a single float64 dot product. ``main.cosine`` computes the
+# same number with numpy, which is already on this list, so the package bought this
+# deployment nothing and it could not spare the 35 MB. The tools and one test that still
+# score with SciPy are pinned in ``backend/requirements-dev.txt`` instead.
 setuptools==84.0.0
 six==1.17.0
 slowapi==0.1.10

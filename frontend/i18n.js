@@ -12,7 +12,7 @@
 const TRANSLATIONS = {
     en: {
         "title": "Site Attendance",
-        "loginIntro": "Site attendance for crews on site. Sign in with the ID and the password your administrator gave you.",
+        "loginIntro": "Site attendance for crews on site. Sign in with the ID, the email or phone number on your account, and the password your administrator gave you.",
         "loginHelp": "Password not working? Ask an administrator to set a new one - your sessions close everywhere when they do.",
         "companyFooter": "{brand} - stone, marble and granite since 1983.",
         // The Company panel: the deployment's own name and mark. Every line here is chrome

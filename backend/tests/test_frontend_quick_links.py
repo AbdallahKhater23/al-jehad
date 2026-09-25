@@ -379,8 +379,13 @@ const results = {};
 // 9b. nobody to force in says so rather than offering an empty button
 {
     const env = await linksEnv();
+    // ``1000`` is in the active list as well as ``3``: the panel's two exclusions are
+    // different rules and both have to be satisfied before "nobody to force" is true. ``3``
+    // is on shift; ``1000`` is an administrator, whom this reader - a head administrator -
+    // *may* force (``_guard_standard_admin`` bars a standard admin only), so an active list
+    // without ``1000`` leaves exactly one worker to offer and the panel is not empty at all.
     results.force_in_empty = env.evaluate(
-        "UI.forceInPanelHtml([{worker_id:'1'},{worker_id:'2'},{worker_id:'3'},{worker_id:'600'}], UI_MODULES._linksRoster || [], [{site_name:'Downtown Tower A'}])"
+        "UI.forceInPanelHtml([{worker_id:'1'},{worker_id:'2'},{worker_id:'3'},{worker_id:'600'},{worker_id:'1000'}], UI_MODULES._linksRoster || [], [{site_name:'Downtown Tower A'}])"
     );
 }
 """
@@ -508,7 +513,12 @@ def test_a_selfie_that_cannot_be_fetched_is_reported(results):
 def test_live_ops_can_force_a_worker_onto_a_site(results):
     force_in = results["force_in"]
     assert force_in["button"] is True
-    assert force_in["workers"] == ["1", "600"], (
+    # ``3`` is on shift and ``2`` is deactivated, so neither is offered - the shift exclusion
+    # is the one this panel exists for. ``1000`` is, and that is the head administrator's
+    # reach rather than a lapse: the reader here is ``5000``, and forcing an administrator is
+    # only barred to a *standard* admin (``_guard_standard_admin``). The standard-admin case
+    # is pinned in ``test_frontend_live_ops``, which has a peer row to read it from.
+    assert force_in["workers"] == ["1", "600", "1000"], (
         "the worker already on shift is not offered - they are on the session list, which is "
         "the one case this panel exists for"
     )
@@ -525,4 +535,7 @@ def test_live_ops_can_force_a_worker_onto_a_site(results):
 def test_the_force_in_panel_says_when_there_is_nobody_to_force(results):
     markup = results["force_in_empty"]
     assert 'data-force-in-note' in markup
+    # The empty panel says so in a sentence rather than printing a count of zero, so the note
+    # is what carries the answer; ``disabled`` is the part that cannot be left out, because a
+    # live button over an empty select is the trap this test exists for.
     assert 'disabled' in markup, "an empty select with a live button is a trap"

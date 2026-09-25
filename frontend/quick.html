@@ -3,59 +3,123 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<meta name="theme-color" content="#0f172a" />
+<meta name="theme-color" content="#162F29" />
 <title>Clock in or out — Site Attendance</title>
+<!--
+  The company's column, in the tab and on the home screen.
+
+  ``../icon.svg`` and not ``icon.svg``, for the reason the script tags at the foot of this
+  page spell out: the page is served at ``/q/<token>``, so a bare href asks the token route
+  for ``/q/icon.svg`` and gets this page back - HTML behind ``rel="icon"``, which the
+  browser discards without a word, leaving the tab on its default globe. One level up is
+  the right file in both worlds this frontend lives in: the app's own mount, and the
+  frontend folder hosted on its own.
+
+  It matters most on this page. A worker arrives from a link, often with no app installed,
+  so "Add to Home Screen" is the normal way to keep the button - and with no icon the tile
+  iOS draws is a grey screenshot of the page instead of the company's mark.
+-->
+<link rel="icon" type="image/svg+xml" href="../icon.svg">
+<link rel="apple-touch-icon" href="../icon.svg">
+<meta name="apple-mobile-web-app-title" content="Al-Jehad">
 <style>
-  :root { color-scheme: dark; }
+  /* The company's palette: the same seven values style.css hands the console's rail and
+     the sign-in panel, written out here because these two pages load no stylesheet - a
+     worker opens them from a link, often on site cellular, and the page has to paint on
+     the first frame either way. The green is also what the phone paints its status bar
+     with (``theme-color`` above), so the chrome and the page are one surface rather than
+     a green bar over a grey page.
+
+     Cream appears at reduced alpha below, for the quieter text and the hairlines, instead
+     of being given tokens of its own to keep in step.
+
+     The alphas are load-bearing, not decoration: each is set so that nothing on these two
+     pages reads fainter than the slate palette it replaced. Quiet text is 0.74 (6.96:1
+     before, 7.00:1 now), the footer credit 0.62 (which also lifts it out of the 3.75:1 it
+     was already failing at), and the hairlines 0.16-0.32, every one of them at least as
+     visible as the #334155 and #475569 edges they stand in for. */
+  :root {
+    --brand-green: #162F29;
+    --brand-green-2: #1B3A32;
+    --brand-green-ink: #102420;
+    --brand-cream: #EDE7D6;
+    --brand-gold: #DDC48C;
+    --brand-gold-hi: #FBF0CB;
+    --brand-gold-lo: #B9945A;
+    color-scheme: dark;
+  }
   * { box-sizing: border-box; }
   body {
-    margin: 0; min-height: 100vh; background: #0f172a; color: #e2e8f0;
+    margin: 0; min-height: 100vh; background: var(--brand-green); color: var(--brand-cream);
     font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     display: flex; flex-direction: column;
   }
-  header { padding: 18px 16px 10px; display: flex; gap: 12px; align-items: flex-start; }
+  /* The mark at the top left, where the console's rail keeps it, so the first thing on the
+     page is the thing the worker tapped to get here. Decorative on purpose: the h1 beside
+     it already says what the page is, and the column is also the tab icon. */
+  .brand-mark { flex: 0 0 auto; margin-top: 2px; }
+  .brand-mark img { display: block; width: 26px; height: auto; }
+  /* ``env()`` is 0 in a browser tab and the notch's height in the installed app - which is
+     the case that matters, because installed is the only mode that paints the status bar
+     the colour set above, and then the notch sits over this padding. */
+  header {
+    padding: calc(18px + env(safe-area-inset-top, 0px)) 16px 10px;
+    display: flex; gap: 12px; align-items: flex-start;
+  }
   header .head { flex: 1; min-width: 0; }
   h1 { font-size: 1.2rem; margin: 0 0 4px; }
-  .sub { color: #94a3b8; font-size: .85rem; margin: 0; }
+  .sub { color: rgba(237, 231, 214, 0.74); font-size: .85rem; margin: 0; }
   main { flex: 1; padding: 12px 16px 28px; display: flex; flex-direction: column; gap: 14px; }
-  .card { background: #1e293b; border: 1px solid #334155; border-radius: 14px; padding: 14px; }
-  video, canvas, img.preview { width: 100%; border-radius: 12px; background: #0b1220; display: block; }
+  .card { background: var(--brand-green-2); border: 1px solid rgba(237, 231, 214, 0.16); border-radius: 14px; padding: 14px; }
+  video, canvas, img.preview { width: 100%; border-radius: 12px; background: var(--brand-green-ink); display: block; }
   img.preview { aspect-ratio: 3/4; object-fit: cover; }
   .row { display: flex; gap: 10px; flex-wrap: wrap; }
   button {
-    flex: 1 1 auto; min-height: 56px; border: 0; border-radius: 12px; font-size: 1.05rem;
-    font-weight: 700; color: #0b1220; background: #38bdf8; cursor: pointer;
+    flex: 1 1 auto; min-height: 56px; border: 1px solid transparent; border-radius: 12px; font-size: 1.05rem;
+    font-weight: 700; color: var(--brand-green-ink); cursor: pointer;
+    /* The gold of the lockup, at the same three stops the sign-in panel's button uses. */
+    background: linear-gradient(180deg, var(--brand-gold-hi), var(--brand-gold) 52%, var(--brand-gold-lo));
   }
-  button.secondary { background: #334155; color: #e2e8f0; }
+  button.secondary {
+    background: rgba(237, 231, 214, 0.12); border-color: rgba(237, 231, 214, 0.26);
+    color: var(--brand-cream);
+  }
   button[disabled] { opacity: .5; cursor: not-allowed; }
   /* The language picker: three letters at the top of the page, sized like a control and
      not like the one thing the page is for. */
   .langs { display: flex; gap: 4px; flex: 0 0 auto; }
   .langs button {
     flex: 0 0 auto; min-height: 30px; min-width: 32px; padding: 0 7px; border-radius: 999px;
-    background: #334155; color: #cbd5e1; font-size: .75rem; font-weight: 700; line-height: 1;
+    background: rgba(237, 231, 214, 0.12); border-color: rgba(237, 231, 214, 0.26);
+    color: var(--brand-cream); font-size: .75rem; font-weight: 700; line-height: 1;
   }
-  .langs button[aria-pressed="true"] { background: #38bdf8; color: #0b1220; }
+  .langs button[aria-pressed="true"] {
+    background: linear-gradient(180deg, var(--brand-gold-hi), var(--brand-gold) 52%, var(--brand-gold-lo));
+    border-color: transparent; color: var(--brand-green-ink);
+  }
   input[type=file] { display: none; }
   label.file {
-    display: block; text-align: center; padding: 14px; border: 1px dashed #475569;
-    border-radius: 12px; color: #cbd5e1; cursor: pointer; margin-top: 12px;
+    display: block; text-align: center; padding: 14px; border: 1px dashed rgba(237, 231, 214, 0.32);
+    border-radius: 12px; color: var(--brand-cream); cursor: pointer; margin-top: 12px;
   }
-  .note { font-size: .8rem; color: #94a3b8; }
+  .note { font-size: .8rem; color: rgba(237, 231, 214, 0.74); }
   /* Amber, because the early clock-out question is about money and is not an error: the
      tap has not failed, it is waiting for an answer. */
-  .card.early { border-color: #b45309; background: #2a1c08; }
+  .card.early { border-color: rgba(245, 158, 11, 0.55); background: rgba(245, 158, 11, 0.12); }
   .note.warn { color: #fca5a5; }
   .msg { border-radius: 12px; padding: 12px; font-weight: 600; display: none; }
-  .msg.ok { display: block; background: #052e1a; color: #86efac; border: 1px solid #166534; }
-  .msg.err { display: block; background: #3b0d0d; color: #fca5a5; border: 1px solid #7f1d1d; }
-  .pill { display: inline-block; padding: 3px 9px; border-radius: 999px; background: #0b1220; color: #7dd3fc; font-size: .75rem; }
+  .msg.ok { display: block; background: rgba(22, 163, 74, 0.18); color: #86efac; border: 1px solid rgba(134, 239, 172, 0.4); }
+  .msg.err { display: block; background: rgba(220, 38, 38, 0.18); color: #fca5a5; border: 1px solid rgba(252, 165, 165, 0.4); }
+  .pill { display: inline-block; padding: 3px 9px; border-radius: 999px; background: var(--brand-green-ink); color: var(--brand-gold); font-size: .75rem; }
   .hidden { display: none !important; }
   .state { font-size: 1.05rem; font-weight: 700; }
   /* The vendor credit closes every page this app serves, this one included. "Thank you
      for using the app" would have been the other candidate and is a lie: a worker tapped
      a link somebody sent them. */
-  .credit { margin: 0; padding: 0 16px 18px; text-align: center; font-size: .78rem; color: #64748b; }
+  .credit {
+    margin: 0; padding: 0 16px calc(18px + env(safe-area-inset-bottom, 0px));
+    text-align: center; font-size: .78rem; color: rgba(237, 231, 214, 0.62);
+  }
 </style>
 </head>
 <body>
@@ -67,6 +131,12 @@
   these two pages already shipped once.
 -->
 <header>
+  <!--
+    The company's mark. ``../`` for the reason the icon link and the scripts give - this page
+    is served one segment deep under its token - and aria-hidden because the h1 beside it
+    already names the page for a screen reader.
+  -->
+  <span class="brand-mark" aria-hidden="true"><img src="../logo-mark.svg" alt="" width="26" height="34"></span>
   <div class="head">
     <h1 id="title" data-t="quick.title">Clock in or out</h1>
     <p class="sub" id="who" data-t="quick.sub">Checking this link…</p>

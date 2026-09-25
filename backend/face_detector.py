@@ -227,6 +227,13 @@ def _ensure() -> tuple[bool, str]:
         try:
             import cv2
 
+            # OpenCV's thread pool is process-global and sized from the visible cores, which
+            # inside a container is the host's count rather than the cgroup quota - a 1 vCPU
+            # instance would otherwise fan every detection out to 32 threads the scheduler
+            # throttles. Set here because this is where the runtime first loads cv2 for
+            # detection; ``detector_640`` states the same cap for the SCRFD/coverage path.
+            cv2.setNumThreads(1)
+
             _detector = cv2.FaceDetectorYN.create(
                 str(path), "", (DETECTOR_INPUT_SIZE, DETECTOR_INPUT_SIZE),
                 SCORE_THRESHOLD, 0.3, 5000

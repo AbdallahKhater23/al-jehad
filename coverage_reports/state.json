@@ -1,0 +1,66 @@
+{
+ "frames": 1520,
+ "corpus": {
+  "frames": 1520,
+  "newest": "2026-09-24 02:10:03",
+  "newest_name": "205ef5665c045165fa0818fbf9f2840b.jpg",
+  "total_bytes": 2470783
+ },
+ "updated_at": "2026-09-25 14:00:12",
+ "runs": 1,
+ "last_run": {
+  "measured_at": "2026-09-25 14:00:12",
+  "sample": {
+   "frames": 200,
+   "limit": 200
+  },
+  "verdict": {
+   "rule": "exactly_one",
+   "threshold": 0.6,
+   "yunet": {
+    "yunet@320": {
+     "found": 27,
+     "frames": 200,
+     "share": 0.135,
+     "ms_per_frame": 12.6
+    },
+    "yunet@640": {
+     "found": 27,
+     "frames": 200,
+     "share": 0.135,
+     "ms_per_frame": 52.6
+    },
+    "yunet@640+2x2tiling": {
+     "found": 3,
+     "frames": 200,
+     "share": 0.015,
+     "ms_per_frame": 128.3
+    }
+   },
+   "best_yunet": {
+    "name": "yunet@640",
+    "found": 27,
+    "frames": 200,
+    "share": 0.135,
+    "ms_per_frame": 52.6
+   },
+   "scrfd": {
+    "name": "scrfd@640",
+    "found": 20,
+    "frames": 200,
+    "share": 0.1,
+    "ms_per_frame": 156.2,
+    "misses_by_reason": {
+     "no_face": 180
+    }
+   },
+   "margin_frames": -7,
+   "scrfd_measured": true,
+   "scrfd_ahead": false,
+   "min_margin_frames": 1,
+   "margin_share": -0.035
+  },
+  "summary": "SCRFD is behind by 7 frame(s) (scrfd@640 20/200 vs yunet@640 27/200, rule exactly_one, 156.2 ms/frame vs 52.6)",
+  "notified": false
+ }
+}

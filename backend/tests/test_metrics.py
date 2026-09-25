@@ -591,11 +591,31 @@ def test_a_presentation_attack_is_counted_as_liveness_spoof(client, app_module, 
 
 
 def test_the_engine_reports_job_time_queue_wait_and_capacity(client, app_module):
+    """One punch is one job, and the operator can see it waiting.
+
+    The label is the job's own ``__name__`` (``face_engine._job_name``), so this changed when a
+    punch became a single unit of work: it used to submit the liveness check and then the
+    comparison, each holding the request's decoded frame in between. ``judge_punch_frame`` is
+    the name of that one unit - decode, liveness, comparison - and the ``compare_faces_sync``
+    count must not grow for a punch any more, because the comparison only ever runs *inside* it.
+    That second assertion is the one that would catch the frame coming back: two submissions per
+    punch is two queue slots, and the pixels have to live somewhere while the punch waits.
+    """
+    before = scrape(client)
     clock_in(client, MOALLEM, headers=bearer(MOALLEM))
     body = scrape(client)
 
-    assert value(body, "attendance_face_engine_job_seconds_count", {"job": "compare_faces_sync"}) >= 1
-    assert value(body, "attendance_face_engine_queue_wait_seconds_count", {"job": "compare_faces_sync"}) >= 1
+    job = "judge_punch_frame"
+    assert value(body, "attendance_face_engine_job_seconds_count", {"job": job}) >= 1
+    assert value(body, "attendance_face_engine_queue_wait_seconds_count", {"job": job}) >= 1
+    assert series_sum(body, "attendance_face_engine_job_seconds_count", {"job": job}) > series_sum(
+        before, "attendance_face_engine_job_seconds_count", {"job": job}
+    )
+    assert series_sum(
+        body, "attendance_face_engine_job_seconds_count", {"job": "compare_faces_sync"}
+    ) == series_sum(
+        before, "attendance_face_engine_job_seconds_count", {"job": "compare_faces_sync"}
+    ), "a punch submitted the comparison as its own engine job again"
     assert value(body, "attendance_face_engine_capacity") == float(settings.face_inference_concurrency)
     assert value(body, "attendance_face_engine_in_flight") == 0.0
     assert value(body, "attendance_face_engine_queued") == 0.0

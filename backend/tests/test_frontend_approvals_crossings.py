@@ -84,6 +84,19 @@ const CROSSINGS = [
             decided_at: '2026-09-22 15:00:00', note: 'the pour ran long'
         },
         needs_answer: true, unauthorised_hours: 1.75
+    },
+    // An *administrator* still on site past the line: the same crossing, and the only one in
+    // this list whose answer is not every reader's to give (``mayActOnAccount``). It is drawn
+    // for both of them - the operator has to be able to see who is on site - and the two
+    // answers are the head admin's alone.
+    {
+        worker_id: '1000', worker_name: 'Site Admin', role: 'admin',
+        site_name: 'Downtown Tower A', clock_in_time: '2026-09-22 07:15:00',
+        crossed_at: '2026-09-22 15:51:00', waiting_seconds: 900,
+        elapsed_hours: 9.25, paid_hours: 8.75, break_hours: 0.5,
+        threshold_hours: 8.1, regular_hours: 8.0, overtime_hours: 0.75,
+        basis: 'paid', close_defers: true, decision: null,
+        needs_answer: true, unauthorised_hours: null
     }
 ];
 
@@ -231,6 +244,27 @@ const results = {};
         reviews_read: reviewReads.length,
         unanswered_text: textOf((/<article class="ui-card[^"]*" data-crossing="1"[\s\S]*?<\/article>/.exec(markup) || [])[0] || ''),
         answered_text: textOf((/<article class="ui-card[^"]*" data-crossing="600"[\s\S]*?<\/article>/.exec(markup) || [])[0] || '')
+    };
+}
+
+// 1b. the same live queue under a *standard* admin: a peer's crossing is theirs to see and
+//     not theirs to answer (the server refuses it either way - ``main._answer_crossing``).
+{
+    const env = consoleEnv();
+    // The reader, not the fixture: this is the same board, signed in as somebody else.
+    env.evaluate("State.saveUser(" + JSON.stringify({
+        id: '2000', name: 'Site Admin', role: 'admin', token: 'tok-2000'
+    }) + ")");
+    await env.evaluate("UI.renderAdminTab('Approvals')");
+    const cards = crossingsOf(render(env));
+    const peer = cards.filter((card) => card.id === '1000')[0] || {};
+    const worker = cards.filter((card) => card.id === '1')[0] || {};
+    results.peer_crossing = {
+        drawn: !!peer.id,
+        has_accept: !!peer.has_accept,
+        has_decline: !!peer.has_decline,
+        has_ceiling: !!peer.has_ceiling,
+        worker_has_accept: !!worker.has_accept
     };
 }
 
@@ -511,7 +545,7 @@ def test_the_approvals_tab_reads_both_queues_and_draws_the_live_crossings(result
     )
 
     ids = [card["id"] for card in page["cards"]]
-    assert ids == ["1", "600", "601"], ids
+    assert ids == ["1", "600", "601", "1000"], ids
     unanswered = [card for card in page["cards"] if card["id"] == "1"][0]
     assert unanswered["has_ceiling"] and unanswered["has_note"], (
         "there is no way to state a ceiling or a reason on an unanswered crossing"
@@ -519,6 +553,14 @@ def test_the_approvals_tab_reads_both_queues_and_draws_the_live_crossings(result
     assert unanswered["has_accept"] and unanswered["has_decline"], (
         "an unanswered crossing offers neither answer"
     )
+    # The administrator's own crossing, read by a head admin: it is answered here, because the
+    # head admin is the role that owns the deployment (``_guard_standard_admin``).
+    peer = [card for card in page["cards"] if card["id"] == "1000"][0]
+    assert peer["has_accept"] and peer["has_decline"], (
+        "a head admin is the one administrator whose overtime a peer's is"
+    )
+
+
     assert "Ana Ruiz" in page["unanswered_text"], page["unanswered_text"]
     assert "Downtown Tower A" in page["unanswered_text"], page["unanswered_text"]
     # The two numbers the decision rests on: what has been paid, and what is being held.
@@ -527,6 +569,29 @@ def test_the_approvals_tab_reads_both_queues_and_draws_the_live_crossings(result
     assert unanswered["close_defers"], (
         "the card does not say that nothing else will end this shift - the operator is left to "
         "discover that the worker cannot clock in again"
+    )
+
+
+def test_a_standard_admin_cannot_answer_an_administrators_crossing(results):
+    """Two answers, and neither of them is this reader's: the row is evidence, not a form.
+
+    ``main._answer_crossing`` refuses both verbs for a standard admin over an administrator, so
+    the controls are absent rather than present-and-refused - the same reasoning the credentials
+    screen gives for a hidden password button.
+    """
+    peer = results["peer_crossing"]
+    assert peer["drawn"], (
+        "who is on site is not a secret from the operator: the card is still drawn"
+    )
+    assert not peer["has_accept"] and not peer["has_decline"], (
+        "a standard admin may not authorise a peer's overtime - the server answers 403"
+    )
+    assert not peer["has_ceiling"], (
+        "and no ceiling to type into: an input with no answer behind it is a trap"
+    )
+    assert peer["worker_has_accept"], (
+        "the rule is about whose record it is, not about the queue: a worker's crossing is still "
+        "this admin's to answer"
     )
 
 

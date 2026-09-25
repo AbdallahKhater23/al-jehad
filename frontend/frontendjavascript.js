@@ -589,11 +589,110 @@ const Camera = {
      * either way, and two copies of it is how one path starts sending a full-resolution
      * frame while the other sends something cropped or re-compressed.
      */
+    //: The server's ingestion boundary (``uploads.face_frame_max_pixels`` and
+    //: ``face_frame_max_edge_px``), in the app shell's own file.
+    //:
+    //: The two page worlds here share no code file - the link pages get ``capture.js``, this
+    //: shell gets i18n plus the three modules - so the boundary is written down once per world
+    //: and a test pins all of them against the backend (``tests/test_frontend_photo_downscale``).
+    //: A *number* is the cheap thing to mirror; a refusal aimed at a worker's photo when their
+    //: phone camera is 12 MP is not, which is why the boundary below resizes rather than
+    //: refuses.
+    PHOTO_LIMITS: {
+        face_frame_max_pixels: 4000000,
+        face_frame_max_edge_px: 2048
+    },
+
+    /**
+     * The size to send, for a photo of a given size. Pure: no canvas, no camera.
+     *
+     * Both rules apply - the area ceiling and the long edge - and the smaller scale wins, so
+     * "this photo is above the boundary" and "it was resized" are one question rather than
+     * two. Never enlarges: ``scale`` is capped at 1, because upscaling adds no detail and would
+     * change what the detector sees for every phone in the field.
+     */
+    fitToLimits(width, height) {
+        const box = this.PHOTO_LIMITS;
+        const w = Number(width || 0);
+        const h = Number(height || 0);
+        if (!(w > 0) || !(h > 0)) return { width: w, height: h, scale: 1 };
+        const scale = Math.min(
+            1,
+            box.face_frame_max_edge_px / Math.max(w, h),
+            Math.sqrt(box.face_frame_max_pixels / (w * h))
+        );
+        if (!(scale < 1)) return { width: w, height: h, scale: 1 };
+        return { width: Math.max(1, Math.floor(w * scale)), height: Math.max(1, Math.floor(h * scale)), scale };
+    },
+
+    /**
+     * A chosen file reduced to the boundary, or the file itself when it already fits.
+     *
+     * The console's photo pickers are the callers: an admin enrolling a worker picks a picture
+     * their own phone took, which its camera app wrote at 12 MP, and the boundary would refuse
+     * it - the ordinary way a worker gets enrolled. Nothing is refused here that the server
+     * would accept, and nothing is sent that the server would refuse: the bytes still get
+     * checked there, and ``checkPhotoFile`` has already had its say on size and type.
+     *
+     * ``done(small, resized)`` is called exactly once. A failure comes back as the *original*
+     * file rather than as nothing, because the server's refusal names the problem in the
+     * worker's language and this is only here to save a phone tether.
+     */
+    shrinkPhoto(file, done) {
+        const finish = typeof done === 'function' ? done : function () {};
+        // Feature-detected: a browser without an image decoder gets the old behaviour, which is
+        // to send the file and let the server be the authority.
+        if (!file || typeof Image === 'undefined') return finish(file, false);
+        const url = URL.createObjectURL(file);
+        const image = new Image();
+        let settled = false;
+        const settle = (small, resized) => {
+            if (settled) return;
+            settled = true;
+            try { URL.revokeObjectURL(url); } catch (e) {}
+            finish(small, resized);
+        };
+        image.onload = () => {
+            const fit = this.fitToLimits(image.naturalWidth || image.width, image.naturalHeight || image.height);
+            if (!(fit.scale < 1)) return settle(file, false);
+            try {
+                const canvas = document.createElement('canvas');
+                canvas.width = fit.width;
+                canvas.height = fit.height;
+                canvas.getContext('2d').drawImage(
+                    image, 0, 0, image.naturalWidth || image.width, image.naturalHeight || image.height,
+                    0, 0, fit.width, fit.height
+                );
+                canvas.toBlob((blob) => {
+                    if (!blob) return settle(file, false);
+                    const name = String(file.name || 'photo').replace(/\.[a-z0-9]+$/i, '') + '.jpg';
+                    try {
+                        settle(new File([blob], name, { type: 'image/jpeg' }), true);
+                    } catch (e) {
+                        // No ``File`` in this browser: the server reads the bytes, so the upload
+                        // is still right - only the filename a log shows is not.
+                        settle(blob, true);
+                    }
+                }, 'image/jpeg', 0.92);
+            } catch (e) {
+                settle(file, false);
+            }
+        };
+        image.onerror = () => settle(file, false);
+        image.src = url;
+        return undefined;
+    },
+
     async snapshot(video) {
         const canvas = document.createElement('canvas');
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-        canvas.getContext('2d').drawImage(video, 0, 0);
+        // Drawn at the size the *deployment* accepts rather than blindly at the stream's: a
+        // phone that hands the page a 4K track would otherwise produce an 8 MP selfie, and the
+        // boundary above answers that with a 422 aimed at the worker's photo. The aspect ratio
+        // is the stream's, unchanged.
+        const fit = this.fitToLimits(video.videoWidth, video.videoHeight);
+        canvas.width = fit.width;
+        canvas.height = fit.height;
+        canvas.getContext('2d').drawImage(video, 0, 0, fit.width, fit.height);
         return new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.9));
     },
 
@@ -1181,6 +1280,17 @@ const UI = {
     //  whether this is the app their administrator told them about, and a wall of
     //  unbranded inputs does not answer that. On a phone the lockup collapses to a
     //  header strip so the form keeps the whole screen.
+    //
+    //  The email-or-phone field is deliberately **not** marked required, and that is
+    //  load-bearing rather than slack. ``/auth/login`` matches the account with
+    //  ``WHERE id = ? AND (email = ? OR phone = ?)``, so the value has to equal the email
+    //  or the phone stored on the account - and for an account whose two columns are both
+    //  empty, the only value that can match is the empty string. The console offers email
+    //  and phone as optional fields when it creates an account, so that account is one
+    //  ordinary action away; a required field here made it unable to sign in at all, with
+    //  the browser saying "Please fill out this field" about a box with nothing to put in
+    //  it and no request leaving the page. The copy above the form names all three values
+    //  for the same reason.
     renderLogin() {
         const container = this.appContainer;
         container.className = 'login-shell';
@@ -1211,7 +1321,8 @@ const UI = {
                             </div>
                             <div class="login-field">
                                 <label class="ui-label" for="email">${this.escapeHtml(I18n.__('emailOrPhone'))}</label>
-                                <input class="ui-field" type="text" id="email" autocomplete="username" required>
+                                <!-- Not required on purpose: see renderLogin. -->
+                                <input class="ui-field" type="text" id="email" autocomplete="email">
                             </div>
                             <div class="login-field">
                                 <label class="ui-label" for="password">${this.escapeHtml(I18n.__('password'))}</label>
@@ -2826,12 +2937,25 @@ const UI = {
      * one in is the opposite case: they are absent by definition, so the panel has to offer
      * the roster with the already-clocked-in removed. A deactivated account is left out too;
      * the server refuses it, and a button that always fails is a trap.
+     *
+     * Two different rules leave somebody out, and they are not the same rule:
+     *
+     * * a **head admin** is never offered, because the role owns the deployment rather than a
+     *   rota - the same line ``SELF_ENROLL_ROLES`` and ``UI.handsetRoles`` draw - so there is no
+     *   punch card for a shift to be forced onto;
+     * * an **administrator** is offered to a head admin and to nobody else
+     *   (``UI_MODULES.mayActOnAccount``, the server's own ``_guard_standard_admin`` said in the
+     *   rail). This used to read ``role !== 'admin' && role !== 'head_admin'``, which dropped
+     *   every administrator from the list - so an administrator who forgot to punch could not
+     *   be put on shift by anybody, while an administrator *with* an open session was already
+     *   on this board with a role beside their name.
      */
     forceInPanelHtml(sessions, users, sites) {
         const escapeHtml = UI_MODULES.escapeHtml.bind(UI_MODULES);
         const onShift = new Set((sessions || []).map((session) => String(session.worker_id)));
         const available = (users || []).filter((user) =>
-            user.role !== 'admin' && user.role !== 'head_admin' &&
+            user.role !== 'head_admin' &&
+            UI_MODULES.mayActOnAccount(user) &&
             String(user.status || 'active').toLowerCase() === 'active' &&
             !onShift.has(String(user.id)));
         const siteNames = (sites || []).map((site) => site.site_name);
