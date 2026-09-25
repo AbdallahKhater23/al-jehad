@@ -1,7 +1,7 @@
 """Reading an alert and *answering* one are different acts.
 
-The server has written administrator alerts for a while, and the only way to close one was
-``POST /admin/notifications/{id}/read`` - which records that somebody looked. For most alerts
+The server has written these alerts for a while, and the only way to close one was
+``POST /developer/notifications/{id}/read`` - which records that somebody looked. For most alerts
 that is the right answer: a retention sweep happened, a worker wrote a note, and there is
 nothing to decide. For the ones that record a *decision* it is the wrong answer entirely. A
 forced start past a failing self-test means a deployment is serving code the self-test refused;
@@ -27,13 +27,15 @@ So this file is about the acknowledgement as an event rather than a flag:
   acknowledgement and passes the moment one exists, keyed per *reason* so an acceptance given
   for one override cannot answer a different one.
 
-The alerts answered here are the deployment's own (``notifications.DEPLOYMENT_KINDS``: a forced
-start, a schema repair, a retention sweep, a detector-coverage verdict). They are the **root
-tier's**, and that is asserted here as well as relied on. A site administrator has no action to
-take on any of them, so the withholding is a rule on the server rather than a filter on a
-screen: an administrator who could still read the list, open one row by a guessed id, or answer
-it would make this file's own subject - who decided, and why - answerable by somebody the events
-are not addressed to.
+The alerts answered here are the deployment's own (a forced start, a schema repair, a retention
+sweep, a detector-coverage verdict), and the queue they sit in is the **root tier's**: every
+reader, every row. It used to be the administrators' - with those very events held back from
+them by a clause in the query - which left a console offering decisions about the *deployment*
+to somebody who cannot take them, and hiding the rows it did not offer as an empty panel. So the
+whole surface moved tiers: the routes are ``/developer/notifications*``, ``/admin/notifications*``
+is gone rather than left answering (a route that still returns a *filtered* list is a second door
+onto the same rows), and the refusals are asserted here because this file's own subject - who
+decided, and why - must not be answerable by somebody the queue is not addressed to.
 
     pytest backend/tests/test_notification_acknowledgement.py -q
 """
@@ -144,7 +146,7 @@ def test_an_alert_is_acknowledged_with_a_reason_and_the_actor_is_recorded(client
     alert_id = _plant_alert()
 
     response = client.post(
-        f"/api/v1/admin/notifications/{alert_id}/acknowledge",
+        f"/api/v1/developer/notifications/{alert_id}/acknowledge",
         json={"note": NOTE},
         headers=_root(),
     )
@@ -187,7 +189,7 @@ def test_the_reason_is_required_and_vetted_like_any_other_free_text(client, app_
     and a view nobody has written yet are all readers that might forget to escape.
     """
     alert_id = _plant_alert()
-    path = f"/api/v1/admin/notifications/{alert_id}/acknowledge"
+    path = f"/api/v1/developer/notifications/{alert_id}/acknowledge"
 
     # Both halves of "a note is required" answer 422, and that is the point of pinning them
     # together: a *missing* note and an *empty* one are refused by the same validator, so a
@@ -217,7 +219,7 @@ def test_a_second_answer_is_refused_and_names_the_first(client, app_module):
     """
     root = _root()
     alert_id = _plant_alert()
-    path = f"/api/v1/admin/notifications/{alert_id}/acknowledge"
+    path = f"/api/v1/developer/notifications/{alert_id}/acknowledge"
 
     first = client.post(path, json={"note": NOTE}, headers=root)
     assert first.status_code == 200
@@ -235,7 +237,7 @@ def test_a_second_answer_is_refused_and_names_the_first(client, app_module):
 
 def test_an_alert_that_does_not_exist_cannot_be_acknowledged(client, app_module):
     response = client.post(
-        "/api/v1/admin/notifications/999999/acknowledge",
+        "/api/v1/developer/notifications/999999/acknowledge",
         json={"note": NOTE},
         headers=_root(),
     )
@@ -243,24 +245,25 @@ def test_an_alert_that_does_not_exist_cannot_be_acknowledged(client, app_module)
     assert _acknowledgements() == []
 
 
-def test_no_role_except_the_root_tier_can_answer_a_deployment_alert(client, app_module):
-    """The alert is about the deployment, and the deployment is the root tier's.
+def test_no_role_below_the_root_tier_can_answer_an_alert(client, app_module):
+    """The queue is the root tier's, and that is a rule on the route rather than a filter.
 
-    Two different refusals, on purpose. A worker is told *not your role* (403): the route exists
-    and they are the wrong audience for it. An administrator is answered exactly as a missing
-    row is (404), because the row is withheld from them - and a withheld row that a guessed id
-    could still be read or answered by would be a filter in name only.
+    Every business role is told *not your role* (403): the route exists and they are the wrong
+    audience for it - which is the one answer an administrator gets, whether they are reading,
+    acknowledging or marking read. A refusal that differed by verb would be a screen's worth of
+    answers to keep in step with each other.
     """
     alert_id = _plant_alert()
-    path = f"/api/v1/admin/notifications/{alert_id}/acknowledge"
-    for user_id in (WORKER, MOALLEM):
+    path = f"/api/v1/developer/notifications/{alert_id}/acknowledge"
+    for user_id in (WORKER, MOALLEM, ADMIN, HEAD_ADMIN):
         response = client.post(path, json={"note": NOTE}, headers=bearer(user_id))
-        assert response.status_code == 403, f"{user_id} could acknowledge an operator alert"
-    for actor in (ADMIN, HEAD_ADMIN):
-        answered = client.post(path, json={"note": NOTE}, headers=bearer(actor))
-        assert answered.status_code == 404, f"{actor} answered a deployment alert: {answered.text}"
-        read = client.post(f"/api/v1/admin/notifications/{alert_id}/read", headers=bearer(actor))
-        assert read.status_code == 404, f"{actor} read a deployment alert: {read.text}"
+        assert response.status_code == 403, f"{user_id} could acknowledge an alert: {response.text}"
+        assert client.get(
+            "/api/v1/developer/notifications", headers=bearer(user_id)
+        ).status_code == 403, f"{user_id} could read the queue"
+        assert client.post(
+            f"/api/v1/developer/notifications/{alert_id}/read", headers=bearer(user_id)
+        ).status_code == 403, f"{user_id} could mark an alert read"
     assert client.post(path, json={"note": NOTE}).status_code in (401, 403), (
         "an anonymous caller reached the acknowledgement"
     )
@@ -268,14 +271,35 @@ def test_no_role_except_the_root_tier_can_answer_a_deployment_alert(client, app_
     assert _acknowledgements() == []
 
 
-def test_the_administrators_queue_carries_the_site_and_not_the_deployment(client, app_module):
-    """The list and the badge, which are the other two readers of the same table.
+def test_the_old_administrator_path_is_gone_rather_than_filtered(client, app_module):
+    """A move that leaves the old path answering is a second door onto the same rows.
 
-    A withheld row that still reached the listing would make the rule a fact about one screen,
-    and the counts are asserted *with* the rows because a badge is a reader too: a queue showing
-    "2 unread" over an empty list claims work it will not show, and the operator spends the
-    difference looking for it. The site's own alert is the control - the point is a narrowing,
-    not an empty queue.
+    404 rather than 403, and for the root tier too: these paths are not routes any more, so
+    nothing about them says who the audience is. An older console build, a saved script or a
+    bookmark therefore fails visibly instead of quietly drawing a filtered queue as empty.
+    """
+    alert_id = _plant_alert()
+    root = _root()
+    for path in (
+        "/api/v1/admin/notifications",
+        f"/api/v1/admin/notifications/{alert_id}/acknowledge",
+        f"/api/v1/admin/notifications/{alert_id}/read",
+    ):
+        for actor in (ADMIN, HEAD_ADMIN):
+            answer = client.get(path, headers=bearer(actor))
+            assert answer.status_code == 404, f"{actor} reached {path}: {answer.status_code}"
+        assert client.get(path, headers=root).status_code == 404, (
+            f"the old path still answers the root tier: {path}"
+        )
+
+
+def test_the_queue_holds_every_row_it_counts(client, app_module):
+    """One reader, so nothing is withheld and the counts mean what the list says.
+
+    The deployment's own event and a site's alert are both in it now - the distinction that
+    used to be drawn (and hidden) is gone with the audience it was drawn for - and the badge is
+    asserted *with* the rows because a count is a reader too: "2 waiting" over a list that shows
+    one claims work the operator will spend time looking for.
     """
     root = _root()
     deployment_alert = _plant_alert(dedupe_key="startup_override:first")
@@ -288,26 +312,18 @@ def test_the_administrators_queue_carries_the_site_and_not_the_deployment(client
         dedupe_key="worker_note:1",
     )
 
-    for actor in (ADMIN, HEAD_ADMIN):
-        body = client.get("/api/v1/admin/notifications", headers=bearer(actor)).json()
-        ids = [row["id"] for row in body["notifications"]]
-        assert site_alert in ids, f"{actor} lost the site's own alert: {ids}"
-        assert deployment_alert not in ids, f"{actor} was shown the deployment's own event: {ids}"
-        assert body["unacknowledged"] == len(ids), (
-            f"{actor} is badged for work the list underneath will not show: {body}"
-        )
-
-    # ...and the root tier, which is who the events are for, sees both.
-    body = client.get("/api/v1/admin/notifications", headers=root).json()
+    body = client.get("/api/v1/developer/notifications", headers=root).json()
     ids = [row["id"] for row in body["notifications"]]
     assert {deployment_alert, site_alert} <= set(ids), ids
+    assert body["unacknowledged"] == len(ids), body
+    assert body["unread"] == len(ids), body
 
 
 def test_answering_an_alert_reads_it_without_rewriting_an_earlier_reader(client, app_module):
     """An accepted alert has by definition been seen - but ``read_by`` is not the answerer."""
     alert_id = _plant_alert()
     response = client.post(
-        f"/api/v1/admin/notifications/{alert_id}/acknowledge",
+        f"/api/v1/developer/notifications/{alert_id}/acknowledge",
         json={"note": NOTE},
         headers=_root(),
     )
@@ -320,7 +336,7 @@ def test_answering_an_alert_reads_it_without_rewriting_an_earlier_reader(client,
     # question, it does not claim the person was the first to look.
     other = _plant_alert(title="Second alert", dedupe_key="startup_override:second", read_by=WORKER)
     client.post(
-        f"/api/v1/admin/notifications/{other}/acknowledge", json={"note": NOTE}, headers=_root()
+        f"/api/v1/developer/notifications/{other}/acknowledge", json={"note": NOTE}, headers=_root()
     )
     assert _alert(other)["read_by"] == WORKER
     assert _alert(other)["acknowledged_by"] == DEV_ID
@@ -329,7 +345,7 @@ def test_answering_an_alert_reads_it_without_rewriting_an_earlier_reader(client,
 def test_reading_an_alert_is_not_answering_it(client, app_module):
     """The two acts stay distinct, which is what keeps the check honest."""
     alert_id = _plant_alert()
-    response = client.post(f"/api/v1/admin/notifications/{alert_id}/read", headers=_root())
+    response = client.post(f"/api/v1/developer/notifications/{alert_id}/read", headers=_root())
     assert response.status_code == 200
 
     stored = _alert(alert_id)
@@ -345,10 +361,10 @@ def test_the_listing_counts_what_is_waiting_for_an_answer(client, app_module):
     answered = _plant_alert(dedupe_key="startup_override:answered")
     waiting = _plant_alert(title="Still waiting", dedupe_key="startup_override:waiting")
     client.post(
-        f"/api/v1/admin/notifications/{answered}/acknowledge", json={"note": NOTE}, headers=_root()
+        f"/api/v1/developer/notifications/{answered}/acknowledge", json={"note": NOTE}, headers=_root()
     )
 
-    body = client.get("/api/v1/admin/notifications", headers=_root()).json()
+    body = client.get("/api/v1/developer/notifications", headers=_root()).json()
     assert body["unacknowledged"] == 1, body["unacknowledged"]
     rows = {row["id"]: row for row in body["notifications"]}
     assert rows[answered]["acknowledgement_note"] == NOTE
@@ -374,7 +390,7 @@ def test_readiness_reports_a_forced_start_nobody_has_answered(app_module):
     assert check.value["acknowledged"] is False
     # The detail tells the operator what to *do*, not only what is wrong - the endpoint is the
     # only way to close it, and the alert id is what the route needs.
-    assert f"/api/v1/admin/notifications/{alert_id}/acknowledge" in check.detail
+    assert f"/api/v1/developer/notifications/{alert_id}/acknowledge" in check.detail
     assert "the electrician is here tomorrow" in check.detail
 
 
@@ -397,7 +413,7 @@ def test_the_check_reads_the_newest_overrides_and_the_public_probe_carries_it(cl
     assert check.value["reason"] == "second"
 
     client.post(
-        f"/api/v1/admin/notifications/{newest}/acknowledge",
+        f"/api/v1/developer/notifications/{newest}/acknowledge",
         json={"note": "the ledger was checked by hand"},
         headers=_root(),
     )

@@ -98,13 +98,19 @@ const UI_MODULES = {
             </div>`;
     },
 
-    /** A clock-in timestamp as a Date, or null when it cannot be read. */
+    /**
+     * A clock-in timestamp as a Date, or null when it cannot be read.
+     *
+     * Only for *display*. These digits are a zone-less wall clock, so the instant they
+     * describe depends on where the reader is standing - see ``SHIFT_CLOCK`` and use
+     * ``liveOpsFacts(...).origin`` for anything that counts.
+     */
     liveOpsStart(clockInTime) {
         if (!clockInTime) return null;
-        // The server writes "YYYY-MM-DD HH:MM:SS"; Safari refuses that shape
-        // without the T, which is why the worker's own card does the same swap.
-        const start = new Date(String(clockInTime).replace(' ', 'T'));
-        return isNaN(start.getTime()) ? null : start;
+        // One parse for both boards, in ``SHIFT_CLOCK.recordedAt``: what the worker's own
+        // card reads and what this board reads have to be the same thing.
+        const at = SHIFT_CLOCK.recordedAt(clockInTime);
+        return at === null ? null : new Date(at);
     },
 
     /**
@@ -163,15 +169,20 @@ const UI_MODULES = {
         const closingOffset = daySeconds / 3600 >= breakAfter ? daySeconds + breakSeconds : daySeconds;
 
         const late = !!(session && (session.late_flag === true || String(session.late_flag || '') === '1'));
+        const at = now === undefined ? Date.now() : Number(now);
         const start = this.liveOpsStart(session && session.clock_in_time);
-        if (!start) {
+        // Where the count starts. The server's own ``seconds_on_site`` is the figure the
+        // shift is really at; falling back to the recorded stamp is the old arithmetic,
+        // and it is right only while this console shares the server's zone.
+        const origin = SHIFT_CLOCK.origin(session, at);
+        if (origin === null) {
             return {
-                start: null, seconds: null, paidSeconds: null, percent: 0, closesAt: null,
+                start: start, origin: null, seconds: null, paidSeconds: null, percent: 0, closesAt: null,
                 breakSeconds, daySeconds, overtimeSeconds, autoCloses, late, state: 'unknown'
             };
         }
 
-        const seconds = Math.max(0, ((now === undefined ? Date.now() : now) - start.getTime()) / 1000);
+        const seconds = SHIFT_CLOCK.elapsed(origin, at);
         // The same rule the server deducts by, so the two never disagree.
         const taken = seconds >= breakAfter * 3600 ? Math.min(breakSeconds, seconds) : 0;
         const paidSeconds = Math.max(0, seconds - taken);
@@ -179,9 +190,11 @@ const UI_MODULES = {
             ? 'closing'
             : paidSeconds >= overtimeSeconds ? 'over' : 'on';
         return {
-            start, seconds, paidSeconds, daySeconds, overtimeSeconds, autoCloses, late, state,
+            start, origin, seconds, paidSeconds, daySeconds, overtimeSeconds, autoCloses, late, state,
             breakSeconds,
-            closesAt: autoCloses ? new Date(start.getTime() + closingOffset * 1000) : null,
+            // Projected off the *displayed* time, so the close time a console shows sits on
+            // the same wall clock as the stamp printed beside it (see ``liveOpsStart``).
+            closesAt: start && autoCloses ? new Date(start.getTime() + closingOffset * 1000) : null,
             percent: Math.min(100, Math.round((paidSeconds / daySeconds) * 100))
         };
     },
@@ -201,17 +214,28 @@ const UI_MODULES = {
     },
 
     /**
-     * The clock-in time and the late flag, on every element the ticker rewrites.
+     * The clock-in time, the instant the count began and the late flag, on every
+     * element the ticker rewrites.
      *
      * The tick runs off the DOM, not off a captured closure: it reads the start
      * time from the element it is about to change. Anything carrying
      * ``data-fact`` therefore has to carry ``data-start`` too - an element that
      * ticks without one is recomputed from `undefined` and paints "clock-in
      * unreadable" over a perfectly healthy row a second after it renders.
+     *
+     * ``data-origin`` rides along for the same reason and carries the *other* figure:
+     * ``data-start`` is the wall clock as the server recorded it (shown, and ambiguous
+     * in another zone), while ``data-origin`` is the instant the shift's count began,
+     * converted once from the server's own ``seconds_on_site`` when the board was read.
+     * The tick rewrites the elapsed figure and the overtime badge from the origin, so a
+     * console in a different zone from the server cannot re-derive them from digits that
+     * mean something else there.
      */
     liveOpsFactAttrs(facts) {
         const start = facts.start instanceof Date ? facts.start.toISOString() : '';
-        return `data-start="${this.escapeHtml(start)}" data-late="${facts.late ? '1' : '0'}"`;
+        const origin = Number.isFinite(facts.origin) ? new Date(facts.origin).toISOString() : '';
+        return `data-start="${this.escapeHtml(start)}" data-origin="${this.escapeHtml(origin)}"` +
+            ` data-late="${facts.late ? '1' : '0'}"`;
     },
 
     /** The verdict badges on a row: the hour state, then the arrival flag. */
@@ -671,8 +695,14 @@ const UI_MODULES = {
         const stateClasses = ['is-on', 'is-over', 'is-closing', 'is-unknown'];
         document.querySelectorAll('[data-fact]').forEach((el) => {
             // Read the start off the element itself: the tick must survive a
-            // repaint of the pane it is looking at.
-            const facts = this.liveOpsFacts({ clock_in_time: el.dataset.start, late_flag: el.dataset.late }, rules);
+            // repaint of the pane it is looking at. ``data-origin`` is the whole
+            // record's clock - the instant the count began - and it is what the
+            // elapsed figure and the hour state are recomputed from.
+            const facts = this.liveOpsFacts({
+                clock_in_time: el.dataset.start,
+                origin_at: el.dataset.origin,
+                late_flag: el.dataset.late
+            }, rules);
             if (el.dataset.fact === 'elapsed') {
                 el.textContent = facts.seconds === null ? '\u2014' : this.liveOpsDuration(facts.seconds);
             } else if (el.dataset.fact === 'bar') {
@@ -1145,9 +1175,15 @@ const UI_MODULES = {
      * what the rest of it is paid for. Reading a queue row is a step towards deciding it;
      * reading a crossing decided nothing at all, which is why it does not live in Alerts.
      */
-    /** Is the reader the root tier - the role that reads the deployment's own business? */
+    /**
+     * Is the reader the root tier - the role that reads the deployment's own business?
+     *
+     * One line, and it is the shell's line: ``isRootTier`` decides which tabs the nav
+     * offers and what this module asks ``/developer/*`` for, so both must answer the same
+     * question or the console would offer a screen it then refuses to fetch.
+     */
     isDeveloper() {
-        return !!State.user && State.user.role === 'developer';
+        return isRootTier();
     },
 
     /**
@@ -1495,14 +1531,21 @@ const UI_MODULES = {
     // -----------------------------------------------------------------
     /**
      * The console's read of ``admin_notifications``: the table the server writes when it has
-     * something an administrator must know - a start that bypassed a failing self-test, a push
-     * channel that has stopped delivering, a schema repair, a retention sweep.
+     * something to say - a note nobody has answered, a shift past its paid day, a start that
+     * bypassed a failing self-test, a push channel that has stopped delivering.
+     *
+     * The tab is the root tier's, and so is the route it reads
+     * (``/developer/notifications``): every row here is either the deployment's own business
+     * or a decision about a site, and the tier that owns the deployment is the one that
+     * answers both. It used to answer every administrator, with the deployment's events
+     * withheld from them by a filter - a queue of decisions about the host, offered to
+     * somebody who cannot take them.
      *
      * The tab exists for the *acknowledgement*, not for the list. Every one of these rows was
      * already stored before this screen, and reachable from an API - which for the people who
      * run the deployment is the same as not being reachable at all. What is new is that a
-     * decision can be given an answer: ``POST /admin/notifications/{id}/acknowledge`` takes a
-     * reason, records it against the administrator's own identity in the append-only
+     * decision can be given an answer: ``POST /developer/notifications/{id}/acknowledge`` takes
+     * a reason, records it against the operator's own identity in the append-only
      * ``audit_log``, and readiness stops reporting the forced start as unaccepted. Readiness is
      * what a monitor watches; this is where a person accepts what it is reporting.
      *
@@ -1632,7 +1675,7 @@ const UI_MODULES = {
         content.innerHTML = UI.consoleSkeletonHtml(I18n.__('adminAlertsTitle'));
         let data;
         try {
-            data = await API.request('/admin/notifications?limit=100');
+            data = await API.request('/developer/notifications?limit=100');
         } catch (err) {
             content.innerHTML = this.uiErrorHtml(err, "UI.renderAdminTab('Alerts')");
             return;
@@ -1688,7 +1731,7 @@ const UI_MODULES = {
         // flight, so one alert cannot take two answers.
         buttons.forEach((button) => { button.disabled = true; });
         try {
-            await API.request(`/admin/notifications/${encodeURIComponent(notificationId)}/acknowledge`, {
+            await API.request(`/developer/notifications/${encodeURIComponent(notificationId)}/acknowledge`, {
                 method: 'POST',
                 body: { note }
             });
@@ -1708,7 +1751,7 @@ const UI_MODULES = {
      */
     async markAlertRead(notificationId) {
         try {
-            await API.request(`/admin/notifications/${encodeURIComponent(notificationId)}/read`, { method: 'POST' });
+            await API.request(`/developer/notifications/${encodeURIComponent(notificationId)}/read`, { method: 'POST' });
         } catch (err) {
             Toast.error(err.message);
             return;

@@ -244,8 +244,10 @@ upload ─► decode/EXIF ─► resize 640 ─┬─► LIVENESS (MiniFASNet, ~
 
 Twilio/WhatsApp is already purged (**DONE**): no dependency, no credential, no outbound call;
 `send_whatsapp_alert()` remains only as a deprecated no-op that returns `False` (it is referenced by
-the frozen acceptance test). All alerts are rows in `admin_notifications`, exposed at
-`/api/v1/admin/notifications` and `/api/v1/admin/notifications/{id}/read` for polling.
+the frozen acceptance test). All alerts are rows in `admin_notifications`, exposed for polling at
+`/api/v1/developer/notifications` and `/api/v1/developer/notifications/{id}/read` - the queue is the
+root tier's, so the two paths this section was written with (`/api/v1/admin/notifications*`) are
+gone rather than left answering a filtered list.
 
 Rules live in the `shift_rules` singleton row, editable via `GET/POST /api/v1/admin/shift_rules`:
 `clock_in_window_start 04:00`, `clock_in_window_end 06:30`, `regular_hours 8.0`,

@@ -108,6 +108,7 @@ from security import (
     admin_only,
     any_authenticated,
     create_access_token,
+    developer_only,
     hash_password,
     pwd_context,
     require_role,
@@ -306,6 +307,28 @@ def _parse_ts(value: Any) -> datetime | None:
         except (TypeError, ValueError):
             continue
     return None
+
+
+def _seconds_on_site(clock_in_time: Any, now: datetime | None = None) -> int | None:
+    """Whole seconds since a stored clock-in, or ``None`` if it cannot be read.
+
+    Sent with every open shift so a client that draws a *live* counter starts at the
+    server's own figure. The stored clock-in is a zone-less wall-clock string
+    (``%Y-%m-%d %H:%M:%S``, written by ``datetime.now()``, i.e. in *this* host's zone);
+    a phone or a console in another zone reads those digits as its own local time, which
+    puts a constant offset on the counter - three hours, for a server in UTC and staff in
+    Kuwait, on a shift that has just started. Sending the count alongside the stamp means
+    the client never has to know what zone the digits were written in: it starts from this
+    number and adds only the seconds it has watched pass.
+
+    The same function the clock-out path measures a closed shift with
+    (``shift_hours.elapsed_seconds``), so the counter on the card and the hours that are
+    actually recorded cannot disagree about what "so far" means.
+    """
+    clock_in = _parse_ts(clock_in_time)
+    if clock_in is None:
+        return None
+    return shift_hours.elapsed_seconds(clock_in, now if now is not None else datetime.now())
 
 
 def _audit(
@@ -1485,6 +1508,9 @@ async def get_worker_stats(worker_id: str, current: CurrentUser = Depends(admin_
                 "site_name": session["site_name"],
                 "clock_in_time": session["clock_in_time"],
                 "late_flag": session["late_flag"],
+                # The count the panel ticks from, as of this response. See
+                # ``_seconds_on_site`` for why the stamp alone is not enough.
+                "seconds_on_site": _seconds_on_site(session["clock_in_time"]),
             }
             if session is not None
             else None
@@ -1909,10 +1935,11 @@ async def get_my_notifications(
 ):
     """Your own inbox: what this application has told you, newest first.
 
-    The worker-facing twin of ``/admin/notifications``, and the *record* half of the push
-    channel: a phone that was off, a permission that was never granted or a push that
-    failed all leave the event here. ``unread`` is what the app badges and what makes a
-    foreground poll able to behave like a notification without a service worker.
+    The worker-facing twin of the alert queue (``/developer/notifications``: the same events,
+    addressed to the person they happened to rather than to whoever reads the log), and the
+    *record* half of the push channel: a phone that was off, a permission that was never granted
+    or a push that failed all leave the event here. ``unread`` is what the app badges and what
+    makes a foreground poll able to behave like a notification without a service worker.
 
     The subject is the token (``current.id``), never a request field - so there is no id to
     tamper with and no way to read somebody else's inbox through it.
@@ -3558,6 +3585,9 @@ async def list_active_sessions(current: CurrentUser = Depends(admin_only)):
             ORDER BY a.clock_in_time DESC
             """
         ).fetchall()
+    # One "now" for the whole board: every row's count is measured against the same
+    # instant, so two shifts planted at the same second cannot be a second apart on it.
+    now = datetime.now()
     return [
         {
             "worker_id": row["worker_id"],
@@ -3566,6 +3596,7 @@ async def list_active_sessions(current: CurrentUser = Depends(admin_only)):
             "clock_in_time": row["clock_in_time"],
             "role": row["role"],
             "late_flag": row["late_flag"],
+            "seconds_on_site": _seconds_on_site(row["clock_in_time"], now),
         }
         for row in rows
     ]
@@ -3584,8 +3615,16 @@ async def get_workers_live(site_name: str, current: CurrentUser = Depends(admin_
             """,
             (site_name,),
         ).fetchall()
+    now = datetime.now()
     return [
-        {"worker_id": row["worker_id"], "name": row["name"], "clock_in_time": row["clock_in_time"]}
+        {
+            "worker_id": row["worker_id"],
+            "name": row["name"],
+            "clock_in_time": row["clock_in_time"],
+            # The live-ops board draws its "on site for" figure from this, and it is the
+            # same field ``/admin/active_sessions`` sends - one number, one meaning.
+            "seconds_on_site": _seconds_on_site(row["clock_in_time"], now),
+        }
         for row in rows
     ]
 
@@ -4416,49 +4455,42 @@ async def get_logs(limit: int = 500, worker_id: str | None = None, current: Curr
 
 
 # ---------------------------------------------------------------------------
-# admin: notifications (replaces the external messaging integration)
+# the alert queue: what the system is telling you, and what nobody has answered
+#
+# This surface is the root tier's, and it is a route rather than a filter. It used to sit at
+# ``/admin/notifications`` and answer every administrator, with the deployment's own events
+# (a forced start, a schema repair, a retention sweep, a coverage verdict) withheld from them
+# by a clause in the query. Withholding was the right instinct and the wrong instrument: what
+# an administrator was offered was a queue of decisions about the *deployment*, which no site
+# administrator can take, drawn as an empty panel wherever a row had been hidden. So the whole
+# queue moved here - one reader, so nothing is withheld and the counts below mean exactly what
+# the list says - and ``/admin/notifications`` is gone rather than left answering, because a
+# route that still returns a filtered list is a second door onto the same rows.
 # ---------------------------------------------------------------------------
-@router.get("/admin/notifications")
+@router.get("/developer/notifications")
 async def list_notifications(
-    unread_only: int = 0, limit: int = 100, current: CurrentUser = Depends(admin_only)
+    unread_only: int = 0, limit: int = 100, current: CurrentUser = Depends(developer_only)
 ):
-    """The administrator's alert queue. The deployment's own events are not in it.
+    """Every alert the system has raised, newest first, with the two counts.
 
-    ``admin_notifications`` carries two different audiences, and the difference is not the
-    severity but *who can act*: a note nobody has answered and a shift past its paid day are a
-    site's work, while a forced start, a schema repair, a retention sweep and a coverage verdict
-    are the host's own log lines (``notifications.DEPLOYMENT_KINDS``). The second group is
-    withheld here rather than at the screen, because the screen is not the only reader - a
-    filter that lived in the console would leave the JSON readable by the role the events are
-    being moved away from.
-
-    The developer sees everything, and does not need a second endpoint to: the root tier is a
-    superset of the administrators by ``require_role``'s wildcard, so opening this route as the
-    developer is how the deployment's own events are read from the console. The withheld rows
-    are excluded in the *query* and in the counts below, so the badge cannot claim work the list
-    underneath will not show.
+    ``unread`` is what nobody has looked at; ``unacknowledged`` is what nobody has *answered*,
+    which is the smaller and more urgent of the two: an alert that records a decision is not
+    answered by having been seen (see :func:`acknowledge_notification`). Both are counted over
+    the same rows this list returns, so a badge can never claim work the list will not show.
     """
     limit = max(1, min(int(limit), 500))
-    hiding = not current.is_developer
-    clause = ""
-    params: list[Any] = []
-    if hiding:
-        clause = "AND kind NOT IN (%s)" % ",".join("?" * len(notifications.DEPLOYMENT_KINDS))
-        params = sorted(notifications.DEPLOYMENT_KINDS)
     with db() as conn:
         if unread_only:
             rows = conn.execute(
-                f"SELECT * FROM admin_notifications WHERE read_at IS NULL {clause} "
-                "ORDER BY id DESC LIMIT ?",
-                (*params, limit),
+                "SELECT * FROM admin_notifications WHERE read_at IS NULL ORDER BY id DESC LIMIT ?",
+                (limit,),
             ).fetchall()
         else:
             rows = conn.execute(
-                f"SELECT * FROM admin_notifications WHERE 1 = 1 {clause} ORDER BY id DESC LIMIT ?",
-                (*params, limit),
+                "SELECT * FROM admin_notifications ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
-        unread = notifications.unread_count(conn, exclude_deployment=hiding)
-        unacknowledged = notifications.unacknowledged_count(conn, exclude_deployment=hiding)
+        unread = notifications.unread_count(conn)
+        unacknowledged = notifications.unacknowledged_count(conn)
     return _json(
         {
             "unread": unread,
@@ -4466,25 +4498,6 @@ async def list_notifications(
             "notifications": [dict(row) for row in rows],
         }
     )
-
-
-def _refuse_a_concealed_alert(
-    conn: sqlite3.Connection, notification_id: int, current: CurrentUser
-) -> None:
-    """An administrator may not act on an alert that is not theirs to read.
-
-    The developer's events are withheld from this role's queue, and a withheld row that a
-    guessed id could still be read or acknowledged would be a filter in name only - the one
-    answer readiness treats as "somebody owns this forced start" is worth guessing an id for.
-    Answers exactly as a missing row does, so the two are indistinguishable from outside.
-    """
-    if current.is_developer:
-        return
-    row = conn.execute(
-        "SELECT kind FROM admin_notifications WHERE id = ?", (int(notification_id),)
-    ).fetchone()
-    if row is not None and notifications.is_deployment_event(row):
-        raise HTTPException(status_code=404, detail="Notification not found.")
 
 
 class NotificationAcknowledgement(BaseModel):
@@ -4509,12 +4522,12 @@ class NotificationAcknowledgement(BaseModel):
         return textguard.prose(value, field="Acknowledgement reason", max_length=textguard.MAX_NOTE)
 
 
-@router.post("/admin/notifications/{notification_id}/acknowledge")
+@router.post("/developer/notifications/{notification_id}/acknowledge")
 async def acknowledge_notification(
     notification_id: int,
     payload: NotificationAcknowledgement,
     request: Request,
-    current: CurrentUser = Depends(admin_only),
+    current: CurrentUser = Depends(developer_only),
 ):
     """Accept an alert with a reason, and put both on the record.
 
@@ -4530,7 +4543,6 @@ async def acknowledge_notification(
     needed anyway.
     """
     with db(write=True) as conn:
-        _refuse_a_concealed_alert(conn, notification_id, current)
         row = conn.execute(
             "SELECT * FROM admin_notifications WHERE id = ?", (int(notification_id),)
         ).fetchone()
@@ -4585,15 +4597,16 @@ async def acknowledge_notification(
     )
 
 
-@router.post("/admin/notifications/{notification_id}/read")
-async def mark_notification_read(notification_id: int, current: CurrentUser = Depends(admin_only)):
+@router.post("/developer/notifications/{notification_id}/read")
+async def mark_notification_read(
+    notification_id: int, current: CurrentUser = Depends(developer_only)
+):
     """Mark one alert seen, which is all this route decides.
 
     ``acknowledge`` is the route that records a decision; this one only moves a row out of the
-    unread badge, and is refused for a withheld row for the same reason ``acknowledge`` is.
+    unread count.
     """
     with db(write=True) as conn:
-        _refuse_a_concealed_alert(conn, notification_id, current)
         exists = conn.execute(
             "SELECT id FROM admin_notifications WHERE id = ?", (notification_id,)
         ).fetchone()

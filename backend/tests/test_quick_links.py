@@ -397,6 +397,46 @@ def test_the_link_pages_draw_the_mark_and_the_brand_palette_in_their_own_head():
         )
 
 
+def test_the_lockup_the_artwork_sets_is_on_both_link_pages():
+    """The company's four lines, in the artwork's order, and never translated.
+
+    ``BRAND_DEFAULTS`` in frontendjavascript.js is where the console reads these four strings
+    from, and the two link pages cannot read it: they load none of the console's scripts, want
+    the lockup on the first frame, and so carry their own copy of it. This test is what keeps
+    the copy honest - rename the company in one place and the other fails here, instead of
+    shipping a page whose wordmark says something the console's does not.
+
+    It also refuses to let them be translated. The pages translate anything carrying a
+    ``data-t`` key, and ``capture.js`` has a table full of them; a wordmark, a legal suffix
+    and a founding year are proper nouns, and a translated wordmark is a different logo.
+    """
+    source = (harness.PROJECT_ROOT / "frontend" / "frontendjavascript.js").read_text(encoding="utf-8")
+    block = re.search(r"const BRAND_DEFAULTS = \{(.*?)\n\};", source, re.S)
+    assert block, "BRAND_DEFAULTS has been renamed or moved; this test reads the lockup from it"
+    shipped = [
+        re.search(rf"\b{key}: '([^']*)'", block.group(1)).group(1)
+        for key in ("name", "legal", "est", "tagline")
+    ]
+
+    for page, _ in LINK_PAGES:
+        body = (harness.PROJECT_ROOT / "frontend" / page).read_text(encoding="utf-8")
+        offsets = [body.find(f">{line}<") for line in shipped]
+        missing = [line for line, at in zip(shipped, offsets) if at < 0]
+        assert missing == [], (
+            f"{page} does not draw {missing}. The artwork sets {shipped}; a page that draws "
+            "three of the four lines is a different lockup"
+        )
+        assert offsets == sorted(offsets), (
+            f"{page} draws the lockup out of order: {shipped} appears at {offsets}. The order "
+            "is part of the logo"
+        )
+        translated = re.findall(r'class="brand-(?:name|legal|est|tagline)"[^>]*\bdata-t', body)
+        assert translated == [], (
+            f"{page} hands the lockup to the translator ({translated}). It is the company's "
+            "name, not a sentence"
+        )
+
+
 def test_both_link_pages_carry_every_element_the_shared_module_reaches_for():
     """One capture module, two pages, and it reaches into their markup by id.
 

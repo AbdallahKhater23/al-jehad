@@ -32,8 +32,10 @@ import pytest
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 
+import developer
 import harness
 import main
+import security
 from security import CurrentUser
 
 pytestmark = pytest.mark.regression
@@ -43,13 +45,20 @@ pytestmark = pytest.mark.regression
 #: have contributed to the payload.
 ADMIN_USER = CurrentUser(id=harness.ADMIN, name="Seed Admin", role="admin", token_version=0)
 
+#: The alert queue's reader, for the same reason: it is the root tier's route now, and the
+#: dependency is the only thing its role would have contributed here.
+ROOT_USER = CurrentUser(
+    id=developer.DEVELOPER_ID_DEFAULT, name="Developer", role=security.DEVELOPER_ROLE,
+    token_version=0,
+)
+
 #: label -> the endpoint call. Called as the ``Depends`` machinery would have called it,
 #: with ``current`` supplied.
 CALLS: dict[str, object] = {
     "/admin/audit_log": lambda: main.list_audit_log(limit=200, current=ADMIN_USER),
     "/admin/pending_reviews": lambda: main.list_pending_reviews(current=ADMIN_USER),
     "/admin/logs": lambda: main.get_logs(limit=200, current=ADMIN_USER),
-    "/admin/notifications": lambda: main.list_notifications(limit=100, current=ADMIN_USER),
+    "/developer/notifications": lambda: main.list_notifications(limit=100, current=ROOT_USER),
 }
 
 

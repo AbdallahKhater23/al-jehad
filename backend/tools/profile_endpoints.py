@@ -76,7 +76,10 @@ CASES: tuple[tuple[str, str, str, dict], ...] = (
     ("admin reports/export csv (a quarter)", "GET", f"/api/v1/admin/reports/export?kind=shifts&format=csv&{PERIOD}", {}),
     ("admin active_sessions (polled board)", "GET", "/api/v1/admin/active_sessions", {}),
     ("admin users (roster)", "GET", "/api/v1/admin/users", {}),
-    ("admin notifications", "GET", "/api/v1/admin/notifications", {}),
+    # The alert queue is not measured here: it left ``/admin/notifications`` for the root
+    # tier's ``/developer/notifications``, and this tool signs in as an administrator (the
+    # harness clones a database with no root account). Measuring it would mean minting one
+    # into the clone to time a ``LIMIT 100`` read, which is not what this list is for.
     ("admin pending_reviews", "GET", "/api/v1/admin/pending_reviews", {}),
     ("admin logs (200 rows)", "GET", "/api/v1/admin/logs?limit=200", {}),
     ("admin audit_log (200 rows)", "GET", "/api/v1/admin/audit_log?limit=200", {}),

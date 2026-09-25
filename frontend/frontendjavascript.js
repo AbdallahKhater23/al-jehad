@@ -948,10 +948,17 @@ const Brand = {
 const ADMIN_TABS = [
     { id: 'Live Ops', key: 'activeShifts', hint: 'hintLiveOps', group: 'navGroupOperations', icon: 'liveOps' },
     { id: 'Approvals', key: 'pendingReviews', hint: 'hintApprovals', group: 'navGroupOperations', icon: 'approvals' },
-    // What the server has written for an administrator, and - for the ones that record a
-    // decision - what nobody has accepted yet. Sits beside Approvals because both are queues
-    // waiting on a person, and this is the one whose items nobody typed.
-    { id: 'Alerts', key: 'adminAlerts', hint: 'hintAlerts', group: 'navGroupOperations', icon: 'alerts' },
+    // What the system has written, and - for the ones that record a decision - what nobody
+    // has accepted yet. Sits beside Approvals because both are queues waiting on a person,
+    // and this is the one whose items nobody typed.
+    //
+    // ``rootOnly``: this queue is the root tier's. It used to answer every administrator,
+    // with the deployment's own events held back from them by a filter, which left a
+    // console offering decisions about the *deployment* to somebody who cannot take them -
+    // and hiding the rest as an empty panel. The route that serves it is the root tier's
+    // now (``/developer/notifications``), so the tab is too: one audience, nothing withheld,
+    // and no administrator left looking at a queue they cannot act on.
+    { id: 'Alerts', key: 'adminAlerts', hint: 'hintAlerts', group: 'navGroupOperations', icon: 'alerts', rootOnly: true },
     { id: 'Sites', key: 'sites', hint: 'hintSites', group: 'navGroupConfig', icon: 'sites' },
     { id: 'Shifts', key: 'shifts', hint: 'hintShifts', group: 'navGroupConfig', icon: 'shifts' },
     // Was three tabs - Users, Pass, Enroll - of which only one did anything: the Users
@@ -974,11 +981,38 @@ const ADMIN_TABS = [
 //: last because it is the one they open twice a year.
 const ADMIN_GROUPS = ['navGroupOperations', 'navGroupPeople', 'navGroupConfig'];
 
-/** The tabs, grouped for the nav. One source, so the rail and the phone strip agree. */
+/**
+ * Is the reader the root tier - the role that reads the deployment's own business?
+ *
+ * One definition, in the shell rather than in ``admin_modules.js``, because the nav is drawn
+ * before the console's own module is necessarily loaded and both have to answer the same
+ * question: which tabs this session is offered, and what ``/developer/*`` surfaces it asks
+ * for. A second copy of ``role === 'developer'`` would be a second answer.
+ */
+function isRootTier() {
+    return !!State.user && State.user.role === 'developer';
+}
+
+/**
+ * The tabs this session is offered. One source, so the rail and the phone strip agree.
+ *
+ * A ``rootOnly`` tab (the alert queue) is left out entirely rather than drawn disabled: a
+ * control that only ever answers "not you" is a dead end for the person holding the phone.
+ * The server refuses the route to an administrator as well - this filter decides what is
+ * *offered*, not what is allowed.
+ */
 function adminNavGroups() {
     return ADMIN_GROUPS
-        .map((key) => ({ key, tabs: ADMIN_TABS.filter((tab) => tab.group === key) }))
+        .map((key) => ({
+            key,
+            tabs: ADMIN_TABS.filter((tab) => tab.group === key && (!tab.rootOnly || isRootTier()))
+        }))
         .filter((group) => group.tabs.length > 0);
+}
+
+/** The tabs this session may open, in the console's own order. */
+function adminVisibleTabs() {
+    return ADMIN_TABS.filter((tab) => !tab.rootOnly || isRootTier());
 }
 
 //: The tab the console is on, or the first one. Used by the header and the
@@ -986,6 +1020,81 @@ function adminNavGroups() {
 function adminTabRecord(tab) {
     return ADMIN_TABS.find((entry) => entry.id === tab) || ADMIN_TABS[0];
 }
+
+/**
+ * The clock the two live boards tick against, and the one thing they must not do.
+ *
+ * A shift's clock-in time is stored and sent as a *zone-less* wall clock
+ * (``2026-09-25 06:00:00``, written by the server's own ``datetime.now()``, so in the
+ * server's zone). ``new Date`` reads such a string in the *reader's* zone, so a counter
+ * that subtracts one from ``Date.now()`` starts at a constant offset whenever the phone
+ * or the console is in a different zone from the server - three hours, for a server in
+ * UTC with the staff in Kuwait, on a shift that began seconds ago. It is the *origin*
+ * that is wrong, not the rate, which is why it reads as a counter that simply starts at
+ * three hours and then counts correctly; and it is not only cosmetic, because the
+ * overtime line the board draws is the server's own paid-hours line.
+ *
+ * So the count now travels with the open shift: ``seconds_on_site``, computed by the same
+ * ``shift_hours.elapsed_seconds`` the clock-out path measures a closed shift with. It is
+ * zone-free by construction, and the device only has to add the seconds it has watched
+ * pass. This turns that count into the instant it began, which is what both boards tick
+ * from.
+ *
+ * The fallback is the old arithmetic, for an older server and for an offline cache written
+ * before the count came with the shift. It is right exactly while the reader's clock shares
+ * the server's zone - the case this app was written for and the one it can never assume.
+ */
+const SHIFT_CLOCK = {
+    /** A stored wall clock (or a Date, or an epoch) as milliseconds, or null. */
+    recordedAt(timestamp) {
+        if (typeof timestamp === 'number') return isFinite(timestamp) ? timestamp : null;
+        if (timestamp instanceof Date) {
+            return isNaN(timestamp.getTime()) ? null : timestamp.getTime();
+        }
+        if (!timestamp) return null;
+        // The server writes "YYYY-MM-DD HH:MM:SS"; Safari refuses that shape without the T.
+        const at = new Date(String(timestamp).replace(' ', 'T'));
+        return isNaN(at.getTime()) ? null : at.getTime();
+    },
+
+    /**
+     * The instant a shift's count began, or null when nothing readable says.
+     *
+     * ``shift`` is a session the server sent (or the badge attributes read back off the
+     * DOM), or a bare timestamp for the callers that only ever had one. ``at`` is the
+     * moment the count was read - the response, normally, and now by default - and it is
+     * what turns ``seconds_on_site`` into an instant rather than a number that ages on the
+     * shelf. A record that carries its own ``read_at`` (or is a cached one, which does)
+     * answers without being told.
+     */
+    origin(shift, at) {
+        const session = shift && typeof shift === 'object' ? shift : { clock_in_time: shift };
+        // Already an instant: the live-ops board stamps one onto the row so its
+        // one-second tick can read the whole origin back off the element it is
+        // rewriting, rather than off a closure a repaint would drop.
+        if (session.origin_at) {
+            const stamped = SHIFT_CLOCK.recordedAt(session.origin_at);
+            if (stamped !== null) return stamped;
+        }
+        const seconds = Number(session.seconds_on_site);
+        if (session.seconds_on_site !== null && session.seconds_on_site !== undefined && isFinite(seconds) && seconds >= 0) {
+            const read = Number(session.read_at);
+            const asOf = isFinite(read) && read > 0
+                ? read
+                : (at === undefined || at === null ? Date.now() : Number(at));
+            return asOf - seconds * 1000;
+        }
+        return SHIFT_CLOCK.recordedAt(session.clock_in_time);
+    },
+
+    /** Seconds on site from an origin, or null when there is no origin to count from. */
+    elapsed(originMs, nowMs) {
+        if (originMs === null || originMs === undefined) return null;
+        const now = nowMs === undefined || nowMs === null ? Date.now() : Number(nowMs);
+        if (!isFinite(originMs) || !isFinite(now)) return null;
+        return Math.max(0, (now - originMs) / 1000);
+    }
+};
 
 const UI = {
     get appContainer() { return document.getElementById('app'); },
@@ -2885,6 +2994,13 @@ const UI = {
     },
 
     async renderAdminTab(tab) {
+        // A tab this session is not offered is not one it opens either. The request can
+        // arrive from anywhere a tab id survives - a ``State.adminTab`` left over from a
+        // session in another tier, a deep link, an old button in a cached page - so the
+        // answer is the first tab this reader *is* offered rather than an error: an
+        // administrator sent at the alert queue gets their board, not a screenful of 403s.
+        const record = adminVisibleTabs().some((entry) => entry.id === tab) ? adminTabRecord(tab) : null;
+        tab = (record || adminVisibleTabs()[0] || adminTabRecord(tab)).id;
         State.adminTab = tab;
         // The previous tab's timers die here, before anything else runs: a board
         // that kept polling from a screen nobody is looking at is just a phone
@@ -2893,9 +3009,7 @@ const UI = {
         this.paintAdminHeader(tab);
 
         const content = document.getElementById('adminContent');
-        if (!content) return;
-        content.innerHTML = this.consoleSkeletonHtml(`${I18n.__(adminTabRecord(tab).key)}...`);
-
+        if (!content) return;        content.innerHTML = this.consoleSkeletonHtml(`${I18n.__(adminTabRecord(tab).key)}...`);
         try {
             switch (tab) {
                 // The whole board - the stats, the filters, the live timer and the

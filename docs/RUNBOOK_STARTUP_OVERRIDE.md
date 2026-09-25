@@ -188,13 +188,14 @@ one exists, readiness reports the deployment as having an unanswered question ab
   a deployment that has never been forced up it passes saying so.
 
 Answer it from the console's **Alerts** tab - the row carries the reason and a box for yours -
-or from the API:
+or from the API. Both are the **root tier's**: the alert queue answers nobody else, and asking
+as an administrator is a `403` on the route and a `404` on the path it used to live at.
 
 ```bash
 curl -s -X POST \
-  -H "Authorization: Bearer <admin token>" -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer <root tier token>" -H 'Content-Type: application/json' \
   -d '{"note": "Read the ledger by hand: the migration is recorded, the column is there."}' \
-  https://<origin>/api/v1/admin/notifications/{notification_id}/acknowledge
+  https://<origin>/api/v1/developer/notifications/{notification_id}/acknowledge
 ```
 
 Substitute the alert's `id` for `{notification_id}` - the readiness detail names this endpoint

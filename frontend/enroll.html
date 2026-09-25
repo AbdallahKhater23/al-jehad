@@ -44,17 +44,75 @@
     font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     display: flex; flex-direction: column;
   }
-  /* The mark at the top left, where the console's rail keeps it, so the first thing on the
-     page is the thing the worker tapped to get here. Decorative on purpose: the h1 beside
-     it already says what the page is, and the column is also the tab icon. */
-  .brand-mark { flex: 0 0 auto; margin-top: 2px; }
-  .brand-mark img { display: block; width: 26px; height: auto; }
+  /* The identity band: the column, then the four lines the artwork sets, in its order.
+     ``flex-basis: 100%`` is what makes it a band of its own rather than a third column
+     competing with the page's own title and the language picker - the header wraps, so
+     this takes the first line and those two share the second. */
+  .brand { flex: 1 1 100%; display: flex; align-items: center; gap: 10px; }
+  .brand-mark { flex: 0 0 auto; }
+  .brand-lockup { display: flex; flex-direction: column; align-items: flex-start; min-width: 0; }
+  /* Metallic, like the wordmark on the sign-in panel: the same gold ramp as the column,
+     clipped to the letters, so the word and the mark are visibly the same material. */
+  .brand-name {
+    font-family: var(--brand-serif);
+    font-size: 16px; font-weight: 700; line-height: 1; letter-spacing: 0.14em;
+    /* Tracked-out capitals leave the last letter's space on the right, which pushes the
+       block off its own edge; the extra em on the other side squares it up. */
+    padding-left: 0.14em;
+    background-image: linear-gradient(180deg, var(--brand-gold-hi), var(--brand-gold) 52%, var(--brand-gold-lo));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .brand-legal {
+    margin-top: 4px; font-size: 10px; line-height: 1; font-weight: 700; letter-spacing: 0.26em;
+    color: var(--brand-gold);
+  }
+  /* ``EST 1983`` between two rules that fade outward, as the lockup sets it: they are what
+     make the line read as part of the mark rather than as another sentence. */
+  .brand-est {
+    display: flex; align-items: center; gap: 7px; margin-top: 3px; width: min(100%, 132px);
+    font-size: 10px; line-height: 1; font-weight: 700; letter-spacing: 0.24em; color: var(--brand-gold);
+  }
+  .brand-est::before, .brand-est::after { content: ''; flex: 1 1 auto; height: 1px; }
+  .brand-est::before { background: linear-gradient(90deg, transparent, rgba(221, 196, 140, 0.6)); }
+  .brand-est::after { background: linear-gradient(90deg, rgba(221, 196, 140, 0.6), transparent); }
+  /* ``90deg`` is a physical angle and a flex row is laid out from the other end in RTL, so
+     in Arabic and Urdu the two rules swap sides and their gradients do not: the line would
+     come out solid gold at the outer ends and invisible next to the word, which is the one
+     thing these rules exist to avoid. The same two rules, pointing the other way. */
+  html[dir="rtl"] .brand-est::before { background: linear-gradient(270deg, transparent, rgba(221, 196, 140, 0.6)); }
+  html[dir="rtl"] .brand-est::after { background: linear-gradient(270deg, rgba(221, 196, 140, 0.6), transparent); }
+  .brand-tagline {
+    margin-top: 3px; font-family: var(--brand-serif);
+    font-size: 10px; line-height: 1; letter-spacing: 0.18em; padding-left: 0.18em;
+    color: rgba(237, 231, 214, 0.82);
+  }
+  /* The three small lines above are single-line caps with nothing hanging below them, so the
+     inherited 1.5 line-height spent 5px each on nothing - 15px of a phone header, which is
+     the currency here. */
+
+  /* The picker and the page's title share the row below the lockup, and on the narrowest
+     phones they cannot both have it: the picker is 141px wide whatever it sits beside, which
+     leaves the title around 120px and breaks "Register your face" in two - and costs more
+     height doing that than giving the picker a line of its own. Measured: the title wants
+     ~150px, the picker 141px, plus the page's padding, so 340px is where the row stops
+     fitting. Above it nothing changes. */
+  @media (max-width: 340px) {
+    /* ``body header .head`` and not ``.head``: the base rule is written further down this
+       sheet as ``header .head``, so a bare class here loses on specificity and that one wins
+       on order as well. One more element in front of it beats both, whatever moves where. */
+    body header .head { flex: 1 1 100%; }
+  }
+  .brand-mark img { display: block; width: 38px; height: auto; }
   /* ``env()`` is 0 in a browser tab and the notch's height in the installed app - which is
      the case that matters, because installed is the only mode that paints the status bar
      the colour set above, and then the notch sits over this padding. */
   header {
     padding: calc(18px + env(safe-area-inset-top, 0px)) 16px 10px;
-    display: flex; gap: 12px; align-items: flex-start;
+    /* Wraps, so the identity band above takes a line of its own and the page's title and
+       the language picker share the one below it. */
+    display: flex; flex-wrap: wrap; gap: 10px 12px; align-items: flex-start;
   }
   header .head { flex: 1; min-width: 0; }
   h1 { font-size: 1.15rem; margin: 0 0 4px; }
@@ -124,10 +182,27 @@
 <header>
   <!--
     The company's mark. ``../`` for the reason the icon link and the scripts give - this page
-    is served one segment deep under its token - and aria-hidden because the h1 beside it
-    already names the page for a screen reader.
+    is served one segment deep under its token - and aria-hidden because the lockup beside it
+    already names the company for a screen reader.
   -->
-  <span class="brand-mark" aria-hidden="true"><img src="../logo-mark.svg" alt="" width="26" height="34"></span>
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"><img src="../logo-mark.svg" alt="" width="38" height="50"></span>
+    <!--
+      The four lines the artwork sets, in its order, and deliberately not translated: a
+      wordmark, a legal suffix and a founding year are proper nouns, and a translated
+      wordmark is a different logo. The console reads these same four strings out of
+      BRAND_DEFAULTS in frontendjavascript.js. They are written into the page rather than
+      fetched from /api/v1/branding because these two pages load none of the console's
+      scripts and have to have the lockup on the first frame, in whatever the phone's
+      connection is doing.
+    -->
+    <span class="brand-lockup">
+      <span class="brand-name">AL-JEHAD</span>
+      <span class="brand-legal">INTERNATIONAL CO.</span>
+      <span class="brand-est">EST 1983</span>
+      <span class="brand-tagline">STONE . MARBLE . GRANITE</span>
+    </span>
+  </div>
   <div class="head">
     <h1 id="title" data-t="enroll.title">Register your face</h1>
     <p class="sub" id="who" data-t="enroll.sub">Checking your link…</p>

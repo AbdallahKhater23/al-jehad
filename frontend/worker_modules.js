@@ -44,6 +44,12 @@ const WORKER_MODULES = {
             // while already on shift - every tap then answered "Already clocked in!".
             const stats = await API.request('/worker/me/stats');
             active = stats.active_session || null;
+            // When this count was read. The card is drawn a beat later - the alert banner is
+            // awaited in between - and the origin has to be the instant the server's figure
+            // was true, not the instant the markup landed, or the wait is time the shift
+            // silently never gets. Cached with the shift, so an offline re-render counts
+            // from the same instant rather than from the moment it was redrawn.
+            if (active) active.read_at = Date.now();
             monthHours = Number(stats.total_hours) || 0;
             // Clock-out is refused while a shift is awaiting review, so say so on the
             // panel instead of letting the worker find out by selfie.
@@ -60,7 +66,11 @@ const WORKER_MODULES = {
                 await OFFLINE.cacheShiftState(workerId, {
                     active: !!active,
                     site_name: active ? active.site_name : null,
-                    clock_in_time: active ? active.clock_in_time : null
+                    clock_in_time: active ? active.clock_in_time : null,
+                    // The count travels with the stamp: a shift re-rendered from this
+                    // cache hours later still ticks from the server's own origin rather
+                    // than from the digits, which mean something else in another zone.
+                    seconds_on_site: active ? active.seconds_on_site : null
                 }).catch(() => {});
             }
         } catch (err) {
@@ -91,9 +101,7 @@ const WORKER_MODULES = {
 
     /** Seconds on shift for a server timestamp, or null if it is unreadable. */
     elapsedSeconds(clockInTime) {
-        const start = new Date(String(clockInTime).replace(' ', 'T'));
-        if (isNaN(start.getTime())) return null;
-        return Math.max(0, (Date.now() - start.getTime()) / 1000);
+        return SHIFT_CLOCK.elapsed(SHIFT_CLOCK.origin(clockInTime));
     },
 
     /** "8:05:07" - hours are not zero-padded so a long shift never wraps the line. */
@@ -135,9 +143,16 @@ const WORKER_MODULES = {
      * administrator's alert and the clock-out gate light up on the same second rather
      * than a second or a break apart.
      *
-     * The device clock drives the display only; the hours that count still come from the
-     * server's clock-in record. The timer tears itself down as soon as the card is
-     * replaced (tab switch, re-render, logout), so no interval outlives the panel.
+     * The count starts where the server says it does. The stored clock-in is a zone-less
+     * wall clock, so a timer that subtracted it from ``Date.now()`` began at whatever
+     * offset separated this phone's zone from the server's - hours, on a shift that had
+     * just started - and the card would say a worker was hours into overtime that the
+     * server had not recorded. ``SHIFT_CLOCK.origin`` starts the count from the server's
+     * own figure instead, so what ticks here is the shift the server will pay for; only
+     * the seconds watched since the answer arrived come from this device's clock.
+     *
+     * The timer tears itself down as soon as the card is replaced (tab switch, re-render,
+     * logout), so no interval outlives the panel.
      *
      * The timer counts time *on site*. The thresholds are about *paid* hours
      * (``shift_hours.OVERTIME_BASIS`` on the server, and the threshold it sends is a paid
@@ -154,9 +169,12 @@ const WORKER_MODULES = {
      * are still on the clock. What it says now is the policy as it actually is: a paid day
      * of N hours plus an unpaid break, and whether that is the end of the shift.
      */
-    startElapsedTimer(clockInTime, settings) {
+    startElapsedTimer(shift, settings) {
         this.stopElapsedTimer();
-        if (!clockInTime) return;
+        // Accepts the open shift as the server sent it, or a bare timestamp for the callers
+        // that hold nothing else - see ``SHIFT_CLOCK.origin`` for how the two are read.
+        const origin = SHIFT_CLOCK.origin(shift);
+        if (origin === null) return;
 
         const options = settings || {};
         const threshold = Number(options.overtimeHours) > 0
@@ -179,7 +197,7 @@ const WORKER_MODULES = {
         const tick = () => {
             const label = document.getElementById('shiftElapsed');
             if (!label) { this.stopElapsedTimer(); return; }  // card is gone
-            const seconds = this.elapsedSeconds(clockInTime);
+            const seconds = SHIFT_CLOCK.elapsed(origin);
             if (seconds === null) return;
             label.textContent = this.formatElapsed(seconds);
 
@@ -355,7 +373,7 @@ const WORKER_MODULES = {
         this.paintAlertBadges();
 
         // Last: the card has to be in the document before the first tick looks for it.
-        this.startElapsedTimer(clockInTime, {
+        this.startElapsedTimer(status.active, {
             overtimeHours: status.overtimeNotifyHours,
             breakMinutes: status.breakMinutes,
             breakAfterHours: status.breakAfterHours,
