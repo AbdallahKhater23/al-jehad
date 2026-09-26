@@ -3721,7 +3721,7 @@ const UI_MODULES = {
     _credentialsEdit: null,
 
     /** The edit form's fields, kept so a repaint never loses what was typed. */
-    _credentialsEditDraft: { name: '', email: '', phone: '', hourly_rate: '' },
+    _credentialsEditDraft: { name: '', email: '', phone: '', hourly_rate: '', transit_enabled: false },
 
     /**
      * The replacement reference photo chosen on the edit panel, or ``null``.
@@ -3763,7 +3763,8 @@ const UI_MODULES = {
                 email: user.email || '',
                 phone: user.phone || '',
                 hourly_rate: user.hourly_rate === null || user.hourly_rate === undefined
-                    ? '' : String(user.hourly_rate)
+                    ? '' : String(user.hourly_rate),
+                transit_enabled: user.transit_enabled === true
             };
         } catch (err) {
             Toast.error(err.message);
@@ -3774,7 +3775,7 @@ const UI_MODULES = {
 
     closeUserEdit() {
         this._credentialsEdit = null;
-        this._credentialsEditDraft = { name: '', email: '', phone: '', hourly_rate: '' };
+        this._credentialsEditDraft = { name: '', email: '', phone: '', hourly_rate: '', transit_enabled: false };
         // The chosen file goes with the panel: it is a copy of somebody's face in memory, and
         // closing the form is what stops holding it.
         this._credentialsEditPhoto = null;
@@ -3795,6 +3796,13 @@ const UI_MODULES = {
         });
         const rate = value('userEditRate');
         if (rate !== null) this._credentialsEditDraft.hourly_rate = rate.trim();
+        // The transit grant is a checkbox, so it is read for its ``checked`` state rather than
+        // its value, and only while the box actually exists - a repaint that dropped it must
+        // not silently turn a granted privilege off on the next save.
+        const transit = document.getElementById('userEditTransit');
+        if (transit && typeof transit.checked === 'boolean') {
+            this._credentialsEditDraft.transit_enabled = transit.checked;
+        }
         return this._credentialsEditDraft;
     },
 
@@ -3826,8 +3834,19 @@ const UI_MODULES = {
                         <input type="number" id="userEditRate" step="0.5" min="0" max="1000"
                                value="${this.escapeHtml(draft.hourly_rate)}" class="${field}">
                     </label>
+                    <!-- The off-geofence privilege, granted one account at a time. It is a plain
+                         checkbox and not a role, because two workers can hold the same role and
+                         only one of them drive - so the administrator names the person, here,
+                         rather than handing the privilege to a category. -->
+                    <label class="ui-stack is-flush ui-span-all">
+                        <span class="${label}">
+                            <input type="checkbox" id="userEditTransit" ${draft.transit_enabled ? 'checked' : ''}>
+                            ${I18n.__('credentialsTransit')}
+                        </span>
+                    </label>
                 </div>
                 <p class="ui-note">${I18n.__('credentialsHourlyRateHint')}</p>
+                <p class="ui-note">${I18n.__('credentialsTransitHint')}</p>
                 <!-- The face, which is the one thing about this person that is not a field on
                      their row. What is on file is stated rather than implied, because the two
                      cases are different jobs: a first photo is what makes the account able to
@@ -3955,7 +3974,11 @@ const UI_MODULES = {
             user_id: user.id,
             name: draft.name,
             email: draft.email,
-            phone: draft.phone
+            phone: draft.phone,
+            // The off-geofence privilege, sent for exactly this one account. It travels on every
+            // save (not only when the box changed), because the checkbox states the whole truth
+            // about the grant and the server treats an absent field as "leave it alone".
+            transit_enabled: !!draft.transit_enabled
         };
         // An empty rate box means "leave the rate as it is"; a 0 means "clear it". The
         // difference matters - the server treats them differently - so a value that is

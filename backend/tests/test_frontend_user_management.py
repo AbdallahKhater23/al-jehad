@@ -63,7 +63,7 @@ function roster() {
 const DETAIL = {
     id: '600', name: 'Ana Torrez', email: 'ana@example.test', phone: '',
     role: 'moallem', status: 'inactive', hourly_rate: 9.5,
-    face_enrolled: false, enrolled_at: null
+    face_enrolled: false, enrolled_at: null, transit_enabled: false
 };
 
 const edits = [];
@@ -191,9 +191,25 @@ const results = {};
         rate: valueOf(markup, 'userEditRate'),
         role_shown: (/data-user-edit-role="([^"]*)"/.exec(markup) || [])[1],
         role_editable: markup.indexOf('id="userEditRole"') >= 0,
+        transit_present: markup.indexOf('id="userEditTransit"') >= 0,
+        transit_checked: /id="userEditTransit"[^>]*checked/.test(markup),
         explains_id: markup.indexOf(env.evaluate("I18n.__('credentialsEditIdNote')")) >= 0,
         closes: env.evaluate("(UI_MODULES.closeUserEdit(), document.getElementById('adminContent').innerHTML.indexOf('data-user-edit=') < 0)")
     };
+}
+
+// 3b. the transit grant is the administrator's, and the box reflects who holds it
+{
+    const env = await credentialsEnv(HEAD);
+    DETAIL.transit_enabled = true;
+    await env.evaluate("UI_MODULES.openUserEdit('600')");
+    const checked_when_held = /id="userEditTransit"[^>]*checked/.test(render(env));
+    await env.evaluate("UI_MODULES.saveUserEdit()");
+    results.transit = {
+        checked_when_held,
+        sent_true: edits[edits.length - 1].body.transit_enabled === true
+    };
+    DETAIL.transit_enabled = false;
 }
 
 // 4. saving sends what the form shows, and nothing it does not
@@ -457,8 +473,17 @@ def test_the_edit_form_is_the_account_read_back_from_the_server(results):
     assert form["rate"] == "9.5", "the hourly rate is not on the roster, so it comes from here"
     assert form["role_shown"] == "moallem"
     assert form["role_editable"] is False, "a role is fixed by the id block"
+    assert form["transit_present"] is True, "the grant is offered on the account's own form"
+    assert form["transit_checked"] is False, "a fresh account does not hold the privilege"
     assert form["explains_id"] is True, "the form says why instead of showing a dead field"
     assert form["closes"] is True
+
+
+def test_the_transit_grant_reflects_who_holds_it_and_is_sent_on_save(results):
+    """The box is the administrator's switch, per account - not a role anyone inherits."""
+    transit = results["transit"]
+    assert transit["checked_when_held"] is True, "an account that holds the grant shows it ticked"
+    assert transit["sent_true"] is True, "saving the form grants it"
 
 
 def test_saving_sends_the_account_and_what_was_typed(results):
@@ -470,6 +495,9 @@ def test_saving_sends_the_account_and_what_was_typed(results):
         "email": "ana.torres@example.test",
         "phone": "+200000000600",
         "hourly_rate": 12.5,
+        # The off-geofence privilege travels on every save: the checkbox is the whole truth
+        # about the grant, and an unchecked box means "this person does not hold it".
+        "transit_enabled": False,
     }
     assert "id" not in saved["body"] and "role" not in saved["body"], (
         "the server does not accept either, and sending them would be cargo cult"
