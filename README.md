@@ -1080,7 +1080,7 @@ photo; `POST /api/v1/enroll/<token>/register` creates the account, writes the fa
 template and consumes the link, in that order - every step that can fail happens before
 anything is written, so a rejected password or an unreadable photo costs a retry rather
 than the link. The **id and the role are the administrator's**: a link can create a
-`worker` or a `moallem` (never an administrator), it is single-use whatever `max_uses`
+`worker`, a `moallem` or an off-office worker (never an administrator), it is single-use whatever `max_uses`
 says, and it refuses an id that is already taken or already **reserved by another live link**.
 The reservation is real rather than cosmetic: the number lives on the invite row until the link
 is claimed, and the walk-up allocator below treats it as taken, so the two creation flows can
@@ -1827,7 +1827,7 @@ shown once to be handed over. Without one, the account exists and cannot clock i
 face is registered, which the panel says in those words rather than letting a worker
 discover it at the gate. The password policy is the same one a registration link is held
 to (`MIN_PASSWORD_LENGTH`, plus the common-password list), and an id outside its role's
-block (`worker` 1-499, `moallem` 500-999, `admin` 1000-4999, `head_admin` 5000+) is
+block (`worker` 1-499, `moallem` 500-749, off-office 750-999, `admin` 1000-4999, `head_admin` 5000+) is
 refused in the browser and again on the server.
 
 **Registration link** does not create anything: it issues the `register` invite described
@@ -1898,7 +1898,7 @@ the worker answers back - which is the difference between a request that gets ha
 and a form somebody submits into silence.
 
 ```
-POST /api/v1/worker/notes                    open one (any signed-in user, incl. a moallem)
+POST /api/v1/worker/notes                    open one (any signed-in user, incl. a moallem or off-office worker)
 GET  /api/v1/worker/notes                    your own, plus the open/unread counts
 GET  /api/v1/worker/notes/{id}               one thread (reading it clears "new reply")
 POST /api/v1/worker/notes/{id}/replies       answer it (reopens a finished note)

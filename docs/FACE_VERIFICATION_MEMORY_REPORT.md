@@ -1,8 +1,10 @@
 # Face verification memory — investigation report
 
 **Status:** adopted. The recommended change (§3) is applied to `backend/uploads.py`, and its
-tests are in `backend/tests/test_face_frame_chain.py` (§6). Everything else in this report is
-investigation, and the options it rejects were not applied.
+tests are in `backend/tests/test_face_frame_chain.py` (§6). One investigated option is also in
+the code but **off by default**: the 640-class letterboxed detection pass (§2.5, §5) is an
+opt-in setting behind a fatal band rail, because validation shows it moves the crop. Everything
+else in this report is investigation, and the options it rejects were not applied.
 
 **Question asked:** are there more ways to cut memory with no tradeoffs, and can the *peak
 during a face verification* be made smaller?
@@ -197,7 +199,7 @@ consequences the earlier reading missed:
   peak less, at the same compute and a comparable reach** (17.6 px native, inside the runtime's
   own `MIN_SUBJECT_PX = 24`).
 
-  **Measured, and rejected: the cap does not preserve the crop.** `tools/detector_resolution_ab.py`
+  **Measured: the cap does not preserve the crop, so it cannot be a drop-in.** `tools/detector_resolution_ab.py`
   runs the native pass, a *same-resolution control*, and the capped arms over the same frames, and
   scores the thing a stored template actually is — the embedding of `face_detector.align`'s crop.
   The control is exact (IoU 1.000, crop drift 0.0000), which is what makes the rest a measurement
@@ -217,6 +219,71 @@ consequences the earlier reading missed:
   pipeline or the process would refuse its own staff. That is a far bigger decision than ~62 MB, so
   the ~86 MB floor stays — the honest answer to "how much is avoidable" is *none of it, at this
   price*. (n=4 real faces; the far-range rows are a synthesized proxy, stated as such in the tool.)
+
+  #### Implemented, but switched off: the cap is opt-in and refuses to score without a band
+
+  The routing above is now in the code rather than only in this report, because the memory win is
+  real and an operator may have a corpus with which to earn the band. It is **off by default** and
+  it is **hard-railed**, so the failure mode of switching it on carelessly is a refusal, not a
+  silent mis-match:
+
+  * `FACE_DETECTOR_INPUT_SIZE` (default `0` = the frame's own size = today's behaviour) and
+    `FACE_DETECTOR_TILES` (default `2`) select the pass. `face_detector.capped_pipeline()` turns
+    them into the pipeline name — `yunet-2023mar-640x2` — and `face_detector.active()`/`describe()`
+    report it, so `/readyz` and the boot log name the crop in force.
+  * The name has **no band**. `band_for("yunet-2023mar-640x2")` raises `UnknownPipelineError`
+    rather than falling back, and `readiness._check_face_match_band` is `TIER_FATAL`: a capped
+    build with no measured band **will not serve**. Verified live — with
+    `FACE_DETECTOR_INPUT_SIZE=640` the startup check returns `tier="fatal"`, `ok=False`, "every
+    punch would be refused until the lines are derived". Adopting the cap is therefore *earned* by
+    measuring a band for this exact name (`tools/derive_facenet_band.py`) and re-enrolling the
+    templates made by the old crop; until then the cap is a researched option, not a deployment.
+  * A capped pass also skips `detect_raw`'s close-up retry: the cap already reads every frame at a
+    scale the anchors were built for, which is what the retry exists to reach, so re-reading a
+    close-up would be a second upscaled crop under the same pipeline name.
+
+  **What the runtime route itself costs** — not the bare `detector_640`, but `face_detector.detect_raw`
+  on one 1280×960 frame, one fresh process per route (`tools/yunet_memory.py`, `runtime` probe):
+
+  | runtime route | resident | peak | pipeline label |
+  |---|---|---|---|
+  | native (today) | **+95.1 MiB** | **+111.9 MiB** | `yunet-2023mar` |
+  | capped 640, 2 tiles | **+33.6 MiB** | **+38.9 MiB** | `yunet-2023mar-640x2` |
+  | capped 480, 2 tiles | +25.5 MiB | +29.1 MiB | `yunet-2023mar-480x2` |
+
+  So routing the *live path* through the letterboxed pass, with the 2×2 grid that keeps the reach,
+  is **−61.5 MiB resident / −73.0 MiB peak** — the same magnitude §2.5 predicted from the detector
+  alone, confirmed through the code an operator would actually switch.
+
+  **Re-validated 2026-09-26, and it still fails the headroom.** `tools/detector_resolution_ab.py`
+  (the control runs the letterbox machinery at the frame's own resolution, so its drift is the new
+  plumbing and the cap arms' drift is resolution):
+
+  | material | arm | found | not one subject | drift p50 | drift max |
+  |---|---|---|---|---|---|
+  | 4 real enrolled photos (96–320 px faces) | control | 4 | 0 | 0.0000 | 0.0124 |
+  | | cap640x2 | 3 | 1 | 0.0180 | 0.0282 |
+  | | cap480x2 | 3 | 1 | 0.0430 | 0.0430 |
+  | synthesized far range (12–128 px faces, 32 frames) | control | 21 | 0 | 0.0000 | 0.0000 |
+  | | cap640x1 | 17 | 4 | 0.0393 | 0.7721 |
+  | | cap640x2 | 18 | 3 | 0.0360 | 0.1183 |
+  | | cap480x2 | 16 | 5 | 0.0598 | 0.1579 |
+
+  The band's headroom is **0.0036 of cosine**; every cap arm exceeds it by one to two orders of
+  magnitude, on real faces squarely inside the deployment's own band and not only at the far range,
+  and it costs punches too (12 arm-frames in the synth run came back as zero or more than one
+  subject where production saw exactly one). Detection **reach** survives — the 2×2 grid holds the
+  native width down to ~24 px, at the runtime's own `MIN_SUBJECT_PX` — but the **crop moves**, and
+  the crop is the template. Verified: `tests/test_face_detector.py` (section 7) and
+  `tests/test_detector_resolution_ab.py`, 42 green; the corpus and synth runs both exit 1 with
+  `FAIL: the worst crop drift … reaches the band's headroom`.
+
+  **Conclusion:** the ~86 MB floor stays for the default deployment. The cap is shipped switchable
+  for a site that measures its own band and re-enrols, and cannot be adopted as a drop-in crop
+  change while stored templates were made by the native pass. The re-enrolment and band
+  re-derivation that adoption would require — and a two-crop transition that keeps a site serving
+  while it happens — is designed in
+  [the crop-change migration runbook](RUNBOOK_CROP_CHANGE_MIGRATION.md).
 
 ---
 
@@ -373,6 +440,14 @@ What remains open:
    quiet period returns them. Platform-specific and costs a little CPU — not "free".
 4. **`punch_frames.store_frame` copies the full frame** to make a 256 px thumbnail. Small
    (~5 MB) and the full frame has to stay alive for `maybe_capture_punch` regardless.
+5. **Run the detection pass at a 640-class letterboxed input — implemented, opt-in, not
+   adopted.** §2.5: `FACE_DETECTOR_INPUT_SIZE` / `FACE_DETECTOR_TILES` route the live pass through
+   `detector_640`'s letterbox, measured at the runtime route as **−61.5 MiB resident / −73.0 MiB
+   peak** with the 2×2 grid that keeps the reach. It is off by default and hard-railed — the capped
+   pipeline name has no band, `band_for` raises, and `readiness` refuses to serve — because the
+   validation shows the cap moves the crop by 5–33× the band's entire 0.0036 headroom. It becomes
+   usable only by measuring a band for e.g. `yunet-2023mar-640x2` (`tools/derive_facenet_band.py`)
+   **and** re-enrolling every template, which is a data migration rather than a config flag.
 
 ### Open item #2, prototyped: the models in a child process
 

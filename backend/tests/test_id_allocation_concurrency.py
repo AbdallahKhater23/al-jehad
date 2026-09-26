@@ -202,6 +202,24 @@ def test_each_role_is_handed_a_number_inside_its_own_block(role):
     validate_user_id_for_role(allocated, role)
 
 
+def test_the_old_moallem_band_is_split_into_two_unoverlapping_blocks():
+    """500-749 is the lead worker's and 750-999 the off-office worker's - no gap, no overlap."""
+    assert ROLE_ID_RANGES["moallem"] == (500, 749)
+    assert ROLE_ID_RANGES["off_office"] == (750, 999)
+    assert ROLE_ID_RANGES["moallem"][1] + 1 == ROLE_ID_RANGES["off_office"][0], (
+        "a number between the two blocks would belong to neither role"
+    )
+    # An id at either edge is accepted by its own role and refused by the other.
+    from fastapi import HTTPException
+
+    validate_user_id_for_role("749", "moallem")
+    validate_user_id_for_role("750", "off_office")
+    for user_id, role in (("749", "off_office"), ("750", "moallem")):
+        with pytest.raises(HTTPException) as raised:
+            validate_user_id_for_role(user_id, role)
+        assert raised.value.status_code == 400
+
+
 def test_a_role_with_no_range_is_refused_rather_than_guessed():
     """A role the ranges do not describe gets an error, not the worker block."""
     with database.immediate() as conn:

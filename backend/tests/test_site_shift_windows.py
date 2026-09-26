@@ -479,8 +479,10 @@ def test_the_schema_version_names_the_newest_migration():
     # account only when an administrator approves it, 25 ``site_categories``, the layer
     # between a site's own window columns and the company rules, and 26 the off-office-worker
     # split of the old moallem band: any account the shrunk range left in 750-999 is rewritten
-    # to the new role so the stored role and the id range still agree.)
-    assert migrations.SCHEMA_VERSION == 26
+    # to the new role so the stored role and the id range still agree, and 27 the transit-to-site
+    # columns - ``users.transit_enabled`` (an administrator's per-account grant) plus the four
+    # ``active_sessions`` columns that carry an off-geofence shift until a site confirms it.)
+    assert migrations.SCHEMA_VERSION == 27
 
 
 def test_the_migration_is_replayable_and_idempotent():
@@ -494,6 +496,42 @@ def test_the_migration_is_replayable_and_idempotent():
         assert migrations.run_migrations(conn) == []
         columns = {row[1] for row in conn.execute("PRAGMA table_info(construction_sites)")}
         assert {"clock_in_window_start", "clock_in_window_end", "site_timezone"} <= columns
+    finally:
+        conn.close()
+
+
+def test_the_off_office_migration_moves_the_upper_half_of_the_old_band():
+    """An account the shrunk moallem range left behind is rewritten, not silently orphaned.
+
+    The range is a rule about what an API may hand out; it says nothing about a row already
+    stored. This is the step that makes the two agree again - and it is boundary-tested, because
+    an off-by-one here moves a real lead worker into the wrong role.
+    """
+    import migrations
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        migrations.ensure_schema(conn)
+        conn.executemany(
+            "INSERT INTO users (id, name, password_hash, role) VALUES (?,?,?,?)",
+            [
+                ("600", "Lower Lead", "x", "moallem"),
+                ("749", "Edge Lead", "x", "moallem"),
+                ("750", "Edge Off", "x", "moallem"),
+                ("800", "Upper Lead", "x", "moallem"),
+                ("1000", "An Admin", "x", "admin"),
+            ],
+        )
+        migrations.migration_26_off_office_workers(conn)
+        roles = dict(conn.execute("SELECT id, role FROM users").fetchall())
+        assert roles["600"] == "moallem"
+        assert roles["749"] == "moallem", "the boundary minute of the band stays a lead worker"
+        assert roles["750"] == "off_office", "and the first minute above it is the new role"
+        assert roles["800"] == "off_office"
+        assert roles["1000"] == "admin", "the migration touches nothing outside the old band"
+        # Replayable: running it again moves nothing further.
+        migrations.migration_26_off_office_workers(conn)
+        assert dict(conn.execute("SELECT id, role FROM users").fetchall()) == roles
     finally:
         conn.close()
 

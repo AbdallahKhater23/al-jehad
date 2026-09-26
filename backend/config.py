@@ -726,6 +726,11 @@ class Settings(BaseModel):
             # Printed because it changes where the memory goes, and an operator looking at
             # two processes has to be told that this was a decision rather than a leak.
             "face_engine_process": self.face_engine_process,
+            # Printed because it silently changes the *crop* every template is compared against,
+            # and the pipeline name it selects has no measured band - so a support ticket asking
+            # "why is this deployment refusing every punch" starts here.
+            "face_detector_input_size": self.face_detector_input_size,
+            "face_detector_tiles": self.face_detector_tiles,
             # Printed because a retention policy nobody can read is a policy nobody follows,
             # and because the numbers are the first thing an auditor asks to see.
             "metrics_enabled": self.metrics_enabled,

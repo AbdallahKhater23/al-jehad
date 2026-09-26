@@ -220,6 +220,29 @@ DEFAULT_SHIFT_RULES: dict[str, Any] = {
 
 ACTION_CLOCK_IN = "Clock In"
 ACTION_CLOCK_OUT = "Clock Out"
+#: Sent by the phone when the worker has reached a site and wants the off-geofence shift
+#: confirmed. Distinct from ``Clock In`` on purpose: it is a *milestone* inside a shift that
+#: was already opened, not the opening of a new one, so the endpoint can tell "start driving"
+#: from "I have arrived" even though both arrive while a transit session is open.
+ACTION_TRANSIT_CHECKPOINT = "Transit Checkpoint"
+
+#: The placeholder ``site_name`` a transit shift carries until a geofence names a real site.
+#: A sentinel and not NULL because ``active_sessions.site_name`` is NOT NULL, and because a
+#: reviewer scanning open shifts should read the state in words rather than infer it from a
+#: blank column.
+TRANSIT_SITE_NAME = "In Transit"
+#: ``active_sessions.start_source`` for a shift opened away from a site, so the record says
+#: *how* it began - the same column already distinguishes online/offline starts.
+START_SOURCE_TRANSIT = "mobile_transit"
+#: ``attendance_logs.action`` for the arrival milestone: the row that turns travel into
+#: authorised time and leaves an auditable trace that a site was actually reached.
+ACTION_TRANSIT_CONFIRMED = "Transit Confirmed"
+#: ``attendance_logs.source`` for that arrival row, so the payroll ledger can tell a
+#: geofence-confirmed arrival from a normal online punch.
+SOURCE_SITE_ARRIVAL = "site_arrival"
+#: The reason stamped on a shift abandoned while still in transit; a constant because the
+#: administrator's review screen and the tests key on the same sentence.
+TRANSIT_ABANDONED_REASON = "Worker clocked out without confirming arrival at any site geofence"
 
 STATUS_APPROVED = "Approved"
 STATUS_PENDING_REVIEW = "pending_review"
@@ -524,6 +547,11 @@ class UserAddRequest(BaseModel):
     phone: str = ""
     password: str
     role: str
+    #: May this account open a paid shift away from every site and have it authorised on
+    #: arrival? Off unless the administrator creating it says otherwise - the privilege is
+    #: granted one account at a time, never by role, because two workers can share a role and
+    #: only one of them drive between sites (see ``migrations.migration_27_transit_to_site_shifts``).
+    transit_enabled: bool = False
 
     @field_validator("name")
     @classmethod
@@ -807,6 +835,11 @@ class UserEditRequest(BaseModel):
     #: agreed 0.00. Nothing multiplies it any more - the shifts screen is a timesheet -
     #: but a wrong record is still a wrong record.
     hourly_rate: float | None = None
+    #: The transit grant, and the reason it lives *here*: this is the endpoint an administrator
+    #: uses to act on one named person. ``None`` leaves it untouched (an edit that only renames
+    #: somebody must not silently revoke their travel privilege); ``True``/``False`` is the
+    #: administrator handing the privilege out or taking it back, for exactly this account.
+    transit_enabled: bool | None = None
 
     @field_validator("name")
     @classmethod
@@ -1432,6 +1465,11 @@ def _user_snapshot(row: sqlite3.Row) -> dict:
         "role": row["role"],
         "status": row["status"],
         "hourly_rate": row["hourly_rate"],
+        # The transit grant is audited like any other account field: "who was allowed to start
+        # a shift on the road, and when did that change" is exactly the question this log exists
+        # to answer, and a privilege that could be flipped without a ``before``/``after`` beside
+        # it would be the one write on this screen with no trail.
+        "transit_enabled": bool(row["transit_enabled"]),
     }
 
 
@@ -2296,8 +2334,11 @@ async def verify_worker(
         raise HTTPException(
             status_code=403, detail="You may only record attendance for your own account."
         )
-    if action not in (ACTION_CLOCK_IN, ACTION_CLOCK_OUT):
-        raise HTTPException(status_code=400, detail="Action must be 'Clock In' or 'Clock Out'.")
+    if action not in (ACTION_CLOCK_IN, ACTION_CLOCK_OUT, ACTION_TRANSIT_CHECKPOINT):
+        raise HTTPException(
+            status_code=400,
+            detail="Action must be 'Clock In', 'Clock Out' or 'Transit Checkpoint'.",
+        )
     # The worker has already seen the warning and chosen to clock out anyway.
     confirmed_early = _form_flag(confirm_early_checkout)
 
@@ -2309,7 +2350,9 @@ async def verify_worker(
     # refusal effective on every ASGI worker at once.
     with db() as conn:
         user_row = conn.execute(
-            "SELECT id, name, biometric_id FROM users WHERE id = ?", (current.id,)
+            "SELECT id, name, biometric_id, COALESCE(transit_enabled, 0) AS transit_enabled "
+            "FROM users WHERE id = ?",
+            (current.id,),
         ).fetchone()
     if user_row is None:
         # The token names an account that is gone: the session is dead, not the form.
@@ -2318,20 +2361,49 @@ async def verify_worker(
     lat, lon = parse_location_input(location_input)
     validate_plausible_coordinates(lat, lon)
 
+    #: Whether this account may open or continue a shift away from every geofence. Read from the
+    #: account, not the role: the privilege is granted one person at a time (see
+    #: ``migrations.migration_27_transit_to_site_shifts``).
+    transit_enabled = bool(user_row["transit_enabled"])
+
     with db() as conn:
         # The window columns come back with the row: the punch is about to be measured against
         # *this* site's shift, and re-reading the row later would be a second query that could
         # disagree with the geofence that just matched (an administrator editing the site
         # between the two). One read, one answer to "which site is this, and what are its hours".
         detected_site_row = site_at(conn, lat, lon)
+        # The open shift is read *here*, before the geofence gate, because an off-site shift is
+        # exactly the case the gate has to reason about: whether a fix outside every fence is a
+        # refusal or a legal transit milestone depends on what this session already says it is.
+        open_session = conn.execute(
+            "SELECT worker_id, site_name, clock_in_time, is_transit, transit_start_time "
+            "FROM active_sessions WHERE worker_id = ?",
+            (current.id,),
+        ).fetchone()
 
     detected_site = detected_site_row["site_name"] if detected_site_row is not None else None
+    #: A shift that was opened off-site and has not yet been confirmed by a geofence.
+    in_transit = bool(open_session) and int(open_session["is_transit"] or 0) == 1
 
     if not detected_site:
-        raise HTTPException(
-            status_code=403,
-            detail="Location Rejected. You are outside any designated construction site geofence.",
+        # Outside every fence. For everybody but a transit-enabled account this is the refusal it
+        # has always been. A transit-enabled account may be here for three reasons, and each is
+        # legal: opening the travel shift (no session yet), reporting an arrival that is not at a
+        # site yet, or abandoning a travel shift - which the endpoint handles by sending it to
+        # review rather than crediting it. Every other case stays refused.
+        #   * no session yet, and an opening action -> the departure that starts the travel shift;
+        #   * an in-transit session, and any action -> an unresolved transit milestone (an arrival
+        #     attempt that has not reached a fence yet, or a Clock Out that abandons the trip).
+        # A transit-enabled account outside a fence for any *other* reason is not covered, and is
+        # refused exactly as before.
+        opening_the_trip = (
+            action in (ACTION_CLOCK_IN, ACTION_TRANSIT_CHECKPOINT) and open_session is None
         )
+        if not (transit_enabled and (opening_the_trip or in_transit)):
+            raise HTTPException(
+                status_code=403,
+                detail="Location Rejected. You are outside any designated construction site geofence.",
+            )
 
     # One upload policy for the whole app (size while reading, image type from the
     # bytes, pixel ceiling): see ``uploads.py``. This endpoint used to read the body
@@ -2612,13 +2684,174 @@ async def verify_worker(
     flag_reason = liveness_flag
 
     with db(write=True) as conn:
-        if action == ACTION_CLOCK_IN:
-            existing = conn.execute(
-                "SELECT worker_id FROM active_sessions WHERE worker_id = ?", (current.id,)
-            ).fetchone()
-            if existing:
-                # The frame goes with the refusal: this rollback writes no row, so the file
-                # would otherwise sit unclaimed until retention's residue pass found it.
+        # The open shift, re-read inside the write lock. The gate above read it for the geofence
+        # decision; this is the read the state machine acts on, so a session another request
+        # opened or closed in between cannot slip past the check that admitted this punch.
+        session = conn.execute(
+            "SELECT worker_id, site_name, clock_in_time, is_transit, transit_start_time "
+            "FROM active_sessions WHERE worker_id = ?",
+            (current.id,),
+        ).fetchone()
+        session_in_transit = bool(session) and int(session["is_transit"] or 0) == 1
+
+        if action in (ACTION_CLOCK_IN, ACTION_TRANSIT_CHECKPOINT):
+            if session is None and detected_site_row is None:
+                # PHASE A - TRANSIT DEPARTURE. No open shift and no geofence, which the gate above
+                # admitted only because this account holds the privilege. The face check has
+                # already passed (this runs after the verdict), so the biometric evidence is as
+                # strong here as at a gate; what is deferred is not identity but *location* - the
+                # shift is opened, marked unpaid, and left waiting for a site to confirm it.
+                conn.execute(
+                    "INSERT INTO active_sessions (worker_id, site_name, clock_in_time, start_source, "
+                    "late_flag, liveness_class, is_transit, transit_start_time, "
+                    "transit_origin_lat, transit_origin_lon) "
+                    "VALUES (?, ?, ?, ?, NULL, ?, 1, ?, ?, ?)",
+                    (
+                        current.id,
+                        TRANSIT_SITE_NAME,
+                        now_str,
+                        START_SOURCE_TRANSIT,
+                        liveness_class,
+                        now_str,
+                        lat,
+                        lon,
+                    ),
+                )
+                _audit(
+                    conn,
+                    action="attendance_transit_departure",
+                    actor=current,
+                    entity="active_sessions",
+                    entity_id=current.id,
+                    after={
+                        "site": TRANSIT_SITE_NAME,
+                        "transit_start_time": now_str,
+                        "origin": {"lat": lat, "lon": lon},
+                        "score": similarity_score,
+                    },
+                    request=request,
+                )
+                telemetry.observe_punch(action="transit_departure", status="in_transit")
+                # No ``attendance_logs`` row and no payable hours yet: the shift exists but is not
+                # authorised until arrival, and writing a zero-hour log for the departure would
+                # put a row in the payroll ledger for time nobody has agreed to pay. For the same
+                # reason the departure frame is discarded - there is no log row to claim it, and
+                # the arrival punch carries its own evidence frame.
+                punch_frames.discard_frame(punch_frame)
+                return {
+                    "status": "in_transit",
+                    "message": "Travel shift initiated. Arrival at site required for approval.",
+                    "site": TRANSIT_SITE_NAME,
+                    "score": similarity_score,
+                    "hours": 0.0,
+                    "break_hours": 0.0,
+                    "paid_hours": 0.0,
+                    "overtime_hours": 0.0,
+                    "liveness": liveness_decision.as_payload(),
+                }
+
+            if session is not None and session_in_transit:
+                # PHASE B - ARRIVAL. An open transit shift and a fresh action: the worker is
+                # telling us they have reached a site. The arrival only counts if the fix is
+                # *actually* inside a geofence - a check-in from the car park is not an arrival -
+                # so an off-fence attempt answers 422 and leaves the shift exactly as it was.
+                if detected_site_row is None:
+                    punch_frames.discard_frame(punch_frame)
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Outside target site geofence. Cannot confirm arrival.",
+                    )
+                # ``clock_in_time`` is left untouched on purpose: it still holds the departure
+                # moment, so the whole travel-plus-work span is credited when the shift closes.
+                # The window is judged against that *departure* moment, since that is when the
+                # worker began the shift the site is now authorising.
+                transit_start = _parse_ts(session["transit_start_time"] or session["clock_in_time"])
+                site_window = shift_windows.effective_window(detected_site_row, rules)
+                late_flag = (
+                    None
+                    if transit_start is None or site_window.contains_moment(transit_start)
+                    else shift_windows.describe(site_window)
+                )
+                conn.execute(
+                    "UPDATE active_sessions SET site_name = ?, is_transit = 0, late_flag = ?, "
+                    "liveness_class = ? WHERE worker_id = ?",
+                    (detected_site, late_flag, liveness_class, current.id),
+                )
+                transit_seconds = (
+                    shift_hours.elapsed_seconds(transit_start, now) if transit_start else 0
+                )
+                # The arrival milestone, written as its own zero-hour row: it authorises the shift
+                # rather than paying for it, and it is the auditable proof that a geofence was
+                # reached. ``site_arrival`` as the source keeps it distinguishable from a normal
+                # online punch in the ledger.
+                arrival_log_id = _insert_log(
+                    conn,
+                    worker_id=current.id,
+                    site_name=detected_site,
+                    action=ACTION_TRANSIT_CONFIRMED,
+                    timestamp=now_str,
+                    hours=0.0,
+                    score=similarity_score,
+                    status=STATUS_APPROVED,
+                    status_code="approved",
+                    lat=lat,
+                    lon=lon,
+                    source=SOURCE_SITE_ARRIVAL,
+                    liveness_class=liveness_class,
+                    liveness_score=liveness_score,
+                    punch_frame=punch_frame,
+                )
+                if late_flag:
+                    notifications.notify(
+                        conn,
+                        kind=notifications.KIND_LATE_ARRIVAL,
+                        severity=notifications.SEVERITY_WARNING,
+                        title="Arrival outside the clock-in window",
+                        body=(
+                            f"{user_row['name']} (id {current.id}) began a transit shift at "
+                            f"{(session['transit_start_time'] or now_str)}, outside "
+                            f"{site_window.site_name or detected_site}'s "
+                            f"{site_window.label()} clock-in window."
+                        ),
+                        worker_id=current.id,
+                        site_name=detected_site,
+                        dedupe_key=f"late:{current.id}:{now_str[:10]}",
+                    )
+                _audit(
+                    conn,
+                    action="attendance_transit_confirmed",
+                    actor=current,
+                    entity="attendance_logs",
+                    entity_id=arrival_log_id,
+                    after={
+                        "site": detected_site,
+                        "origin": {"lat": lat, "lon": lon},
+                        "transit_hours": round(transit_seconds / 3600.0, 2),
+                        "score": similarity_score,
+                    },
+                    request=request,
+                )
+                telemetry.observe_punch(action="transit_confirmed", status="approved")
+                return {
+                    "status": "arrived",
+                    "message": (
+                        f"Arrival confirmed at {detected_site}. Travel time is credited to this "
+                        "shift."
+                    ),
+                    "site": detected_site,
+                    "score": similarity_score,
+                    "hours": 0.0,
+                    "break_hours": 0.0,
+                    "paid_hours": 0.0,
+                    "overtime_hours": 0.0,
+                    "transit_hours": round(transit_seconds / 3600.0, 2),
+                    "liveness": liveness_decision.as_payload(),
+                }
+
+            if session is not None:
+                # An open shift that is not in transit: the plain "already clocked in" refusal,
+                # unchanged. The frame goes with the refusal - this rollback writes no row, so the
+                # file would otherwise sit unclaimed until retention's residue pass found it.
                 punch_frames.discard_frame(punch_frame)
                 raise HTTPException(status_code=400, detail="Already clocked in!")
 
@@ -2671,12 +2904,111 @@ async def verify_worker(
                     status_code=403, detail="Your account is flagged for manual review. Please contact HR."
                 )
 
-            session = conn.execute(
-                "SELECT clock_in_time, site_name FROM active_sessions WHERE worker_id = ?", (current.id,)
-            ).fetchone()
             if session is None:
                 punch_frames.discard_frame(punch_frame)
                 raise HTTPException(status_code=400, detail=_no_open_shift_message(conn, current.id))
+
+            if session_in_transit and detected_site_row is None:
+                # PHASE C - ABANDONED TRANSIT. A Clock Out while the shift is still unconfirmed and
+                # the worker is outside every fence: the trip never arrived. The shift is closed so
+                # it stops counting and does not hang open forever, but the outcome is *review*,
+                # never automatic approval - nothing about the hours is authorised, and an
+                # administrator decides what, if anything, is payable. The travel time is recorded
+                # for that decision rather than approved by it.
+                abandoned_start = _parse_ts(
+                    session["transit_start_time"] or session["clock_in_time"]
+                )
+                abandoned_seconds = (
+                    shift_hours.elapsed_seconds(abandoned_start, now) if abandoned_start else 0
+                )
+                abandoned_hours = round(abandoned_seconds / 3600.0, 4)
+                conn.execute("DELETE FROM active_sessions WHERE worker_id = ?", (current.id,))
+                # No ``approved_hours``: it is deliberately left NULL, because assigning it would
+                # be the automatic approval this path exists to withhold.
+                log_id = _insert_log(
+                    conn,
+                    worker_id=current.id,
+                    site_name=session["site_name"],
+                    action=action,
+                    timestamp=now_str,
+                    hours=abandoned_hours,
+                    score=similarity_score,
+                    status=STATUS_PENDING_REVIEW,
+                    status_code="pending_review",
+                    lat=lat,
+                    lon=lon,
+                    source="online",
+                    liveness_class=liveness_class,
+                    liveness_score=liveness_score,
+                    flag_reason=TRANSIT_ABANDONED_REASON,
+                    punch_frame=punch_frame,
+                )
+                notifications.notify(
+                    conn,
+                    kind=notifications.KIND_REVIEW_PENDING,
+                    severity=notifications.SEVERITY_WARNING,
+                    title="Transit shift ended before reaching a site",
+                    body=(
+                        f"{user_row['name']} (id {current.id}) clocked out {abandoned_hours:.2f}h "
+                        "after starting a travel shift, without ever confirming arrival at a site "
+                        "geofence. The time is not payable until an administrator reviews it."
+                    ),
+                    worker_id=current.id,
+                    site_name=None,
+                    log_id=log_id,
+                    dedupe_key=f"transit_abandon:{log_id}",
+                    payload={
+                        "transit_start_time": session["transit_start_time"],
+                        "abandoned_hours": abandoned_hours,
+                    },
+                )
+                _audit(
+                    conn,
+                    action="attendance_clock_out",
+                    actor=current,
+                    entity="attendance_logs",
+                    entity_id=log_id,
+                    after={
+                        "site": session["site_name"],
+                        "status": STATUS_PENDING_REVIEW,
+                        "reason": TRANSIT_ABANDONED_REASON,
+                        "hours": abandoned_hours,
+                    },
+                    request=request,
+                )
+                telemetry.observe_punch(action="clock_out", status="pending_review")
+                return {
+                    "status": "pending_review",
+                    "message": (
+                        "You clocked out before reaching a site. This shift is held for "
+                        "administrator review, and its travel time is not payable until it is "
+                        "approved."
+                    ),
+                    "site": session["site_name"],
+                    "score": similarity_score,
+                    "hours": abandoned_hours,
+                    "break_hours": 0.0,
+                    "paid_hours": 0.0,
+                    "overtime_hours": 0.0,
+                    "liveness": liveness_decision.as_payload(),
+                }
+
+            if session_in_transit:
+                # Arrived *and* finished in one tap: the fix is inside a fence, so the trip is
+                # confirmed here rather than refused. Clearing the flag lets the ordinary close
+                # below do its work, and because ``clock_in_time`` still holds the departure
+                # moment the credited span includes the travel. Reaching a site is the condition
+                # that authorises the shift, whether it arrives through the explicit checkpoint or
+                # through this clock-out.
+                conn.execute(
+                    "UPDATE active_sessions SET site_name = ?, is_transit = 0 WHERE worker_id = ?",
+                    (detected_site, current.id),
+                )
+                session = conn.execute(
+                    "SELECT worker_id, site_name, clock_in_time, is_transit, transit_start_time "
+                    "FROM active_sessions WHERE worker_id = ?",
+                    (current.id,),
+                ).fetchone()
 
             clock_in_time = _parse_ts(session["clock_in_time"])
             if clock_in_time is None:
@@ -2902,6 +3234,7 @@ async def list_users(current: CurrentUser = Depends(admin_only)):
     with db() as conn:
         rows = conn.execute(
             "SELECT id, name, email, phone, role, status, enrolled_at, biometric_id, "
+            "COALESCE(transit_enabled, 0) AS transit_enabled, "
             "COALESCE(token_version, 0) AS token_version, "
             "(password_hash IS NOT NULL AND password_hash <> '') AS password_set "
             "FROM users WHERE 1 = 1" + hide_sql + " ORDER BY CAST(id AS INTEGER) ASC",
@@ -2938,6 +3271,10 @@ async def list_users(current: CurrentUser = Depends(admin_only)):
             "password_set": bool(row["password_set"]),
             "password_changed_at": changed.get(row["id"]),
             "sessions_revoked": row["token_version"],
+            # Whether this account may start a shift off-site. Published so the roster can show
+            # the switch's position for everyone, which is how an administrator audits who holds
+            # the privilege without opening each account in turn.
+            "transit_enabled": bool(row["transit_enabled"]),
         }
         for row in rows
     ]
@@ -2957,8 +3294,8 @@ async def add_user(
     with db(write=True) as conn:
         try:
             conn.execute(
-                "INSERT INTO users (id, name, email, phone, password_hash, role, status, biometric_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, 'active', ?)",
+                "INSERT INTO users (id, name, email, phone, password_hash, role, status, biometric_id, "
+                "transit_enabled) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)",
                 (
                     req.user_id,
                     req.name,
@@ -2972,6 +3309,7 @@ async def add_user(
                     # clears any legacy-named file that id left behind, so this account can
                     # never resolve to that face (see ``biometrics``).
                     biometrics.new_account_id(req.user_id),
+                    1 if req.transit_enabled else 0,
                 ),
             )
         except sqlite3.IntegrityError:
@@ -2982,7 +3320,11 @@ async def add_user(
             actor=current,
             entity="users",
             entity_id=req.user_id,
-            after={"name": req.name, "role": req.role},
+            after={
+                "name": req.name,
+                "role": req.role,
+                "transit_enabled": bool(req.transit_enabled),
+            },
             request=request,
         )
     return {"status": "success", "message": f"User {req.user_id} with role '{req.role}' successfully created."}
@@ -2997,6 +3339,7 @@ async def create_user(
     password: str = Form(...),
     email: str = Form(default=""),
     phone: str = Form(default=""),
+    transit_enabled: str = Form(default=""),
     photo: UploadFile | None = File(default=None),
     current: CurrentUser = Depends(admin_only),
 ):
@@ -3021,6 +3364,11 @@ async def create_user(
     """
     role = str(role or "").strip().lower()
     user_id = str(user_id).strip()
+    # A multipart body carries no booleans, so the same shape ``confirm_early_checkout`` uses
+    # is read here: anything truthy from the console's checkbox is the grant, everything else
+    # (including the field being absent) is the default refusal. Read once, so the insert and
+    # the audit entry cannot disagree about what was granted.
+    grant_transit = _form_flag(transit_enabled)
     if current.role == "admin" and role in ("admin", "head_admin"):
         raise HTTPException(
             status_code=403, detail="Standard Admins cannot create admin or head admin accounts."
@@ -3062,7 +3410,8 @@ async def create_user(
         try:
             conn.execute(
                 "INSERT INTO users (id, name, email, phone, password_hash, role, status, enrolled_at, "
-                "template_version, biometric_id) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)",
+                "template_version, biometric_id, transit_enabled) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)",
                 (
                     user_id,
                     name,
@@ -3076,6 +3425,7 @@ async def create_user(
                     # presence flag - whether the template exists is the file on disk.
                     1 if image is not None else 0,
                     biometrics.new_account_id(user_id),
+                    1 if grant_transit else 0,
                 ),
             )
         except sqlite3.IntegrityError:
@@ -3090,6 +3440,7 @@ async def create_user(
                 "source": "credentials_console",
                 "name": name,
                 "role": role,
+                "transit_enabled": grant_transit,
                 "photo": image is not None,
                 **({"liveness": decision.as_payload()} if decision is not None else {}),
             },
@@ -3255,6 +3606,16 @@ async def edit_user(
                     status_code=400, detail="hourly_rate must be between 0 and 1000."
                 )
             changes["hourly_rate"] = rate or None
+
+        if req.transit_enabled is not None:
+            # The one write that grants or revokes the off-geofence privilege, and it is here on
+            # purpose: it acts on a single named account, in the same transaction as the audit
+            # entry that records the change. There is no role- or group-level switch, so an
+            # administrator cannot hand the privilege to a whole category of workers - they
+            # name each person they mean. Stored as an int by SQLite either way, but kept as a
+            # bool here so the `before`/`after` pair in the log reads `false`/`true` rather than
+            # `0`/`1` - the log is read by people.
+            changes["transit_enabled"] = bool(req.transit_enabled)
 
         assignments = ", ".join(f"{key} = ?" for key in changes)
         conn.execute(
