@@ -35,7 +35,7 @@ from security import hash_password
 #: ``MIGRATIONS``. ``readiness`` refuses to start a deployment whose database is older, so a
 #: migration added without bumping this is a server that will not boot; the invariant is
 #: asserted in ``tests/test_site_shift_windows.py`` rather than left to memory.
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 #: Magic number stamped into the SQLite header so we can recognise "this is our
 #: database" - cheap protection against pointing DATABASE_PATH at some other file.
@@ -1574,6 +1574,32 @@ def migration_25_site_categories(conn: sqlite3.Connection) -> None:
         )
 
 
+def migration_26_off_office_workers(conn: sqlite3.Connection) -> None:
+    """Split the old 500-999 ``moallem`` band into moallem (500-749) and off-office (750-999).
+
+    WHY A MIGRATION AND NOT JUST A NEW RANGE
+    ----------------------------------------
+    A range in ``security.ROLE_ID_RANGES`` is a rule about ids an *API* may hand out; it says
+    nothing about rows already in ``users``. Once the range shrank, an account numbered 800
+    and still carrying ``role = 'moallem'`` would be a moallem outside the moallem band - the
+    one thing the ranges exist to make impossible, and invisible until somebody tried to edit
+    that account's id and was refused for a range that no longer contains the id they already
+    have. Rewriting the row is what makes the stored data and the range agree again.
+
+    The threshold is the band boundary, not a curated list: every id that used to belong to
+    moallem and now belongs to off-office moves, so the split is exactly the one the new ranges
+    describe. ``CAST`` matches how every other consumer reads ``users.id`` (TEXT holding a
+    decimal integer).
+
+    On a database with no such accounts this is a no-op, which is the common case here - the
+    old band was rarely filled past its midpoint - so it is safe to run unconditionally.
+    """
+    conn.execute(
+        "UPDATE users SET role = 'off_office' "
+        "WHERE role = 'moallem' AND CAST(id AS INTEGER) BETWEEN 750 AND 999"
+    )
+
+
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "audit_notifications_shift_rules", migration_1_audit_notifications_shift_rules),
     (2, "provenance_columns_status_code", migration_2_provenance_columns),
@@ -1600,6 +1626,7 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (23, "corpus_capture_consents", migration_23_corpus_capture_consents),
     (24, "walk_up_registration", migration_24_walk_up_registration),
     (25, "site_categories", migration_25_site_categories),
+    (26, "off_office_workers", migration_26_off_office_workers),
 ]
 
 

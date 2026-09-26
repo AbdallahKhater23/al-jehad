@@ -1,15 +1,15 @@
 {
- "frames": 1520,
+ "frames": 1546,
  "corpus": {
-  "frames": 1520,
-  "newest": "2026-09-24 02:10:03",
-  "newest_name": "205ef5665c045165fa0818fbf9f2840b.jpg",
-  "total_bytes": 2470783
+  "frames": 1546,
+  "newest": "2026-09-26 13:55:35",
+  "newest_name": "3e516e8a993cd543243a34140c8559f9.jpg",
+  "total_bytes": 2702743
  },
- "updated_at": "2026-09-25 14:00:12",
- "runs": 1,
+ "updated_at": "2026-09-26 14:19:04",
+ "runs": 2,
  "last_run": {
-  "measured_at": "2026-09-25 14:00:12",
+  "measured_at": "2026-09-26 14:19:04",
   "sample": {
    "frames": 200,
    "limit": 200
@@ -19,48 +19,48 @@
    "threshold": 0.6,
    "yunet": {
     "yunet@320": {
-     "found": 27,
+     "found": 53,
      "frames": 200,
-     "share": 0.135,
-     "ms_per_frame": 12.6
+     "share": 0.265,
+     "ms_per_frame": 20.7
     },
     "yunet@640": {
-     "found": 27,
+     "found": 53,
      "frames": 200,
-     "share": 0.135,
-     "ms_per_frame": 52.6
+     "share": 0.265,
+     "ms_per_frame": 87.4
     },
     "yunet@640+2x2tiling": {
-     "found": 3,
+     "found": 4,
      "frames": 200,
-     "share": 0.015,
-     "ms_per_frame": 128.3
+     "share": 0.02,
+     "ms_per_frame": 211.9
     }
    },
    "best_yunet": {
     "name": "yunet@640",
-    "found": 27,
+    "found": 53,
     "frames": 200,
-    "share": 0.135,
-    "ms_per_frame": 52.6
+    "share": 0.265,
+    "ms_per_frame": 87.4
    },
    "scrfd": {
     "name": "scrfd@640",
-    "found": 20,
+    "found": 35,
     "frames": 200,
-    "share": 0.1,
-    "ms_per_frame": 156.2,
+    "share": 0.175,
+    "ms_per_frame": 192.3,
     "misses_by_reason": {
-     "no_face": 180
+     "no_face": 165
     }
    },
-   "margin_frames": -7,
+   "margin_frames": -18,
    "scrfd_measured": true,
    "scrfd_ahead": false,
    "min_margin_frames": 1,
-   "margin_share": -0.035
+   "margin_share": -0.09000000000000002
   },
-  "summary": "SCRFD is behind by 7 frame(s) (scrfd@640 20/200 vs yunet@640 27/200, rule exactly_one, 156.2 ms/frame vs 52.6)",
+  "summary": "SCRFD is behind by 18 frame(s) (scrfd@640 35/200 vs yunet@640 53/200, rule exactly_one, 192.3 ms/frame vs 87.4)",
   "notified": false
  }
 }

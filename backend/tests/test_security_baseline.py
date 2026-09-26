@@ -20,6 +20,7 @@ from harness import (
     EMAILS,
     HEAD_ADMIN,
     MOALLEM,
+    OFF_OFFICE,
     PASSWORDS,
     SEEDED_PENDING_LOG_ID,
     WORKER,
@@ -129,7 +130,9 @@ def test_authorization_is_not_just_payload_validation(client):
 # 2. Under-privileged (but authenticated) callers
 # ---------------------------------------------------------------------------
 @pytest.mark.security_gap
-@pytest.mark.parametrize("user_id", [WORKER, MOALLEM], ids=["worker", "moallem"])
+@pytest.mark.parametrize(
+    "user_id", [WORKER, MOALLEM, OFF_OFFICE], ids=["worker", "moallem", "off_office"]
+)
 def test_non_admin_roles_cannot_reach_the_admin_surface(client, user_id):
     failures = _failures(client, SPOOFED_IDENTITY_CALLS, headers=bearer(user_id))
     assert not failures, (

@@ -1223,12 +1223,13 @@ const UI = {
             container.className = '';
             return this.renderLogin();
         }
-        // A ``worker`` belongs on the handset and nowhere else, and a ``moallem`` with them:
-        // a lead worker is not a console operator here - every ``/admin/*`` endpoint refuses
-        // that role (``admin_only`` names ``admin`` and ``head_admin``) - so the console was
-        // a screen of failing requests for them, and the handset, where they clock in and
-        // read their own hours exactly like a worker, is the one screen they can use.
-        if (State.user.role === 'worker' || State.user.role === 'moallem') {
+        // A ``worker`` belongs on the handset and nowhere else, and a ``moallem`` and an
+        // ``off_office`` worker with them: none of those roles is a console operator here -
+        // every ``/admin/*`` endpoint refuses them (``admin_only`` names ``admin`` and
+        // ``head_admin``) - so the console was a screen of failing requests for them, and the
+        // handset, where they clock in and read their own hours exactly like a worker, is the
+        // one screen they can use.
+        if (this.isHandsetRole(State.user.role)) {
             return this.renderWorkerPortal();
         }
         // An administrator reaches the console by default and steps onto the handset from it:
@@ -1314,11 +1315,23 @@ const UI = {
         bind('[data-close-handset]', this.closeHandset);
     },
 
+    /**
+     * The roles whose home is the handset rather than the console.
+     *
+     * One list, because ``worker || moallem`` was copied into four different checks, and a
+     * new handset role that updated only some of them would reach the console on one screen
+     * and the handset on another - the drift this method exists to stop.
+     */
+    isHandsetRole(role) {
+        return role === 'worker' || role === 'moallem' || role === 'off_office';
+    },
+
     /** A role code in the reader's own language. */
     roleLabel(role) {
         const keys = {
             worker: 'roleWorker',
             moallem: 'roleMoallem',
+            off_office: 'roleOffOffice',
             admin: 'roleAdmin',
             head_admin: 'roleHeadAdmin'
         };
@@ -1602,8 +1615,8 @@ const UI = {
      * whatever it last said rather than being cleared on a guess.
      */
     resyncUnreadBadge() {
-        const worker = !!State.user && (State.user.role === 'worker' || State.user.role === 'moallem');
-        if (!State.token || !(worker || State.handsetMode)) return;
+        const worker = !!State.user && (this.isHandsetRole(State.user.role) || State.handsetMode);
+        if (!State.token || !worker) return;
         if (typeof WORKER_MODULES === 'undefined' || !WORKER_MODULES.refreshAlerts) return;
         const now = Date.now();
         if (now - this._alertsResyncedAt < 1000) return;
@@ -1759,7 +1772,8 @@ const UI = {
      */
     renderWorkerProfile(container) {
         const roleLabel = I18n.__(State.user.role === 'moallem' ? 'roleMoallem'
-            : (State.user.role === 'admin' ? 'admin' : 'roleWorker'));
+            : State.user.role === 'off_office' ? 'roleOffOffice'
+                : (State.user.role === 'admin' ? 'admin' : 'roleWorker'));
         container.innerHTML = `
             <section class="hand-card">
                 <div class="hand-section-head">
@@ -2670,7 +2684,7 @@ const UI = {
      * error replacing a screen that works, and the badge keeps whatever it last said.
      */
     async refreshApprovalsBadge(force) {
-        const admin = !!State.user && State.user.role !== 'worker' && State.user.role !== 'moallem';
+        const admin = !!State.user && !this.isHandsetRole(State.user.role);
         if (!State.token || !admin) return;
         if (typeof API === 'undefined' || !API.request) return;
         const now = Date.now();

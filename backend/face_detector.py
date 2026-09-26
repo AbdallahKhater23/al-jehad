@@ -50,6 +50,7 @@ import hashlib
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -168,6 +169,7 @@ DETECTOR_INPUT_SIZE = 320
 
 _lock = threading.Lock()
 _detector: Any = None
+_capped: tuple[tuple[int, int], Any] | None = None
 _load_error: str | None = None
 _loaded = False
 
@@ -200,6 +202,150 @@ def available() -> tuple[bool, str]:
     """
     ok, reason = _ensure()
     return ok, reason
+
+
+#: The frame ceiling assumed when the settings cannot be read. It is the chain's own default
+#: (``settings.face_frame_max_px``), named here so a failure to read them warms at the size the
+#: deployment actually uses rather than at whatever a literal happened to be.
+_FALLBACK_FRAME_CEILING = 1280
+
+
+def frame_ceiling() -> int:
+    """The longest edge a face frame can have - the size ``uploads.face_frame`` resizes to.
+
+    Read from the settings rather than derived from ``DETECTOR_INPUT_SIZE``: that constant is
+    the scale the graph's anchors are laid out for, **not** the size a pass runs at, and
+    warming at it would leave the working set to grow to the real frame on the first punch -
+    which is the spike ``warm`` exists to move. Read per call, like every other setting here,
+    so a test or an operator can move it.
+    """
+    try:
+        import config
+
+        return max(1, int(getattr(config.settings, "face_frame_max_px", _FALLBACK_FRAME_CEILING)))
+    except Exception:  # pragma: no cover - config is importable everywhere else
+        return _FALLBACK_FRAME_CEILING
+
+
+def warm_frame_size(edge: int | None = None) -> tuple[int, int]:
+    """``(width, height)`` for the warm pass: the ceiling's long edge at 4:3.
+
+    4:3 (or its portrait 3:4, the same area) is the shape a phone photo arrives in, and the
+    working set follows the frame's *area* rather than either edge - measured in
+    ``tools/yunet_memory.py``. A square frame is the largest area the chain can produce at
+    this ceiling, but warming for it would hold ~35 MB more at every other punch; a square
+    upload therefore grows the pool once, which is the rarer and the cheaper mistake.
+    """
+    longest = max(1, int(edge if edge is not None else frame_ceiling()))
+    return longest, max(1, (longest * 3) // 4)
+
+
+def capped_input_size() -> int:
+    """The working size a pass runs at, or ``0`` for the frame's own size - the default.
+
+    Read per call, like every other setting here. ``FACE_DETECTOR_INPUT_SIZE`` is the one knob
+    that changes the crop, so it is read where the crop is decided rather than cached at import.
+    """
+    try:
+        import config
+
+        return max(0, int(getattr(config.settings, "face_detector_input_size", 0) or 0))
+    except Exception:  # pragma: no cover - config is importable everywhere else
+        return 0
+
+
+def capped_tiles() -> int:
+    """Tile grid for the capped pass. 1 is cheapest and loses the far range; 2 is the default."""
+    try:
+        import config
+
+        return max(1, int(getattr(config.settings, "face_detector_tiles", 2) or 2))
+    except Exception:  # pragma: no cover - config is importable everywhere else
+        return 2
+
+
+def capped_pipeline(size: int | None = None, tiles: int | None = None) -> str:
+    """The pipeline name for the capped crop, or ``PIPELINE`` when the pass runs at native size.
+
+    This is the whole safety rail, in one function. Reducing the working size changes the
+    *crop* - ``tools/detector_resolution_ab.py`` measures the crop moving by 5-33x the band's
+    entire headroom, on faces squarely inside the deployment's own band, not only at the far
+    range. A template is an embedding of a crop, so a differently-cropped pass is a different
+    pipeline and no band exists under this name: ``band_for`` raises, enrolment refuses, and the
+    application will not score a worker against lines derived from a crop their template was
+    not made with. Adoption is therefore *earned* by measuring a band for this exact name
+    (``tools/derive_facenet_band.py``), and a cap switched on without one fails loudly at
+    startup instead of quietly mis-matching staff.
+    """
+    working = capped_input_size() if size is None else max(0, int(size))
+    if working <= 0:
+        return PIPELINE
+    grid = capped_tiles() if tiles is None else max(1, int(tiles))
+    return f"{PIPELINE}-{working}x{grid}"
+
+
+def _models_run_elsewhere() -> bool:
+    """Whether this process has handed the face models to a child (``face_process``).
+
+    ``face_detector`` never speaks to that child - ``face_engine`` and ``face_onnx`` forward,
+    and they forward exactly the detector-backed calls, so a detection run *here* would be the
+    one thing in the process that still built a detector working set. Refusing is what keeps
+    that mode's promise (a smaller API process), and it is why the child - whose own flag is
+    cleared - is the only place ``warm`` ever builds one.
+    """
+    try:
+        import config
+
+        return bool(getattr(config.settings, "face_engine_process", False))
+    except Exception:  # pragma: no cover - config is importable everywhere else
+        return False
+
+
+def warm(edge: int | None = None) -> dict[str, Any]:
+    """Run one detection at the frame ceiling, at startup, so no punch pays for it.
+
+    WHY THIS EXISTS
+    ---------------
+    Opening the graph costs ~3 MB, but the *first detection* costs far more: the pass sizes a
+    working set in proportion to the frame's area - ~106 MB peak and ~88 MB kept at the 1280 px
+    ceiling (``tools/yunet_memory.py``), against a 232 KB model. Nothing ran a detection before
+    the first punch, so whoever clocked in first paid that allocation *and* the detector's cold
+    start, with their colleagues queued behind them.
+
+    This does not make the process smaller - the working set is the same size and is now held
+    from boot instead of from the first punch - it moves the spike and the latency to a moment
+    when nothing is waiting for an answer. That is the whole change, and it is why the frame is
+    built at the ceiling: a warm pass at a smaller size would leave the pool to grow to the
+    real frame later, which is the spike this exists to move.
+
+    Never raises, and never builds a detector in a process that has delegated the models to a
+    child: a host without the model must still boot, and the process that owns the models is
+    the one that should warm them. Returns a small description either way.
+    """
+    if _models_run_elsewhere():
+        return {
+            "available": True,
+            "warmed": False,
+            "delegated": True,
+            "error": "the face models run in a child process, which warms its own detector",
+        }
+    ok, reason = _ensure()
+    if not ok or _detector is None:
+        return {"available": False, "warmed": False, "error": reason or "detector unavailable"}
+    width, height = warm_frame_size(edge)
+    # A synthetic frame, because the pool this sizes depends on the frame's dimensions and on
+    # nothing about its contents - and a real face is not committed to this repository.
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    started = time.perf_counter()
+    rows = _detect_rows(frame)
+    return {
+        "available": True,
+        "warmed": True,
+        "width": width,
+        "height": height,
+        "detections": len(rows),
+        "seconds": round(time.perf_counter() - started, 3),
+    }
 
 
 def _ensure() -> tuple[bool, str]:
@@ -272,7 +418,9 @@ def active() -> tuple[str, str]:
     mismatch this provenance exists to catch.
     """
     ok, _reason = _ensure()
-    return (DETECTOR_NAME, PIPELINE) if ok else (FALLBACK_DETECTOR, FALLBACK_PIPELINE)
+    if not ok:
+        return (FALLBACK_DETECTOR, FALLBACK_PIPELINE)
+    return (DETECTOR_NAME, capped_pipeline())
 
 
 def active_pipeline() -> str:
@@ -614,6 +762,13 @@ def detect_raw(image) -> list[np.ndarray]:
     if frame is None or frame.size == 0 or frame.shape[0] == 0 or frame.shape[1] == 0:
         return []
     rows = _detect_rows(frame)
+    if capped_input_size() > 0:
+        # The cap already reads every frame at a scale the anchors were built for, which is
+        # precisely what the close-up retry below exists to reach. Re-reading a close-up at
+        # CLOSE_FRAME_RETRY_PX here would be a second, *upscaled* pass - a third crop, under the
+        # same pipeline name - so the retry stays the native path's answer to a native path's
+        # problem, and is skipped once a cap is in force.
+        return rows
     width = float(frame.shape[1])
     if width <= CLOSE_FRAME_RETRY_PX:
         # Already at (or below) the working width the retry would ask for: there is nothing to
@@ -648,8 +803,63 @@ def detect_raw(image) -> list[np.ndarray]:
     return retry
 
 
+def _capped_detector(size: int, tile_count: int) -> Any:
+    """The letterboxed detector, built once per ``(size, tiles)``.
+
+    One instance, reused: the working set is a function of the input size, and reusing the same
+    size is what makes tiling free in memory (``tools/yunet_memory.py``). Cached rather than
+    rebuilt per pass for the same reason the native detector is - a fresh session per frame would
+    pay the construct cost and, worse, would keep allocating arenas nothing joins.
+    """
+    global _capped
+    key = (int(size), int(tile_count))
+    if _capped is not None and _capped[0] == key:
+        return _capped[1]
+    import detector_640
+
+    detector = detector_640.YuNetDetector(str(model_path()), input_size=key[0])
+    _capped = (key, detector)
+    return detector
+
+
+def _capped_rows(frame: np.ndarray, size: int, tile_count: int) -> list[np.ndarray]:
+    """One capped pass, shaped as the same ``[x, y, w, h, 5x(x,y), score]`` rows as the native one.
+
+    ``detector_640`` returns them in *native* coordinates already - the letterbox map is
+    invertible and it applies the inverse itself - so nothing here rescales anything, and the
+    box and the landmarks stay a matched pair for ``align``.
+    """
+    rows: list[np.ndarray] = []
+    for detection in _capped_detector(size, tile_count).detect(frame, tiles=tile_count):
+        points = np.asarray(detection.landmarks, dtype=np.float32).reshape(5, 2)
+        rows.append(
+            np.array(
+                [*detection.box, *points.ravel(), float(detection.score)],
+                dtype=np.float32,
+            )
+        )
+    return rows
+
+
 def _detect_rows(frame: np.ndarray) -> list[np.ndarray]:
-    """One detection pass, at the frame's own size - the model call, and nothing else."""
+    """One detection pass - the model call, and nothing else.
+
+    At the frame's own size by default. With ``FACE_DETECTOR_INPUT_SIZE`` set, the frame is
+    letterboxed into that working size instead and the answer is mapped back to native
+    coordinates (``detector_640``): the same reach for ~a quarter of the working set
+    (``tools/yunet_memory.py``), at the cost of a different crop (``capped_pipeline``).
+    """
+    size = capped_input_size()
+    if size > 0:
+        height, width = frame.shape[:2]
+        with _lock:
+            try:
+                return _capped_rows(frame, size, capped_tiles())
+            except Exception:  # noqa: BLE001 - a frame it cannot parse is "no face", not a crash
+                log.warning(
+                    "capped face detector failed on a %sx%s frame", width, height, exc_info=True
+                )
+                return []
     ok, _reason = _ensure()
     if not ok or _detector is None:
         return []
@@ -958,5 +1168,7 @@ def describe() -> dict[str, Any]:
         "available": ok,
         "model": str(model_path()),
         "model_fingerprint": fingerprint(),
+        "working_size": capped_input_size() or None,
+        "tiles": capped_tiles() if capped_input_size() else None,
         "error": reason or None,
     }

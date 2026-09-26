@@ -119,13 +119,21 @@ def _models():
 def _describe(load: bool) -> dict:
     """What this process holds. ``load`` decides whether describing it also opens it."""
     face_engine, face_onnx, face_detector, liveness = _models()
+    detector_warm = None
     if load:
         embedding = face_onnx.load_now()
+        # The embedding graph is not the only thing the first punch pays for: the first
+        # *detection* sizes the detector's working set to the frame it is shown, which is why
+        # ``face_detector.warm`` exists. A preload that loaded the embedding and left the
+        # detector cold would have moved only half the spike off the request - and here, in
+        # the process that owns the models, building it is exactly what this mode allows.
+        detector_warm = face_detector.warm()
     else:
         embedding = face_onnx.get_engine().describe()
     return {
         "embedding": embedding,
         "detector": face_detector.describe(),
+        "detector_warm": detector_warm,
         "liveness": liveness.status(),
         "pid": os.getpid(),
         "rss_bytes": _self_rss(),

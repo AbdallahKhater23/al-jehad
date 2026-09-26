@@ -45,6 +45,7 @@ from harness import (
     ADMIN,
     HEAD_ADMIN,
     MOALLEM,
+    OFF_OFFICE,
     WORKER,
     bearer,
     clock_in,
@@ -194,7 +195,7 @@ def test_metrics_refuses_an_anonymous_scrape(client):
     assert response.json()["detail"]["error_code"] == "metrics_unauthorised"
 
 
-@pytest.mark.parametrize("user_id", [WORKER, MOALLEM])
+@pytest.mark.parametrize("user_id", [WORKER, MOALLEM, OFF_OFFICE])
 def test_metrics_refuses_a_non_administrator(client, user_id):
     response = client.get("/api/v1/metrics", headers=bearer(user_id))
     assert response.status_code == 401

@@ -122,7 +122,7 @@ def test_the_link_says_whether_it_is_open_and_what_the_form_must_satisfy(client)
 def test_the_open_link_describes_its_policy_and_no_data(client, intake):
     body = client.get(PUBLIC).json()
     assert body["enabled"] is True
-    assert body["roles"] == ["worker", "moallem"]
+    assert body["roles"] == ["worker", "moallem", "off_office"]
     assert body["photo_policy"]["max_bytes"] == 5 * 1024 * 1024
     assert body["min_password_length"] >= 8
     assert body["consent_version"] == registrations.CONSENT_VERSION
@@ -471,8 +471,20 @@ def test_a_moallem_is_approved_into_the_lead_worker_block(client, intake):
     response = approve(client, request_id)
     assert response.status_code == 200, response.text[:300]
     worker_id = int(response.json()["worker_id"])
-    assert 500 <= worker_id <= 999
+    assert 500 <= worker_id <= 749, "the lead-worker block ends where the new role's begins"
     assert db_scalar("SELECT role FROM users WHERE id = ?", (str(worker_id),)) == "moallem"
+
+
+def test_an_off_office_worker_is_approved_into_the_upper_block(client, intake):
+    """The old moallem band's upper half is a role of its own, with numbers of its own."""
+    request_id = submit(
+        client, name="Off-Office Applicant", role="off_office", image=photo(82)
+    ).json()["request_id"]
+    response = approve(client, request_id)
+    assert response.status_code == 200, response.text[:300]
+    worker_id = int(response.json()["worker_id"])
+    assert 750 <= worker_id <= 999, "an off-office worker is never handed a lead worker's number"
+    assert db_scalar("SELECT role FROM users WHERE id = ?", (str(worker_id),)) == "off_office"
 
 
 def test_an_approved_worker_can_clock_in(client, intake):

@@ -476,9 +476,11 @@ def test_the_schema_version_names_the_newest_migration():
     # the mid-shift decision on a crossing, 22 ``refused_punches``, the score, reason and frame of
     # a punch the band rejected, 23 the corpus-capture consent records, and 24 the walk-up
     # registration requests - the public onboarding link's queue, a row of which becomes an
-    # account only when an administrator approves it, and 25 ``site_categories``, the layer
-    # between a site's own window columns and the company rules.)
-    assert migrations.SCHEMA_VERSION == 25
+    # account only when an administrator approves it, 25 ``site_categories``, the layer
+    # between a site's own window columns and the company rules, and 26 the off-office-worker
+    # split of the old moallem band: any account the shrunk range left in 750-999 is rewritten
+    # to the new role so the stored role and the id range still agree.)
+    assert migrations.SCHEMA_VERSION == 26
 
 
 def test_the_migration_is_replayable_and_idempotent():

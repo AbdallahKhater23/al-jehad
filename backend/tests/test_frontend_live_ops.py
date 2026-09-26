@@ -145,6 +145,22 @@ function boardPane(env) {
     return env.evaluate("document.getElementById('liveOpsBoard').innerHTML");
 }
 
+// The board as a *fresh* render left it.
+//
+// A browser parses the markup written into ``#adminContent`` and builds the ``#liveOpsBoard``
+// node inside it; this stub keeps innerHTML as a string and never parses it, so the by-id
+// board element stays empty until the board repaints *in place*. A test that reads the board
+// straight after ``renderAdminTab`` therefore has to read it out of the render, and a test
+// that reads it after a toggle/poll/tick reads it off ``boardPane`` above.
+function boardInRender(env) {
+    const admin = rendered(env);
+    const marker = '<div id="liveOpsBoard">';
+    const open = admin.indexOf(marker);
+    if (open < 0) return '';
+    const end = admin.lastIndexOf('</section>');
+    return admin.slice(open + marker.length, admin.lastIndexOf('</div>', end));
+}
+
 function rowOf(markup, id) {
     const match = new RegExp('<tr[^>]*data-session="' + id + '"[\\\\s\\\\S]*?</tr>').exec(markup);
     return match ? match[0] : '';
@@ -220,8 +236,11 @@ const results = {};
             label: env.evaluate("I18n.__('liveOpsShowMore').replace('{count}', '2')"),
             label_present: markup.indexOf(env.evaluate("I18n.__('liveOpsShowMore').replace('{count}', '2')")) >= 0,
             is_a_button: /<button[^>]*data-live-ops-toggle/.test(markup),
-            // The fold's words are its own: the filter's sentence is untouched by it.
-            filter_sentence_is_not_the_folds: markup.indexOf(env.evaluate("I18n.__('liveOpsShowing').replace('{shown}', '2').replace('{total}', '2')")) < 0
+            // The fold's words are its own: what it must *not* say is the filter's sentence
+            // ("Showing 2 of 4"), which already means "a search or a site chip is narrowing
+            // this board" - a fold reported in those words leaves an operator unable to tell
+            // their own filter from a fold they forgot.
+            filter_sentence_is_not_the_folds: markup.indexOf(env.evaluate("I18n.__('liveOpsShowing').replace('{shown}', '2').replace('{total}', '4')")) < 0
         },
         // Every element the one-second tick rewrites has to be able to answer
         // "how long has this shift run?" on its own - a fact element without a
@@ -244,7 +263,9 @@ const results = {};
 // 1a. the fold opens: every shift, in the same order, under the same status line
 {
     const returned = env.evaluate("UI_MODULES.toggleLiveOpsExpanded()");
-    const markup = rendered(env);
+    // The repaint lands on the board element; the stats and status above it do not move.
+    const markup = boardPane(env);
+    const page = rendered(env);
     results.expanded = {
         returned: returned,
         order: sessionOrder(markup),
@@ -263,7 +284,7 @@ const results = {};
             hidden_count_gone: markup.indexOf(env.evaluate("I18n.__('liveOpsShowMore').replace('{count}', '2')")) < 0
         },
         // The figures above the board are the *read*, not the fold: opening it moved no number.
-        on_site: statOf(markup, 'on-site'),
+        on_site: statOf(page, 'on-site'),
         filter_note: env.evaluate("UI_MODULES.liveOpsFilterNoteHtml(UI_MODULES._liveOps)"),
         reads: env.requests.filter((r) => r.url.indexOf('/admin/active_sessions') >= 0).length
     };
@@ -413,7 +434,7 @@ const results = {};
     // function directly - which would have skipped the fold entirely.
     env6.evaluate("localStorage.setItem('layoutOverride', 'mobile')");
     await env6.evaluate("UI.renderAdminTab('Live Ops')");
-    const folded = boardPane(env6);
+    const folded = boardInRender(env6);
     results.cards = {
         cards: (folded.match(/data-session="/g) || []).length,
         has_table: folded.indexOf('<table') >= 0,
@@ -488,13 +509,17 @@ const results = {};
     await env9b.evaluate("UI.renderAdminTab('Live Ops')");
     const folded = {
         expanded: env9b.evaluate("UI_MODULES._liveOpsExpanded"),
-        rows: sessionOrder(boardPane(env9b)).length,
-        has_toggle: boardPane(env9b).indexOf('data-live-ops-toggle') >= 0
+        rows: sessionOrder(boardInRender(env9b)).length,
+        has_toggle: boardInRender(env9b).indexOf('data-live-ops-toggle') >= 0
     };
+    const readCount = () => env9b.requests.filter((r) => r.url.indexOf('/admin/active_sessions') >= 0).length;
+    const reads_before_open = readCount();
     env9b.evaluate("UI_MODULES.toggleLiveOpsExpanded()");
     const opened = {
         expanded: env9b.evaluate("UI_MODULES._liveOpsExpanded"),
-        rows: sessionOrder(boardPane(env9b)).length
+        rows: sessionOrder(boardPane(env9b)).length,
+        reads_before: reads_before_open,
+        reads_after: readCount()
     };
     const note_opened = env9b.evaluate("UI_MODULES.liveOpsFilterNoteHtml(UI_MODULES._liveOps)");
 
@@ -523,12 +548,14 @@ const results = {};
     await env9b.evaluate("UI.renderAdminTab('Live Ops')");
     const after_return = {
         expanded: env9b.evaluate("UI_MODULES._liveOpsExpanded"),
-        rows: sessionOrder(boardPane(env9b)).length
+        // A fresh render, so this reads the render rather than the (now stale) board element.
+        rows: sessionOrder(boardInRender(env9b)).length,
+        has_toggle: boardInRender(env9b).indexOf('data-live-ops-toggle') >= 0
     };
 
     results.fold = {
-        folded, opened, after_poll, after_tick, after_return, note_opened,
-        // Opening the fold is a repaint of the board, never another read of the server.
+        folded, opened,        after_poll, after_tick, after_return, note_opened,
+        // The total across the whole block: one render, one poll, one re-render on return.
         reads: env9b.requests.filter((r) => r.url.indexOf('/admin/active_sessions') >= 0).length
     };
 }
@@ -562,7 +589,7 @@ const results = {};
         return responders(url);
     });
     await short.evaluate("UI.renderAdminTab('Live Ops')");
-    const pane = boardPane(short);
+    const pane = boardInRender(short);
     results.short_board = {
         rows: sessionOrder(pane).length,
         has_toggle: pane.indexOf('data-live-ops-toggle') >= 0,
@@ -617,24 +644,31 @@ def test_the_board_leads_with_the_figures_an_operator_came_for(results):
 
 def test_the_worst_shift_is_the_first_row(results):
     """Newest-first buries exactly the row an operator opened the board to find."""
-    assert results["board"]["order"] == ["w1", "w2", "w3", "w4"], results["board"]["order"]
+    assert results["board"]["order"] == ["w1", "w2"], (
+        "the board opens folded, and even folded it leads with the worst shift"
+    )
+    assert results["expanded"]["order"] == ["w1", "w2", "w3", "w4"], (
+        f"opening the fold shows the same order: {results['expanded']['order']}"
+    )
 
 
 def test_each_shift_is_labelled_with_what_it_has_crossed(results):
     states = results["board"]["states"]
     assert states["w1"] == "closing", "10 h on site is past the paid day"
     assert states["w2"] == "over", "7.75 paid hours is past the 7.5 h overtime line"
-    assert states["w3"] == "on" and states["w4"] == "on"
+    expanded = results["expanded"]["states"]
+    assert expanded["w3"] == "on" and expanded["w4"] == "on"
     assert results["board"]["w2_has_late_badge"], "the late arrival is named, not just coloured"
 
 
 def test_a_closing_shift_names_the_moment_it_closes(results):
-    board = results["board"]
-    assert board["w1_names_a_close_time"], (
+    assert results["board"]["w1_names_a_close_time"], (
         "an operator deciding whether to leave a shift alone needs the time the "
         "system will close it"
     )
-    assert board["w3_has_no_close_time"], "and a shift on an ordinary day must not claim one"
+    assert results["expanded"]["w3_has_no_close_time"], (
+        "and a shift on an ordinary day must not claim one"
+    )
 
 
 def test_every_live_fact_can_recompute_itself_from_the_dom(results):
@@ -646,9 +680,14 @@ def test_every_live_fact_can_recompute_itself_from_the_dom(results):
     after it rendered. Only a browser showed it; this is the guard.
     """
     board = results["board"]
-    assert board["fact_elements"] >= 12, "the board should have facts to tick"
+    assert board["fact_elements"] >= 6, "the board should have facts to tick"
     assert board["facts_without_a_start"] == [], (
         f"these tick targets cannot recompute themselves: {board['facts_without_a_start']}"
+    )
+    expanded = results["expanded"]
+    assert expanded["fact_elements"] >= 12, "every shown shift carries its own tick targets"
+    assert expanded["facts_without_a_start"] == [], (
+        f"a revealed row that cannot recompute itself: {expanded['facts_without_a_start']}"
     )
 
 
@@ -656,7 +695,7 @@ def test_the_live_timers_read_as_hours_and_minutes(results):
     elapsed = results["board"]["elapsed"]
     assert elapsed["w1"] == "10h 0m", elapsed
     assert elapsed["w2"] == "8h 15m", elapsed
-    assert elapsed["w4"] == "2h 0m", elapsed
+    assert results["expanded"]["elapsed_w4"] == "2h 0m", results["expanded"]["elapsed_w4"]
     assert results["facts"]["on_site_is_what_the_row_shows"] == "8h 0m"
 
 
@@ -664,7 +703,12 @@ def test_the_table_is_a_table_a_screen_reader_can_use(results):
     board = results["board"]
     assert board["has_table"] and board["has_caption"], "a data table needs a caption and headers"
     assert board["aria_sort"], "the sorted column has to say so"
-    assert board["rows_have_force_out"] == 4, "one action per person, reachable from the row"
+    assert board["rows_have_force_out"] == 2, (
+        "one action per *shown* row, reachable from the row"
+    )
+    assert results["expanded"]["rows_have_force_out"] == 4, (
+        "and one for each of the four once the fold is open"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -777,15 +821,99 @@ def test_a_board_that_could_not_be_loaded_says_so_and_offers_a_retry(results):
 
 def test_the_phone_layout_carries_the_same_facts_as_the_table(results):
     cards = results["cards"]
-    assert cards["cards"] == 4 and not cards["has_table"]
+    # The phone folds at the same point as the table: the first two shifts, then the control.
+    assert cards["cards"] == 2 and not cards["has_table"]
     assert cards["closing_named"] and cards["over_named"] and cards["late_named"], (
         "colour is never the only signal"
     )
-    assert cards["force_out"] == 4
+    assert cards["force_out"] == 2
     assert cards["elapsed_present"], "the phone gets the live timer too"
+    assert cards["fold_present"] and cards["closed"], (
+        "the phone gets the fold too, and it says it is closed"
+    )
+    opened = results["cards_expanded"]
+    assert opened["cards"] == 4 and opened["force_out"] == 4 and opened["open"], (
+        f"the phone reveals every shift when opened: {opened}"
+    )
     assert results["mobile_sort"]["has_select"] and results["mobile_sort"]["options"] == 3, (
         "cards have no column headers, so the phone needs the sort control"
     )
+
+
+# ---------------------------------------------------------------------------
+# The fold: a board that opens on the shift that needs a decision
+# ---------------------------------------------------------------------------
+def test_the_board_opens_folded_and_says_how_many_it_hides(results):
+    fold = results["board"]["fold"]
+    assert fold["toggle_present"] and fold["is_a_button"], (
+        "the fold is a control a keyboard can reach, not a styled word"
+    )
+    assert fold["closed"], "a fresh board is closed, and says so for a screen reader"
+    assert fold["label"] == "Show more (2)", fold["label"]
+    assert fold["label_present"], "the control carries the number of rows it is hiding"
+    assert fold["filter_sentence_is_not_the_folds"], (
+        "the fold must not borrow the filter's 'Showing X of Y' sentence, which already means "
+        "'a search or a site chip is narrowing this board'"
+    )
+    opened = results["expanded"]["fold"]
+    assert opened["toggle_present"] and opened["open"], "opening flips aria-expanded to true"
+    assert opened["label"] == "Show fewer", opened["label"]
+    assert opened["label_present"]
+    assert opened["hidden_count_gone"], "the 'Show more (n)' label is gone once every row shows"
+
+
+def test_the_fold_never_moves_the_filter_sentence(results):
+    """A fold is not a filter: the note above the board is the filter's own voice."""
+    assert results["board"]["filter_note"] == "4 open shifts"
+    assert results["fold"]["note_opened"] == "4 open shifts", (
+        "opening the fold moved no figure and no sentence"
+    )
+
+
+def test_the_fold_survives_the_tick_and_the_poll(results):
+    """The board replaces its own innerHTML on the 1 s tick and the 45 s poll.
+
+    A fold kept in a DOM attribute or a class name would snap shut under the operator's
+    hands mid-read; the state has to live in the module.
+    """
+    fold = results["fold"]
+    assert fold["folded"]["expanded"] is False and fold["folded"]["rows"] == 2
+    assert fold["folded"]["has_toggle"], "four shifts on a two-row board means a control"
+    assert fold["opened"]["expanded"] is True and fold["opened"]["rows"] == 4
+    # The 45 s poll, finding a change: this repaints the whole board.
+    assert fold["after_poll"]["expanded"] is True and fold["after_poll"]["rows"] == 4
+    assert fold["after_poll"]["open"], "the repainted board still says it is open"
+    assert fold["after_poll"]["label_present"], "and still offers the way back closed"
+    assert fold["after_poll"]["shows_the_new_name"], (
+        "the poll really did land - otherwise 'the fold survived it' proves nothing"
+    )
+    # The 1 s tick and an explicit repaint, for the same reason.
+    assert fold["after_tick"]["expanded"] is True and fold["after_tick"]["rows"] == 4
+    assert fold["opened"]["reads_after"] == fold["opened"]["reads_before"], (
+        "opening the fold repaints the read in hand; it must not re-read the server: "
+        f"{fold['opened']}"
+    )
+    # ...and leaving the tab starts folded again: the fold is about the board being read.
+    assert fold["after_return"]["expanded"] is False and fold["after_return"]["rows"] == 2
+    assert fold["after_return"]["has_toggle"], "and the fresh board offers the control again"
+
+
+def test_two_shifts_fit_without_a_fold(results):
+    boundary = results["boundary"]
+    assert boundary["fold_at_two"] == "", "two shifts fit: no control at all"
+    assert boundary["fold_at_three"], "a third shift needs the control"
+    assert boundary["three_label"] == "Show more (1)", boundary["three_label"]
+    assert boundary["visible_two"] == 2 and boundary["visible_one"] == 1
+    assert boundary["visible_of_four_closed"] == 2
+    assert boundary["visible_of_four_open"] == 4
+    assert boundary["expanded_state_cleared_by_stop"] is False, (
+        "stopLiveOps is the only place the fold resets - never the tick or the poll"
+    )
+    short = results["short_board"]
+    assert short["rows"] == 2 and not short["has_toggle"], (
+        "a board of exactly two is laid out in full, with nothing hidden"
+    )
+    assert short["has_table"], "the board is still a table, just one that fits"
 
 
 # ---------------------------------------------------------------------------

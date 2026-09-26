@@ -374,7 +374,7 @@ const results = {};
         keeps_id: markup.indexOf('value="642"') >= 0,
         keeps_name: markup.indexOf('value="Lead Worker"') >= 0,
         role: attr(markup, 'data-id-range="([^"]*)"'),
-        range_shown: markup.indexOf('500-999') >= 0,
+        range_shown: markup.indexOf('500-749') >= 0,
         selected: /<option value="moallem" selected>/.test(markup)
     };
 }
@@ -519,13 +519,13 @@ def test_the_create_panel_states_the_policy_and_picks_a_password(results):
     assert panel["states_photos_only"] is True
     assert panel["id_range"] == "worker"
     assert panel["range_shown"] is True, "the id block for the chosen role, before the server has to say it"
-    assert panel["roles"] == ["worker", "moallem", "admin", "head_admin"]
+    assert panel["roles"] == ["worker", "moallem", "off_office", "admin", "head_admin"]
     assert panel["requests"] == 0, "rendering a form is not a reason to talk to the server"
 
 
 def test_a_standard_admin_is_not_offered_roles_it_cannot_create(results):
     """The server refuses these; offering them would be a button that always fails."""
-    assert results["panel"]["roles_for_standard_admin"] == ["worker", "moallem"]
+    assert results["panel"]["roles_for_standard_admin"] == ["worker", "moallem", "off_office"]
 
 
 def test_the_upload_rule_is_enforced_before_anything_is_uploaded(results):
@@ -617,7 +617,9 @@ def test_the_new_account_password_can_be_typed_instead_of_generated(results):
 def test_a_registration_link_is_issued_with_the_admins_own_id_name_and_role(results):
     panel = results["invite_panel"]
     assert panel["has_panel"] is True
-    assert panel["roles"] == ["worker", "moallem"], "a link may only create a worker or a moallem"
+    assert panel["roles"] == ["worker", "moallem", "off_office"], (
+        "a link may only create the business roles"
+    )
     assert panel["requests"] == 0
 
     call = results["invite_call"]

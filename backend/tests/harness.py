@@ -564,6 +564,27 @@ def _stub_detect_landmarks(image):
     ]
 
 
+def _stub_warm(edge=None):
+    """The startup warm-up, answered without a graph or a detection.
+
+    ``main`` warms the detector at import, so without this every test session would load the
+    real YuNet model and run a real OpenCV pass over a synthetic frame - ~100 MB and a real
+    detection per import, to prove nothing about the routing these tests are about. The
+    returned shape is the real one (the ceiling at 4:3), so a test can still assert that the
+    warm is aimed at the frame the chain actually produces; the real pass is exercised in
+    ``test_face_detector.py``, which puts the original back.
+    """
+    width, height = _face_detector.warm_frame_size(edge)
+    return {
+        "available": True,
+        "warmed": True,
+        "width": width,
+        "height": height,
+        "detections": 0,
+        "seconds": 0.0,
+    }
+
+
 def _stub_detect_and_align(image):
     """The detector's answer, in the shape ``extract_faces`` and ``represent`` read.
 
@@ -590,11 +611,13 @@ REAL_FACE_DETECTOR = {
     "available": _face_detector.available,
     "detect_and_align": _face_detector.detect_and_align,
     "detect_landmarks": _face_detector.detect_landmarks,
+    "warm": _face_detector.warm,
 }
 
 _face_detector.available = _stub_available
 _face_detector.detect_and_align = _stub_detect_and_align
 _face_detector.detect_landmarks = _stub_detect_landmarks
+_face_detector.warm = _stub_warm
 
 
 # ---------------------------------------------------------------------------
@@ -709,6 +732,10 @@ def install_outbound_guard() -> None:
 # ---------------------------------------------------------------------------
 WORKER = "1"
 MOALLEM = "600"
+#: The upper half of the old 500-999 moallem band, now its own handset role. Its id is
+#: deliberately above 749, so a test that gets the split wrong - treating the two roles as
+#: one range - would hand a moallem this number and be caught here.
+OFF_OFFICE = "800"
 ADMIN = "1000"
 HEAD_ADMIN = "5000"
 
@@ -716,6 +743,7 @@ HEAD_ADMIN = "5000"
 SEED_USERS: dict[str, tuple[str, str, str, str]] = {
     WORKER: ("Seed Worker", "worker", "worker-pass-123", "seed1@example.test"),
     MOALLEM: ("Seed Lead Worker", "moallem", "moallem-pass-123", "seed600@example.test"),
+    OFF_OFFICE: ("Seed Off-Office Worker", "off_office", "off-office-pass-123", "seed800@example.test"),
     ADMIN: ("Seed Admin", "admin", "admin-pass-123", "seed1000@example.test"),
     HEAD_ADMIN: ("Seed Head Admin", "head_admin", "head-pass-123", "seed5000@example.test"),
 }
@@ -788,9 +816,15 @@ ACTIVITY_TABLES: Final = (
 CONFIGURATION_TABLES: Final = ("schema_migrations", "developer_config_version")
 
 #: Tables ``seed_database`` rewrites from scratch on every test, so their live contents never
-#: reach an assertion: the roster, the sites, the shift rules a punch is judged by, and the
-#: company's own name and mark.
-SEEDED_TABLES: Final = ("users", "construction_sites", "shift_rules", "company_settings")
+#: reach an assertion: the roster, the sites, the shift rules a punch is judged by, the
+#: company's own name and mark, and the site categories the console groups sites by.
+SEEDED_TABLES: Final = (
+    "users",
+    "construction_sites",
+    "shift_rules",
+    "company_settings",
+    "site_categories",
+)
 
 #: The biometric id every seeded account is given, minted once for the session.
 #:
@@ -992,6 +1026,20 @@ def seed_database(app_module) -> None:
                 (name, lat, lon, radius, *SEED_SITE_WINDOWS.get(name, (None, None, None)))
                 for name, (lat, lon, radius) in SITES.items()
             ],
+        )
+        # The site categories are configuration too, and the snapshot is a live database: a real
+        # deployment may have added a category or renamed one of the three the migration seeds.
+        # Rewriting them from the shipped seed list keeps a test that counts categories ("the
+        # three ops names are seeded", "the seeding is idempotent") reading the shipped state
+        # rather than somebody's live edits. ``migrations`` is imported here, not at module
+        # scope, so the harness does not pull the application's schema module in before the
+        # stubs are installed.
+        import migrations
+
+        conn.execute("DELETE FROM site_categories")
+        conn.executemany(
+            "INSERT INTO site_categories (name, created_at, updated_at) VALUES (?,?,?)",
+            [(name, now, now) for name in migrations.SEED_SITE_CATEGORIES],
         )
         conn.execute("DELETE FROM active_sessions")
         conn.execute(

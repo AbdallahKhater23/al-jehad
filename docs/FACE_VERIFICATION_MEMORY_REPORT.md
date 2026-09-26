@@ -140,13 +140,19 @@ fixed **~86 MB per process**, on top of the embedding graph's floor.
   that is exactly the small-face regime `detect_raw` reads at native size to serve, so it is
   an accuracy tradeoff, not a free win (see `face_detector.MIN_SUBJECT_PX` and the framing
   coach's working-distance band).
-* **The first-call transient is free to move.** Nothing warms the detector at startup today:
-  `settings.face_model_preload` calls `face_onnx.load_now()` (the embedding graph only) and
-  `readiness` calls `face_detector.describe()`, which loads the 232 KB model but runs no
-  detection. So the first worker of the day pays the ~104 MB peak spike *and* a ~141 ms
-  detection instead of ~116 ms. One synthetic detection at the ceiling size during startup
-  would move both to boot, where nothing is waiting. It does not reduce total memory — it
-  relocates the spike away from a request.
+* **The first-call transient is free to move — and now is moved.** Nothing used to warm the
+  detector at startup: `settings.face_model_preload` called `face_onnx.load_now()` (the
+  embedding graph only) and `readiness` called `face_detector.describe()`, which loads the
+  232 KB model but runs no detection. So the first worker of the day paid the ~104 MB peak
+  spike *and* the detector's cold start, with the queue behind them. **Applied:**
+  `face_detector.warm()` runs one synthetic detection at the frame ceiling, and `main`'s
+  preload block calls it beside `face_onnx.load_now()`. Re-measured in a fresh process, the
+  first real detection of a 1280×960 frame goes from **+107.3 MB peak / 89.7 MB kept / 111 ms**
+  to **+0.7 MB / 3.7 MB** once the warm has run. It does not reduce total memory — it
+  relocates the spike and the latency to boot, where nothing is waiting. The frame is 4:3 at
+  `settings.face_frame_max_px` (the size the chain actually resizes to, so no punch can grow
+  the pool past it), and warm declines when `FACE_ENGINE_PROCESS` is set, because building a
+  detector here is exactly what that mode moves out; the child warms its own instead.
 
 #### Stage by stage, and the option that costs no reach
 
@@ -187,13 +193,30 @@ consequences the earlier reading missed:
   | `detector_640`, input 480, 2 tiles | +17.6 MB | +20.9 MB | 23.5 px |
 
   A 2×2 grid at a 640 input processes about the same total pixels as one 1280 native pass
-  (4 × 640×480 ≈ 1280×960), so the 640-with-tiles option is **~61 MB resident / ~73 MB peak
-  less, at the same compute and a comparable reach** (17.6 px native, inside the runtime's own
-  `MIN_SUBJECT_PX = 24`). That is the avoidable part, and it is not an accuracy tradeoff in
-  the geometry — but the *recall* on real faces is not measurable here (no face is committed
-to this repository), so it has to be checked with the corpus tooling
-  (`detector_640.min_detectable_width` is the geometry, `tools/coverage_sweep.py` the
-  measurement) before it is adopted.
+  (4 × 640×480 ≈ 1280×960), so on paper the 640-with-tiles option is **~61 MB resident / ~73 MB
+  peak less, at the same compute and a comparable reach** (17.6 px native, inside the runtime's
+  own `MIN_SUBJECT_PX = 24`).
+
+  **Measured, and rejected: the cap does not preserve the crop.** `tools/detector_resolution_ab.py`
+  runs the native pass, a *same-resolution control*, and the capped arms over the same frames, and
+  scores the thing a stored template actually is — the embedding of `face_detector.align`'s crop.
+  The control is exact (IoU 1.000, crop drift 0.0000), which is what makes the rest a measurement
+  of resolution rather than of the new plumbing. Against it:
+
+  | material | face width | cap640x2 crop drift | cap480x2 |
+  |---|---|---|---|
+  | 4 real enrolled photos | 96–320 px (inside the band) | p50 0.018, max 0.028 | drift 0.043, IoU 0.644 |
+  | synthesized far range | 24–128 px | p50 0.009–0.118 | drift 0.060, max 0.158 |
+
+  The decision has **0.0036 of cosine** between the band's measured genuine ceiling (0.4964) and
+  its line (0.5000) — the same margin the decode section quotes — so the cap spends **5–33× the
+  entire headroom**, and one of the four real frames additionally came back as *more than one
+  face*. Detection *reach* is fine (the 2×2 grid finds the face down to ~24 px, as the native pass
+  does); *identity* is not, because the crop moves. Adopting it is therefore not a detector swap
+  but a **crop change**: every stored template would have to be re-enrolled through the new
+  pipeline or the process would refuse its own staff. That is a far bigger decision than ~62 MB, so
+  the ~86 MB floor stays — the honest answer to "how much is avoidable" is *none of it, at this
+  price*. (n=4 real faces; the far-range rows are a synthesized proxy, stated as such in the tool.)
 
 ---
 
@@ -333,11 +356,14 @@ full-resolution image. Nothing to save there either.
 
 What remains open:
 
-1. **Warm the detector at startup.** §2.5: nothing runs a detection before the first punch, so
-   the first worker pays a ~104 MB transient spike and ~25 ms of extra latency that a boot-time
-   warm-up would move off the request. One synthetic detection at the ceiling size, gated on
-   the existing `settings.face_model_preload`, is the whole change. It relocates the spike
-   rather than shrinking it — a site with no punches yet would hold ~86 MB it does not need.
+1. **Warm the detector at startup — applied.** §2.5: nothing ran a detection before the first
+   punch, so the first worker paid the ~104 MB transient spike and the detector's cold start
+   that a boot-time warm-up moves off the request. `face_detector.warm()` is one synthetic
+   detection at the frame ceiling, called from the existing `settings.face_model_preload` block
+   in `main` and — when the models live in a child process — from the child's own warm. It
+   relocates the spike rather than shrinking it; a site with no punches yet holds ~88 MB it
+   does not need, which is the honest cost and the reason it rides the same preload switch an
+   operator can turn off.
 2. **Separate the models into their own process/service.** The only way to remove the
    150–250 MB floor from the API process and to turn an ONNX OOM kill from "the whole API
    dies" into "one punch fails". `face_engine` is explicitly the seam for this. Real

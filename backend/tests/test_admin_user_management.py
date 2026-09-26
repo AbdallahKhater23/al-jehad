@@ -12,7 +12,8 @@ Each endpoint has one rule that matters more than its happy path:
 1. **Editing is an update to a person, not a new identity for one.** The id cannot change
    (it is the key every attendance row, punch, device key and audit entry is written
    against) and neither can the role (the id ranges make the role a function of the id:
-   1-499 worker, 500-999 lead worker, 1000-4999 admin, 5000+ head admin). A promotion is a
+   1-499 worker, 500-749 lead worker, 750-999 off-office worker, 1000-4999 admin, 5000+
+   head admin). A promotion is a
    new account in the right id block; the old account keeps the hours, which are the part
    that must not move.
 2. **Deactivating removes access and keeps history.** No sign-in, no live token, no offline

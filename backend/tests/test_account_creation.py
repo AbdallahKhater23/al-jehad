@@ -376,7 +376,9 @@ def test_a_link_cannot_reserve_or_mint_what_it_should_not(client, jpeg):
 
     as_admin = issue_link(client, role="admin")
     assert as_admin.status_code == 400
-    assert "worker or a moallem" in as_admin.json()["detail"]
+    assert "off-office worker" in as_admin.json()["detail"], (
+        "the refusal names the business roles a link may create, administrator not among them"
+    )
 
     nameless = issue_link(client, name="   ")
     assert nameless.status_code == 400
