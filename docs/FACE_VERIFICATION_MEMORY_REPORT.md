@@ -148,6 +148,53 @@ fixed **~86 MB per process**, on top of the embedding graph's floor.
   would move both to boot, where nothing is waiting. It does not reduce total memory — it
   relocates the spike away from a request.
 
+#### Stage by stage, and the option that costs no reach
+
+`tools/yunet_memory.py` re-measures the 1280×960 call broken into stages, each delta from the
+OS (`punch_saturation.process_reader`, the per-push gate's own reader). Re-measured
+2026-09-26 on the same Windows box:
+
+| stage | resident | peak |
+|---|---|---|
+| `cv2.FaceDetectorYN.create` (the 232 KB graph, session, pool) | +2.8 MB | +2.8 MB |
+| `setInputSize(1280, 960)` (the float32 blob) | ≈0 | ≈0 |
+| **first `detect` (the forward pass)** | **+84.4 MB** | **+101.3 MB** |
+| second `detect`, same frame (reuse) | −0.2 MB | +0.6 MB |
+| `align` warp to 112×112 (first call) | +1.2 MB | +1.2 MB |
+| whole `detect_and_align` | +84.5 MB | +101.3 MB |
+| `del detector` + `gc.collect()` | **−82.4 MB** | — |
+
+So the number everyone attributes to "the detector" is one thing: **the OpenCV DNN
+forward-pass working set at the pass's own input resolution.** The graph is 2.8 MB,
+`setInputSize` is nothing, `align` is 1.2 MB once, and a repeat pass is free. Two
+consequences the earlier reading missed:
+
+* **It is not a leak and not committed forever — it is owned by the detector object.**
+  Destroying the module's `_detector` global returns ~82 MB immediately. That makes the
+  ~86 MB a *lifetime* choice rather than an allocator floor; it does not by itself reduce the
+  peak (recreating pays it again), but an idle process need not hold it.
+* **The reach can be recovered without growing the pool.** `detector_640` — the corpus/tools
+  path, which letterboxes into a 640-class input and maps detections back natively with a
+  measured round-trip error of ~1e−13 px — costs **+25.8 MB resident / +31.1 MB peak** on the
+  same 1280×960 frame, then run with its own **2×2 overlapping grid** to recover the far
+  range:
+
+  | path | resident | peak | native width still detectable |
+  |---|---|---|---|
+  | runtime native pass, 1280 px | +87.0 MB | +104.1 MB | 16 px |
+  | `detector_640`, input 640, 1 tile | +25.8 MB | +31.1 MB | 32.0 px |
+  | `detector_640`, input 640, **2 tiles** | **+25.8 MB** | **+31.1 MB** | **17.6 px** |
+  | `detector_640`, input 480, 2 tiles | +17.6 MB | +20.9 MB | 23.5 px |
+
+  A 2×2 grid at a 640 input processes about the same total pixels as one 1280 native pass
+  (4 × 640×480 ≈ 1280×960), so the 640-with-tiles option is **~61 MB resident / ~73 MB peak
+  less, at the same compute and a comparable reach** (17.6 px native, inside the runtime's own
+  `MIN_SUBJECT_PX = 24`). That is the avoidable part, and it is not an accuracy tradeoff in
+  the geometry — but the *recall* on real faces is not measurable here (no face is committed
+to this repository), so it has to be checked with the corpus tooling
+  (`detector_640.min_detectable_width` is the geometry, `tools/coverage_sweep.py` the
+  measurement) before it is adopted.
+
 ---
 
 ## 3. Recommended change
@@ -301,6 +348,58 @@ What remains open:
 4. **`punch_frames.store_frame` copies the full frame** to make a 256 px thumbnail. Small
    (~5 MB) and the full frame has to stay alive for `maybe_capture_punch` regardless.
 
+### Open item #2, prototyped: the models in a child process
+
+The seam `face_engine` names is now a working prototype, off by default and enabled with
+`FACE_ENGINE_PROCESS=1` (`config.py`). It is `backend/face_process.py` (the parent transport)
+plus `backend/face_worker.py` (the child interpreter that owns the models), with the model
+calls forwarded from `face_engine._represent`/`_detect`, `liveness.check_liveness` and the
+startup preload in `face_onnx.load_now`.
+
+**Measured, `tools/face_process_memory.py` (flags off, then on; a fresh interpreter per mode;
+the child read from outside with the same `punch_saturation` reader):**
+
+| mode | API process after preload + a 1280×960 detection | model process |
+|---|---|---|
+| inline (flag off) | **+211.7 MiB** | — |
+| child (flag on) | **+3.8 MiB** | **262.5 MiB** |
+
+The floor does not shrink, it moves: the API process drops **~208 MiB** and the child holds
+~263 MiB. That is the whole trade — a smaller *critical* process and a shared-fate fix, not a
+smaller machine.
+
+What crosses the pipe is only the model calls. The queue, the capacity policy, the
+one-subject rule, the cosine, the thresholds, the liveness mode policy and every refusal
+sentence stay in the API process, so this is an isolation of models rather than a second copy
+of the application. The wire protocol is a closed set of ops (`face_worker.OPS`),
+length-prefixed and pickled.
+
+Failure semantics: a child that dies fails the in-flight request with
+`FaceProcessUnavailable` and the **next** call spawns a fresh one; a child that stops
+answering is killed at the deadline (`FaceProcessTimeout`) rather than waited for, because
+replies are matched by id in order and a one-behind child would attribute the wrong reply to
+the wrong photograph. Both surface to callers as `FaceEngineUnavailable`, which every
+endpoint already answers as a server fault rather than as "your photo is wrong".
+
+Honest costs, all in the module docstrings: a second interpreter (the host total is
+*bigger*); one child means one inference at a time where the queue admits two (measured on
+1 vCPU at 2.55 vs 1.90 verifications/s, so small but not zero); the child has no memory bound
+of its own (a cgroup is the way to bound it); and telemetry is recorded by the parent from the
+reply's timings, because the child's Prometheus counters live in a process nobody scrapes.
+
+One Windows finding worth keeping: the venv's `python.exe` is a launcher stub, so the pid
+`subprocess` returns is **not** the interpreter running the models. The transport learns the
+real pid from the child (`worker_pid`) and terminates that one on the forced path, so a kill
+does not leave a ~260 MiB orphan behind.
+
+Tests: `tests/test_face_process.py` (21) pins the transport against a stub worker, the wiring
+against a stand-in transport, and the recursion guard; `tests/test_face_engine.py`'s
+`test_only_the_engine_calls_the_face_models` source scan now also allows `face_worker.py`,
+whose job is to reach the models. Neighbouring suites (`test_face_engine`,
+`test_face_frame_chain`, `test_metrics`, `test_one_vcpu_profile`, `test_face_detector`,
+`test_face_match_bands`, `test_phase02_liveness_and_shifts`, `test_readiness_surface`,
+`test_fake_face_contract`, `test_secrets_and_surfaces`) are green with the new modules present.
+
 ---
 
 ## 6. Test plan for the recommended change
@@ -354,13 +453,30 @@ second decode anywhere in the chain is caught even though the frame stays byte-i
   repeatable (±0.2 MB) and internally consistent, but absolute RSS on the Linux 1 vCPU /
   512 MB deployment will differ.
 * **The Linux confirmation has not been taken yet.** There is no docker, podman or WSL on the
-  Windows box these figures come from, so the deployment class host is still unmeasured. Two
-  routes to it, both ready: dispatch the `frame-decode-memory` job in
-  `.github/workflows/punch-memory.yml` (it runs `tools/frame_decode_memory.py` on
-  `ubuntu-latest` and then again inside the built image at `--memory 512m --memory-swap 512m
-  --cpus 1`, i.e. the deployment's jemalloc), or run the same tool verbatim on the host.
-  `tools/capacity_test.py` remains the heavier hook for the ceiling itself, and the profile in
+  Windows box these figures come from, so the deployment class host is still unmeasured. What
+  has changed is that the *guard* now runs there: the `punch-saturation` job (push / PR) runs
+  `test_an_upright_decode_does_not_pay_for_a_transpose_buffer` on `ubuntu-latest`, so the
+  Linux half of the portable test is confirmed on every push; and the hand-dispatched
+  `frame-decode-memory` job runs the same test inside the built image at `--memory 512m
+  --memory-swap 512m --cpus 1` (plus `tools/frame_decode_memory.py` on the runner and in the
+  image), which is the deployment's own jemalloc and its own ceiling. Neither has been
+  *executed* yet - the job file is uncommitted on this branch - so the confirmation is one
+  push-and-dispatch away rather than one measurement away.
+* **A Windows job object cannot stand in for the cgroup, and trying is a trap worth recording.**
+  Rehearsing the 1 vCPU / 512 MB shape locally (a `JOB_OBJECT_LIMIT_PROCESS_MEMORY` cap of 512
+  MiB plus a single-core affinity mask) does not reproduce the profile: the cap counts
+  **commit**, not resident set, and the dev import chain (`cv2`, `scipy`, pytest) commits far
+  more than it keeps resident - so pytest's start-up and the tool's probe both died inside
+  `re`/`dataclasses` on allocations of tens of kilobytes. A limit was hit, but not the decode's.
+  At 2048 MiB the same test passes. The Linux cgroup limits RSS and kills on it, which is the
+  number this report is about, so the local rehearsal confirms only that the test and the tool
+  are green unconstrained here (**+6.9 MB** upright against **+18.8 MB** rotated, saving
+  **+11.9 MB**). `tools/capacity_test.py` remains the heavier hook for the ceiling itself, and
   `tests/test_one_vcpu_profile.py` for the runtime configuration.
+* The child-process figures above are also **Windows working sets**. The same question is
+  wired as the hand-dispatched `face-process-memory` job in `.github/workflows/punch-memory.yml`
+  (`tools/face_process_memory.py` on `ubuntu-latest`, then inside the built image at
+  `--memory 512m --memory-swap 512m --cpus 1`), so the Linux confirmation is one dispatch away.
 
 ---
 

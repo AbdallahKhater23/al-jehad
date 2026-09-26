@@ -35,6 +35,12 @@
 # exactly the flags tools/capacity_test.py applies). The tool fails the job only when the
 # saving is genuinely absent (exit 1); an allocator that cannot expose the buffer at all is
 # reported as inconclusive (exit 2) rather than read as a pass.
+#
+# A third hand-dispatched job, `face-process-memory`, answers a different host question: does
+# moving the face models into a child process (FACE_ENGINE_PROCESS, face_process.py) really
+# leave the API process without the ~150 MiB model floor? It runs tools/face_process_memory.py
+# on the runner and inside the image, and it fails only when the parent still carries the floor
+# or the child did not receive it. Like the decode job it is off the push path.
 
 name: Punch memory budget
 
@@ -82,6 +88,18 @@ jobs:
       - name: The gate logic, with no server and no models
         working-directory: backend
         run: python -m pytest tests/test_punch_saturation_gates.py -q
+
+      # The section 3 saving is invisible in the output (the frame is byte-identical either
+      # way), so the only place it shows is memory - and the guard for it is portable
+      # (`test_face_frame_chain.py` reads `resource.getrusage` here and the Windows counters
+      # elsewhere). It used to run only on a development box; this is it running where it
+      # ships, on the same Linux and the same allocator as the punch above.
+      - name: The upright decode's peak, on Linux
+        working-directory: backend
+        run: >-
+          python -m pytest
+          tests/test_face_frame_chain.py::test_an_upright_decode_does_not_pay_for_a_transpose_buffer
+          -q
 
       - name: Saturate the punch endpoint and gate the peak RSS
         working-directory: backend
@@ -148,6 +166,17 @@ jobs:
             exit 1
           fi
 
+      # The test, not the tool that mirrors it: same comparison, same machine, and it fails
+      # loudly rather than skipping when the allocator *can* expose the buffer and the saving
+      # is gone. On this runner the allocator is glibc's, which is why it is paired with the
+      # container run below.
+      - name: The peak test here, on this runner's glibc
+        working-directory: backend
+        run: >-
+          python -m pytest
+          tests/test_face_frame_chain.py::test_an_upright_decode_does_not_pay_for_a_transpose_buffer
+          -q
+
       - name: Build the deployment image
         if: inputs.capped_container
         run: docker build -t frame-decode-memory .
@@ -172,6 +201,28 @@ jobs:
             echo "::warning::this allocator hid the buffer, so the answer is inconclusive rather than absent"
           fi
 
+      # And the test itself at the instance's shape: jemalloc, 512 MB with swap off, one core.
+      # The image is the runtime manifest only (pytest is deliberately not in it), so pytest
+      # is installed into the throwaway container rather than the image; everything else the
+      # test imports - numpy, Pillow, FastAPI, the application - is already there. A test that
+      # skips here is a `::warning`, because an allocator that cannot show the buffer is an
+      # inconclusive answer, not a pass; a failure is a failure.
+      - name: The peak test inside the image, at the instance's shape
+        if: inputs.capped_container
+        run: |
+          set -o pipefail
+          code=0
+          docker run --rm --memory 512m --memory-swap 512m --cpus 1 --entrypoint sh --env FACE_INFERENCE_QUEUE=8 --env STANDING_SWEEP_ENABLED=0 frame-decode-memory -c "pip install --quiet pytest==9.1.1 && cd backend && python -m pytest tests/test_face_frame_chain.py::test_an_upright_decode_does_not_pay_for_a_transpose_buffer -q" | tee /tmp/frame-decode-test-container.txt || code=$?
+          echo "container test exit code: $code" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$code" -ne 0 ]; then
+            if grep -q "1 skipped" /tmp/frame-decode-test-container.txt; then
+              echo "::warning::the peak test skipped inside the image (this allocator hid the buffer)"
+            else
+              echo "::error::the peak test failed inside the deployment's own image"
+              exit 1
+            fi
+          fi
+
       - name: Keep both reports, whatever the verdict
         if: always()
         uses: actions/upload-artifact@v4
@@ -180,4 +231,73 @@ jobs:
           path: |
             /tmp/frame-decode-runner.txt
             /tmp/frame-decode-container.txt
+            /tmp/frame-decode-test-container.txt
+          if-no-files-found: warn
+
+  # Does the model floor actually leave the API process on Linux? `tools/face_process_memory.py`
+  # measures the same preload-plus-detector work twice - flag off, then flag on - and reports
+  # the API process's floor on each side plus the child that received the work. It fails the
+  # job only when the parent still carries the floor (exit 1) or the child is empty (exit 1); a
+  # host that cannot expose a floor-sized buffer is inconclusive (exit 2), never a pass.
+  face-process-memory:
+    name: the model floor, in a child
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            backend/requirements-dev.txt
+
+      - name: Install the deployment's dependencies and the tooling
+        run: pip install -r requirements.txt -r backend/requirements-dev.txt
+
+      - name: The floor here, on this runner
+        working-directory: backend
+        run: |
+          set -o pipefail
+          code=0
+          python tools/face_process_memory.py --json | tee /tmp/face-process-runner.txt || code=$?
+          echo "runner exit code: $code" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$code" -eq 1 ]; then
+            echo "::error::the API process still carries the model floor on this runner"
+            exit 1
+          fi
+
+      - name: Build the deployment image
+        if: inputs.capped_container
+        run: docker build -t face-process-memory .
+
+      # Same 512m / --cpus 1 shape the other jobs use, with the entrypoint replaced so this runs
+      # the tool rather than the server. The tool spawns the model child itself, so the flag
+      # under test is the tool's, not the container's.
+      - name: The floor inside the image, at the instance's shape
+        if: inputs.capped_container
+        run: |
+          set -o pipefail
+          code=0
+          docker run --rm --memory 512m --memory-swap 512m --cpus 1 --entrypoint python --workdir /app/backend --env FACE_INFERENCE_QUEUE=8 --env STANDING_SWEEP_ENABLED=0 face-process-memory tools/face_process_memory.py --json | tee /tmp/face-process-container.txt || code=$?
+          echo "container exit code: $code" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$code" -eq 1 ]; then
+            echo "::error::the API process still carries the model floor inside the deployment's own image"
+            exit 1
+          fi
+          if [ "$code" -eq 2 ]; then
+            echo "::warning::this host could not expose a floor-sized buffer, so the answer is inconclusive rather than absent"
+          fi
+
+      - name: Keep both reports, whatever the verdict
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: face-process-memory
+          path: |
+            /tmp/face-process-runner.txt
+            /tmp/face-process-container.txt
           if-no-files-found: warn
