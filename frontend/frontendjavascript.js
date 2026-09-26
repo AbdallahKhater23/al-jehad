@@ -642,6 +642,13 @@ const Camera = {
      * ``done(small, resized)`` is called exactly once. A failure comes back as the *original*
      * file rather than as nothing, because the server's refusal names the problem in the
      * worker's language and this is only here to save a phone tether.
+     *
+     * The re-encode is at the *maximum* quality (``1.0``), and that is the whole point of the
+     * resize: the boundary is about how many pixels the detector is shown, not how hard the
+     * JPEG was squeezed, so a photo above it is brought under it by dropping resolution and by
+     * nothing else. Spending quality here would soften the reference template the punches are
+     * matched against - the one image whose detail the band's decision lines were measured on -
+     * and quality is not the knob that was over budget. Only the *number of pixels* was.
      */
     shrinkPhoto(file, done) {
         const finish = typeof done === 'function' ? done : function () {};
@@ -678,7 +685,7 @@ const Camera = {
                         // is still right - only the filename a log shows is not.
                         settle(blob, true);
                     }
-                }, 'image/jpeg', 0.92);
+                }, 'image/jpeg', 1.0);
             } catch (e) {
                 settle(file, false);
             }
@@ -1898,6 +1905,21 @@ const UI = {
             const info = Camera.explain(err);
             this.showHelpModal(info.title, info.steps);
         }
+    },
+
+    /**
+     * The shared photo resize, named on ``UI`` for the console's own pickers.
+     *
+     * ``admin_modules.js`` calls ``UI.shrinkPhoto(file, done)`` for the credentials and
+     * reference-photo pickers. That name has to resolve to *something*: when it did not, the
+     * guard in ``shrinkFacePhoto`` fell straight through to ``done(file)``, so an admin's
+     * 12 MP phone photo went to ``/admin/enroll`` exactly as the camera app wrote it - above
+     * the ingestion boundary, for a 422 that read as "the server refused your photo". The
+     * resize itself lives once, beside ``Camera``; this is the shell's name for it, and it is
+     * the same function the link pages' ``capture.js`` runs in its own world.
+     */
+    shrinkPhoto(file, done) {
+        return Camera.shrinkPhoto(file, done);
     },
 
     refreshPanels() {

@@ -178,6 +178,8 @@ const TRANSLATIONS = {
         "credentialsEditIdNote": "The user id and the role cannot be changed here. The id block fixes the role (1-499 worker, 500-999 lead worker, 1000-4999 admin, 5000+ head admin), and every attendance record, punch and device key is written against the id. To correct either, delete the account and create it again.",
         "credentialsHourlyRate": "Hourly rate (0 clears it)",
         "credentialsHourlyRateHint": "Leave the rate empty to keep it unchanged. 0 clears it: an agreed rate of zero and no agreed rate are different records, and this keeps them different.",
+        "credentialsTransit": "Allow off-site shift start (transit worker)",
+        "credentialsTransitHint": "Grant this only to the people who drive between sites: with it on, they may begin a paid shift outside every site and have it authorised when they reach a geofence. It is per account - off for everyone until you give it.",
         "credentialsUserSaved": "Account updated.",
         "credentialsUserDeleted": "Account deleted.",
         "credentialsDeactivated": "Account deactivated.",

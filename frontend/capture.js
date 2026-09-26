@@ -631,6 +631,12 @@
      * file rather than as nothing: the server is the authority on what it will accept, and its
      * refusal names the problem in the worker's own language. The browser's job here is only to
      * not spend a phone tether sending something that will be refused.
+     *
+     * The re-encode is at the *maximum* quality (``1.0``). The boundary this brings a photo
+     * under is about how many pixels the detector is shown, so the size is bought with
+     * resolution and nothing else - lowering the JPEG quality instead would soften the very
+     * crop the embedding is measured from, which is the half of the boundary that must not
+     * move. Only the pixel count was over budget.
      */
     function shrinkPhoto(file, done, limits) {
         var finish = done || function () {};
@@ -674,7 +680,7 @@
                 canvas.toBlob(function (blob) {
                     if (!blob) return settle(file, false);
                     settle(renameToJpeg(blob, file), true);
-                }, "image/jpeg", 0.92);
+                }, "image/jpeg", 1.0);
             } catch (e) {
                 settle(file, false);
             }

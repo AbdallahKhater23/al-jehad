@@ -136,6 +136,32 @@ def test_the_console_reads_the_same_boundary_the_shrink_helper_enforces():
     assert "face_frame_max_pixels: 4000000" in _source("admin_modules.js")
 
 
+def test_the_console_resize_is_wired_to_a_real_function():
+    """``UI.shrinkPhoto`` has to *exist*; the call site alone resizes nothing.
+
+    ``shrinkFacePhoto`` guards on ``UI.shrinkPhoto`` and hands the file straight back when it
+    is missing, so a console whose ``UI`` object never grew this method silently sends the
+    camera app's own 12 MP file - the ordinary way a worker is enrolled - to ``/admin/enroll``
+    for a 422. The call site in ``admin_modules.js`` is pinned above; this is the other end of
+    the wire, and it was missing while that pin still passed.
+    """
+    squashed = _squashed("frontendjavascript.js")
+    assert "shrinkPhoto(file, done) { return Camera.shrinkPhoto(file, done); }" in squashed, (
+        "the console calls UI.shrinkPhoto; the app shell must define it"
+    )
+
+
+def test_a_resize_spends_resolution_and_not_quality():
+    """The downscale re-encodes at maximum quality, in both page worlds.
+
+    The boundary is about how many pixels the detector sees. Buying it with JPEG quality
+    instead would soften the reference crop the punches are matched against, so the resize
+    must encode at ``1.0`` - resolution is the only thing it is allowed to cost.
+    """
+    assert "}, 'image/jpeg', 1.0);" in _squashed("frontendjavascript.js")
+    assert '}, "image/jpeg", 1.0);' in _squashed("capture.js")
+
+
 # --------------------------------------------------------------------------- #
 # 3. the behaviour, against the real file in a modelled browser
 # --------------------------------------------------------------------------- #
@@ -273,7 +299,7 @@ def test_a_phone_photo_is_resized_and_re_encoded_as_a_named_jpeg(browser):
     assert big["resized"] is True
     assert big["same_object"] is False
     assert big["type"] == "image/jpeg"
-    assert big["frame"] == "modelled frame 2048x1536 image/jpeg q0.92", big["frame"]
+    assert big["frame"] == "modelled frame 2048x1536 image/jpeg q1", big["frame"]
 
 
 def test_a_photo_that_already_fits_is_handed_back_untouched(browser):
