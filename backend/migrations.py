@@ -35,7 +35,7 @@ from security import hash_password
 #: ``MIGRATIONS``. ``readiness`` refuses to start a deployment whose database is older, so a
 #: migration added without bumping this is a server that will not boot; the invariant is
 #: asserted in ``tests/test_site_shift_windows.py`` rather than left to memory.
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 #: Magic number stamped into the SQLite header so we can recognise "this is our
 #: database" - cheap protection against pointing DATABASE_PATH at some other file.
@@ -1600,6 +1600,40 @@ def migration_26_off_office_workers(conn: sqlite3.Connection) -> None:
     )
 
 
+def migration_27_transit_to_site_shifts(conn: sqlite3.Connection) -> None:
+    """A paid shift that may *start* on the road and be authorised only on arrival.
+
+    WHY A COLUMN ON ``users`` AND NOT A ROLE
+    ----------------------------------------
+    The privilege is granted per person by an administrator, not conferred by a job title.
+    Two workers can hold the same role and the same id band, and only one of them drives to
+    scattered sites; a role would hand the privilege to everybody with the badge. So it is a
+    flag on the account, defaulting to off, that an administrator turns on for the people who
+    need it - ``transit_enabled``. Nothing in the schema can flip it: only ``/admin/users/edit``
+    (and creation) writes it, so "who may start a shift off-site" is an administrator's answer.
+
+    WHAT EACH COLUMN IS FOR
+    -----------------------
+    * ``users.transit_enabled`` - may this account open a shift outside every geofence at all.
+      Default 0, so every existing account keeps the strict rule it was created under.
+    * ``active_sessions.is_transit`` - this *open* shift has begun but no geofence has
+      confirmed it yet; its hours are not payable until arrival clears this.
+    * ``active_sessions.transit_start_time`` - the departure moment, kept beside
+      ``clock_in_time`` so the arrival path can credit the elapsed travel without guessing.
+    * ``transit_origin_lat``/``transit_origin_lon`` - where the departure was taken. Evidence,
+      not a gate: the geofence that authorises the shift is the arrival site's, and this is
+      what lets a reviewer see how far the worker had to travel to reach it.
+
+    Idempotent and additive: ``add_column`` is a no-op on a database that already has these,
+    so replaying the migration list cannot corrupt anything.
+    """
+    add_column(conn, "users", "transit_enabled", "INTEGER NOT NULL DEFAULT 0")
+    add_column(conn, "active_sessions", "is_transit", "INTEGER NOT NULL DEFAULT 0")
+    add_column(conn, "active_sessions", "transit_start_time", "TEXT DEFAULT NULL")
+    add_column(conn, "active_sessions", "transit_origin_lat", "REAL DEFAULT NULL")
+    add_column(conn, "active_sessions", "transit_origin_lon", "REAL DEFAULT NULL")
+
+
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "audit_notifications_shift_rules", migration_1_audit_notifications_shift_rules),
     (2, "provenance_columns_status_code", migration_2_provenance_columns),
@@ -1627,6 +1661,7 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (24, "walk_up_registration", migration_24_walk_up_registration),
     (25, "site_categories", migration_25_site_categories),
     (26, "off_office_workers", migration_26_off_office_workers),
+    (27, "transit_to_site_shifts", migration_27_transit_to_site_shifts),
 ]
 
 

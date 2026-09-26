@@ -139,7 +139,10 @@ Then, in this order:
    without its measurement, or a collapsed window fails here rather than at a gate.
 2. **Re-enroll every account** if the crop or the model moved:
    `GET /api/v1/admin/enroll/needs_reenrollment` lists who, and their templates are stale
-   until they are re-enrolled - a stale template is not scored at all.
+   until they are re-enrolled - a stale template is not scored at all. When the *crop* moved
+   (a detector input-size change, not just a model swap), re-enrolment is a data migration with
+   its own fingerprint, fidelity gate and two-crop transition window -
+   see [the crop-change migration runbook](RUNBOOK_CROP_CHANGE_MIGRATION.md).
 3. Confirm: `GET /admin/readiness` reports `face_match_band` **ok**, with the derivation in its
    detail and `approve` / `review` / `genuine_ceiling` / `impostor_floor` in its value. An
    operator whose review queue moves wants those four numbers, not the verdict.

@@ -30,6 +30,10 @@ ROSTER_FIELDS = {
     "id", "name", "email", "phone", "role", "status",
     "face_enrolled", "enrolled_at", "password_set", "password_changed_at",
     "sessions_revoked",
+    # Whether this account may start a shift off-site. A roster field rather than a hidden one
+    # because it is a privilege an administrator grants one person at a time, so the list has to
+    # show who holds it.
+    "transit_enabled",
 }
 
 
