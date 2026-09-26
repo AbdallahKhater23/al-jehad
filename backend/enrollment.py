@@ -79,7 +79,7 @@ router = APIRouter(prefix="/admin/enrollment", tags=["enrollment"])
 public_router = APIRouter(prefix="/enroll", tags=["enrollment"])
 
 #: Roles accepted from a roster, matching ``security.ROLE_ID_RANGES``.
-VALID_ROLES = ("worker", "moallem", "admin", "head_admin")
+VALID_ROLES = ("worker", "moallem", "off_office", "admin", "head_admin")
 
 #: Invite kinds. ``enroll`` registers a face for an account that already exists;
 #: ``register`` creates the account itself.
@@ -90,7 +90,7 @@ KIND_REGISTER = "register"
 #: bearer token sent over WhatsApp, and a token that mints an administrator is a
 #: privilege-escalation lever that leaks with the message. An admin account is created
 #: by an admin, in the console, with the roster in front of them.
-REGISTER_ROLES = ("worker", "moallem")
+REGISTER_ROLES = ("worker", "moallem", "off_office")
 
 STAGING_ROOT = PROJECT_ROOT / "temp" / "enrollment_jobs"
 
@@ -455,8 +455,9 @@ async def create_invite(request: Request, payload: InviteCreate, current: Curren
     * ``register`` - the account does **not** exist; the link creates it. This is the
       "send this to the new man" link, so it is the more dangerous of the two and is
       constrained accordingly: the role is chosen here by the admin (never by whoever
-      opens the link), it must be a worker or a moallem, the id is reserved here so the
-      visitor cannot pick its own, and it is single-use whatever ``max_uses`` says.
+      opens the link), it must be a worker, a moallem or an off-office worker, the id is
+      reserved here so the visitor cannot pick its own, and it is single-use whatever
+      ``max_uses`` says.
 
     The plaintext token is returned exactly once: only its hash is stored, so it cannot
     be recovered later - issue a new invite instead.
@@ -491,12 +492,13 @@ async def create_invite(request: Request, payload: InviteCreate, current: Curren
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "A registration link may only create a worker or a moallem, with the role chosen "
-                    "here. An administrator account is created by an administrator in the console."
+                    "A registration link may only create a worker, a moallem or an off-office "
+                    "worker, with the role chosen here. An administrator account is created by an "
+                    "administrator in the console."
                 ),
             )
         # A standard admin cannot create an administrator anywhere else either; this is
-        # belt and braces, because the role is already restricted to worker/moallem.
+        # belt and braces, because the role is already restricted to the business roles.
         if pending_role in ("admin", "head_admin") and current.role != "head_admin":
             raise HTTPException(status_code=403, detail="Only a head administrator may create administrators.")
         # One implementation for every path that mints an account - the console, the

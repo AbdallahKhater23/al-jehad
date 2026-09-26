@@ -194,7 +194,7 @@ def test_a_number_that_was_freed_is_handed_out_again():
         assert lowest_free_id(conn, "worker") == freed
 
 
-@pytest.mark.parametrize("role", ["worker", "moallem", "admin", "head_admin"])
+@pytest.mark.parametrize("role", ["worker", "moallem", "off_office", "admin", "head_admin"])
 def test_each_role_is_handed_a_number_inside_its_own_block(role):
     """The ranges do not overlap, so a moallem can never be handed a worker's number."""
     with database.immediate() as conn:

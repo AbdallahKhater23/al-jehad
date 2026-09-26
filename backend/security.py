@@ -109,7 +109,8 @@ DEVELOPER_ID_FLOOR = 309_010_000_000
 
 ROLE_ID_RANGES: dict[str, tuple[int, int | None]] = {
     "worker": (1, 499),
-    "moallem": (500, 999),
+    "moallem": (500, 749),
+    "off_office": (750, 999),
     "admin": (1000, 4999),
     "head_admin": (5000, None),
     DEVELOPER_ROLE: (DEVELOPER_ID_FLOOR, None),
@@ -117,7 +118,8 @@ ROLE_ID_RANGES: dict[str, tuple[int, int | None]] = {
 
 ROLE_ID_MESSAGES: dict[str, str] = {
     "worker": "Worker ID must be in range 1-499 for role 'worker'.",
-    "moallem": "Lead Worker (Moallem) ID must be in range 500-999.",
+    "moallem": "Lead Worker (Moallem) ID must be in range 500-749.",
+    "off_office": "Off-Office Worker ID must be in range 750-999.",
     "admin": "Admin ID must be in range 1000-4999.",
     "head_admin": "Head Admin ID must be 5000 or greater.",
     DEVELOPER_ROLE: f"Developer ID must be {DEVELOPER_ID_FLOOR} or greater.",
@@ -492,7 +494,7 @@ def ensure_self_or_role(target_id: str, current: CurrentUser, roles: tuple[str, 
 # The administrator guards name the *declared* administrators, not ``ADMIN_ROLES``: the
 # developer reaches them through the wildcard above, and listing it here would put the bypass
 # back into every declaration this file was written to keep clean.
-any_authenticated = require_role("worker", "moallem", "admin", "head_admin")
+any_authenticated = require_role("worker", "moallem", "off_office", "admin", "head_admin")
 admin_only = require_role("admin", "head_admin")
 head_admin_only = require_role("head_admin")
 #: The developer surface. Nothing below the root tier passes it, by construction.

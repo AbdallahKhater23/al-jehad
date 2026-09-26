@@ -16,6 +16,7 @@ flaky test, not evidence.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import sys
@@ -24,6 +25,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import config
 import face_detector
 import harness
 
@@ -467,3 +469,240 @@ def test_a_frame_already_at_the_retry_width_is_not_resampled(real_detector, monk
     face_detector.detect_raw(np.zeros((960, width, 3), dtype=np.uint8))
 
     assert seen == [width], "a frame no wider than the retry width is read exactly once"
+
+
+# ---------------------------------------------------------------------------
+# the startup warm-up: the spike that should not land on the first punch
+# ---------------------------------------------------------------------------
+# Opening the graph is ~3 MB; the first *detection* is what costs - ~106 MB peak and ~88 MB
+# kept at the ceiling, sized by the frame's area (tools/yunet_memory.py). Nothing ran one
+# before a punch, so the first worker of the day paid it, queue and all.
+# ---------------------------------------------------------------------------
+def test_the_warm_frame_is_the_one_the_chain_would_hand_the_detector():
+    """The warm size has to be the size a punch's frame has, or it moves the spike nowhere.
+
+    ``uploads.face_frame`` resizes every frame the models see to ``settings.face_frame_max_px``,
+    and the working set follows the frame's *area*. Warming smaller leaves the pool to grow on
+    the first punch; warming larger holds memory no punch would use. Pinning the two numbers
+    together is what keeps this from drifting away from the chain.
+    """
+    ceiling = face_detector.frame_ceiling()
+    assert ceiling == int(config.settings.face_frame_max_px)
+
+    width, height = face_detector.warm_frame_size()
+    assert (width, height) == (ceiling, ceiling * 3 // 4)
+
+
+def test_the_warm_pass_runs_a_detection_at_that_size(real_detector, monkeypatch):
+    """A model *load* is not enough: it is ~3 MB of the ~106 MB the first punch pays."""
+    seen = []
+    monkeypatch.setattr(
+        face_detector, "_detect_rows", lambda frame: seen.append(frame.shape) or []
+    )
+
+    report = face_detector.warm()
+
+    width, height = face_detector.warm_frame_size()
+    assert report["warmed"] is True
+    assert (report["width"], report["height"]) == (width, height)
+    assert seen == [(height, width, 3)], "the warm pass did not run a frame at the ceiling"
+    assert report["seconds"] >= 0.0
+
+
+def test_a_warm_pass_without_the_model_reports_it_instead_of_raising(
+    real_detector, monkeypatch, tmp_path
+):
+    """A host without the model still boots; ``warm`` is the last thing that may stop it."""
+    monkeypatch.setattr(face_detector, "model_path", lambda: tmp_path / "absent.onnx")
+    monkeypatch.setattr(face_detector, "_loaded", False)
+
+    report = face_detector.warm()
+
+    assert report["warmed"] is False and report["available"] is False
+    assert "not found" in report["error"]
+
+
+def test_the_warm_pass_is_refused_when_the_models_run_in_a_child(real_detector, monkeypatch):
+    """``FACE_ENGINE_PROCESS`` moves the models out - working set included.
+
+    A warm here would build exactly the detector that mode exists to move out of the API
+    process, so the refusal belongs where the mistake would be made. The child, whose own flag
+    is cleared, is where the real warm then happens (``face_worker``).
+    """
+    monkeypatch.setattr(config.settings, "face_engine_process", True, raising=False)
+    monkeypatch.setattr(
+        face_detector, "_ensure", lambda: pytest.fail("the API process built a detector")
+    )
+
+    report = face_detector.warm()
+
+    assert report["warmed"] is False and report["delegated"] is True
+
+
+def test_the_startup_preload_warms_the_detector_not_just_the_embedding():
+    """A preload that opened only the embedding would leave the first punch the bigger spike.
+
+    Parsed rather than grepped: the sentence that explains this in ``main`` names the function
+    too, and a scan that counted a comment as a call would pass against code that has none.
+    """
+    tree = ast.parse((harness.BACKEND_DIR / "main.py").read_text(encoding="utf-8"))
+    called = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "face_detector"
+    }
+    assert "warm" in called, called
+
+
+# ---------------------------------------------------------------------------
+# 7. the capped working size: ~62 MB of detector, bought with a different crop
+# ---------------------------------------------------------------------------
+# ``tools/yunet_memory.py`` measures the detector's working set at ~86 MB resident / ~104 MB peak
+# at the 1280 px ceiling, and ~24 MB at 640. ``tools/detector_resolution_ab.py`` measures what
+# that costs: the 640 crop moves by 5-33x the band's entire headroom (the line sits 0.0036 cosine
+# above the genuine ceiling), on faces squarely inside the deployment's own band and not only at
+# the far range. So the cap is a *crop* change dressed as a memory change, and the pipeline label
+# is the rail that stops it being adopted quietly: a capped build names a pipeline with no band,
+# ``band_for`` raises, and the startup gate refuses to open the port until one is measured.
+
+def _capped(monkeypatch, size: int = 640, tiles: int = 2) -> None:
+    monkeypatch.setattr(config.settings, "face_detector_input_size", size, raising=True)
+    monkeypatch.setattr(config.settings, "face_detector_tiles", tiles, raising=True)
+
+
+def test_the_pass_runs_at_the_frames_own_size_until_a_cap_is_asked_for(real_detector):
+    """Off by default, and the default is the crop the shipped band was measured through."""
+    assert face_detector.capped_input_size() == 0
+    assert face_detector.capped_pipeline() == face_detector.PIPELINE
+    assert face_detector.active_pipeline() == face_detector.PIPELINE
+    assert face_detector.PIPELINE in face_detector.BANDS, (
+        "the default pass has to have earned a band, or the default build would not boot"
+    )
+
+
+def test_a_cap_names_a_pipeline_of_its_own_and_the_band_does_not_cover_it(
+    real_detector, monkeypatch
+):
+    """The rail: a capped crop is a *different pipeline*, and no line has been derived for it.
+
+    This is the assertion that makes the change safe to have in the code and unsafe to switch on
+    without measuring. If a capped build could answer with ``yunet-2023mar``'s lines it would
+    score every punch against thresholds derived from a crop the template was not made with,
+    and every stored template would have to be re-enrolled anyway - so the failure would arrive
+    as silent mis-matches rather than as a build that refuses to serve.
+    """
+    _capped(monkeypatch)
+
+    name = face_detector.capped_pipeline()
+    assert name == f"{face_detector.PIPELINE}-640x2"
+    assert name != face_detector.PIPELINE
+    assert name not in face_detector.BANDS
+    with pytest.raises(face_detector.UnknownPipelineError):
+        face_detector.band_for(name)
+
+    # ``readiness`` reads this, and ``face_match_band`` is FATAL: the cap cannot be served
+    # until a band exists for exactly this name.
+    assert face_detector.active_pipeline() == name
+
+
+def test_the_tile_grid_is_part_of_the_crop_name(real_detector, monkeypatch):
+    """Tiles decide which faces are found, so a band must not carry across a grid change.
+
+    The 2x2 grid is what buys the far range back at a 640 input (17.6 px native, against the
+    runtime's own ``MIN_SUBJECT_PX`` of 24), and it is the *same* working set as one tile - but
+    a face is found in a different window, at a different effective scale, so the crop of a
+    distant face genuinely differs between them. One band cannot cover both.
+    """
+    _capped(monkeypatch, tiles=1)
+    one = face_detector.capped_pipeline()
+    _capped(monkeypatch, tiles=2)
+    two = face_detector.capped_pipeline()
+    _capped(monkeypatch, size=480, tiles=2)
+    smaller = face_detector.capped_pipeline()
+
+    assert len({one, two, smaller}) == 3, (one, two, smaller)
+    assert face_detector.capped_pipeline(640, 1) != face_detector.capped_pipeline(640, 2)
+
+
+def test_a_capped_pass_reads_through_the_letterboxed_detector(real_detector, monkeypatch):
+    """The capped route is ``detector_640``, and its answer arrives in the frame's own pixels.
+
+    Two things at once: the native detector is never built (that is the memory change), and the
+    row shape the rest of this module reads - ``[x, y, w, h, 5x(x,y), score]`` - is preserved, so
+    ``align``, ``subject_detections`` and the corpus provenance all keep working untouched.
+    """
+    import detector_640
+
+    seen: dict[str, object] = {}
+
+    class _Letterboxed:
+        input_size = 640
+
+        def detect(self, frame, *, tiles=1, overlap=0.2):
+            seen["shape"] = frame.shape[:2]
+            seen["tiles"] = tiles
+            return [
+                detector_640.Detection(
+                    box=(100.0, 40.0, 30.0, 30.0),
+                    landmarks=np.array(
+                        [[110, 50], [130, 50], [120, 60], [112, 68], [128, 68]], dtype=np.float32
+                    ),
+                    score=0.91,
+                    origin="full",
+                    scale=0.5,
+                )
+            ]
+
+    _capped(monkeypatch)
+    monkeypatch.setattr(face_detector, "_capped_detector", lambda size, tiles: _Letterboxed())
+    monkeypatch.setattr(
+        face_detector, "_ensure", lambda: pytest.fail("the capped pass built the native detector")
+    )
+
+    rows = face_detector.detect_raw(np.zeros((960, 1280, 3), dtype=np.uint8))
+
+    assert seen == {"shape": (960, 1280), "tiles": 2}
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.shape == (15,), "box + 5 landmarks + score, the layout every caller reads"
+    assert list(row[:4]) == [100.0, 40.0, 30.0, 30.0], "already native; nothing rescaled it"
+    assert np.allclose(row[4:14], [110, 50, 130, 50, 120, 60, 112, 68, 128, 68])
+    assert float(row[14]) == pytest.approx(0.91)
+    assert face_detector.landmarks_of(row).shape == (5, 2)
+
+
+def test_a_capped_pass_does_not_re_read_a_close_up(real_detector, monkeypatch):
+    """The cap *is* the close-up retry, so paying for a third crop would be pure cost.
+
+    The retry exists because a face filling a native-resolution frame has no single anchor to
+    land on. A capped pass already reads every frame at a scale the anchors were built for, and
+    re-reading a close-up at ``CLOSE_FRAME_RETRY_PX`` would *upscale* it into the letterbox - a
+    third crop under the same pipeline name, for a face the cap had just answered about.
+    """
+    seen: list[int] = []
+    _fake_passes(monkeypatch, native=[_row(x=0, y=0, w=900, h=800)], reduced=[], seen=seen)
+
+    _capped(monkeypatch)
+    rows = face_detector.detect_raw(np.zeros((960, 1280, 3), dtype=np.uint8))
+    assert len(rows) == 1 and seen == [1280], "one read, at the frame's own size"
+
+    # The native path still re-reads it, which is the difference being pinned.
+    monkeypatch.setattr(config.settings, "face_detector_input_size", 0, raising=True)
+    seen.clear()
+    face_detector.detect_raw(np.zeros((960, 1280, 3), dtype=np.uint8))
+    assert seen == [1280, face_detector.CLOSE_FRAME_RETRY_PX]
+
+
+def test_describe_names_the_working_size_a_capped_pass_would_use(real_detector, monkeypatch):
+    """Readiness has to show which crop is live, or the memory change is invisible in the report."""
+    assert face_detector.describe()["working_size"] is None
+    assert face_detector.describe()["tiles"] is None
+
+    _capped(monkeypatch)
+    described = face_detector.describe()
+    assert described["working_size"] == 640
+    assert described["tiles"] == 2
+    assert described["active_pipeline"] == described["pipeline"] + "-640x2"

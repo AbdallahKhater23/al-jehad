@@ -24,10 +24,12 @@ Method
   ``detect`` (the forward pass), a second ``detect`` (reuse), ``align`` (the warp), and the
   destruction of the detector are each measured on their own, so the 116 MB is attributed
   rather than assumed.
-* **A width sweep and a letterbox comparison.** The same pass at 320/480/640/960/1280 px
-  shows the cost follows input *area*; the ``detector_640`` letterboxed path at a 640 input
-  (with and without its own tiling) shows what the same detection costs when the pass is not
-  run at the frame's native size.
+* **A width sweep, a letterbox comparison, and the runtime route.** The same pass at
+  320/480/640/960/1280 px shows the cost follows input *area*; the ``detector_640``
+  letterboxed path at a 640 input (with and without its own tiling) shows what the same
+  detection costs when the pass is not run at the frame's native size; and ``detect_raw`` is
+  measured with ``FACE_DETECTOR_INPUT_SIZE`` off and on, which is the number the application
+  actually pays - reported with the ``active_pipeline`` name it would run under.
 * **The reader is ``punch_saturation.process_reader()``** - the same one the per-push memory
   gate uses - so this cannot disagree with that gate about what "peak" and "resident" mean.
 
@@ -175,6 +177,21 @@ elif mode == "release":
     gc.collect()
     report(width=1280, platform=platform, resident_before=before, resident_after=now(),
            released=before - now())
+elif mode == "runtime":
+    # The *runtime route*, not the underlying detector: ``detect_raw`` with the cap off and on,
+    # which is the only thing the application's memory actually depends on.
+    size = int(sys.argv[4])
+    tiles = int(sys.argv[5])
+    import config
+    import face_detector
+    config.settings.face_detector_input_size = size
+    config.settings.face_detector_tiles = tiles
+    frame = frame_for(1280)
+    base_now, base_peak = now(), peak()
+    rows = face_detector.detect_raw(frame)
+    report(width=1280, size=size, tiles=tiles, platform=platform,
+           pipeline=face_detector.capped_pipeline(),
+           retained=now() - base_now, peak=peak() - base_peak, rows=len(rows))
 else:
     raise SystemExit(f"unknown mode {mode!r}")
 '''
@@ -235,6 +252,11 @@ def main(argv: list[str] | None = None) -> int:
             measure("letterbox", 640, 2, model=model),
             measure("letterbox", 480, 2, model=model),
         ]
+        runtime = [
+            measure("runtime", 0, 0, model=model),
+            measure("runtime", 640, 2, model=model),
+            measure("runtime", 480, 2, model=model),
+        ]
     except Unanswerable as exc:
         print(f"cannot answer on this machine: {exc}")
         return 2
@@ -250,6 +272,7 @@ def main(argv: list[str] | None = None) -> int:
                     "release": release,
                     "sweep": sweep,
                     "letterbox": letterbox,
+                    "runtime": runtime,
                 },
                 indent=2,
             )
@@ -279,10 +302,20 @@ def main(argv: list[str] | None = None) -> int:
             f"reach {run['reach_px']} px native"
         )
     print()
+    print("What the runtime route itself costs, through ``detect_raw`` (one 1280x960 frame):")
+    for run in runtime:
+        what = "native" if run["size"] == 0 else f"capped input {run['size']}, {run['tiles']} tiles"
+        print(
+            f"  {what:<28} : {mi(run['retained'])} resident, {mi(run['peak'])} peak  "
+            f"[{run['pipeline']}]"
+        )
+    print()
     print(
         "Verdict: the cost is the forward-pass pool, sized by the resolution the pass runs "
         "at (it follows input area) and held by the detector object; the model, "
-        "setInputSize and align are noise beside it."
+        "setInputSize and align are noise beside it. The capped row is the same saving the "
+        "application gets when ``FACE_DETECTOR_INPUT_SIZE`` is set - and the pipeline name "
+        "in brackets is the crop change that comes with it."
     )
     return 0
 

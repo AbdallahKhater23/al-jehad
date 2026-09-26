@@ -239,6 +239,23 @@ class Settings(BaseModel):
     face_detector_model_path: Path = Path("backend/models/face_detection_yunet_2023mar.onnx")
     face_detector_model_sha256: str | None = None
 
+    #: The working size the detector's pass runs at, as the frame's long edge in pixels. ``0`` -
+    #: the default - means the frame's own size, which is what the deployment does today.
+    #:
+    #: Anything else letterboxes the frame into that size and maps the answer back to native
+    #: coordinates (``detector_640``), which is worth ~62 MB of working set at the ceiling
+    #: (``tools/yunet_memory.py``) - and is a **crop change**, measured in
+    #: ``tools/detector_resolution_ab.py`` at 5-33x the band's entire headroom. It is not a
+    #: detector swap: ``active_pipeline`` names the new crop, no band exists for that name, and
+    #: ``band_for`` refuses - so switching this on cannot silently score a staff member against
+    #: thresholds derived from a crop their template was not made with.
+    face_detector_input_size: int = 0
+
+    #: Tile grid for that pass. ``1`` is the cheapest and loses the far range; ``2`` is what
+    #: recovers it (``detector_640.min_detectable_width``) at the *same* working set, because the
+    #: tiles reuse one input size and the working set is a function of that size, not of the count.
+    face_detector_tiles: int = 2
+
     # -- face embedding (FaceNet-128 ONNX, see ``face_onnx``) ----------------
     #  The recognition half of verification, and the one that decides what a template *is*.
     #  It was VGG-Face: 4096 floats from a 553 MiB TensorFlow graph at ~250 ms and ~2.3 GiB
@@ -829,6 +846,8 @@ def build_settings(*, env_file: Path | None = None) -> Settings:
             PROJECT_ROOT / "backend/models/face_detection_yunet_2023mar.onnx",
         ),
         face_detector_model_sha256=_env_str("FACE_DETECTOR_MODEL_SHA256"),
+        face_detector_input_size=_env_int("FACE_DETECTOR_INPUT_SIZE", 0),
+        face_detector_tiles=_env_int("FACE_DETECTOR_TILES", 2),
         facenet_model_path=_env_path(
             "FACENET_MODEL_PATH", PROJECT_ROOT / "backend/models/facenet128.onnx"
         ),

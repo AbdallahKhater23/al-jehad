@@ -5785,3 +5785,18 @@ if settings.face_model_preload:  # pragma: no cover - heavy, skipped when disabl
         face_onnx.load_now()
     except Exception as exc:  # pragma: no cover - the model can also be fetched lazily
         print(f"[startup] face model preload skipped: {exc}")
+    # The embedding is not the only thing the first punch pays for. The first *detection*
+    # sizes the detector's working set to the frame it is shown - ~106 MB peak at the 1280 px
+    # ceiling, against a 232 KB graph (tools/yunet_memory.py) - and nothing ran one before a
+    # punch, so that allocation and the detector's cold start both landed on whoever clocked
+    # in first, with the queue behind them. One synthetic detection at the ceiling moves both
+    # to boot. ``warm`` declines when the models live in a child process: the child builds its
+    # own from the preload above, and building one here would be the very working set that
+    # mode exists to move out of this process.
+    try:
+
+        import face_detector
+
+        face_detector.warm()
+    except Exception as exc:  # pragma: no cover - a warm pass must not stop the application booting
+        print(f"[startup] detector warm-up skipped: {exc}")

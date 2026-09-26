@@ -34,7 +34,7 @@ from __future__ import annotations
 import re
 
 import readiness
-from harness import ADMIN, HEAD_ADMIN, MOALLEM, WORKER, bearer
+from harness import ADMIN, HEAD_ADMIN, MOALLEM, OFF_OFFICE, WORKER, bearer
 from security import DEVELOPER_ROLE
 
 #: The audience is expressed in **role names**, because that is what a guard compares and
@@ -44,6 +44,7 @@ from security import DEVELOPER_ROLE
 ROLE_ACCOUNTS: dict[str, str] = {
     "worker": WORKER,
     "moallem": MOALLEM,
+    "off_office": OFF_OFFICE,
     "admin": ADMIN,
     "head_admin": HEAD_ADMIN,
 }

@@ -44,6 +44,7 @@ from harness import (
     ADMIN,
     HEAD_ADMIN,
     MOALLEM,
+    OFF_OFFICE,
     WORKER,
     bearer,
     db_rows,
@@ -168,8 +169,8 @@ def test_the_subject_is_the_token_and_not_a_form_field(client):
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
     "user_id",
-    [WORKER, MOALLEM, HEAD_ADMIN],
-    ids=["worker", "moallem", "head_admin"],
+    [WORKER, MOALLEM, OFF_OFFICE, HEAD_ADMIN],
+    ids=["worker", "moallem", "off_office", "head_admin"],
 )
 def test_only_the_role_that_clocks_in_from_the_console_may_do_this(client, user_id):
     """A worker's face is issued by the company; a head administrator works no rota.

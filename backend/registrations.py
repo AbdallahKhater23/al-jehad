@@ -393,12 +393,12 @@ async def submit_registration(
             detail={
                 "error_code": "role_not_available",
                 "message": (
-                    "This link can register a worker or a lead worker (moallem) only. An "
-                    "administrator account is created by an administrator."
+                    "This link can register a worker, a lead worker (moallem) or an off-office "
+                    "worker only. An administrator account is created by an administrator."
                 ),
             },
         )
-    # Belt and braces: the role is already restricted to the two business roles above, and the
+    # Belt and braces: the role is already restricted to the business roles above, and the
     # root tier must be refused *by name* on every path that could mint one rather than by an
     # accident of a list.
     refuse_developer_role(role)

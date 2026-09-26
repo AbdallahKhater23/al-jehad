@@ -447,7 +447,7 @@ def test_seeded_configuration_is_rewritten_rather_than_inherited(app_module, tab
 #: The app modules that own a file tree. Scanning their globals is how a tree added to the
 #: application - the way ``punch_frames.FRAMES_DIR`` was added and missed - is caught here
 #: instead of by a directory of stray JPEGs in the checkout.
-APP_MODULE_NAMES: Final = ("main", "punch_frames", "quick_links", "corpus")
+APP_MODULE_NAMES: Final = ("main", "punch_frames", "quick_links", "corpus", "registrations")
 
 #: Directories the application only *reads*. Rotating these would be wrong - the frontend ships
 #: with the code and is not a test's data - but a directory global that belongs to neither list

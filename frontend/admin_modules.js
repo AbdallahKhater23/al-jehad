@@ -594,11 +594,15 @@ const UI_MODULES = {
         const label = expanded
             ? I18n.__('liveOpsShowLess')
             : I18n.__('liveOpsShowMore').replace('{count}', String(hidden));
+        // No handler attribute: the control is inside a board whose innerHTML is replaced on
+        // every tick and poll, and the click is delegated from ``renderLiveOps`` instead
+        // (``onLiveOpsClick``). A handler written into the markup is also a handler the
+        // document's CSP has to allow inline for, which is the allowance an injected image
+        // with a bogus source needs.
         return `
             <div class="ops-fold">
                 <button type="button" class="ops-btn" data-live-ops-toggle
-                        aria-expanded="${expanded ? 'true' : 'false'}"
-                        onclick="UI_MODULES.toggleLiveOpsExpanded()">${this.escapeHtml(label)}</button>
+                        aria-expanded="${expanded ? 'true' : 'false'}">${this.escapeHtml(label)}</button>
             </div>`;
     },
 
@@ -613,6 +617,17 @@ const UI_MODULES = {
         this._liveOpsExpanded = !this._liveOpsExpanded;
         if (this._liveOps) this.paintLiveOps(this._liveOps);
         return this._liveOpsExpanded;
+    },
+
+    /**
+     * A click anywhere in the board's pane. The fold is the only delegated control so far;
+     * anything else has its own handler, and a click that is not the fold falls through.
+     */
+    onLiveOpsClick(event) {
+        const target = event && event.target;
+        if (!target || typeof target.closest !== 'function') return undefined;
+        if (target.closest('[data-live-ops-toggle]')) return this.toggleLiveOpsExpanded();
+        return undefined;
     },
 
     liveOpsFilterNoteHtml(data) {
@@ -723,6 +738,11 @@ const UI_MODULES = {
         if (this.liveOpsRenderIsStale(run)) return;
         this._liveOps = data;
         content.innerHTML = this.liveOpsHtml(data);
+        // The fold's control, delegated: the button is a string at paint time, so there is no
+        // node to attach to - and a handler per paint would be a handler per repaint. Assigned
+        // rather than added, like the Shifts tab's, so a repaint cannot leave the previous
+        // paint's listener behind on the same element.
+        content.onclick = (event) => this.onLiveOpsClick(event);
         this.startLiveOps();
     },
 
@@ -4080,21 +4100,22 @@ const UI_MODULES = {
      */
     creatableRoles() {
         const actor = State.user || {};
-        const roles = ['worker', 'moallem'];
+        const roles = ['worker', 'moallem', 'off_office'];
         if (actor.role === 'head_admin') roles.push('admin', 'head_admin');
         return roles;
     },
 
     /** Roles a *link* may create - the server's narrower list, said out loud here. */
     linkRoles() {
-        return ['worker', 'moallem'];
+        return ['worker', 'moallem', 'off_office'];
     },
 
     /** The id block a role owns, so a wrong id is caught before the round trip. */
     roleRange(role) {
         const ranges = {
             worker: { min: 1, max: 499 },
-            moallem: { min: 500, max: 999 },
+            moallem: { min: 500, max: 749 },
+            off_office: { min: 750, max: 999 },
             admin: { min: 1000, max: 4999 },
             head_admin: { min: 5000, max: null }
         };
@@ -4530,6 +4551,7 @@ const UI_MODULES = {
         const keys = {
             worker: 'roleWorker',
             moallem: 'roleMoallem',
+            off_office: 'roleOffOffice',
             admin: 'roleAdmin',
             head_admin: 'roleHeadAdmin'
         };
