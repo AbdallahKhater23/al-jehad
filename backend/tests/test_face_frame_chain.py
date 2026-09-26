@@ -43,11 +43,15 @@ from __future__ import annotations
 
 import ast
 import io
+import json
+import os
+import subprocess
+import sys
 
 import numpy as np
 import pytest
 from fastapi import HTTPException
-from PIL import Image
+from PIL import Image, ImageOps
 
 import config
 import harness
@@ -439,3 +443,236 @@ def test_the_policy_publishes_the_boundary_a_client_has_to_obey():
 
     assert policy["face_frame_max_pixels"] == config.settings.face_frame_max_pixels
     assert policy["face_frame_max_edge_px"] == config.settings.face_frame_max_edge_px
+
+
+# ---------------------------------------------------------------------------
+# 5. one buffer per decode, and no handle left on the upload
+# ---------------------------------------------------------------------------
+# ``ImageOps.exif_transpose`` allocates a full-resolution copy of the photo *whether or not*
+# it rotates anything, and that allocation lands while the decoder's own buffers are still
+# live - so it, and not the later ``convert``, is what sets the peak of a decode. On a 3.1 MP
+# upload at the default ceiling, asking for it only when there is something to rotate takes
+# one frame from ~38 MB to ~26 MB; the measurements are in
+# ``docs/FACE_VERIFICATION_MEMORY_REPORT.md``.
+#
+# This needs a test rather than a comment because the extra copy is *invisible*: the frame is
+# byte-identical either way, so nothing about the output can catch its return - only the call
+# can, and only while the photo is upright.
+# ---------------------------------------------------------------------------
+def _oriented_jpeg(size: tuple[int, int], orientation: int) -> bytes:
+    """A JPEG carrying an EXIF orientation tag, the way a phone camera writes one."""
+    buffer = io.BytesIO()
+    exif = Image.Exif()
+    exif[0x0112] = orientation
+    Image.new("RGB", size, (120, 130, 140)).save(buffer, format="JPEG", quality=85, exif=exif)
+    return buffer.getvalue()
+
+
+def test_an_upright_photo_is_not_transposed(monkeypatch):
+    """The transpose is *asked for* only when the tag says the pixels need rotating.
+
+    Counted rather than observed: the frame it returns is byte-identical to the one a
+    transpose would produce, and the extra full-resolution buffer is the only difference -
+    which no comparison of the output can see. That is how the copy got in and stayed.
+    """
+    calls: list[object] = []
+    real = ImageOps.exif_transpose
+
+    def counting(image, *args, **kwargs):
+        calls.append(image)
+        return real(image, *args, **kwargs)
+
+    monkeypatch.setattr(ImageOps, "exif_transpose", counting)
+
+    frame = uploads.face_frame(_jpeg((1600, 1200)), field="selfie")
+
+    assert calls == [], "an upright photo was transposed, paying a full-resolution copy"
+    assert frame.size == (1280, 960)
+
+
+def test_an_exif_rotated_photo_still_comes_back_upright(monkeypatch):
+    """The fast path must not be the one that skips a rotation the photo *needs*.
+
+    Orientation 6 is the portrait-phone case: the sensor wrote landscape pixels and the tag
+    is what makes them portrait. A template stored at the wrong rotation rejects its owner
+    forever, so the *smaller* frame here (960x1280) is the correct answer, and the landscape
+    one would be a bug that only ever surfaces as a worker who can never match.
+    """
+    calls: list[object] = []
+    real = ImageOps.exif_transpose
+
+    def counting(image, *args, **kwargs):
+        calls.append(image)
+        return real(image, *args, **kwargs)
+
+    monkeypatch.setattr(ImageOps, "exif_transpose", counting)
+
+    frame = uploads.face_frame(_oriented_jpeg((1600, 1200), 6), field="selfie")
+
+    assert calls, "the rotation the EXIF tag asked for was skipped"
+    assert frame.size == (960, 1280), "the frame was not transposed"
+    assert max(frame.size) <= config.settings.face_frame_max_px
+
+
+def test_a_decoded_frame_leaves_no_handle_on_the_upload(tmp_path):
+    """The property a spooled punch depends on: the file can go the moment the frame exists.
+
+    ``main.verify_worker`` deletes its spool file as soon as the face job returns, and on
+    Windows a file somebody still has open cannot be unlinked at all - so a frame that kept
+    the descriptor would leave every punch's upload on disk until the hourly sweep, quietly.
+    The *refusal* path is pinned by the header-only test above; this is the **success** path,
+    which is the one whose frame outlives the request.
+    """
+    path = tmp_path / "upload.jpg"
+    path.write_bytes(_jpeg((1600, 1200)))
+
+    frame = uploads.face_frame(str(path), field="selfie")
+
+    assert getattr(frame, "fp", None) is None, "the frame still holds the upload open"
+    os.remove(path)  # would raise on Windows if the handle were still held
+    frame.load()  # the pixels survived the file
+    assert frame.size == (1280, 960)
+
+
+# ---------------------------------------------------------------------------
+# the peak, in bytes: one full-resolution buffer per decode
+# ---------------------------------------------------------------------------
+# The buffer count above is the exact, portable guard. This is the backstop that does not
+# depend on knowing *which* operation allocated the buffer: it measures the peak of one
+# decode and holds it against a second decode whose extra buffer is *required*, so a future
+# change anywhere in the chain - a `.copy()`, a second `np.array`, a second decode - shows up
+# as memory even though it leaves the frame byte-identical.
+#
+# Peak resident memory is a process-lifetime high-water mark and never comes back down, so
+# the two measurements need two interpreters: in one process the second measurement would
+# inherit the first's peak and always look free. And an absolute megabyte figure is a
+# property of one allocator on one operating system, while this ships on another - which is
+# why the assertion is a *comparison* between two runs on the same machine.
+#
+# The rotated photo is the calibration, and it is deliberately a *legitimate* path rather
+# than a reconstruction of the old bug: its transpose is required, so its peak necessarily
+# contains the extra full-resolution buffer and differs from the upright case by nothing else.
+_DECODE_PEAK_PROBE = r'''
+import ctypes, io, json, os, sys
+sys.path.insert(0, os.path.abspath("."))
+import numpy as np
+from PIL import Image
+import uploads
+
+
+def peak_bytes():
+    """Resident high-water mark, in bytes, on the three families this ships on."""
+    if sys.platform == "win32":
+        from ctypes import wintypes
+
+        class PMC(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+        fn = ctypes.windll.psapi.GetProcessMemoryInfo
+        fn.argtypes = [wintypes.HANDLE, ctypes.POINTER(PMC), wintypes.DWORD]
+        fn.restype = wintypes.BOOL
+        counters = PMC()
+        counters.cb = ctypes.sizeof(counters)
+        fn(ctypes.windll.kernel32.GetCurrentProcess(), ctypes.byref(counters), ctypes.sizeof(counters))
+        return int(counters.PeakWorkingSetSize)
+    import resource
+    rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    return rss if sys.platform == "darwin" else rss * 1024   # KiB on Linux
+
+
+mode = sys.argv[1]
+
+if mode == "calibrate":
+    # Can this allocator see one extra full-resolution buffer at all? Two 2048x1536 RGB
+    # buffers, the second allocated while the first is live and nothing else happening. When
+    # this measures ~0 the machine cannot answer the question, and the caller skips instead
+    # of reading a level result as "the chain stopped allocating the buffer".
+    held = Image.new("RGB", (2048, 1536))
+    base = peak_bytes()
+    extra = held.copy()
+    print(json.dumps({"peak_above_base": peak_bytes() - base, "held": [held.size, extra.size]}))
+    raise SystemExit(0)
+
+rng = np.random.RandomState(0)
+photo = Image.fromarray(rng.randint(0, 255, (1536, 2048, 3), dtype=np.uint8))
+buffer = io.BytesIO()
+exif = Image.Exif()
+exif[0x0112] = int(mode)
+photo.save(buffer, format="JPEG", quality=85, exif=exif)
+data = buffer.getvalue()
+del photo, buffer
+# Built *before* the baseline is read, so the JPEG encoder's own peak is not charged to
+# the decode.
+base = peak_bytes()
+frame = uploads.face_frame(data, field="selfie")
+print(json.dumps({"peak_above_base": peak_bytes() - base, "size": list(frame.size)}))
+'''
+
+#: One 2048x1536 RGB photo, the size of the buffer a decode is allowed to allocate once.
+_SOURCE_BUFFER = 2048 * 1536 * 3
+
+
+def _decode_peak(mode: int | str) -> int:
+    """Bytes of peak above baseline for one probe run, in a fresh interpreter.
+
+    ``mode`` is an EXIF orientation to decode, or ``"calibrate"`` for the allocator
+    sensitivity check.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", _DECODE_PEAK_PROBE, str(mode)],
+        cwd=harness.BACKEND_DIR,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"peak memory could not be measured here: {result.stderr.strip()[-200:]}")
+    return int(json.loads(result.stdout.strip().splitlines()[-1])["peak_above_base"])
+
+
+def test_an_upright_decode_does_not_pay_for_a_transpose_buffer():
+    """One decode allocates one full-resolution buffer, and the peak is what says so.
+
+    ``ImageOps.exif_transpose`` allocates a full-resolution copy of the photo, and it does so
+    while the decoder's own buffers are still live - which is why it, and not the ``convert``
+    that follows it, is the whole peak of a decode. Skipping it when the orientation says the
+    pixels are already upright is worth ~12.5 MB per verification (measurements and method:
+    ``docs/FACE_VERIFICATION_MEMORY_REPORT.md``).
+
+    The regression this catches is invisible in the output - the frame is byte-identical
+    either way - so it can only be seen in memory. A rotated photo is the calibration: its
+    transpose is *required*, so its peak necessarily contains that extra buffer and differs
+    from the upright case by nothing else. Holding one run against the other on the same
+    machine is what makes this portable; an absolute megabyte figure is a property of one
+    allocator on one operating system, and this ships on another.
+
+    A third run establishes whether this allocator can see one extra full-resolution buffer
+    *at all*, by allocating two 2048x1536 buffers with nothing else happening. Without that,
+    a level result is ambiguous - "the allocator reused the memory" and "the chain stopped
+    allocating it" measure the same - and the ambiguity would have to be resolved by skipping,
+    which is also how a regression would hide. With it, an insensitive allocator skips (and
+    ``test_an_upright_photo_is_not_transposed`` has the portable half covered) while a
+    sensitive one that finds no difference at all reports a failure.
+    """
+    margin = _SOURCE_BUFFER // 4
+
+    if _decode_peak("calibrate") <= margin:
+        pytest.skip(
+            "this allocator did not expose a single extra full-resolution buffer, so a "
+            "regression would be invisible to this measurement"
+        )
+
+    upright = _decode_peak(1)
+    rotated = _decode_peak(6)
+
+    assert upright < rotated - margin, (
+        f"an upright decode peaked at {upright} B against a rotated decode's {rotated} B - "
+        f"inside a quarter of one {_SOURCE_BUFFER} B source buffer, on a machine that *can* "
+        "see such a buffer - which means a full-resolution copy of the photo is being "
+        "allocated again (docs/FACE_VERIFICATION_MEMORY_REPORT.md)"
+    )

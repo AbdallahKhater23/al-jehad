@@ -55,6 +55,13 @@ decides whether the crossing is ever reported, and that decision is stated once,
   crossing), so the close acts and the scans report that the alert cannot fire;
 * **the close is off** - only a clock-out ends a shift, and the alert always fires.
 
+That table governs the close at the **paid day**, and only at the paid day. An *answered*
+crossing is a separate permission: authorising a ceiling in the Approvals queue is the operator
+naming the end of the day, so the close ends that shift at the ceiling whether the switch is on
+or the alert line is above the paid day (see ``scan_auto_close`` and ``_is_authorised``). A
+refusal is not - it records the ordinary paid day - so declining a crossing never becomes a way
+to end a shift from a surface about money.
+
 The verdict travels: ``start_watcher`` logs it once at startup, ``GET /admin/shift_rules``
 publishes it to the console, and ``readiness`` reports both halves of it as advisory checks
 (the alert reachable, and the close standing down). A deferral is never silent, because "the
@@ -359,6 +366,18 @@ def live_decision(conn: sqlite3.Connection, worker_id: str, clock_in_time) -> sq
         "AND consumed_by_log_id IS NULL AND superseded_by IS NULL ORDER BY id DESC LIMIT 1",
         (str(worker_id), str(clock_in_time)),
     ).fetchone()
+
+
+def _is_authorised(decision: sqlite3.Row | None) -> bool:
+    """Whether a standing decision is an *approval* - the answer that ends the day at a ceiling.
+
+    A refusal is a decision too, and it is deliberately not one of these. Answering a crossing
+    with a ceiling is the operator naming the end of the day, so it arms the automatic close at
+    that ceiling by itself (see ``scan_auto_close``); declining says "no extra time", which is
+    the paid day the ordinary clock-out already produces, and it must not become a second way to
+    end somebody's shift on a surface whose only job was to answer a question about money.
+    """
+    return decision is not None and str(decision["decision"]) == DECISION_AUTHORISED
 
 
 #: How far past a ceiling a shift has to be before the hours beyond it are a *new question*.
@@ -1064,10 +1083,21 @@ def scan_auto_close(*, now: datetime | None = None) -> dict:
     out. Standing down entirely would be the wrong reading of the same answer - a shift that
     nothing can bound is how a session nobody remembers runs for a week.
 
-    Stands down entirely when ``day_end_rules`` says the close defers to the overtime
-    workflow (``close_defers``): closing at the paid limit would end the shift before it
-    could be observed crossing the alert line, and observing that crossing is the other
-    rule's whole job. The summary says so (``deferred``, with the reason) rather than
+    AN APPROVAL ARMS THE CLOSE BY ITSELF
+    ------------------------------------
+    Answering a crossing with a ceiling *is* the operator ending the day, so an authorised
+    shift is closed at its ceiling whether or not the ordinary close is switched on and
+    whether or not it is standing down. Both of those gates exist for the paid-day close, and
+    neither reason survives the answer: ``auto_close_at_regular`` off means "a human ends the
+    day", and the human has just named the end; ``close_defers`` stands down so a crossing can
+    still be *observed*, and an answered crossing has been observed by definition. Only an
+    approval counts - a refusal records the ordinary paid day, which a clock-out already
+    reaches, and is not a reason for a surface about money to end somebody's shift.
+
+    Stands down for a shift with **no live approval** when ``day_end_rules`` says the close
+    defers to the overtime workflow (``close_defers``): closing at the paid limit would end the
+    shift before it could be observed crossing the alert line, and observing that crossing is
+    the other rule's whole job. The summary says so (``deferred``, with the reason) rather than
     returning a quiet zero that looks like a watcher with nothing to do - and a shift being
     held inside an authorised window is reported the same way (``holding``, with the window).
 
@@ -1113,25 +1143,46 @@ def scan_auto_close(*, now: datetime | None = None) -> dict:
             values = rules(conn)
             day_end = shift_hours.day_end_rules(values)
             summary["day_end"] = day_end
-            if not shift_hours.auto_close_enabled(values):
-                summary["enabled"] = False
-                return summary
-            if day_end["close_defers"]:
+            switch_on = shift_hours.auto_close_enabled(values)
+            summary["enabled"] = switch_on
+            if switch_on and day_end["close_defers"]:
                 # Standing down is the whole reconciliation: a shift ended here could not be
                 # reported as crossing the alert line, and the crossing is the point of the
                 # other rule. The shifts stay open for the overtime workflow to see.
                 summary["deferred"] = True
                 summary["deferred_reason"] = day_end["detail"]
-                return summary
+            # The close at the *paid day* is what the switch and the deferral govern. An
+            # answered crossing is a different permission and is honoured either way - see
+            # ``_is_authorised`` and the per-shift branch below.
+            general_close = switch_on and not day_end["close_defers"]
 
             regular = shift_hours.regular_hours(values)
             sessions = conn.execute(
                 "SELECT worker_id, site_name, clock_in_time FROM active_sessions"
             ).fetchall()
-            for session in sessions:
+            # Resolve each shift's standing answer once. An approval arms the close even when
+            # the general close is off or standing down, so the early exit below is only taken
+            # when no live approval is waiting on any shift.
+            resolved = [
+                (session, live_decision(conn, session["worker_id"], session["clock_in_time"]))
+                for session in sessions
+            ]
+            if not general_close and not any(
+                _is_authorised(decision) for _, decision in resolved
+            ):
+                return summary
+
+            for session, decision in resolved:
                 summary["scanned"] += 1
                 clock_in = _parse_ts(session["clock_in_time"])
                 if clock_in is None:
+                    continue
+                authorised = _is_authorised(decision)
+                if not general_close and not authorised:
+                    # Neither the ordinary close nor an approval is in play for this shift: a
+                    # clock-out ends the day, which is what the switch off (or the deferral)
+                    # has always meant.
+                    summary["skipped"] += 1
                     continue
                 # The end of the day this shift is allowed to reach. Without an answer it is
                 # the paid day, which is the boundary this rule has always used. With one, the
@@ -1141,7 +1192,6 @@ def scan_auto_close(*, now: datetime | None = None) -> dict:
                 # said could run on. The close therefore waits *inside the window* rather than
                 # standing down entirely: an answer that nothing could ever bound is how a
                 # session nobody remembers runs for a week.
-                decision = live_decision(conn, session["worker_id"], session["clock_in_time"])
                 # Never below the paid day: the hours are already worked, and no answer makes
                 # a worked day worth less than the standard one.
                 limit = max(regular, float(decision["authorised_hours"])) if decision else regular
@@ -1355,13 +1405,17 @@ def _loop(interval: int) -> None:
     while not _stop_event.is_set():
         try:
             closed = scan_auto_close()
+            if closed.get("closed"):
+                # Reported before the deferral: a deferral and a close are not exclusive any
+                # more. The close still stands down for shifts nobody answered, but an
+                # approval arms it at its ceiling all the same, so a pass can both defer and
+                # end an authorised day.
+                log.info("auto-close ended %s shift(s) at the paid limit", closed["closed"])
             if closed.get("deferred"):
                 log.info(
                     "auto-close standing down for the overtime workflow: %s",
                     closed.get("deferred_reason", "the alert line is above the paid day"),
                 )
-            elif closed.get("closed"):
-                log.info("auto-close ended %s shift(s) at the paid limit", closed["closed"])
             summary = scan_overtime()
             if summary.get("notified"):
                 log.info("overtime watcher raised %s notification(s)", summary["notified"])

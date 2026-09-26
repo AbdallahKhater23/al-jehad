@@ -18,6 +18,11 @@ Two names for two different things, which is the whole design:
   before the detector was replaced, or with no provenance at all). Same fix, different cause,
   and an operator clearing a worklist needs to tell them apart.
 
+A third cause is not about the vector at all and still needs the same photograph: a template
+filed under the account id the old naming scheme used (``STALE_LEGACY_NAME``). It routes as the
+*version* one - both codes say "this record predates a change in the system" - and carries its
+own diagnosis, so a client that enumerates two codes never meets a third.
+
 The unhandled-exception half of the requirement is pinned where it can be reached honestly, by
 punching against a planted legacy template: ``tests/test_biometric_identity.py``.
 """
@@ -49,6 +54,7 @@ def test_every_stale_reason_has_a_status_and_a_reason():
         biometrics.STALE_NO_PROVENANCE,
         biometrics.STALE_OTHER_PIPELINE,
         biometrics.STALE_OTHER_MODEL,
+        biometrics.STALE_LEGACY_NAME,
     }
     for reason, (status, code) in biometrics.REENROLLMENT_STATUSES.items():
         assert status == biometrics.STATUS_NEEDS_REENROLLMENT, reason
@@ -68,6 +74,9 @@ def test_every_stale_reason_has_a_status_and_a_reason():
         # The same width, a different part of the face.
         (biometrics.STALE_NO_PROVENANCE, biometrics.REASON_STALE_TEMPLATE_PIPELINE),
         (biometrics.STALE_OTHER_PIPELINE, biometrics.REASON_STALE_TEMPLATE_PIPELINE),
+        # Not a version or a crop of the *vector* at all, and still a record from before a
+        # change in the system: a face filed under an account id rather than the immutable one.
+        (biometrics.STALE_LEGACY_NAME, biometrics.REASON_STALE_TEMPLATE_VERSION),
     ],
 )
 def test_the_diagnosis_distinguishes_a_version_change_from_a_crop_change(reason, expected):
@@ -116,3 +125,25 @@ def test_the_stale_refusal_is_not_reported_as_a_server_fault():
     error_code, _ = main._frame_refusal(main.FACE_REFERENCE_STALE)
 
     assert error_code != main.FACE_CHECK_FAILED[0]
+
+
+def test_a_misfiled_template_routes_to_the_same_screen_with_its_own_diagnosis():
+    """A second error string for one code, and the string has to be a true diagnosis.
+
+    Both are stored on the punch row for an operator to read afterwards, so "predates the current
+    face pipeline" cannot stand in for a template that may have been written yesterday and filed
+    wrongly. What must *not* differ is the code: the worker is routed to the same re-enrollment,
+    and a client that knows one refusal knows this one.
+    """
+    error_code, message = main.FACE_FRAME_REFUSALS[main.FACE_REFERENCE_MISFILED]
+
+    assert error_code == main.REFERENCE_STALE_CODE, (error_code, message)
+    assert main.FACE_REFERENCE_MISFILED != main.FACE_REFERENCE_STALE
+    assert "enroll" in message.lower() and "administrator" in message.lower(), message
+
+    payload = biometrics.reenrollment_status(biometrics.STALE_LEGACY_NAME)
+    assert payload == {
+        "status": biometrics.STATUS_NEEDS_REENROLLMENT,
+        "reason": biometrics.REASON_STALE_TEMPLATE_VERSION,
+        "stale_reason": biometrics.STALE_LEGACY_NAME,
+    }, payload

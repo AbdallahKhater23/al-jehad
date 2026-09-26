@@ -22,12 +22,33 @@
 #     but if a runner's floor differs, these two flags are where that is adjusted, next to the
 #     report the run uploads.
 
+# A second job, `frame-decode-memory`, runs only when dispatched by hand. It answers a
+# question about a *host* rather than a commit: whether the face frame's upright fast path
+# (docs/FACE_VERIFICATION_MEMORY_REPORT.md, section 3) still avoids one full-resolution
+# buffer once the allocator is the deployment's jemalloc under a 512 MB / 1 vCPU cgroup,
+# rather than the Windows development box every figure in that report was taken on. So it is
+# deliberately off the push path - it builds the deployment image, and that is worth a few
+# minutes only when the answer is wanted.
+#
+# It measures twice, because the two disagree in a way that matters: once bare on the runner
+# (Linux, glibc, uncapped) and once inside the built image (jemalloc, 512m/512m, --cpus 1 -
+# exactly the flags tools/capacity_test.py applies). The tool fails the job only when the
+# saving is genuinely absent (exit 1); an allocator that cannot expose the buffer at all is
+# reported as inconclusive (exit 2) rather than read as a pass.
+
 name: Punch memory budget
 
 on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      capped_container:
+        description: >-
+          Also build the deployment image and measure inside it at 512m / --cpus 1, where
+          the allocator is the deployment's jemalloc rather than the runner's glibc.
+        type: boolean
+        default: true
 
 concurrency:
   group: punch-memory-${{ github.ref }}
@@ -78,4 +99,85 @@ jobs:
         with:
           name: punch-memory-report
           path: backend/punch-memory.json
+          if-no-files-found: warn
+
+  # Does the section 3 saving exist on the deployment's own allocator, or only on the box it
+  # was measured on? Two runs, and the second needs the answer from the first to be trusted:
+  #
+  #   * on the runner, `process_reader()` reads /proc (VmHWM), so the number is real Linux
+  #     but glibc's allocator - the reason the comparison is a *rotated* photo rather than an
+  #     absolute figure, and the same method the test suite's peak guard uses.
+  #   * in the image, the allocator is the one the instance runs (jemalloc, LD_PRELOAD from
+  #     the Dockerfile) and the ceiling is the one it runs under. A saving that survives here
+  #     is the deployment's, not the development box's.
+  #
+  # Neither of these is a cgroup-level OOM gate - that is `tools/capacity_test.py`, and it
+  # needs a real punch load. This asks one narrower question: is one full-resolution buffer
+  # still being avoided when the frame is upright?
+  frame-decode-memory:
+    name: the upright decode saving, on Linux
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            backend/requirements-dev.txt
+
+      - name: Install the deployment's dependencies and the tooling
+        run: pip install -r requirements.txt -r backend/requirements-dev.txt
+
+      # The runner first: fast, and it answers the same question one allocator earlier. Its
+      # exit code is kept rather than consumed by `tee`, so a red run is red because the tool
+      # said so rather than because the log survived.
+      - name: The saving here, on this runner's glibc
+        working-directory: backend
+        run: |
+          set -o pipefail
+          code=0
+          python tools/frame_decode_memory.py --json | tee /tmp/frame-decode-runner.txt || code=$?
+          echo "runner exit code: $code" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$code" -eq 1 ]; then
+            echo "::error::no upright saving measured on this Linux runner"
+            exit 1
+          fi
+
+      - name: Build the deployment image
+        if: inputs.capped_container
+        run: docker build -t frame-decode-memory .
+
+      # `--memory-swap` equal to `--memory` is what turns "slower" into "killed", and the
+      # Dockerfile's memory profile is restated for the same reason capacity_test.py restates
+      # it. The entrypoint is replaced so this runs the tool and not the server - the question
+      # is about a decode, and a serving process sharing the same 512 MB would answer it
+      # wrongly in both directions.
+      - name: The saving inside the image, at the instance's shape
+        if: inputs.capped_container
+        run: |
+          set -o pipefail
+          code=0
+          docker run --rm --memory 512m --memory-swap 512m --cpus 1 --entrypoint python --workdir /app/backend --env FACE_INFERENCE_QUEUE=8 --env STANDING_SWEEP_ENABLED=0 frame-decode-memory tools/frame_decode_memory.py --json | tee /tmp/frame-decode-container.txt || code=$?
+          echo "container exit code: $code" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$code" -eq 1 ]; then
+            echo "::error::an upright decode costs what a rotated one does inside the deployment's own image"
+            exit 1
+          fi
+          if [ "$code" -eq 2 ]; then
+            echo "::warning::this allocator hid the buffer, so the answer is inconclusive rather than absent"
+          fi
+
+      - name: Keep both reports, whatever the verdict
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frame-decode-memory
+          path: |
+            /tmp/frame-decode-runner.txt
+            /tmp/frame-decode-container.txt
           if-no-files-found: warn

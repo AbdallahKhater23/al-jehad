@@ -496,6 +496,11 @@ Key settings (all optional except `SECRET_KEY`, full list in `backend/config.py`
 | `WORKER_PHOTOS_DIR` | `worker_photos` | reference selfies, one per enrolled account |
 | `PUNCH_FRAMES_DIR` | `punch_frames` | the downscaled evidence frame stored with a punch |
 | `QUICK_LINK_PHOTOS_DIR` | `quick_link_photos` | the selfie a quick-link punch arrives with |
+| `REGISTRATION_ENABLED` | `0` | the walk-up onboarding link (`GET`/`POST /api/v1/register`). Off by default, so a deployment publishes it deliberately; while off the link answers as closed and every submission is refused |
+| `REGISTRATION_PHOTOS_DIR` | `registration_photos` | the selfie a walk-up applicant sends, held until an administrator approves or rejects it |
+| `REGISTRATION_PENDING_CAP` | `200` | how many applications may wait for review at once; the next is refused rather than letting the queue grow without bound |
+| `REGISTRATION_RATE_LIMIT` | `20/minute` | per-IP ceiling on submissions to the public link |
+| `REGISTRATION_PHOTO_STALE_HOURS` | `168` | how long an application photo no row references is kept before the startup sweep deletes it |
 | `MIN_PASSWORD_LENGTH` | `8` | shortest password the server will set, in the console and on a registration link |
 | `ENROLLMENT_TOKEN_TTL_HOURS` | `72` | how long an enrollment or registration link stays usable |
 | `OVERTIME_WATCHER_INTERVAL_SECONDS` | `60` | how often that timer runs |
@@ -747,6 +752,57 @@ was actually applied. `GET /api/v1/readiness` reports any stored window the appl
 not parse - which is the only way a bad value becomes visible, because the punch path falls
 back to the global rule rather than failing a worker's arrival.
 
+### Site categories (a warehouse, a factory, a project)
+
+Between the site and the company rules there is a third layer: a **category**. Sites are grouped
+into categories - `مخزن` (warehouse), `مصنع` (factory), `مشاريع` (projects) are seeded on a fresh
+database - and a category may carry the clock-in window for every site inside it. The order is
+**site → category → company**, still resolved per field:
+
+* a site that has set its own hours ignores its category's entirely;
+* a category that sets only an opening time leaves the closing time to the company rules;
+* a site in no category resolves exactly as it did before categories existed.
+
+The retune Ops asked for - "the warehouses open at 07:00 now" - is therefore **one edit**, and it
+moves every warehouse at once, including sites that have not been visited in months. Nothing is
+copied onto the member sites: their own columns stay `NULL`, so `GET /api/v1/admin/sites` can
+still say *which layer* each half of the window in force came from, and a later category edit
+cannot stamp over hours somebody deliberately set on one site.
+
+```bash
+# What is in the list, and how many sites follow each one
+curl -H "Authorization: Bearer $TOKEN" localhost:8000/api/v1/admin/site_categories
+
+# The retune itself. The id is the key: renaming is display-only.
+curl -X POST localhost:8000/api/v1/admin/site_categories/edit \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"category_id":1,"name":"مخزن","clock_in_window_start":"07:00","clock_in_window_end":"15:00"}'
+
+# Put a site into one, on the site form (null - or the empty option - takes it out again)
+curl -X POST localhost:8000/api/v1/admin/sites/edit \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"site_name":"Downtown Tower A","location_input":"30.05,31.23","radius":65,"category_id":1}'
+```
+
+* `GET|POST /api/v1/admin/site_categories[/add|/edit|/delete]` is the whole surface, and it
+  mirrors `/admin/sites` deliberately: the same absent-key rule (omitting a window field leaves it
+  alone, `null` clears the override), the same `HH:MM` and IANA-timezone checks, and the same
+  audit trail (`site_category_create|edit|delete`).
+* **Deleting is refused while sites still belong to it** (409, naming the count), rather than
+  reassigning them: every destination would be a guess about those sites' opening hours. Move them
+  to another category, or to none, first.
+* On the Shifts tab the categories appear as chips beside the period presets, each carrying the
+  number of shifts **in this period** behind it - so a chip cannot offer an empty table - and the
+  search box matches a site's category, so typing `مخزن` finds every warehouse shift. The chosen
+  category travels in the shareable link (`#shifts=…&q=…&c=…`) and narrows the printed and
+  downloaded timesheet exactly as it narrows the screen.
+* The **Sites** tab gets a category picker on both forms - with *No category* first, which is what
+  every existing site is - and a *Site categories* panel to add, rename, retune and delete them.
+  A card names the category the site is in, and a window that came from a category says so.
+* `GET /api/v1/readiness` checks the categories too, not only the sites: a category whose zone no
+  runtime can resolve moves every site inside it at once, and it is reported as `category <name>`
+  rather than as one of its sites - which is the screen where the fix is made.
+
 ## Which rule ends the day (the automatic close and the overtime alert)
 
 One timer, two rules, and only one of them can end a day. `overtime.py` runs both every
@@ -775,6 +831,17 @@ stands down, so a deployment that shipped it on switched nothing while the conso
 *on* - and every fresh volume was born reporting `overtime_close_deferred`. An alert line above
 the paid day only means anything if shifts are allowed to reach it, so what ships is the
 arrangement with nothing standing down: the close is off, the alert is the rule that acts.
+
+**Answering a crossing is its own permission.** The tables above govern the close at the
+**paid day**. An *approval* in the Approvals queue - the operator naming a ceiling for a live
+shift - arms the same close at that ceiling whether or not `auto_close_at_regular` is on and
+whether or not it is standing down. A worker still on the clock at 14 h authorised for 12 is
+checked out at the 12 h boundary; a worker at 9 h authorised for 12 is left running and closed
+the moment they reach it. Both reasons the gates exist are answers the approval has already
+given: the switch off means "a human ends the day", and the deferral exists so a crossing can
+be *observed* - an answered crossing has been. A **refusal** is not an approval, so declining a
+crossing never ends a day from a surface about money. The close runs on the watcher's pass, so
+an approved shift ends within `OVERTIME_WATCHER_INTERVAL_SECONDS` (a minute by default).
 
 To get the automatic close back, do **both** halves of the pair - switch it on *and* set the
 overtime line **strictly below** the paid day (7.5 h). That is also what being warned *before*
@@ -1014,8 +1081,40 @@ template and consumes the link, in that order - every step that can fail happens
 anything is written, so a rejected password or an unreadable photo costs a retry rather
 than the link. The **id and the role are the administrator's**: a link can create a
 `worker` or a `moallem` (never an administrator), it is single-use whatever `max_uses`
-says, and it refuses an id that is already taken. The Credentials tab has this behind one
+says, and it refuses an id that is already taken or already **reserved by another live link**.
+The reservation is real rather than cosmetic: the number lives on the invite row until the link
+is claimed, and the walk-up allocator below treats it as taken, so the two creation flows can
+never hand the same id to two people. Revoking, expiring or claiming the invite releases it. The Credentials tab has this behind one
 button, with the URL, a copy button, a WhatsApp message and the QR code.
+
+**Walk-up registration (one standing link, no account yet).** An invite is issued per
+person; a *walk-up* link is the opposite - a single public URL a site can print or display,
+where anybody applies and nothing exists until an administrator decides. `GET /api/v1/register`
+reports whether it is open and what the form must satisfy, `POST /api/v1/register` streams the
+photo to disk and writes a `registration_requests` row (`PENDING_REVIEW`) - never an account,
+a face template or an id. An administrator lists the queue at `GET /api/v1/admin/registrations`,
+views the photo at `.../{id}/photo`, and *then* approves or rejects:
+
+```
+GET  /api/v1/register                      -> whether it is open, the roles, the photo policy
+POST /api/v1/register                      multipart: photo + name, phone, role, password,...
+GET  /api/v1/admin/registrations           the queue, oldest first, no password, no path
+GET  /api/v1/admin/registrations/{id}/photo     the application photo, `Cache-Control: no-store`
+POST /api/v1/admin/registrations/{id}/approve   {"note": "..."} -> creates the account
+POST /api/v1/admin/registrations/{id}/reject    {"note": "..."} -> wipes the photo, keeps the row
+```
+
+Approval is the only thing that creates an account, and it is atomic: it allocates the
+**lowest free id in the role's block** - an id a live registration invite is holding counts as
+taken, so an approval can never spend a number another administrator already promised to
+somebody - writes the user row and its face template behind one write lock, and clears the
+pending row in the same movement, so two administrators approving the last slot cannot both
+think they won. The password the applicant chose is never returned,
+logged or selected by the queue - the applicant would otherwise learn the account's credentials
+from a screenshot of the review list. The link is off unless `REGISTRATION_ENABLED=1`, capped by
+`REGISTRATION_PENDING_CAP`, rate-limited per IP (`REGISTRATION_RATE_LIMIT`), and deliberately
+does **no model work** on the public route: the 1 vCPU that serves the punch gate must not be
+spent on a stranger's upload. Liveness, if it applies at all, runs at review.
 
 **Bulk import.** `POST /api/v1/admin/enrollment/bulk` with `roster` (CSV: `user_id,name`
 plus optional `role,email,phone,photo`) and `photos` (ZIP). Add `?dry_run=true` to

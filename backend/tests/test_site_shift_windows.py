@@ -474,8 +474,11 @@ def test_the_schema_version_names_the_newest_migration():
     # for it rather than merely that somebody looked, 20 the developer-operations tables - runtime
     # configuration and the root tier's private alert hub - 21 the overtime-authorisation records,
     # the mid-shift decision on a crossing, 22 ``refused_punches``, the score, reason and frame of
-    # a punch the band rejected, and 23 the corpus-capture consent records.)
-    assert migrations.SCHEMA_VERSION == 23
+    # a punch the band rejected, 23 the corpus-capture consent records, and 24 the walk-up
+    # registration requests - the public onboarding link's queue, a row of which becomes an
+    # account only when an administrator approves it, and 25 ``site_categories``, the layer
+    # between a site's own window columns and the company rules.)
+    assert migrations.SCHEMA_VERSION == 25
 
 
 def test_the_migration_is_replayable_and_idempotent():

@@ -91,6 +91,7 @@ import punch_frames
 import push
 import quick_links
 import readiness
+import registrations
 import reports
 import retention
 import schema_guard
@@ -608,6 +609,10 @@ class SiteModel(BaseModel):
     clock_in_window_start: str | None = None
     clock_in_window_end: str | None = None
     site_timezone: str | None = None
+    #: The category this site belongs to, by id - ``None`` leaves it uncategorised, which is
+    #: exactly the behaviour a site had before categories existed. The id is checked against
+    #: ``site_categories`` where it is written; a name is sent to a screen, never to a row.
+    category_id: int | None = None
 
     @field_validator("site_name")
     @classmethod
@@ -634,6 +639,61 @@ class SiteModel(BaseModel):
     def _validate_timezone(cls, value: str | None) -> str | None:
         """The site's own zone, checked by the shared rule (see ``_plain_timezone``)."""
         return _plain_timezone(value)
+
+
+class SiteCategoryModel(BaseModel):
+    """A category of sites, and the clock-in window the sites inside it inherit.
+
+    The window fields are nullable for the same reason a site's are: ``None`` means "inherit",
+    and here that means the company rules. A category may therefore set only a start time and
+    leave the end alone, which is the shape the retune actually takes - "the warehouses open at
+    07:00 now" - and forcing the pair would make an administrator retype a value they are not
+    changing (the same argument ``shift_windows`` makes for resolving per field).
+    """
+
+    name: str
+    clock_in_window_start: str | None = None
+    clock_in_window_end: str | None = None
+    site_timezone: str | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _plain_category_name(cls, value: str) -> str:
+        """Arabic or English, with spaces and the usual punctuation - a site's own rule.
+
+        A category name is a label on the Shifts board, a row in ``site_categories`` and the
+        word an administrator reads before changing four sites' hours at once, so it goes
+        through the same allowlist as a site name. ``MAX_LABEL`` rather than
+        ``MAX_SITE_NAME``: a category is a word, not a compound address.
+        """
+        return textguard.identifier(
+            value, field="Category name", max_length=textguard.MAX_LABEL
+        )
+
+    @field_validator("clock_in_window_start", "clock_in_window_end")
+    @classmethod
+    def _validate_window_time(cls, value: str | None) -> str | None:
+        """The category's hours, checked by the shared rule (see ``_plain_hhmm``)."""
+        return _plain_hhmm(value, field="Category clock-in window")
+
+    @field_validator("site_timezone")
+    @classmethod
+    def _validate_timezone(cls, value: str | None) -> str | None:
+        """The category's zone, checked by the shared rule (see ``_plain_timezone``)."""
+        return _plain_timezone(value)
+
+
+class SiteCategoryEditModel(SiteCategoryModel):
+    """An edit names the row it changes; the window fields keep the site form's rule.
+
+    ``name`` is required because it is the one field the form always shows; the three window
+    fields obey ``model_fields_set`` - absent leaves them alone, an explicit ``null`` clears
+    the override so the category inherits from the company again. That parity with
+    ``/admin/sites/edit`` is deliberate: the two forms are siblings, and a reader who has
+    learned one has learned the other.
+    """
+
+    category_id: int
 
 
 class ForceClockRequest(BaseModel):
@@ -846,6 +906,38 @@ def _site_window_columns(req: SiteModel) -> dict[str, Any]:
     return {key: getattr(req, key) for key in _SITE_WINDOW_FIELDS}
 
 
+def _category_audit_payload(req: Any) -> dict[str, Any]:
+    """What an audit entry records about a category: its name and the three window fields.
+
+    The window fields are recorded as ``None`` when the caller did not send them, which is the
+    honest reading of an edit that left them alone - the audit row describes the *change*, and
+    a field nobody touched is not part of it.
+    """
+    return {
+        "name": req.name,
+        **{key: getattr(req, key) for key in _SITE_WINDOW_FIELDS},
+    }
+
+
+def _require_site_category(conn: sqlite3.Connection, category_id: Any) -> int | None:
+    """``category_id``, checked to name a real category. ``None`` means "uncategorised".
+
+    Checked here rather than left to a foreign key for two reasons: SQLite only enforces
+    ``REFERENCES`` when ``PRAGMA foreign_keys`` is on, which this application does not set, and
+    the failure it would produce is an ``IntegrityError`` at the bottom of the insert - a 500,
+    not a sentence about what the administrator got wrong. The id is also an integer chosen by a
+    client, so it is refused where it can still be corrected.
+    """
+    if category_id is None:
+        return None
+    row = conn.execute(
+        "SELECT category_id FROM site_categories WHERE category_id = ?", (int(category_id),)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Site category not found.")
+    return int(row["category_id"])
+
+
 def _validate_site_radius(radius: float) -> float:
     """A radius a worker can actually be inside of.
 
@@ -934,7 +1026,10 @@ def site_at(conn: sqlite3.Connection, lat: float, lon: float) -> sqlite3.Row | N
     ask this question - the punch handler and the worker's own "what window applies where I am
     standing" look-up - and a second copy of this loop is how they would come to disagree.
     """
-    for site in conn.execute("SELECT * FROM construction_sites").fetchall():
+    # The row carries the site's category as well as the site (``shift_windows.SITE_ROW_SQL``),
+    # so the window this returns is already resolved through all three layers - site, category,
+    # company - without the punch path having to look the category up itself.
+    for site in conn.execute(shift_windows.SITE_ROW_SQL).fetchall():
         if get_distance_meters(site["lat"], site["lon"], lat, lon) <= site["radius"]:
             return site
     return None
@@ -952,6 +1047,17 @@ def site_at(conn: sqlite3.Connection, lat: float, lon: float) -> sqlite3.Row | N
 #: stale template needs an administrator to take a photograph, and a server fault needs
 #: somebody to read a log. Keys the mapping below, so it is a constant and not a literal.
 FACE_REFERENCE_STALE = "Reference face template predates the current face pipeline."
+
+#: The error ``compare_faces_sync`` reports when the *filing* of the stored template is the
+#: problem: a face named after the account id the old scheme used, rather than the immutable id
+#: this build files faces under (see ``biometrics.is_id_named``). Its own string rather than the
+#: stale one above because that sentence is a *diagnosis* and would be a false one here: the
+#: template may have been written yesterday and filed wrongly. This text is stored on the punch
+#: row and read by an operator afterwards, so it has to be true.
+#:
+#: The refusal *code* is shared with the stale case (``REFERENCE_STALE_CODE``), because the fix
+#: is the same screen - re-enrollment - and that is what a client keys on.
+FACE_REFERENCE_MISFILED = "Reference face template is filed under the old account-id name."
 
 #: The error code the stale-template refusal answers with (the key in
 #: ``FACE_FRAME_REFUSALS`` below). Named rather than written at the one call site that
@@ -979,6 +1085,11 @@ FACE_FRAME_REFUSALS: dict[str, tuple[str, str]] = {
         "Your face records were taken before a change to the face check, so this photo "
         "cannot be compared with them. Ask your administrator to enroll you again - it "
         "takes one photo.",
+    ),
+    FACE_REFERENCE_MISFILED: (
+        REFERENCE_STALE_CODE,
+        "Your face record is stored the old way, so this photo cannot be checked against "
+        "it. Ask your administrator to enroll you again - it takes one photo.",
     ),
 }
 
@@ -1021,37 +1132,60 @@ def cosine(u, v) -> float:
 
 
 def compare_faces_sync(reference_json_path: str, live_image_data) -> dict:
-    # The template is read *before* the model runs, on purpose: an unusable template is a
+    # The template is settled *before* the model runs, on purpose: an unusable template is a
     # fact about the file, and spending a VGG-Face embedding to discover it would put a
     # 200 ms model call in front of a refusal that has nothing to do with the photo. It
     # also keeps the failure where an operator can find it - see ``biometrics``.
-    try:
-        reference = biometrics.read_reference(reference_json_path)
-    except FileNotFoundError:
+    if not os.path.exists(reference_json_path):
+        # Checked before the name is judged, so "there is no file" never depends on what that
+        # file would have been called: nothing is enrolled is a different thing to tell a worker
+        # than your reference cannot be used.
         return {"verified": False, "distance": 99.9, "error": "Reference embedding not found."}
-    except Exception:
-        # Unreadable is answered as stale rather than as a server fault: the fix is the
-        # same photograph, and two names for one fix is how a worker gets sent round a
-        # loop. The detailed reason is in ``biometrics.stale_references`` for an admin, and
-        # it travels back here too so the response can say *which* kind of unusable it is.
-        return {
-            "verified": False,
-            "distance": 99.9,
-            "error": FACE_REFERENCE_STALE,
-            "stale_reason": biometrics.STALE_UNREADABLE,
-        }
 
-    reason = biometrics.stale_reason(reference)
-    if reason is not None:
+    # The **name first, then the contents** - the same rule the worklist and the readiness check
+    # apply (``biometrics.template_problem``), so the gate cannot refuse something the admin list
+    # reports as fine or the other way round. A template this build did not file is refused
+    # without being read: nothing in it can say whether it is this account's current face or the
+    # copy a later enrollment replaced (see ``biometrics.STALE_LEGACY_NAME``), and a punch decided
+    # against a face the worker may no longer have is exactly the failure this refusal is for.
+    try:
+        reason, reference = biometrics.template_problem(reference_json_path)
+    except FileNotFoundError:
+        # The file was there a moment ago and is not now (a punch cannot reach this - the
+        # endpoint checks before its job - but the offline scoring path can). Same answer it has
+        # always been: nothing is enrolled, which is a different thing to tell a worker than
+        # "your reference cannot be used".
+        return {"verified": False, "distance": 99.9, "error": "Reference embedding not found."}
+    except Exception as exc:  # noqa: BLE001 - an unjudgeable template is still not a server fault
+        # Nothing about a *reference* may reach a worker as a 500: the answer for a file this
+        # build cannot make sense of is the same photograph as any other unusable template, and
+        # the exception text is not something a worker at a gate can act on.
         log.warning(
-            "refusing to score a stale face template (%s): %s",
+            "could not judge the face template %s: %s",
+            os.path.basename(reference_json_path),
+            exc,
+        )
+        reason, reference = biometrics.STALE_UNREADABLE, None
+
+    if reason is not None or reference is None:
+        reason = reason or biometrics.STALE_UNREADABLE
+        # An unusable template is answered as stale rather than as a server fault: the fix is the
+        # same photograph, and two names for one fix is how a worker gets sent round a loop. The
+        # detailed reason is in ``biometrics.stale_references`` for an admin, and it travels back
+        # here too so the response can say *which* kind of unusable it is.
+        log.warning(
+            "refusing to score an unusable face template (%s): %s",
             reason,
             os.path.basename(reference_json_path),
         )
         return {
             "verified": False,
             "distance": 99.9,
-            "error": FACE_REFERENCE_STALE,
+            "error": (
+                FACE_REFERENCE_MISFILED
+                if reason == biometrics.STALE_LEGACY_NAME
+                else FACE_REFERENCE_STALE
+            ),
             "stale_reason": reason,
         }
 
@@ -2213,6 +2347,9 @@ async def verify_worker(
     # 404 for a missing one is still raised below, where it has always been: after a liveness
     # refusal, not in front of it. An enrolled-looking worker whose template file is gone must
     # still be told their presentation attack was refused rather than sent to re-enroll.
+    # The template this build will *refuse to score* - one still filed under the account id -
+    # is resolved all the same, so the job runs and the liveness check is judged first, and the
+    # refusal the worker gets is the one described in ``biometrics.STALE_LEGACY_NAME``.
     reference_filepath = biometrics.resolve_reference(current.id, biometrics.id_from(user_row))
     has_reference = os.path.exists(reference_filepath)
     # --- the whole face check: one queue slot, decoded inside the worker -------
@@ -3393,14 +3530,20 @@ async def list_sites(current: CurrentUser = Depends(admin_only)):
 
     Both shapes are returned on purpose. The three raw columns say what the site has been
     *configured* with (``null`` = inherit), which is what an edit form has to load. ``window``
-    is the resolved result - the hours, the zone, and which of the two each came from - which
-    is what an administrator needs to answer "why was this arrival flagged?" without having to
-    know how the fallback works. Reporting only the configured values would leave a site with
-    no overrides looking unconfigured at 04:00.
+    is the resolved result - the hours, the zone, and which of the *three* layers each came from
+    (the site, its category, the company) - which is what an administrator needs to answer "why
+    was this arrival flagged?" without having to know how the fallback works. Reporting only the
+    configured values would leave a site with no overrides looking unconfigured at 04:00, and
+    reporting only the site's own columns would leave a warehouse looking unconfigured at the
+    hours its category gave it.
+
+    ``category_id`` and ``category`` travel beside them because they are the other half of the
+    same question: a window that says ``category`` is only actionable if the reader knows which
+    category to open.
     """
     global_rules = get_shift_rules()
     with db() as conn:
-        rows = conn.execute("SELECT * FROM construction_sites").fetchall()
+        rows = conn.execute(shift_windows.SITE_ROW_SQL).fetchall()
     sites = []
     for row in rows:
         sites.append(
@@ -3412,6 +3555,8 @@ async def list_sites(current: CurrentUser = Depends(admin_only)):
                 "clock_in_window_start": row["clock_in_window_start"],
                 "clock_in_window_end": row["clock_in_window_end"],
                 "site_timezone": row["site_timezone"],
+                "category_id": row["category_id"],
+                "category": row["category_name"],
                 "window": shift_windows.effective_window(row, global_rules).as_dict(),
             }
         )
@@ -3425,12 +3570,13 @@ async def add_site(request: Request, req: SiteModel, current: CurrentUser = Depe
     _validate_site_radius(req.radius)
     window = _site_window_columns(req)
     with db(write=True) as conn:
+        category_id = _require_site_category(conn, req.category_id)
         try:
             conn.execute(
                 "INSERT INTO construction_sites "
-                "(site_name, lat, lon, radius, clock_in_window_start, clock_in_window_end, site_timezone) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (req.site_name, lat, lon, req.radius, *window.values()),
+                "(site_name, lat, lon, radius, clock_in_window_start, clock_in_window_end, "
+                "site_timezone, category_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (req.site_name, lat, lon, req.radius, *window.values(), category_id),
             )
         except sqlite3.IntegrityError:
             raise HTTPException(status_code=400, detail="Site name already exists.")
@@ -3440,7 +3586,7 @@ async def add_site(request: Request, req: SiteModel, current: CurrentUser = Depe
             actor=current,
             entity="construction_sites",
             entity_id=req.site_name,
-            after={"lat": lat, "lon": lon, "radius": req.radius, **window},
+            after={"lat": lat, "lon": lon, "radius": req.radius, **window, "category_id": category_id},
             request=request,
         )
     return {"status": "success", "message": f"Site '{req.site_name}' successfully added at ({lat}, {lon})."}
@@ -3458,6 +3604,10 @@ async def edit_site(request: Request, req: SiteModel, current: CurrentUser = Dep
     # it leaves whatever is there alone (``model_fields_set``).
     sent = [key for key in _SITE_WINDOW_FIELDS if key in req.model_fields_set]
     window = {key: getattr(req, key) for key in sent}
+    # The category follows the same rule as the window fields, and for the same reason: the
+    # form posts it only when it is on screen, so an absent key must leave the membership
+    # alone. Moving a site's pin on the map is not a reason to empty its warehouse.
+    moves_category = "category_id" in req.model_fields_set
     with db(write=True) as conn:
         existing = conn.execute(
             "SELECT * FROM construction_sites WHERE site_name = ?", (req.site_name,)
@@ -3465,9 +3615,14 @@ async def edit_site(request: Request, req: SiteModel, current: CurrentUser = Dep
         if existing is None:
             raise HTTPException(status_code=404, detail="Site not found.")
         assignments = ["lat = ?", "lon = ?", "radius = ?", *[f"{key} = ?" for key in sent]]
+        values: list[Any] = [lat, lon, req.radius, *window.values()]
+        if moves_category:
+            category_id = _require_site_category(conn, req.category_id)
+            assignments.append("category_id = ?")
+            values.append(category_id)
         conn.execute(
             f"UPDATE construction_sites SET {', '.join(assignments)} WHERE site_name = ?",
-            (lat, lon, req.radius, *window.values(), req.site_name),
+            (*values, req.site_name),
         )
         _audit(
             conn,
@@ -3476,7 +3631,13 @@ async def edit_site(request: Request, req: SiteModel, current: CurrentUser = Dep
             entity="construction_sites",
             entity_id=req.site_name,
             before=dict(existing),
-            after={"lat": lat, "lon": lon, "radius": req.radius, **window},
+            after={
+                "lat": lat,
+                "lon": lon,
+                "radius": req.radius,
+                **window,
+                **({"category_id": category_id} if moves_category else {}),
+            },
             request=request,
         )
     return {"status": "success", "message": f"Site '{req.site_name}' updated successfully."}
@@ -3520,6 +3681,195 @@ async def delete_site(
             request=request,
         )
     return {"status": "success", "message": f"Site '{site_name}' deleted successfully."}
+
+
+# ---------------------------------------------------------------------------
+# admin: site categories
+#
+# A category is the layer between a site and the company rules (``shift_windows``): it holds
+# the clock-in window for every site inside it, so retuning "the warehouses" is one edit
+# rather than one edit per warehouse. The routes mirror ``/admin/sites`` deliberately - add,
+# edit, delete, with the same absent-key rule and the same audit trail - because an operator
+# who has learned the site form should not have to learn a second grammar for its parent.
+# ---------------------------------------------------------------------------
+@router.get("/admin/site_categories")
+async def list_site_categories(current: CurrentUser = Depends(admin_only)):
+    """Every category, its hours, and how many sites are inside it.
+
+    The count is the figure an administrator needs *before* an edit, not after: "warehouse
+    hours" is a promise about however many sites are in there, and the console can only say so
+    if the server counted. A ``LEFT JOIN`` (a correlated subquery here) so a category with
+    nobody in it still appears - that empty row is the one you open to delete a mistake.
+    """
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT c.category_id, c.name, c.clock_in_window_start, c.clock_in_window_end, "
+            "c.site_timezone, c.created_at, c.updated_at, "
+            "(SELECT COUNT(*) FROM construction_sites s WHERE s.category_id = c.category_id) "
+            "AS site_count FROM site_categories c ORDER BY c.name"
+        ).fetchall()
+    return [
+        {
+            "category_id": int(row["category_id"]),
+            "name": row["name"],
+            "clock_in_window_start": row["clock_in_window_start"],
+            "clock_in_window_end": row["clock_in_window_end"],
+            "site_timezone": row["site_timezone"],
+            "site_count": int(row["site_count"] or 0),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+        for row in rows
+    ]
+
+
+@router.post("/admin/site_categories/add")
+async def add_site_category(
+    request: Request, req: SiteCategoryModel, current: CurrentUser = Depends(admin_only)
+):
+    """Add a category. Its hours start empty, which means "follow the company rules"."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with db(write=True) as conn:
+        try:
+            cursor = conn.execute(
+                "INSERT INTO site_categories "
+                "(name, clock_in_window_start, clock_in_window_end, site_timezone, created_at, "
+                "updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    req.name,
+                    req.clock_in_window_start,
+                    req.clock_in_window_end,
+                    req.site_timezone,
+                    now,
+                    now,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            # The UNIQUE name, and the realistic cause is a second warehouse called مخزن with a
+            # different spelling of the same word - so the message names the constraint rather
+            # than the SQL, and the console can show it verbatim.
+            raise HTTPException(
+                status_code=400, detail="A category with that name already exists."
+            ) from None
+        category_id = int(cursor.lastrowid)
+        _audit(
+            conn,
+            action="site_category_create",
+            actor=current,
+            entity="site_categories",
+            entity_id=str(category_id),
+            after=_category_audit_payload(req),
+            request=request,
+        )
+    return {
+        "status": "success",
+        "message": f"Category '{req.name}' added.",
+        "category_id": category_id,
+    }
+
+
+@router.post("/admin/site_categories/edit")
+async def edit_site_category(
+    request: Request, req: SiteCategoryEditModel, current: CurrentUser = Depends(admin_only)
+):
+    """Rename a category and/or retune the window every site inside it inherits.
+
+    Nothing is written to the member sites, and that is the design rather than an omission: the
+    sites keep their own NULL columns and resolve through this row at punch time
+    (``shift_windows``), so one update moves the window of every warehouse at once and a site
+    that has deliberately set its own hours is untouched. The reply says how many sites the
+    change reached, because "saved" is not the interesting number - "and it moved four sites"
+    is.
+    """
+    sent = [key for key in _SITE_WINDOW_FIELDS if key in req.model_fields_set]
+    window = {key: getattr(req, key) for key in sent}
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with db(write=True) as conn:
+        existing = conn.execute(
+            "SELECT * FROM site_categories WHERE category_id = ?", (req.category_id,)
+        ).fetchone()
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Site category not found.")
+        assignments = ["name = ?", "updated_at = ?", *[f"{key} = ?" for key in sent]]
+        values: list[Any] = [req.name, now, *window.values()]
+        try:
+            conn.execute(
+                f"UPDATE site_categories SET {', '.join(assignments)} "
+                "WHERE category_id = ?",
+                (*values, req.category_id),
+            )
+        except sqlite3.IntegrityError:
+            raise HTTPException(
+                status_code=400, detail="A category with that name already exists."
+            ) from None
+        moved = conn.execute(
+            "SELECT COUNT(*) AS total FROM construction_sites WHERE category_id = ?",
+            (req.category_id,),
+        ).fetchone()["total"]
+        _audit(
+            conn,
+            action="site_category_edit",
+            actor=current,
+            entity="site_categories",
+            entity_id=str(req.category_id),
+            before=dict(existing),
+            after={**_category_audit_payload(req), "sites_affected": int(moved or 0)},
+            request=request,
+        )
+    return {
+        "status": "success",
+        "message": (
+            f"Category '{req.name}' updated. {int(moved or 0)} site(s) now follow it."
+        ),
+        "sites_affected": int(moved or 0),
+    }
+
+
+@router.post("/admin/site_categories/delete")
+async def delete_site_category(
+    request: Request,
+    category_id: int = Form(...),
+    current: CurrentUser = Depends(admin_only),
+):
+    """Delete a category, but only once nothing is inside it.
+
+    Refused while member sites exist, and refused rather than reassigned: the sites would have
+    to *go* somewhere, and every destination is a guess about four sites' opening hours. The
+    message names the count so the administrator can empty it deliberately - which is also the
+    moment they see which sites were following it.
+    """
+    with db(write=True) as conn:
+        existing = conn.execute(
+            "SELECT * FROM site_categories WHERE category_id = ?", (category_id,)
+        ).fetchone()
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Site category not found.")
+        members = conn.execute(
+            "SELECT COUNT(*) AS total FROM construction_sites WHERE category_id = ?",
+            (category_id,),
+        ).fetchone()["total"]
+        if int(members or 0) > 0:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"{int(members)} site(s) still belong to '{existing['name']}'. Move them to "
+                    "another category, or to none, before deleting it."
+                ),
+            )
+        conn.execute("DELETE FROM site_categories WHERE category_id = ?", (category_id,))
+        _audit(
+            conn,
+            action="site_category_delete",
+            actor=current,
+            entity="site_categories",
+            entity_id=str(category_id),
+            before=dict(existing),
+            request=request,
+        )
+    return {
+        "status": "success",
+        "message": f"Category '{existing['name']}' deleted successfully.",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -3764,6 +4114,11 @@ async def _answer_crossing(
     # the row this request just wrote. A repeat of an answer already on the record wrote no notice,
     # and the helper reads that flag itself - so this is the same call on both paths.
     overtime.deliver_worker_notices(result)
+    # The *close* that an approval arms is deliberately not run here. Answering a crossing is
+    # not itself a clock-out, and a decision that settled a shift by being written would make
+    # the verdict depend on the order two writes happened to land in. The watcher does it on
+    # its next pass - see ``overtime.scan_auto_close``, which reads a live approval as the end
+    # of the day and ends the shift at that ceiling, now or when the hours reach it.
     return _json(result)
 
 
@@ -5218,6 +5573,11 @@ app.include_router(notes.admin_router, prefix="/api/v1")
 # public one-tap punch the link itself authenticates. Additive, like the routers above.
 app.include_router(quick_links.admin_router, prefix="/api/v1")
 app.include_router(quick_links.public_router, prefix="/api/v1")
+# Walk-up registration: one permanent public link anybody can submit to, and the administrators'
+# review queue that is the only thing which creates an account. Additive, like the routers above -
+# the per-person enrollment link keeps its own routes and its own meaning.
+app.include_router(registrations.public_router, prefix="/api/v1")
+app.include_router(registrations.admin_router, prefix="/api/v1")
 # The root tier's own surface: runtime configuration, the private alert hub, diagnostics and
 # the raw audit stream. Additive, like every router above - nothing already served moved, and
 # every route on it is built from ``require_developer``, so an administrator cannot reach one
@@ -5297,6 +5657,12 @@ async def lifespan(application: FastAPI):
     # enough - the file means nothing after its request - and it only touches files far older
     # than any live request (see ``uploads.SPOOL_STALE_SECONDS``).
     uploads.sweep_spool_dir()
+    # ...and the registration intake's version of the same thing. A submission writes its photo
+    # before it inserts the row that names it (so a row never points at a file that is not there),
+    # so a crash in between leaves a file with nothing behind it. Narrower than the spool sweep on
+    # purpose: it removes only files *no request references*, and only ones older than the
+    # configured window, because a photo that is still somebody's evidence must survive a restart.
+    registrations.sweep_orphan_photos()
     try:
         yield
     finally:

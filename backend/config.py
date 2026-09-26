@@ -143,6 +143,11 @@ class Settings(BaseModel):
     worker_photos_dir: Path
     punch_frames_dir: Path
     quick_link_photos_dir: Path
+    #: Where a walk-up registration's photo waits for review (see ``registrations``). Its own
+    #: tree rather than the punch spool: a spool file means nothing after its request, and the
+    #: startup sweep deletes one an hour old - a registration photo has to survive until an
+    #: administrator has looked at it, which is days.
+    registration_photos_dir: Path
     #: The *fifth* tree, and the only one that is not application data: the labelled calibration
     #: corpus (see ``corpus``). It is read from the environment for the same reason the other four
     #: are - a child inherits the environment, not this process's state - and it is deliberately its
@@ -295,6 +300,30 @@ class Settings(BaseModel):
     #: shorter than a phone's patience; together with the queue depth, this is what absorbs a
     #: burst instead of shedding it.
     face_inference_wait_seconds: float = 20.0
+    #  ``face_engine_process`` moves the model calls into a child process (see
+    #  ``face_process`` and ``face_worker``). **Off by default, and it is a prototype.**
+    #
+    #  What it buys: the API process stops importing the 87 MiB FaceNet graph, stops
+    #  building an ONNX session and stops running a detector, so an ONNX Runtime allocation
+    #  failure, a corrupt model or the kernel's OOM killer ends the *child* - which the next
+    #  punch restarts - instead of ending the process that serves the gate, the console and
+    #  every other endpoint. What it costs: a second interpreter, every frame copied over a
+    #  pipe, one inference at a time (see ``face_process``) and a slightly *larger* host
+    #  total, because the models now live in a process of their own. This is a decision about
+    #  survivability, not about the size of the machine, which is why it is a flag.
+    face_engine_process: bool = False
+    #: How long one model call may take before the child is treated as hung. It is killed
+    #: rather than waited for (replies are matched by id, so a late answer would be applied
+    #: to the wrong photograph); generous, because a cold graph load is inside this window.
+    face_engine_process_timeout_seconds: float = 60.0
+    #: How long the child has to answer the first request - the preload, in practice, which
+    #: is where importing onnxruntime and opening 87 MiB of graph actually happens.
+    face_engine_process_start_seconds: float = 120.0
+    #: The interpreter to spawn. ``None`` means this process's own ``sys.executable``, which
+    #: is what keeps the child inside the deployment's venv (or the image's Python).
+    face_engine_process_python: str | None = None
+    #: How long a child status answer is reused (``/api/v1/status`` and readiness call it).
+    face_engine_process_status_seconds: float = 5.0
 
     # -- rapid enrollment ---------------------------------------------------
     enrollment_token_ttl_hours: int = 72
@@ -323,6 +352,23 @@ class Settings(BaseModel):
     quick_link_rate_limit: str = "20/minute"
     bulk_enroll_max_rows: int = 500
     bulk_enroll_max_zip_mb: int = 64
+
+    # -- walk-up registration (see ``registrations``) -----------------------
+    #  One persistent public link anybody can submit to, and an administrator's decision
+    #  before any account exists. Closed by default, on the same reasoning as the
+    #  calibration switch below: a public endpoint that collects a face is not something a
+    #  deployment should *discover* it is running, and this switch is also the kill switch
+    #  for a link that has been forwarded too far.
+    registration_enabled: bool = False
+    #  How many requests may sit waiting for a decision at once. Enforced inside the same
+    #  write that inserts one - a cap read before the insert is only advice.
+    registration_pending_cap: int = 200
+    #  The link is public and static, so the limit is per IP and deliberately tight: an
+    #  honest applicant submits once, and a shift-full of workers at one gate shares an IP.
+    registration_rate_limit: str = "20/minute"
+    #  How long a *crashed* submission's photo, or a photo with no request behind it, waits
+    #  before the startup sweep removes it. Never touches a live pending request.
+    registration_photo_stale_hours: int = 24 * 7
 
     # -- calibration corpus (see ``corpus``) ---------------------------------
     #  Capturing faces for measurement is a separate decision from storing punch evidence, so it is
@@ -622,6 +668,9 @@ class Settings(BaseModel):
             "worker_photos_dir": str(self.worker_photos_dir),
             "punch_frames_dir": str(self.punch_frames_dir),
             "quick_link_photos_dir": str(self.quick_link_photos_dir),
+            "registration_photos_dir": str(self.registration_photos_dir),
+            "registration_enabled": self.registration_enabled,
+            "registration_pending_cap": self.registration_pending_cap,
             "calibration_corpus_dir": str(self.calibration_corpus_dir),
             "calibration_capture_enabled": self.calibration_capture_enabled,
             "calibration_corpus_max_px": self.calibration_corpus_max_px,
@@ -657,6 +706,9 @@ class Settings(BaseModel):
             "face_inference_concurrency": self.face_inference_concurrency,
             "face_inference_queue": self.face_inference_queue,
             "face_inference_wait_seconds": self.face_inference_wait_seconds,
+            # Printed because it changes where the memory goes, and an operator looking at
+            # two processes has to be told that this was a decision rather than a leak.
+            "face_engine_process": self.face_engine_process,
             # Printed because a retention policy nobody can read is a policy nobody follows,
             # and because the numbers are the first thing an auditor asks to see.
             "metrics_enabled": self.metrics_enabled,
@@ -742,7 +794,8 @@ def build_settings(*, env_file: Path | None = None) -> Settings:
         worker_photos_dir=_env_path("WORKER_PHOTOS_DIR", PROJECT_ROOT / "worker_photos"),
         punch_frames_dir=_env_path("PUNCH_FRAMES_DIR", PROJECT_ROOT / "punch_frames"),
         quick_link_photos_dir=_env_path("QUICK_LINK_PHOTOS_DIR", PROJECT_ROOT / "quick_link_photos"),
-    calibration_corpus_dir=_env_path("CALIBRATION_CORPUS_DIR", PROJECT_ROOT / "calibration_corpus"),
+        registration_photos_dir=_env_path("REGISTRATION_PHOTOS_DIR", PROJECT_ROOT / "registration_photos"),
+        calibration_corpus_dir=_env_path("CALIBRATION_CORPUS_DIR", PROJECT_ROOT / "calibration_corpus"),
         allowed_origins=_env_list("ALLOWED_ORIGINS"),
         cors_worker_origins=_env_list("CORS_WORKER_ORIGINS"),
         cors_admin_origins=_env_list("CORS_ADMIN_ORIGINS"),
@@ -798,6 +851,15 @@ def build_settings(*, env_file: Path | None = None) -> Settings:
         face_inference_concurrency=_env_int("FACE_INFERENCE_CONCURRENCY", 2),
         face_inference_queue=_env_int("FACE_INFERENCE_QUEUE", 64),
         face_inference_wait_seconds=_env_float("FACE_INFERENCE_WAIT_SECONDS", 20.0),
+        face_engine_process=_env_flag("FACE_ENGINE_PROCESS", False),
+        face_engine_process_timeout_seconds=_env_float(
+            "FACE_ENGINE_PROCESS_TIMEOUT_SECONDS", 60.0
+        ),
+        face_engine_process_start_seconds=_env_float("FACE_ENGINE_PROCESS_START_SECONDS", 120.0),
+        face_engine_process_python=_env_str("FACE_ENGINE_PROCESS_PYTHON"),
+        face_engine_process_status_seconds=_env_float(
+            "FACE_ENGINE_PROCESS_STATUS_SECONDS", 5.0
+        ),
         bulk_enroll_max_rows=_env_int("BULK_ENROLL_MAX_ROWS", 500),
         bulk_enroll_max_zip_mb=_env_int("BULK_ENROLL_MAX_ZIP_MB", 64),
         quick_link_ttl_hours=_env_int("QUICK_LINK_TTL_HOURS", 24 * 30),
@@ -825,10 +887,14 @@ def build_settings(*, env_file: Path | None = None) -> Settings:
         metrics_enabled=_env_flag("METRICS_ENABLED", True),
         metrics_token=_env_str("METRICS_TOKEN"),
         push_enabled=_env_flag("PUSH_ENABLED", True),
-    calibration_capture_enabled=_env_flag("CALIBRATION_CAPTURE_ENABLED", False),
-    calibration_capture_until=_env_str("CALIBRATION_CAPTURE_UNTIL") or "",
-    calibration_corpus_max_px=_env_int("CALIBRATION_CORPUS_MAX_PX", 1280),
-    calibration_corpus_retention_days=_env_int("CALIBRATION_CORPUS_RETENTION_DAYS", 180),
+        calibration_capture_enabled=_env_flag("CALIBRATION_CAPTURE_ENABLED", False),
+        registration_enabled=_env_flag("REGISTRATION_ENABLED", False),
+        registration_pending_cap=_env_int("REGISTRATION_PENDING_CAP", 200),
+        registration_rate_limit=_env_str("REGISTRATION_RATE_LIMIT", "20/minute") or "20/minute",
+        registration_photo_stale_hours=_env_int("REGISTRATION_PHOTO_STALE_HOURS", 24 * 7),
+        calibration_capture_until=_env_str("CALIBRATION_CAPTURE_UNTIL") or "",
+        calibration_corpus_max_px=_env_int("CALIBRATION_CORPUS_MAX_PX", 1280),
+        calibration_corpus_retention_days=_env_int("CALIBRATION_CORPUS_RETENTION_DAYS", 180),
         vapid_public_key=_env_str("VAPID_PUBLIC_KEY"),
         vapid_private_key=_env_str("VAPID_PRIVATE_KEY"),
         vapid_subject=_env_str("VAPID_SUBJECT", "mailto:admin@example.invalid") or "mailto:admin@example.invalid",

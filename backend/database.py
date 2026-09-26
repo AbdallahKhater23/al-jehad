@@ -296,6 +296,59 @@ def db(*, write: bool = False, db_path: Path | None = None, isolation_level: str
         conn.close()
 
 
+@contextmanager
+def immediate(db_path: Path | None = None, *, timeout: float = 10.0):
+    """A connection that holds SQLite's single write lock for the whole block.
+
+    WHY THIS EXISTS BESIDE ``db``
+    -----------------------------
+    ``db(write=True)`` is an *implicit* transaction: the driver opens one around the first
+    DML statement, which means a ``SELECT`` that precedes that first write runs outside any
+    transaction at all. That is fine for a write that only depends on itself, and wrong for
+    the writes this application has that **read before they write**:
+
+    * ``security.lowest_free_id`` - the number it hands back has to still be free when the
+      caller's ``INSERT`` runs, or two walk-up registrations are told one account id. It
+      counts an id a live registration invite is holding as taken, so the invite flow and the
+      walk-up flow are one allocator rather than two that disagree;
+    * ``enrollment.create_invite`` - the reserved id has to still be free when the invite that
+      reserves it is written, or two links promise one number;
+    * the pending-registration cap - a ``COUNT(*)`` taken before the write is advice, so N
+      concurrent submissions each read ``cap - 1`` and every one of them proceeds.
+
+    ``BEGIN IMMEDIATE`` takes the write lock *up front*, so the read and the write that
+    depends on it are one indivisible step: the second caller cannot read until the first
+    has committed, and therefore sees the row the first one wrote. It also *waits* for the
+    lock rather than failing (``BUSY_TIMEOUT_MS``, which every connection already sets), so
+    a burst queues and is answered slowly rather than being answered with an error - and the
+    wait is recorded next to every other transaction's, so a hot lock shows up as a metric.
+
+    The block commits on success and rolls back on any exception. Held only around the read
+    and the write it protects: the model work a registration's approval needs (decoding a
+    photo, running the embedder) happens *outside* it, because holding the one write lock for
+    the length of an inference is how a punch at the gate ends up queued behind a review.
+
+    ``timeout`` is how long ``BEGIN IMMEDIATE`` waits for the lock before giving up with
+    ``database is locked``; it exists so a test can ask for the refusal rather than waiting ten
+    seconds for it.
+    """
+    conn = connect(db_path=db_path, isolation_level=None, timeout=timeout)
+    started = time.perf_counter()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        yield conn
+        conn.execute("COMMIT")
+        telemetry.observe_transaction(mode="explicit", seconds=time.perf_counter() - started)
+    except Exception:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
 def configure(*, db_path: Path | None = None, repair: bool = True) -> dict:
     """Apply connection-level pragmas. Returns what was observed.
 

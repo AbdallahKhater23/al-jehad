@@ -375,36 +375,56 @@ def _check_site_windows(ctx: dict) -> Check:
         conn = _open(ctx.get("db_path"))
         conn.row_factory = sqlite3.Row
         try:
-            rows = conn.execute(
-                "SELECT site_name, clock_in_window_start, clock_in_window_end, site_timezone "
-                "FROM construction_sites"
-            ).fetchall()
+            # Fetched through ``SITE_ROW_SQL`` so the category layer is visible to the check.
+            rows = conn.execute(shift_windows.SITE_ROW_SQL).fetchall()
+            # ...and the categories are read on their own as well, because a category with no
+            # sites in it still holds hours: they become the window of the first site that
+            # joins, which is exactly the typo a scan like this exists to find. A database old
+            # enough to predate the table is not a failure - there is simply nothing to check.
+            try:
+                categories = conn.execute("SELECT * FROM site_categories").fetchall()
+            except sqlite3.Error:
+                categories = []
         finally:
             conn.close()
     except sqlite3.Error as exc:
         return Check("site_clock_in_windows", TIER_ADVISORY, True, f"could not be checked: {exc}")
 
-    # The rows are re-fetched with names so the problem can be attributed to a site: an
-    # operator reading "07" needs to know which site to open.
-    broken: list[str] = []
-    for row in rows:
-        broken.extend(shift_windows.window_problems(row))
+    # The rows are re-fetched with names so the problem can be attributed to a site or to a
+    # category: an operator reading "07" needs to know which one to open. Deduplicated, because
+    # a site inside a broken category is reported by both passes - and the same sentence twice
+    # reads as two faults.
+    broken: list[str] = list(
+        dict.fromkeys(
+            [
+                problem
+                for row in rows
+                for problem in shift_windows.window_problems(row)
+            ]
+            + [
+                problem
+                for row in categories
+                for problem in shift_windows.category_problems(row)
+            ]
+        )
+    )
 
     if broken:
         return Check(
             "site_clock_in_windows",
             TIER_ADVISORY,
             False,
-            "these sites' windows cannot be applied, so the global rule is used instead: "
+            "these windows cannot be applied, so the global rule is used instead: "
             + ", ".join(broken),
-            {"sites": len(rows), "unusable": broken},
+            {"sites": len(rows), "categories": len(categories), "unusable": broken},
         )
     return Check(
         "site_clock_in_windows",
         TIER_ADVISORY,
         True,
-        f"{len(rows)} site(s) checked; every configured window is usable",
-        {"sites": len(rows)},
+        f"{len(rows)} site(s) and {len(categories)} category(ies) checked; "
+        "every configured window is usable",
+        {"sites": len(rows), "categories": len(categories)},
     )
 
 
@@ -916,6 +936,19 @@ PUBLIC_ROUTES: dict[str, str] = {
     ),
     "POST /api/v1/enroll/{token}": "the same invite token; submits the capture.",
     "POST /api/v1/enroll/{token}/register": "the same invite token; claims the link.",
+    "GET /api/v1/register": (
+        "the walk-up registration link's own page reads the policy it has to satisfy - the "
+        "upload ceiling, the accepted roles, the shortest password - before anybody has an "
+        "account. It answers with that policy and no data of any kind, and it says so when "
+        "intake is switched off rather than 404-ing a link the company printed."
+    ),
+    "POST /api/v1/register": (
+        "the same permanent link, submittable by anybody: it is how a person who has no "
+        "account applies for one. Single static URL by design, off by default, per-IP rate "
+        "limited, capped by a pending-queue limit enforced inside the insert's transaction, "
+        "and it creates nothing - no account, no roster row, no id - until an administrator "
+        "approves the request."
+    ),
     "GET /api/v1/q/{token}": (
         "one-tap clock link: the link token in the path is the credential. Reusing one does "
         "not authenticate anybody else."
@@ -1328,18 +1361,96 @@ def _check_biometric_dirs(ctx: dict) -> Check:
     )
 
 
+def _check_registration_intake(ctx: dict) -> Check:
+    """Walk-up registration: whether it is open, how full the queue is, and where photos go.
+
+    Three facts an operator has to be able to see without asking the application, because each
+    of them is invisible until somebody complains:
+
+    * a **closed intake** is a supported state rather than a fault - the switch ships off - so
+      this reports it as an ok check that says so, and exists for the other two;
+    * a **full queue** stops accepting submissions (the cap is enforced inside the insert's
+      transaction), and it is the one way this feature fails *quietly*: the applicant is refused
+      and the administrator sees nothing, because a queue only looks long when somebody reads it;
+    * an **unwritable photo directory** while intake is open means every submission fails.
+
+    **Advisory in every case, including the last, and that is a deliberate choice about the gate
+    rather than about this feature.** A fatal check stops the deployment from serving - the
+    punches at the gate included - and taking the attendance surface down because an optional,
+    off-by-default intake is misconfigured would be this check prioritising the wrong thing. A
+    warning that names the directory is what an operator needs; a boot refusal is not.
+    """
+    from config import settings
+
+    if not settings.registration_enabled:
+        return Check("registration_intake", TIER_ADVISORY, True, "walk-up registration is closed")
+
+    import registrations
+    from database import db as _db
+
+    directory = registrations.photos_dir()
+    try:
+        with tempfile.NamedTemporaryFile(dir=directory, prefix=".readiness_", delete=True):
+            pass
+    except OSError as exc:
+        return Check(
+            "registration_intake",
+            TIER_ADVISORY,
+            False,
+            f"walk-up registration is open and its photo directory is not writable ({directory}): {exc}",
+            {"directory": directory},
+        )
+
+    try:
+        with _db() as conn:
+            pending = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM registration_requests WHERE status = 'PENDING_REVIEW'"
+                ).fetchone()[0]
+            )
+    except Exception as exc:  # noqa: BLE001 - a report must never fail on one check
+        return Check(
+            "registration_intake",
+            TIER_ADVISORY,
+            True,
+            f"walk-up registration is open; the review queue could not be counted: {exc}",
+        )
+
+    cap = int(settings.registration_pending_cap)
+    if pending >= cap:
+        return Check(
+            "registration_intake",
+            TIER_ADVISORY,
+            False,
+            f"the registration review queue is full ({pending} of {cap}); new submissions are "
+            "refused until an administrator reviews some",
+            {"pending": pending, "cap": cap},
+        )
+    return Check(
+        "registration_intake",
+        TIER_ADVISORY,
+        True,
+        f"walk-up registration is open; {pending} of {cap} review slots in use",
+        {"pending": pending, "cap": cap},
+    )
+
+
 def _check_biometric_file_naming(ctx: dict) -> Check:
     """Whether any face is still filed under the account id it used to be named by.
 
     Migration 11 gives every account an immutable id, and ``main.init_db`` renames the
-    files already on disk to match. The readers keep a fallback to the old names so that an
-    interrupted rename cannot take a worker's clock-in away mid-shift - but that fallback
-    is a migration path, not a resting state. While it is in use, a filename still says
-    which account a face belongs to, and says it from a number anybody can iterate; zero is
-    the only answer that means the change is finished on this deployment.
+    files already on disk to match. The readers keep a fallback to the old names - but that
+    fallback is a migration path, not a resting state, and it is not a way to be *scored*:
+    a template filed under an account id is refused at the gate (``biometrics``,
+    ``STALE_LEGACY_NAME``), because nothing in the file can say whether it is the account's
+    current face or a copy a later enrollment replaced. So a count above zero here is not
+    cosmetic: it is workers who cannot clock in. While it is in use, a filename also still
+    says which account a face belongs to, and says it from a number anybody can iterate;
+    zero is the only answer that means the change is finished on this deployment.
 
     Advisory rather than fatal, and it never repairs: deciding what to do with somebody
-    else's template - rename it, re-enroll the worker, delete it - is an operator's call.
+    else's template - restart to retry the rename, enroll the worker again, delete it - is an
+    operator's call.
     """
     try:
         import biometrics
@@ -1355,8 +1466,10 @@ def _check_biometric_file_naming(ctx: dict) -> Check:
         "every biometric file is named by its account's immutable id"
         if total == 0
         else (
-            f"{total} biometric file(s) are still named after their account id; "
-            "restart the service to retry the rename, then check again"
+            f"{total} biometric file(s) are still named after their account id; any of them "
+            "that is a face template is never scored, so that worker cannot clock in until "
+            "they are enrolled again - restart the service to retry the rename, or enroll "
+            "them, then check again"
         ),
         remaining,
     )
@@ -1738,9 +1851,12 @@ def _check_face_detector(ctx: dict) -> Check:
 
     stale = int(worklist.get("count") or 0)
     if stale:
+        # Not "made by the previous pipeline" any more: the worklist also holds templates this
+        # build refuses for their *name*, and a line that misdiagnoses them sends an operator
+        # to the wrong fix (see ``biometrics.STALE_LEGACY_NAME``).
         detail += (
-            f"; {stale} of {worklist.get('enrolled_checked', 0)} enrolled templates were made "
-            "by the previous pipeline and need re-enrollment (/api/v1/admin/enroll/needs_reenrollment)"
+            f"; {stale} of {worklist.get('enrolled_checked', 0)} enrolled templates cannot be "
+            "scored as they are and need re-enrollment (/api/v1/admin/enroll/needs_reenrollment)"
         )
     return Check("face_detector", TIER_ADVISORY, ok, detail, worklist)
 
@@ -1994,6 +2110,7 @@ CHECKS = (
     _check_network_policy,
     _check_stored_text_hygiene,
     _check_biometric_dirs,
+    _check_registration_intake,
     _check_biometric_file_naming,
     _check_retention_sweep,
     _check_retention_residue,

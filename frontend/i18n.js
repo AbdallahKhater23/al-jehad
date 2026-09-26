@@ -76,6 +76,10 @@ const TRANSLATIONS = {
         "shiftsThisMonth": "This month",
         "shiftsLastMonth": "Last month",
         "shiftsThisWeek": "This week",
+        // The Shifts board's category filter. The names on the chips are the company's own
+        // words for its sites and are never translated; only these two pieces of chrome are.
+        "shiftsAllCategories": "All categories",
+        "shiftsCategoryFilter": "Category",
         "shiftsPeriod": "Period",
         "shiftsApproved": "Approved hours",
         "shiftsRegular": "Regular hours",
@@ -582,6 +586,11 @@ const TRANSLATIONS = {
         "liveOpsAllSites": "All sites",
         "liveOpsOpenCount": "{total} open shifts",
         "liveOpsShowing": "Showing {shown} of {total}",
+        // The fold's own words, deliberately not the filter's: "Showing 2 of 4" means a search
+        // or a site chip is narrowing the board, and the fold must not borrow that sentence or
+        // an operator cannot tell the two apart.
+        "liveOpsShowMore": "Show more ({count})",
+        "liveOpsShowLess": "Show fewer",
         "liveOpsNoMatches": "No shift matches these filters",
         "liveOpsNoMatchesHint": "Clear the search, or pick another site.",
         "liveOpsClearFilters": "Clear filters",
@@ -759,6 +768,22 @@ const TRANSLATIONS = {
         "sitesWindowNoticeSite": "This site has its own window: {window}.",
         "sitesWindowUseCompany": "Use the company window",
         "sitesWindowWillInherit": "Saved without times, this site follows the company window again.",
+        "sitesCategory": "Category",
+        "sitesCategoryNone": "No category",
+        "sitesCategories": "Site categories",
+        "sitesCategoriesHint": "A category carries the clock-in window for the sites inside it. Change it once and every site that has not set its own hours follows the change - including sites on other screens, and shifts that clock in tomorrow.",
+        "sitesCategorySiteCount": "{count} site(s)",
+        "sitesCategoryAdd": "Add category",
+        "sitesCategoryName": "Name",
+        "sitesCategoryNamePlaceholder": "Warehouse",
+        "sitesCategoryFormHint": "Leave both times empty and this category follows the company window.",
+        "sitesCategoryNoHours": "Follows the company window",
+        "sitesWindowFromCategory": "from {category}",
+        "sitesWindowNoticeCategory": "This site follows {category}'s window: {window}.",
+        "sitesCategoryAdded": "Category added.",
+        "sitesCategorySaved": "Category saved. Every site that follows it moved with it.",
+        "sitesCategoryDeleted": "Category deleted.",
+        "sitesCategoryDeleteConfirm": "Delete \u201c{name}\u201d? {sites} site(s) follow it - move those sites to another category, or to none, first.",
 
         "adminRulesHint": "These are the numbers the whole console reads: the board's overtime line, the payroll totals and the automatic close all come from here.",
         // Was eight keys for the Admin tab's own create-an-administrator form. The panel is
