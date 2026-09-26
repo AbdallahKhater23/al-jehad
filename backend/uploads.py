@@ -25,6 +25,13 @@ turned a burst into an out-of-memory event on a 512 MB instance. ``spool_photo()
 same policy with the body going to a temporary file instead, so what a waiting punch holds is
 one chunk - and the file is the caller's to remove (see ``SpooledPhoto.discard``).
 
+**A third destination, ``store_photo()``: a directory that keeps what it is given.**
+A walk-up registration's photo has to outlive its request - it waits for an administrator to
+look at it, which is days - so it cannot live in the spool, and it must not be held as bytes
+either. ``store_photo()`` is the same policy aimed at a caller's own directory, and it returns
+the digest of what it wrote as well, because the caller de-duplicates the *upload* by it
+without ever holding it.
+
 **Type: a real image, decided by the bytes.**
 ``Content-Type`` is a client-supplied string and so is the filename; anybody can send a
 PDF as ``selfie.jpg`` with ``image/jpeg`` set. So the first bytes have to be a JPEG, PNG
@@ -69,9 +76,11 @@ downscale it first, or stop uploading a document.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import logging
 import os
+import secrets
 import tempfile
 import time
 from typing import Any
@@ -103,6 +112,11 @@ SPOOL_DIR = os.path.join(tempfile.gettempdir(), "attendance-spool")
 #: directory (the test suite runs several against one temp root) and its live files must not
 #: be swept out from under it.
 SPOOL_STALE_SECONDS = 3600.0
+
+#: The EXIF tag that says how a photo is rotated relative to the sensor - value 1 (or its
+#: absence) means "already upright". Named because it is the one fact that decides whether a
+#: decode has to transpose the pixels at all; see ``decode_photo``.
+ORIENTATION_TAG = 0x0112
 
 #: Pixel ceiling for a decoded photo. 40 MP is far above any phone camera (a 108 MP
 #: sensor still produces a 12 MP default JPEG) and far below the point where a
@@ -311,21 +325,27 @@ def spool_dir() -> str:
     return SPOOL_DIR
 
 
-class SpooledPhoto:
-    """One uploaded photo, on disk, owned by whoever spooled it.
+class StoredPhoto:
+    """One uploaded photo, on disk, owned by whoever wrote it there.
 
     Deliberately not a context manager: the owner is a request, and a request's cleanup points
-    are not all indented inside one block. ``discard`` never raises - a punch that cannot
+    are not all indented inside one block. ``discard`` never raises - a caller that cannot
     remove its own temporary file has lost nothing (the startup sweep collects it) and must not
     fail a worker's clock-in over it.
+
+    ``sha256`` is the digest of the bytes as they were written, computed while writing rather
+    than by reading the file back. It exists because one caller needs it: a walk-up
+    registration is de-duplicated by it, so the same upload cannot become two requests for a
+    reviewer to read. A spooled punch has no use for it and passes nothing.
     """
 
-    __slots__ = ("path", "size", "mime")
+    __slots__ = ("path", "size", "mime", "sha256")
 
-    def __init__(self, path: str, size: int, mime: str) -> None:
+    def __init__(self, path: str, size: int, mime: str, sha256: str | None = None) -> None:
         self.path = path
         self.size = size
         self.mime = mime
+        self.sha256 = sha256
 
     def discard(self) -> None:
         """Remove the file. Never raises: a refusal must not become a 500 on the way out.
@@ -351,8 +371,21 @@ class SpooledPhoto:
 
     def __repr__(self) -> str:
         # A path in a traceback is fine; the bytes of somebody's face are not, and neither is
-        # anything derived from them. Nothing here reads the file.
-        return f"SpooledPhoto(path={self.path!r}, size={self.size}, mime={self.mime!r})"
+        # anything derived from them. Nothing here reads the file, and the digest is left out
+        # for the same reason - it is derived from them.
+        return f"{type(self).__name__}(path={self.path!r}, size={self.size}, mime={self.mime!r})"
+
+
+class SpooledPhoto(StoredPhoto):
+    """A ``StoredPhoto`` in the spool: it means nothing after the request that wrote it.
+
+    The two are the same object with different lifetimes, and saying so once is what keeps
+    ``spool_photo`` and ``store_photo`` from drifting: a punch's photo waits for *capacity* and
+    is removed by the request that owns it or by the startup sweep, and a registration's waits
+    for a *human* and is removed only when a decision or an orphan sweep says so.
+    """
+
+    __slots__ = ()
 
 
 async def spool_photo(
@@ -415,6 +448,83 @@ async def spool_photo(
         _unlink(path)
         raise
     return SpooledPhoto(path=path, size=total, mime=mime)
+
+
+#: The extension a stored upload gets, by sniffed type. Cosmetic - a preview sets its
+#: ``Content-Type`` from the mime recorded on the row that points at the file, never from this -
+#: but a directory an operator opens by hand should not be a wall of temporary names.
+EXTENSIONS: dict[str, str] = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
+
+
+async def store_photo(
+    upload: UploadFile,
+    directory: str,
+    *,
+    field: str = "photo",
+    max_bytes: int | None = None,
+    prefix: str = "",
+) -> StoredPhoto:
+    """Read one photo upload onto disk **in a directory that keeps it**, under the same policy.
+
+    ``spool_photo`` aimed at a directory nothing is supposed to keep, and otherwise the same
+    function: the body is pulled in ``CHUNK_BYTES`` pieces and written straight out, so a
+    512 MB instance holds one chunk however large the upload is, and the refusals are identical
+    (same status, same ``error_code``, same sentence) for the reason given on
+    ``check_photo_type``.
+
+    It differs in exactly two ways, both of which the caller's lifetime demands:
+
+    * the file is written under a ``.part`` temporary name and renamed into position with a
+      random, meaning-free name only after the body has been validated - so a refused upload, a
+      cancelled request or a crash mid-write never leaves a half-written face in a directory of
+      faces waiting for review;
+    * the digest comes back with it, computed on the fly. Nothing here reads the file back.
+
+    The directory is the caller's to choose and is created on first use. Removing the file is
+    the caller's job (``StoredPhoto.discard``), because this function cannot know when a
+    reviewer is finished with it.
+    """
+    os.makedirs(directory, exist_ok=True)
+    limit = int(max_bytes if max_bytes is not None else max_photo_bytes())
+    handle = tempfile.NamedTemporaryFile(
+        prefix=f".{prefix}part-", suffix=".upload", dir=directory, delete=False
+    )
+    path = handle.name
+    head = b""
+    total = 0
+    digest = hashlib.sha256()
+    try:
+        with handle:
+            while True:
+                chunk = await upload.read(CHUNK_BYTES)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > limit:
+                    raise _refuse(
+                        413,
+                        ERR_TOO_LARGE,
+                        f"The {field} is larger than {limit // (1024 * 1024)} MB. Retake the "
+                        "photo at a lower resolution.",
+                        limit_bytes=limit,
+                    )
+                digest.update(chunk)
+                if len(head) < SNIFF_BYTES:
+                    head += chunk[: SNIFF_BYTES - len(head)]
+                handle.write(chunk)
+        if not total:
+            raise _refuse(400, ERR_EMPTY, f"No {field} received (the file was empty).")
+        mime = check_photo_type(head, field=field)
+        final = os.path.join(
+            directory, f"{prefix}{secrets.token_hex(16)}{EXTENSIONS.get(mime, '.jpg')}"
+        )
+        os.replace(path, final)
+        path = final
+    except BaseException:
+        # Every refusal - and every cancellation - takes the partial file with it.
+        _unlink(path)
+        raise
+    return StoredPhoto(path=path, size=total, mime=mime, sha256=digest.hexdigest())
 
 
 def _unlink(path: str) -> None:
@@ -554,8 +664,19 @@ def decode_photo(
         if refusal is not None:
             raise refusal
         # ``exif_transpose`` is what makes a portrait phone photo landscape-correct; a
-        # face reference stored at the wrong rotation rejects its owner forever.
-        upright = ImageOps.exif_transpose(image)
+        # face reference stored at the wrong rotation rejects its owner forever. It is only
+        # *asked* when there is something to rotate, though: it returns a full-resolution copy
+        # either way, and that copy is allocated while libjpeg's own decode buffers are still
+        # live, which is what makes it the peak. Measured on a 3.1 MP gate upload at the
+        # default 1280 px ceiling, skipping it when the orientation says the pixels are
+        # already upright takes the transient from ~38 MB to ~26 MB per frame - on the host
+        # with 512 MB to spend, that is the memory. The copy the caller receives is still the
+        # ``convert`` below, so nothing downstream reads this descriptor (see the ``finally``).
+        if image.getexif().get(ORIENTATION_TAG, 1) in (None, 1):
+            image.load()
+            upright = image
+        else:
+            upright = ImageOps.exif_transpose(image)
         if keep_alpha and has_alpha(upright):
             return upright.convert("RGBA")
         return upright.convert("RGB")

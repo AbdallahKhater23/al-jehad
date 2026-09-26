@@ -480,7 +480,10 @@ def _detect_site_row(conn: sqlite3.Connection, lat: float | None, lon: float | N
         return None
     from main import get_distance_meters  # local import: main imports this module
 
-    for site in conn.execute("SELECT * FROM construction_sites").fetchall():
+    # Fetched through ``SITE_ROW_SQL`` so the row carries the site's category too: a replay of
+    # a queued punch has to be measured against the same window the gate would have applied,
+    # and that includes the category's hours (``shift_windows``).
+    for site in conn.execute(shift_windows.SITE_ROW_SQL).fetchall():
         try:
             if get_distance_meters(site["lat"], site["lon"], float(lat), float(lon)) <= float(site["radius"]):
                 return site

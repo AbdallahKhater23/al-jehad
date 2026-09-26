@@ -31,15 +31,39 @@ backfills every existing row), and never changes. Re-enrolling replaces the file
 id names; it does not move the account to a new id, so an audit row, a backup or an
 operator's note that recorded the name still points at the same person.
 
+The one thing that is replaced is a value that is not an id at all - a hand-set number,
+a column written by something that was not this application. The *name* of a face file is
+derived from that value, so a bogus one would file the account's own template outside the
+scheme this build scores (see ``ensure_id``, and ``STALE_LEGACY_NAME`` for what such a
+template is answered with).
+
 What happens to the faces already on disk
 -----------------------------------------
 ``adopt_legacy_files()`` renames what is already stored to the id its account now
 holds, and is idempotent. The readers here keep a **legacy fallback** - if the
 id-named file is absent and a file named after the account id is present, that one is
-used - so a rename blocked by a running backup cannot take a worker's clock-in away,
-and upgrading a live site mid-shift needs no downtime. The fallback is the migration
-path, not the steady state: a file left under a sequential name is reported by
-``readiness`` so an operator can see that the adoption had work left to do.
+what they resolve to - so an account whose rename a running backup blocked still *reads*
+as enrolled, and ``readiness`` and the re-enrollment worklist can name it.
+
+What the fallback is not is a way to be **scored**. A punch against a template filed under
+an account id is refused (``STALE_LEGACY_NAME``), because the name is the one fact the file
+cannot supply: the old scheme wrote the account id, account ids are reused, and a file left
+under one may be this account's only template or a copy that a later enrollment replaced.
+Scored, a face the worker may no longer have becomes the live template, silently and with no
+refusal to read afterwards; refused, the fix is one more photograph - the enrollment that
+files the new face properly and retires this one. That is a real cost on an upgraded site
+(such a worker cannot clock in until an administrator takes that photograph), and it is the
+cheaper of the two.
+
+A leftover is not left lying there either. ``write_reference`` **retires** it - renamed out of
+the readers' reach, never deleted - once both id-named files have landed, so every enrollment
+path (console, enrollment link, bulk import, the CLI) retires its own, whether it created a
+template or replaced one; ``adopt_legacy_files()`` does the same on the next boot for a pair
+that was already superseded before this rule existed. Both matter for the same reason: the
+refusal above has to be a state *with an end* (one photograph), this build must not leave a
+file behind for a later restore to hand back to the fallback, and it must not leave a face
+sitting in a directory under a number anybody can iterate. ``readiness`` reports what is left,
+and ``retention`` sweeps a quarantine name on the same window as any other residue.
 
 The one thing the fallback could get wrong is handled where it would happen: a
 *new* account created on an id that somebody else used to hold clears any leftover
@@ -79,10 +103,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import secrets
 import sqlite3
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable
 
 from database import db
 
@@ -111,6 +136,34 @@ def new_id() -> str:
     return secrets.token_hex(ID_BYTES)
 
 
+#: The name this build files a face under: ``new_id``'s hex characters and nothing else.
+#: Built from ``ID_BYTES``, so the pattern and the ids it describes cannot drift apart.
+_ID_NAME_PATTERN = re.compile(rf"[0-9a-f]{{{ID_BYTES * 2}}}")
+
+
+def _looks_like_an_id(value: str) -> bool:
+    """Whether ``value`` is an id this build minted, rather than a number that names one."""
+    return bool(_ID_NAME_PATTERN.fullmatch(value.strip()))
+
+
+def is_id_named(path: str) -> bool:
+    """Whether ``path`` is filed the way this build files a face.
+
+    Two schemes have written into these directories: the account id (``1.json``, the id the
+    worker signs in with) and, since migration 11, an immutable 32-hex id. Only the second is
+    a name this build chose, and that is the whole test - the *shape* of the name, not a lookup
+    against the row, because the question is asked about a file whose account is not always in
+    hand (``compare_faces_sync`` is handed a path, not a user) and because it is the same answer
+    either way: the id is never derived from the account, so a name that is not the one this
+    build writes is a name something else wrote.
+
+    It says nothing about what is *inside* the file. That is ``read_reference`` and
+    ``stale_reason``, and both are still asked - see ``template_problem``.
+    """
+    stem, _ = os.path.splitext(os.path.basename(path))
+    return _looks_like_an_id(stem)
+
+
 def id_from(row: Any) -> str | None:
     """The id on an already-read ``users`` row, or ``None`` when the row has none.
 
@@ -134,19 +187,35 @@ def id_from(row: Any) -> str | None:
 
 
 def ensure_id(conn: sqlite3.Connection, user_id: str) -> str:
-    """``user_id``'s id, minting one when the row does not carry it yet.
+    """``user_id``'s id, minting one when the row does not carry a usable one.
 
     The migration backfills every existing row, so this is the safety net for a row
     that arrived some other way (a hand-run script, a restore from before the
     migration). It writes, because an id that is never recorded is not an id.
+
+    "Carrying one" means carrying an *id*: a value that is not shaped like one - a hand-set
+    number, a column written by something that was not this application - is replaced rather
+    than trusted. That is not tidiness. The name of a face file is derived from this value
+    (``is_id_named``), so an id that is not an id puts the account's own template outside the
+    only naming scheme this build scores - where the gate refuses it, and where a
+    re-enrollment under the same value would file the new face in the same refused place. A
+    refusal with no way out is the one outcome this module will not ship, so the row is
+    repaired instead: the account's next enrollment files a template the gate will use.
     """
     row = conn.execute("SELECT biometric_id FROM users WHERE id = ?", (user_id,)).fetchone()
     if row is None:
         raise LookupError(f"no users row for {user_id!r}")
     current = id_from(row)
-    if current:
+    if current and _looks_like_an_id(current):
         return current
     fresh = new_id()
+    if current:
+        log.warning(
+            "users.biometric_id for %s is not an id this application writes (%r); replacing it "
+            "with a fresh one, which leaves that account needing a new photograph",
+            user_id,
+            current,
+        )
     conn.execute("UPDATE users SET biometric_id = ? WHERE id = ?", (fresh, user_id))
     return fresh
 
@@ -262,6 +331,16 @@ STALE_NO_PROVENANCE = "no_provenance"
 STALE_OTHER_PIPELINE = "other_pipeline"
 STALE_OTHER_MODEL = "other_model"
 
+#: A template filed under the **account id** the old scheme used, rather than the immutable id
+#: this build files a face under. Deliberately not a statement about the vector: the embedding
+#: may be perfectly current, and it is still refused. The name is the only fact available, and
+#: what it cannot tell you is which of two files it is - the account's own template from before
+#: the migration, or an older copy that a re-enrollment has since superseded (the ids exist
+#: precisely because account ids are reused and files outlive the accounts they were named
+#: after). Scoring it makes a stale face the live template silently; refusing it costs one
+#: photograph and re-files the face properly.
+STALE_LEGACY_NAME = "legacy_template_name"
+
 # ---------------------------------------------------------------------------
 # the re-enrollment contract (machine-readable, for a client rather than a worker)
 # ---------------------------------------------------------------------------
@@ -291,6 +370,12 @@ REENROLLMENT_STATUSES: dict[str, tuple[str, str]] = {
     STALE_OTHER_MODEL: (STATUS_NEEDS_REENROLLMENT, REASON_STALE_TEMPLATE_VERSION),
     STALE_NO_PROVENANCE: (STATUS_NEEDS_REENROLLMENT, REASON_STALE_TEMPLATE_PIPELINE),
     STALE_OTHER_PIPELINE: (STATUS_NEEDS_REENROLLMENT, REASON_STALE_TEMPLATE_PIPELINE),
+    # The routing code is the *version* one and deliberately not a third value: both codes say
+    # "this record predates a change in the system, so re-enroll" - here the change is how a
+    # face is filed rather than how it is embedded - and a client that enumerates two of them
+    # must not meet a third. That it is the *filing* and not the embedding is the diagnosis, and
+    # the diagnosis travels beside the code in ``stale_reason``.
+    STALE_LEGACY_NAME: (STATUS_NEEDS_REENROLLMENT, REASON_STALE_TEMPLATE_VERSION),
 }
 
 
@@ -425,24 +510,44 @@ def stale_reason(
     return None
 
 
+def template_problem(
+    path: str, *, expected_dimensions: int | None = None
+) -> tuple[str | None, Reference | None]:
+    """``(reason, parsed)`` for the file at ``path``: the **name** first, then the contents.
+
+    The two questions a caller has to answer before a template can be scored, in one place, so
+    the name rule and the content rules cannot be asked in a different order by two callers -
+    and so a caller that only *reports* does not have to know the order either.
+
+    ``reason`` is ``None`` when this file can be scored. ``parsed`` is the template when it
+    could be read, and ``None`` when the refusal came from the name or from a file that will
+    not parse: a caller with no use for the vector ignores it, and the one that scores
+    (``compare_faces_sync``) gets the parse it would otherwise have to do again.
+    """
+    if not is_id_named(path):
+        return STALE_LEGACY_NAME, None
+    try:
+        reference = read_reference(path)
+    except (OSError, ValueError, TypeError):
+        return STALE_UNREADABLE, None
+    return stale_reason(reference, expected_dimensions=expected_dimensions), reference
+
+
 def reference_health(
     user_id: str, biometric_id: str | None = None, *, expected_dimensions: int | None = None
 ) -> tuple[bool, str | None]:
     """``(usable, reason)`` for this account's template. Never raises.
 
-    ``usable`` is ``False`` when a punch against this template would be meaningless. A
-    caller that only wants "can this person clock in" should keep using ``is_enrolled``:
-    that answers whether a *file* is there, which is a different question from whether the
-    template in it still describes the same kind of picture.
+    ``usable`` is ``False`` when a punch against this template would be meaningless - because
+    of what is *in* the file, or because of where it is filed (see ``is_id_named``). A caller
+    that only wants "can this person clock in" should keep using ``is_enrolled``: that answers
+    whether a *file* is there, which is a different question from whether a punch could be
+    decided against it.
     """
     path = resolve_reference(user_id, biometric_id)
     if not os.path.exists(path):
         return False, "missing"
-    try:
-        reference = read_reference(path)
-    except (OSError, ValueError, TypeError):
-        return False, STALE_UNREADABLE
-    reason = stale_reason(reference, expected_dimensions=expected_dimensions)
+    reason, _ = template_problem(path, expected_dimensions=expected_dimensions)
     return reason is None, reason
 
 
@@ -465,6 +570,12 @@ STALE_EXPLANATIONS: dict[str, str] = {
         "the stored face template was made by a different recognition model, so no distance "
         "computed from it can be compared with the thresholds in force, and it has to be "
         "re-enrolled"
+    ),
+    STALE_LEGACY_NAME: (
+        "the stored face template is filed under the account id the old scheme used, so "
+        "nothing distinguishes the account's own template from a copy a later enrollment "
+        "replaced; enrolling the worker again files the new face under the account's "
+        "biometric id and retires this file"
     ),
 }
 
@@ -504,14 +615,11 @@ def stale_references(*, expected_dimensions: int | None = None) -> dict[str, Any
         path = resolve_reference(user_id, str(row["biometric_id"]))
         if not os.path.exists(path):
             continue
-        reason: str | None
-        pipeline: str | None = None
-        try:
-            reference = read_reference(path)
-            pipeline = reference.pipeline
-            reason = stale_reason(reference, expected_dimensions=expected_dimensions)
-        except (OSError, ValueError, TypeError):
-            reason = STALE_UNREADABLE
+        # One read, and the same rule the gate applies (``template_problem``): a template this
+        # build did not file is refused without being read, so it arrives here as
+        # ``legacy_template_name`` with no pipeline to report, and an id-named file is judged
+        # on what is inside it.
+        reason, template = template_problem(path, expected_dimensions=expected_dimensions)
         if reason is None:
             continue
         worklist.append(
@@ -520,7 +628,7 @@ def stale_references(*, expected_dimensions: int | None = None) -> dict[str, Any
                 "name": row["name"],
                 "role": row["role"],
                 "reason": reason,
-                "template_pipeline": pipeline,
+                "template_pipeline": template.pipeline if template is not None else None,
                 "file": os.path.basename(path),
             }
         )
@@ -544,6 +652,13 @@ def write_reference(user_id: str, image, embedding: list[float]) -> str:
     halfway through must not leave a truncated template, which would make every
     subsequent punch fail with an unreadable embedding. The temporary name carries
     random bytes as well, because half a template is still half a face on disk.
+
+    Any file this account still has **under the old naming scheme is retired** once both
+    writes have landed - renamed out of the fallback's reach, not deleted. This is the one
+    writer every enrollment path goes through, which is why the retirement lives here: a
+    caller cannot re-enroll somebody and leave the template they replaced reachable, and
+    the ordering means a crash between the two halves leaves the account with the template
+    it already had rather than with none.
 
     Returns the template path.
     """
@@ -577,6 +692,18 @@ def write_reference(user_id: str, image, embedding: list[float]) -> str:
     temporary_photo = f"{photo}.{secrets.token_hex(6)}.tmp"
     thumbnail.save(temporary_photo, format="JPEG", quality=PHOTO_QUALITY)
     os.replace(temporary_photo, photo)
+
+    # Deliberately after both writes rather than before them: the fallback may be the only
+    # template this account has until the id-named file exists, and an enrollment that died
+    # between the two must not leave the account with nothing to be scored against.
+    retired = quarantine_legacy(user_id, keep=(reference, photo))
+    if retired:
+        log.info(
+            "retired %d superseded biometric file(s) for %s: %s",
+            len(retired),
+            user_id,
+            ", ".join(retired),
+        )
     return reference
 
 
@@ -609,44 +736,109 @@ def remove_files(user_id: str, biometric_id: str | None = None) -> tuple[list[st
     return removed, failed
 
 
-def quarantine_legacy(user_id: str) -> list[str]:
+def _path_key(path: str) -> str:
+    """A path comparable across the two naming schemes, case-insensitively on Windows.
+
+    ``reference_path`` and ``legacy_reference_path`` build their names independently, and
+    asking whether the two ever name the same file is a question about the filesystem, not
+    about the strings.
+    """
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _quarantine_file(path: str) -> list[str]:
+    """Move one legacy-named file aside. ``[new name]``, or ``[]`` if it would not move.
+
+    A failure is logged rather than raised, and named as the quarantine it is: a file a
+    running backup holds open on Windows cannot be renamed, and neither an enrollment nor a
+    boot may fail over a leftover that ``readiness`` reports anyway.
+    """
+    if not os.path.exists(path):
+        return []
+    target = f"{path}{QUARANTINE_SUFFIX}-{secrets.token_hex(4)}"
+    try:
+        os.replace(path, target)
+    except OSError:  # pragma: no cover - a locked file
+        log.warning("legacy biometric file %s could not be moved aside", path)
+        return []
+    return [os.path.basename(target)]
+
+
+def quarantine_legacy(user_id: str, *, keep: Iterable[str] = ()) -> list[str]:
     """Move any legacy-named file for ``user_id`` out of reach of the id-based readers.
 
     Renamed, never deleted: it is still somebody's face, and a file the application
     silently destroys is worse than one an operator can see and remove deliberately.
     The new name is never read by anything (see ``QUARANTINE_SUFFIX``).
+
+    ``keep`` names paths that must not be moved whatever they are called. ``write_reference``
+    passes the two files it has just written, which is what makes this safe on the one
+    configuration where the two names collide: if an account's id were ever its own account
+    id (a hand-migrated row, an id set by hand in the database), ``<user_id>.json`` is *both*
+    the legacy name and the template, and moving it aside would leave that account with no
+    template at all.
     """
+    protected = {_path_key(path) for path in keep}
     moved: list[str] = []
     for path in (legacy_reference_path(user_id), legacy_photo_path(user_id)):
-        if not os.path.exists(path):
+        if _path_key(path) in protected:
             continue
-        target = f"{path}{QUARANTINE_SUFFIX}-{secrets.token_hex(4)}"
-        try:
-            os.replace(path, target)
-            moved.append(os.path.basename(target))
-        except OSError:  # pragma: no cover - a locked file; the caller still gets a fresh id
-            log.warning("legacy biometric file %s could not be moved aside", path)
+        moved += _quarantine_file(path)
     return moved
 
 
 # ---------------------------------------------------------------------------
 # the migration of what is already on disk
 # ---------------------------------------------------------------------------
+def _usable(path: str) -> bool:
+    """Whether an id-named file is worth leaving an account on.
+
+    The naming change must never turn a leftover that is the *only* working template into
+    no template at all, so a superseded legacy file is retired only beside a survivor that
+    can actually be read: non-empty, and for a template parseable by ``read_reference``.
+    This is not theoretical - the writer that made today's files was not always atomic, so
+    an empty or truncated id-named file is a state that has existed on disk, and it would
+    read as "there is a template" to ``resolve_reference`` while every punch against it
+    failed with an unreadable embedding.
+    """
+    try:
+        if os.path.getsize(path) <= 0:
+            return False
+    except OSError:
+        return False
+    if path.endswith(".json"):
+        try:
+            read_reference(path)
+        except (OSError, ValueError):
+            return False
+    return True
+
+
 def _adopt_pair(legacy: str, target: str, summary: dict[str, list]) -> None:
     """Move one legacy-named file to its id-named counterpart, once.
 
-    Three outcomes, and each is worth telling an operator about:
+    Four outcomes, and each is worth telling an operator about:
 
     * the legacy file is there and the target is not -> rename;
-    * both are there -> *leave it alone* and report it as ``superseded``: the id-named
-      file is the one the application wrote, so the legacy file is an older copy of the
-      same person's template, and deciding to delete a face is a human's call;
+    * both are there -> the id-named file is the one the application wrote, so the legacy
+      file is an older copy of the same person's face, and it is **retired**: renamed out of
+      the fallback's reach (never deleted) and listed in ``superseded``. Leaving it in place
+      is what let a template replaced long ago come back silently the day the id-named file
+      went missing, and rename-with-keep is a decision an operator can still reverse while
+      the file waits out the retention window;
+    * both are there but the survivor is not usable -> the legacy file is **kept** and
+      reported. That is the one state where removing the leftover could cost the account its
+      only readable template, and it is a state for an operator to look at rather than one
+      for this function to resolve;
     * neither is there -> nothing to do.
     """
     if not os.path.exists(legacy):
         return
     if os.path.exists(target):
-        summary["superseded"].append(os.path.basename(legacy))
+        if not _usable(target):
+            summary["kept"].append(os.path.basename(legacy))
+            return
+        summary["superseded"] += _quarantine_file(legacy)
         return
     try:
         os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -670,8 +862,20 @@ def adopt_legacy_files() -> dict[str, Any]:
     Reports what it did, including what it deliberately did not touch: a live site
     adopting this change should be able to read one summary and know whether any face
     is still filed under an account id.
+
+    The four lists mean: ``renamed`` (a leftover filed properly), ``superseded`` (a leftover
+    retired beside an id-named file that replaces it - the names are the quarantine names,
+    so an operator can find them), ``kept`` (a leftover left where it is because its id-named
+    twin is not readable, which needs a human) and ``failed``. Only ``kept`` and ``failed``
+    leave a face reaching the fallback.
     """
-    summary: dict[str, list[Any]] = {"renamed": [], "superseded": [], "failed": [], "orphans": []}
+    summary: dict[str, list[Any]] = {
+        "renamed": [],
+        "superseded": [],
+        "kept": [],
+        "failed": [],
+        "orphans": [],
+    }
     refs_dir, photos_dir = directories()
     try:
         with db() as conn:
@@ -703,16 +907,33 @@ def adopt_legacy_files() -> dict[str, Any]:
             stem, extension = os.path.splitext(name)
             if extension == suffix and stem.isdigit() and stem not in known:
                 summary["orphans"].append(name)
+
+    # Said out loud, not only returned: a boot that retires faces should say so in the log,
+    # since the summary's one reader is whoever is watching the server start.
+    if summary["superseded"]:
+        log.info(
+            "retired %d superseded biometric file(s): %s",
+            len(summary["superseded"]),
+            ", ".join(summary["superseded"]),
+        )
+    if summary["kept"]:
+        log.warning(
+            "%d legacy biometric file(s) left in place beside an unreadable id-named twin: %s",
+            len(summary["kept"]),
+            ", ".join(summary["kept"]),
+        )
     return summary
 
 
 def legacy_files_remaining() -> dict[str, int]:
     """How many files are still filed under an account id. For readiness to report.
 
-    A deployment that has upgraded should reach zero here (``superseded`` files, where
-    an account was re-enrolled after the change, need a human's decision and are counted
-    separately by ``adopt_legacy_files``). Any other answer means the adoption was
-    interrupted and the readers are still relying on the fallback.
+    A deployment that has upgraded should reach zero here, and zero is now reachable without
+    a human deciding anything: a leftover superseded by an id-named file is retired by
+    ``write_reference`` when that account is re-enrolled, and by ``adopt_legacy_files`` on the
+    next boot. Any other answer therefore means the adoption was interrupted, or a retirement
+    could not move a file (a running backup holding it open on Windows, say) - and the readers
+    are still relying on the fallback in the meantime.
     """
     counts = {"references": 0, "photos": 0}
     refs_dir, photos_dir = directories()

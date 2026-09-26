@@ -1,30 +1,31 @@
-"""The five file trees are named in the environment, so a *child* process writes where the server does.
+"""The six file trees are named in the environment, so a *child* process writes where the server does.
 
 WHY THIS EXISTS
 ---------------
-``harness`` keeps a test run out of the checkout by repointing five module attributes —
+``harness`` keeps a test run out of the checkout by repointing six module attributes —
 ``main.LOCAL_REFS_DIR``, ``main.WORKER_PHOTOS_DIR``, ``punch_frames.FRAMES_DIR``,
-``quick_links.PHOTOS_DIR`` and ``corpus.ROOT_DIR`` — and every module reads its own at call time,
+``quick_links.PHOTOS_DIR``, ``registrations.PHOTOS_DIR`` and ``corpus.ROOT_DIR`` — and every
+module reads its own at call time,
 so one repoint (and
 one database reset) carries the whole rotation. That works for code running *inside* the test
 process, which is where every rotation test lives, and nowhere else.
 
 A module attribute does not cross a process boundary; the environment does. So a child that
 imported the application — a report, an operator's script, a second worker, the load-test tool —
-resolved those four paths to the directories inside the project and wrote there: biometric
+resolved those paths to the directories inside the project and wrote there: biometric
 templates, enrollment selfies, punch evidence and quick-link photos landing in the checkout of a
 test run, with no row in the rotated database and nothing in the log. The rotation tests could
 not see it, because the leak happened in a process they never inspected.
 
 ``DATABASE_PATH`` never had that problem — it is read from the environment by ``config``, so a
-child inherits the answer. These four now work the same way, and this suite pins the three
+child inherits the answer. These now work the same way, and this suite pins the three
 things that make it true:
 
 1. **``config`` reads them**, one environment variable per tree, defaulting to the directory
    inside the project the application has always used (a deployment that sets none of them is
    unchanged).
 2. **The application names its directories from the settings**, so a child that sets nothing but
-   the variables gets the same four answers the parent has - asserted in a child process,
+   the variables gets the same answers the parent has - asserted in a child process,
    because in *this* process the harness has already overridden the attributes.
 3. **The suite publishes them for children**, from the same ``harness.FILE_TREES`` table that
    drives the rotation: the parent's attributes and the child's environment are two views of one
@@ -59,6 +60,7 @@ TREES: Final = (
     ("WORKER_PHOTOS_DIR", "worker_photos_dir", "worker_photos"),
     ("PUNCH_FRAMES_DIR", "punch_frames_dir", "punch_frames"),
     ("QUICK_LINK_PHOTOS_DIR", "quick_link_photos_dir", "quick_link_photos"),
+    ("REGISTRATION_PHOTOS_DIR", "registration_photos_dir", "registration_photos"),
     ("CALIBRATION_CORPUS_DIR", "calibration_corpus_dir", "calibration_corpus"),
 )
 
@@ -74,13 +76,14 @@ CONFIG = Path(config.__file__)
 #: real child process does rather than a stub.
 READ_PROBE = (
     "import json;"
-    "import main, punch_frames, quick_links, biometrics, corpus;"
+    "import main, punch_frames, quick_links, registrations, biometrics, corpus;"
     "refs, photos = biometrics.directories();"
     "print(json.dumps({"
     " 'LOCAL_REFS_DIR': refs,"
     " 'WORKER_PHOTOS_DIR': photos,"
     " 'PUNCH_FRAMES_DIR': punch_frames.frames_dir(),"
     " 'QUICK_LINK_PHOTOS_DIR': quick_links.photos_dir(),"
+    " 'REGISTRATION_PHOTOS_DIR': registrations.photos_dir(),"
     " 'CALIBRATION_CORPUS_DIR': corpus.root_dir()}))"
 )
 
@@ -188,9 +191,9 @@ def test_an_unset_environment_still_means_the_projects_own_directory(
 
 
 def test_a_child_process_reads_the_directories_from_the_environment(tmp_path):
-    """The child-process claim, in a child process: all five, through the app's own accessors.
+    """The child-process claim, in a child process: every tree, through the app's own accessors.
 
-    The corpus resolves through ``root_dir()``, its own accessor, like the other four - so a child
+    The corpus resolves through ``root_dir()``, its own accessor, like the others - so a child
     that inherits the environment and nothing else lands in the tree the parent configured. Its
     ``captures/`` subdirectory is what a *capture* is written into, and that is what the corpus
     suite's own tests assert against a monkeypatched root.
@@ -253,7 +256,7 @@ def test_a_child_spawned_by_the_suite_writes_into_the_generation():
 
     The two halves are each asserted above; this is the one that matters, and it is the state
     the suite will be in for every future test that starts a subprocess: no overrides, simply
-    what ``harness`` published, and every one of the five lands in the generation that holds the
+    what ``harness`` published, and every one of them lands in the generation that holds the
     database - which is the property the rotation promised and could not deliver across a
     process boundary.
     """

@@ -713,10 +713,10 @@ async def submit_quick_punch(
                 detail={"error_code": "link_unknown", "message": "This clock link is not valid."},
             )
         _require_active_worker(worker)
-        # The whole row: this punch is measured against the matched site's own shift window,
-        # so the window columns have to arrive with the geofence that matched (see
-        # ``shift_windows``).
-        sites = conn.execute("SELECT * FROM construction_sites").fetchall()
+        # The whole row, with the site's category joined on: this punch is measured against the
+        # matched site's own shift window, and that window is the category's when the site has
+        # not set one (see ``shift_windows.SITE_ROW_SQL``).
+        sites = conn.execute(shift_windows.SITE_ROW_SQL).fetchall()
 
     detected_site = None
     detected_site_row = None

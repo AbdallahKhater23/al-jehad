@@ -232,6 +232,15 @@ def get_session():
 
 def reset_session() -> None:
     """Forget the cached session (used after changing settings, and by tests)."""
+    if settings.face_engine_process:
+        # The session that matters is the child's; forgetting only this process's copy would
+        # leave the model the operator just changed still loaded over there. Swallowed when
+        # the child is unreachable: this is a cache reset, and failing it must not be the
+        # thing that stops an operator from applying a configuration.
+        try:
+            _remote("liveness_reset")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not reset the model process's liveness session: %s", exc)
     global _SESSION, _SESSION_ERROR, _MODEL_FINGERPRINT
     with _SESSION_LOCK:
         _SESSION = None
@@ -239,8 +248,80 @@ def reset_session() -> None:
         _MODEL_FINGERPRINT = None
 
 
+# ---------------------------------------------------------------------------
+# where the model runs: here, or in the child that owns it
+# ---------------------------------------------------------------------------
+def _remote(op: str, *args, **kwargs):
+    """One liveness op in the face model process (see ``face_process``).
+
+    Only the *model call* crosses: ``gate()``, the modes and the thresholds are policy, and
+    policy stays in the API process where the alternatives are (an RPC boundary that carried
+    the decision would need the settings and the audit trail on both sides).
+    """
+    import face_process
+
+    return face_process.client().call(op, *args, **kwargs)
+
+
+def _remote_check(image_rgb: np.ndarray, *, size: int | None) -> LivenessResult:
+    """``check_liveness``, evaluated in the model process.
+
+    Never raises, exactly like the function it stands in for: a transport failure is just
+    another way for liveness to be *unavailable*, which every caller already handles - the
+    mode decides whether that blocks a punch or only records it.
+    """
+    started = time.perf_counter()
+    try:
+        result = _remote("liveness_check", image_rgb, size=size)
+    except Exception as exc:  # noqa: BLE001 - unavailable is an answer, not a raise
+        log.warning("the face model process could not evaluate liveness: %s", exc)
+        return LivenessResult(
+            verdict=VERDICT_UNAVAILABLE,
+            is_live=False,
+            available=False,
+            error_code=ERR_UNAVAILABLE,
+            detail=f"the face model process could not answer: {exc}",
+            model=str(settings.liveness_model_path),
+            latency_ms=(time.perf_counter() - started) * 1000.0,
+        )
+    if isinstance(result, LivenessResult):
+        return result
+    return LivenessResult(  # pragma: no cover - a child that answered with something else
+        verdict=VERDICT_ERROR,
+        is_live=False,
+        available=False,
+        error_code=ERR_UNAVAILABLE,
+        detail=f"the face model process answered with {type(result).__name__}",
+        model=str(settings.liveness_model_path),
+        latency_ms=(time.perf_counter() - started) * 1000.0,
+    )
+
+
+def _remote_status() -> dict | None:
+    """The child's own liveness status, or ``None`` when it cannot be asked.
+
+    Consulted rather than assumed for the reason that matters at startup: this process has no
+    session of its own in that mode, so reporting its own answer would tell an operator that
+    ``LIVENESS_MODE=enforce`` has no model - a fatal readiness verdict - while the child is
+    healthy and serving.
+    """
+    import face_process
+
+    try:
+        snapshot = face_process.client().status()
+    except face_process.FaceProcessError as exc:
+        log.warning("liveness status lives in the face model process, which did not answer: %s", exc)
+        return None
+    section = snapshot.get("liveness") if isinstance(snapshot, dict) else None
+    return dict(section) if isinstance(section, dict) else None
+
+
 def status() -> dict:
     """Read-only self-description, surfaced by ``/api/v1/status`` and readiness."""
+    if settings.face_engine_process:
+        remote = _remote_status()
+        if remote is not None:
+            return remote
     session = get_session()
     available = session is not None
     inputs = []
@@ -319,6 +400,8 @@ def _probabilities(raw: np.ndarray) -> tuple[np.ndarray, str]:
 
 def check_liveness(image_rgb: np.ndarray, *, size: int | None = None) -> LivenessResult:
     """Evaluate one frame. Never raises: failures come back as ``unavailable``/``error``."""
+    if settings.face_engine_process:
+        return _remote_check(image_rgb, size=size)
     started = time.perf_counter()
     session = get_session()
     if session is None:

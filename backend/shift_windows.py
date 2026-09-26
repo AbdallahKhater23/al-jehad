@@ -19,6 +19,19 @@ The window an arrival is measured against now comes from the site the punch was 
 falling back per field to the global rules - so a site may override only the hours and keep
 the global timezone, or the other way round.
 
+A third layer sits between the two. Sites are grouped into *categories* - the company's own
+words for them are a warehouse, a factory and a project - and a category may carry the
+window for every site inside it, so retuning "the warehouses" is one edit rather than one
+edit per warehouse. The order is site -> category -> company, still per field: a site that
+runs its own hours ignores the category's, and a category that sets only the start leaves
+the end inherited from the company rules. Which layer won is reported per field, because an
+administrator looking at 04:00 has to know whether editing the *site* will change it.
+
+The category arrives on the site row, under ``category_``-prefixed columns (see
+:data:`SITE_ROW_SQL`). One row carries all three layers, so no caller has to fetch a second
+thing or remember to pass it - and a caller that fetches the site some other way simply has
+no category layer, which is exactly the old behaviour rather than a wrong answer.
+
 THE THREE THINGS THAT ARE EASY TO GET WRONG
 -------------------------------------------
 1. **Cross-midnight is a different predicate, not a different comparison.** ``start <= end``
@@ -78,8 +91,42 @@ MINUTES_PER_DAY = 24 * 60
 #: "configured here" are distinguishable - an administrator looking at 04:00 needs to know
 #: whether editing the site will change it.
 SOURCE_SITE = "site"
+#: The site's category - the company's own grouping of sites (a warehouse, a factory, a
+#: project), which may carry the window for every site inside it.
+SOURCE_CATEGORY = "category"
 SOURCE_GLOBAL = "global"
 SOURCE_DEFAULT = "default"
+
+#: Where a site's category layer lives on a fetched site row: the window field's name on the
+#: left, the ``category_``-prefixed column the join publishes on the right.
+#:
+#: This mapping is the contract between the row fetchers and :func:`effective_window`. It exists
+#: because a site row and a category row have the *same* column names for the window - they are
+#: the same window at a different scope - so a second row cannot simply be splatted in beside
+#: the first without one of the two being renamed on the way.
+CATEGORY_COLUMN: dict[str, str] = {
+    "clock_in_window_start": "category_clock_in_window_start",
+    "clock_in_window_end": "category_clock_in_window_end",
+    "site_timezone": "category_site_timezone",
+}
+
+#: The site-row query every punch path reads, with the site's category joined on to it.
+#:
+#: One row carries all three layers, which is the whole point: the punch handler, the offline
+#: replay, the quick link, the timesheet and the readiness scan each already fetch the site they
+#: are about, and none of them has to remember a second lookup to get the category's hours. A
+#: path that uses this query gets the category layer; a path that fetches ``construction_sites``
+#: by hand gets exactly the behaviour it had before categories existed - never a wrong window,
+#: just an unlayered one.
+SITE_ROW_SQL = (
+    "SELECT s.*, "
+    "c.name AS category_name, "
+    "c.clock_in_window_start AS category_clock_in_window_start, "
+    "c.clock_in_window_end AS category_clock_in_window_end, "
+    "c.site_timezone AS category_site_timezone "
+    "FROM construction_sites s "
+    "LEFT JOIN site_categories c ON c.category_id = s.category_id"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +293,11 @@ class Window:
     start_source: str = SOURCE_DEFAULT
     end_source: str = SOURCE_DEFAULT
     timezone_source: str = SOURCE_DEFAULT
+    #: The name of the category this window was resolved through, when the site has one. It is
+    #: shown beside a value whose source is ``category`` - "warehouse hours", not "inherited" -
+    #: because the administrator who has to change it is on a different screen from the one
+    #: reading it.
+    category_name: str | None = None
 
     # -- derived -----------------------------------------------------------
     @property
@@ -272,6 +324,17 @@ class Window:
     def has_site_hours(self) -> bool:
         """True when the site overrode the hours, whatever it did with the timezone."""
         return SOURCE_SITE in (self.start_source, self.end_source)
+
+    @property
+    def is_category_specific(self) -> bool:
+        """True when any part of this window came from the site's category.
+
+        Separate from :attr:`is_site_specific` on purpose: "this site has its own hours" and
+        "this site follows its category's hours" are different things to an administrator, and
+        a single flag would make the second read as the first - which is how somebody comes to
+        edit a site and wonder why nothing moved.
+        """
+        return SOURCE_CATEGORY in (self.start_source, self.end_source, self.timezone_source)
 
     # -- behaviour ---------------------------------------------------------
     def local(self, moment: datetime) -> datetime:
@@ -335,6 +398,8 @@ class Window:
             "window": self.label(),
             "crosses_midnight": self.crosses_midnight,
             "site_specific": self.is_site_specific,
+            "category": self.category_name,
+            "category_specific": self.is_category_specific,
             "source": self.source_dict(),
         }
 
@@ -358,13 +423,29 @@ def _field(row: Any, key: str) -> Any:
         return None
 
 
+def _is_set(value: Any) -> bool:
+    """Whether a layer actually configured this field. ``None`` and ``''`` both mean "inherit"."""
+    return value is not None and str(value).strip() != ""
+
+
 def _pick(site_row: Any, global_rules: Mapping[str, Any] | None, key: str) -> tuple[Any, str]:
-    """The effective value of ``key``: the site's, else the global rules', else the default."""
+    """The effective value of ``key``: the site's, its category's, the company's, the default.
+
+    Three layers and a fallback, tried in that order and per field. The category is read off
+    the site row's ``category_*`` column (:data:`SITE_ROW_SQL`); a row fetched without the join
+    has no such column, and ``_field`` answers ``None`` for a column that is not in the result
+    set - so the layer is simply absent rather than mistaken for an empty override.
+    """
     site_value = _field(site_row, key)
-    if site_value is not None and str(site_value).strip() != "":
+    if _is_set(site_value):
         return site_value, SOURCE_SITE
+    category_column = CATEGORY_COLUMN.get(key)
+    if category_column is not None:
+        category_value = _field(site_row, category_column)
+        if _is_set(category_value):
+            return category_value, SOURCE_CATEGORY
     global_value = (global_rules or {}).get(key)
-    if global_value is not None and str(global_value).strip() != "":
+    if _is_set(global_value):
         return global_value, SOURCE_GLOBAL
     return None, SOURCE_DEFAULT
 
@@ -397,6 +478,7 @@ def effective_window(
         start_source=start_source,
         end_source=end_source,
         timezone_source=timezone_source,
+        category_name=(str(_field(site_row, "category_name")) if _field(site_row, "category_name") else None),
     )
 
 
@@ -424,28 +506,67 @@ def is_within_site_window(
             start_source=window.start_source,
             end_source=window.end_source,
             timezone_source=window.timezone_source,
+            category_name=window.category_name,
         )
     return window.contains_moment(current_time)
 
 
+def _layer_problems(row: Any, label: str) -> list[str]:
+    """The window fields of one layer that this module cannot apply, described."""
+    problems: list[str] = []
+    for column in ("clock_in_window_start", "clock_in_window_end"):
+        value = _field(row, column)
+        if value is not None and not is_valid_hhmm(value):
+            problems.append(f"{label}.{column}={value!r}")
+    zone = _field(row, "site_timezone")
+    if zone is not None and not is_known_timezone(zone):
+        problems.append(f"{label}.site_timezone={zone!r}")
+    return problems
+
+
+def category_problems(category_row: Any) -> list[str]:
+    """Every window field stored on a category that this module cannot apply, described.
+
+    Checked on the category itself, not only through the sites that belong to it: a category
+    with nobody inside it still holds hours, and those hours become the window of the first
+    site that joins - which is exactly the latent typo a scan exists to find. It is also the
+    only way to see one whose members have all set their own hours and are therefore unaffected.
+
+    Attributed to the category rather than to a site, because hours that do not parse move
+    *every* site inside it at once, and the screen where that is fixed is the category's.
+    """
+    if category_row is None:
+        return []
+    name = _field(category_row, "name") or "?"
+    return _layer_problems(category_row, f"category {name}")
+
+
 def window_problems(site_row: Any) -> list[str]:
-    """Every window field on a stored site row that this module cannot apply, described.
+    """Every window field on a stored site row - or on its category - that cannot be applied.
 
     The rule lives here rather than in the caller that reports it (``readiness``) because this
     is the module that knows what "usable" means, and a report that disagreed with the
     fallback it describes would be worse than no report at all.
+
+    The category is included when the row was fetched with it (:data:`SITE_ROW_SQL`), and it
+    is attributed to the category rather than to one of its sites: hours that do not parse
+    affect *every* warehouse at once, so naming a single site would send an operator to the
+    wrong screen - and to the one screen where the fix cannot be made.
     """
     if site_row is None:
         return []
     name = _field(site_row, "site_name") or "?"
-    problems: list[str] = []
-    for column in ("clock_in_window_start", "clock_in_window_end"):
-        value = _field(site_row, column)
-        if value is not None and not is_valid_hhmm(value):
-            problems.append(f"{name}.{column}={value!r}")
-    zone = _field(site_row, "site_timezone")
-    if zone is not None and not is_known_timezone(zone):
-        problems.append(f"{name}.site_timezone={zone!r}")
+    problems: list[str] = _layer_problems(site_row, str(name))
+    category = _field(site_row, "category_name") or "?"
+    for column, category_column in CATEGORY_COLUMN.items():
+        value = _field(site_row, category_column)
+        if value is None:
+            continue
+        if column == "site_timezone":
+            if not is_known_timezone(value):
+                problems.append(f"category {category}.site_timezone={value!r}")
+        elif not is_valid_hhmm(value):
+            problems.append(f"category {category}.{column}={value!r}")
     return problems
 
 

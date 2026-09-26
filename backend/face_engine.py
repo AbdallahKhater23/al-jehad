@@ -133,6 +133,70 @@ class NoFaceDetected(ValueError):
 
 
 # ---------------------------------------------------------------------------
+# where the models run: here, or in the child that owns them
+# ---------------------------------------------------------------------------
+def _remote_enabled() -> bool:
+    """Whether the model calls belong to the child process (``face_process``).
+
+    Read from settings on every call rather than latched at import: a test switches modes
+    with ``monkeypatch``, and an operator who flips the flag gets one mechanism deciding it
+    rather than two that can disagree.
+    """
+    return bool(settings.face_engine_process)
+
+
+def _remote_call(op: str, image, *, enforce_detection: bool, fallback_operation: str):
+    """One model call, in the child, with this process's telemetry recorded around it.
+
+    The child's own Prometheus counters are in another process and are never scraped, so the
+    timing on ``/metrics`` is taken here, from the reply - measured around the model call
+    rather than around the pipe, and labelled with what the child actually ran.
+    """
+    import face_process
+
+    started = time.perf_counter()
+    error: BaseException | None = None
+    reply: dict | None = None
+    try:
+        reply = face_process.client().reply_of(
+            op, image, enforce_detection=enforce_detection
+        )
+        return reply.get("result")
+    except face_process.FaceProcessError as exc:
+        # ``FaceEngineUnavailable``, not a new error type: every endpoint already answers
+        # that as a server fault - "we could not verify you right now" - rather than as a
+        # problem with the photo, which is the only distinction a worker can act on.
+        error = FaceEngineUnavailable(f"the face model process could not answer: {exc}")
+        raise error from exc
+    except BaseException as exc:  # noqa: BLE001 - recorded, then handed on unchanged
+        error = exc
+        raise
+    finally:
+        extra = (reply or {}).get("extra") or {}
+        telemetry.observe_model_call(
+            operation=extra.get("operation") or fallback_operation,
+            seconds=float((reply or {}).get("seconds") or (time.perf_counter() - started)),
+            model=extra.get("model") or FACE_MODEL,
+            detector=extra.get("detector") or face_detector.active_detector(),
+            error=error,
+        )
+
+
+def _represent_remote(image, *, enforce_detection: bool = True):
+    """``_represent``, run in the model process. Same function, different address."""
+    return _remote_call(
+        "represent", image, enforce_detection=enforce_detection, fallback_operation="represent"
+    )
+
+
+def _detect_remote(image, *, enforce_detection: bool = False):
+    """``_detect``, run in the model process."""
+    return _remote_call(
+        "detect", image, enforce_detection=enforce_detection, fallback_operation="detect"
+    )
+
+
+# ---------------------------------------------------------------------------
 # the model calls: the only place a face model is run for verification work
 # ---------------------------------------------------------------------------
 def _represent(image, *, enforce_detection: bool = True):
@@ -162,6 +226,8 @@ def _represent(image, *, enforce_detection: bool = True):
     decision is made from. A failure is timed too - a model that raises instantly is not
     fast, it is broken, and it would otherwise look like excellent latency on a graph.
     """
+    if _remote_enabled():
+        return _represent_remote(image, enforce_detection=enforce_detection)
     started = time.perf_counter()
     error: BaseException | None = None
     try:
@@ -224,6 +290,8 @@ def _detect(image, *, enforce_detection: bool = False):
     DeepFace's MTCNN, and a detection path that silently changes the detector is a detection
     path that silently changes the crop every stored template was built from.
     """
+    if _remote_enabled():
+        return _detect_remote(image, enforce_detection=enforce_detection)
     started = time.perf_counter()
     error: BaseException | None = None
     try:
@@ -392,7 +460,14 @@ class FaceEngine:
         A sentinel per worker goes behind the waiting jobs, so a job that was accepted is
         still run. Idempotent, safe when no worker ever started, and *not* permanent: the
         next submission starts the pool again (see ``start``).
+
+        The model process, when there is one, is stopped too: a graceful shutdown that left a
+        200 MiB child behind would be a worse leak than the one this prototype is about.
         """
+        if settings.face_engine_process:
+            import face_process
+
+            face_process.shutdown()
         with self._start_lock:
             if self._closed:
                 return
@@ -537,7 +612,15 @@ class FaceEngine:
         """A consistent-enough view of the counters, for readiness."""
         with self._counters_lock:
             self.stats.queued = self._slots.qsize()
-            return {**self.stats.as_dict(), "name": self.name, "wait_seconds": self.wait_seconds}
+            view = {**self.stats.as_dict(), "name": self.name, "wait_seconds": self.wait_seconds}
+        if settings.face_engine_process:
+            # Reported here rather than only at ``/metrics`` because this is what readiness
+            # reads: an operator whose gate is slow needs to see, in the same place, that the
+            # models are in a child and whether that child is alive.
+            import face_process
+
+            view["model_process"] = face_process.stats()
+        return view
 
 
 #: The application's engine: one queue for the whole process, which is the point.

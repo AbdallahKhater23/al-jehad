@@ -205,12 +205,24 @@ const results = {};
         aria_sort: /aria-sort="(ascending|descending)"/.test(markup),
         icons_are_svg: /<svg/.test(markup),
         emoji: (markup.match(/[\\u{1F300}-\\u{1FAFF}\\u{2190}-\\u{21FF}\\u{2600}-\\u{27BF}]/gu) || []),
-        states: { w1: stateOf(markup, 'w1'), w2: stateOf(markup, 'w2'), w3: stateOf(markup, 'w3'), w4: stateOf(markup, 'w4') },
-        elapsed: { w1: elapsedOf(markup, 'w1'), w2: elapsedOf(markup, 'w2'), w4: elapsedOf(markup, 'w4') },
+        // Only the first two shifts are drawn: the board opens folded, so rows three and four
+        // are not in this markup at all - they are read again in ``1a``, below, once opened.
+        states: { w1: stateOf(markup, 'w1'), w2: stateOf(markup, 'w2') },
+        elapsed: { w1: elapsedOf(markup, 'w1'), w2: elapsedOf(markup, 'w2') },
         w2_has_late_badge: rowOf(markup, 'w2').indexOf('is-late') >= 0,
         w1_names_a_close_time: /closes at \\d{2}:\\d{2}/.test(rowOf(markup, 'w1')),
-        w3_has_no_close_time: /closes at/.test(rowOf(markup, 'w3')) === false,
         rows_have_force_out: (markup.match(/data-force-out="/g) || []).length,
+        // The fold itself: a button that says how many rows it is hiding, and says whether the
+        // list under it is open.
+        fold: {
+            toggle_present: markup.indexOf('data-live-ops-toggle') >= 0,
+            closed: markup.indexOf('aria-expanded="false"') >= 0,
+            label: env.evaluate("I18n.__('liveOpsShowMore').replace('{count}', '2')"),
+            label_present: markup.indexOf(env.evaluate("I18n.__('liveOpsShowMore').replace('{count}', '2')")) >= 0,
+            is_a_button: /<button[^>]*data-live-ops-toggle/.test(markup),
+            // The fold's words are its own: the filter's sentence is untouched by it.
+            filter_sentence_is_not_the_folds: markup.indexOf(env.evaluate("I18n.__('liveOpsShowing').replace('{shown}', '2').replace('{total}', '2')")) < 0
+        },
         // Every element the one-second tick rewrites has to be able to answer
         // "how long has this shift run?" on its own - a fact element without a
         // start is recomputed from undefined and repaints a healthy row as
@@ -226,6 +238,34 @@ const results = {};
         // An `admin`-role account is a different question from the `head_admin` above, and this
         // reader is a head admin: a peer is offered to them, and only to them.
         panel_offers_the_peer_administrator: markup.indexOf('<option value="a2">') >= 0
+    };
+}
+
+// 1a. the fold opens: every shift, in the same order, under the same status line
+{
+    const returned = env.evaluate("UI_MODULES.toggleLiveOpsExpanded()");
+    const markup = rendered(env);
+    results.expanded = {
+        returned: returned,
+        order: sessionOrder(markup),
+        states: { w3: stateOf(markup, 'w3'), w4: stateOf(markup, 'w4') },
+        elapsed_w4: elapsedOf(markup, 'w4'),
+        w3_has_no_close_time: /closes at/.test(rowOf(markup, 'w3')) === false,
+        rows_have_force_out: (markup.match(/data-force-out="/g) || []).length,
+        fact_elements: (markup.match(/data-fact="(elapsed|bar|state)"/g) || []).length,
+        facts_without_a_start: (markup.match(/data-fact="(elapsed|bar|state)"[^>]*>/g) || [])
+            .filter((tag) => tag.indexOf('data-start="') < 0),
+        fold: {
+            toggle_present: markup.indexOf('data-live-ops-toggle') >= 0,
+            open: markup.indexOf('aria-expanded="true"') >= 0,
+            label: env.evaluate("I18n.__('liveOpsShowLess')"),
+            label_present: markup.indexOf(env.evaluate("I18n.__('liveOpsShowLess')")) >= 0,
+            hidden_count_gone: markup.indexOf(env.evaluate("I18n.__('liveOpsShowMore').replace('{count}', '2')")) < 0
+        },
+        // The figures above the board are the *read*, not the fold: opening it moved no number.
+        on_site: statOf(markup, 'on-site'),
+        filter_note: env.evaluate("UI_MODULES.liveOpsFilterNoteHtml(UI_MODULES._liveOps)"),
+        reads: env.requests.filter((r) => r.url.indexOf('/admin/active_sessions') >= 0).length
     };
 }
 
@@ -365,19 +405,32 @@ const results = {};
     };
 }
 
-// 7. the phone layout says the same thing as the table
+// 7. the phone layout says the same thing as the table - and folds at the same point
 {
     const env6 = bootBoard();
+    // The layout switch is real (``Device.isMobile`` reads this), so the fold is exercised
+    // through the renderer that a phone actually gets rather than by calling the card
+    // function directly - which would have skipped the fold entirely.
+    env6.evaluate("localStorage.setItem('layoutOverride', 'mobile')");
     await env6.evaluate("UI.renderAdminTab('Live Ops')");
-    const cards = env6.evaluate("UI_MODULES.liveOpsCardsHtml(UI_MODULES.liveOpsRows(UI_MODULES._liveOps))");
+    const folded = boardPane(env6);
     results.cards = {
-        cards: (cards.match(/data-session="/g) || []).length,
-        has_table: cards.indexOf('<table') >= 0,
-        closing_named: cards.indexOf('is-closing') >= 0,
-        over_named: cards.indexOf('is-over') >= 0,
-        late_named: cards.indexOf('is-late') >= 0,
-        force_out: (cards.match(/data-force-out="/g) || []).length,
-        elapsed_present: cards.indexOf('data-fact="elapsed"') >= 0
+        cards: (folded.match(/data-session="/g) || []).length,
+        has_table: folded.indexOf('<table') >= 0,
+        closing_named: folded.indexOf('is-closing') >= 0,
+        over_named: folded.indexOf('is-over') >= 0,
+        late_named: folded.indexOf('is-late') >= 0,
+        force_out: (folded.match(/data-force-out="/g) || []).length,
+        elapsed_present: folded.indexOf('data-fact="elapsed"') >= 0,
+        fold_present: folded.indexOf('data-live-ops-toggle') >= 0,
+        closed: folded.indexOf('aria-expanded="false"') >= 0
+    };
+    env6.evaluate("UI_MODULES.toggleLiveOpsExpanded()");
+    const opened = boardPane(env6);
+    results.cards_expanded = {
+        cards: (opened.match(/data-session="/g) || []).length,
+        force_out: (opened.match(/data-force-out="/g) || []).length,
+        open: opened.indexOf('aria-expanded="true"') >= 0
     };
     const mobile = env6.evaluate("UI_MODULES.liveOpsSortSelectHtml()");
     results.mobile_sort = { has_select: mobile.indexOf('id="liveOpsSort"') >= 0, options: (mobile.match(/<option/g) || []).length };
@@ -426,6 +479,94 @@ const results = {};
             "document.getElementById('liveOpsBoard').innerHTML.indexOf('Renamed') >= 0"
         ),
         query_still_kept: env8.evaluate("UI_MODULES._liveOpsQuery")
+    };
+}
+
+// 9b. the fold is remembered while the board repaints under the operator
+{
+    const env9b = bootBoard();
+    await env9b.evaluate("UI.renderAdminTab('Live Ops')");
+    const folded = {
+        expanded: env9b.evaluate("UI_MODULES._liveOpsExpanded"),
+        rows: sessionOrder(boardPane(env9b)).length,
+        has_toggle: boardPane(env9b).indexOf('data-live-ops-toggle') >= 0
+    };
+    env9b.evaluate("UI_MODULES.toggleLiveOpsExpanded()");
+    const opened = {
+        expanded: env9b.evaluate("UI_MODULES._liveOpsExpanded"),
+        rows: sessionOrder(boardPane(env9b)).length
+    };
+    const note_opened = env9b.evaluate("UI_MODULES.liveOpsFilterNoteHtml(UI_MODULES._liveOps)");
+
+    // The 45 s poll, finding a change: this replaces the board's innerHTML whole, which is
+    // exactly the repaint that would fold the list shut if the state lived in the markup.
+    renamed = true;
+    await env9b.evaluate("UI_MODULES.pollLiveOps()");
+    const after_poll = {
+        expanded: env9b.evaluate("UI_MODULES._liveOpsExpanded"),
+        rows: sessionOrder(boardPane(env9b)).length,
+        open: boardPane(env9b).indexOf('aria-expanded="true"') >= 0,
+        label_present: boardPane(env9b).indexOf(env9b.evaluate("I18n.__('liveOpsShowLess')")) >= 0,
+        shows_the_new_name: boardPane(env9b).indexOf('Renamed') >= 0
+    };
+
+    // The 1 s tick and an explicit repaint, for the same reason.
+    env9b.evaluate("UI_MODULES.tickLiveOps()");
+    env9b.evaluate("UI_MODULES.paintLiveOps(UI_MODULES._liveOps)");
+    const after_tick = {
+        expanded: env9b.evaluate("UI_MODULES._liveOpsExpanded"),
+        rows: sessionOrder(boardPane(env9b)).length
+    };
+
+    // ...and leaving the tab starts folded again: the fold is about the board being read.
+    await env9b.evaluate("UI.renderAdminTab('Sites')");
+    await env9b.evaluate("UI.renderAdminTab('Live Ops')");
+    const after_return = {
+        expanded: env9b.evaluate("UI_MODULES._liveOpsExpanded"),
+        rows: sessionOrder(boardPane(env9b)).length
+    };
+
+    results.fold = {
+        folded, opened, after_poll, after_tick, after_return, note_opened,
+        // Opening the fold is a repaint of the board, never another read of the server.
+        reads: env9b.requests.filter((r) => r.url.indexOf('/admin/active_sessions') >= 0).length
+    };
+}
+
+// 9c. the boundary: two rows fit, three do not
+{
+    const env9c = bootBoard();
+    const foldHtml = (n) => env9c.evaluate("UI_MODULES.liveOpsFoldHtml(new Array(" + n + ").fill({}))");
+    const visibleCount = (n, expanded) => env9c.evaluate(
+        "(function () { UI_MODULES._liveOpsExpanded = " + expanded + ";" +
+        " return UI_MODULES.liveOpsVisibleRows(new Array(" + n + ").fill(0)).length; })()"
+    );
+    results.boundary = {
+        fold_at_two: foldHtml(2),
+        fold_at_three: foldHtml(3),
+        three_label: env9c.evaluate("I18n.__('liveOpsShowMore').replace('{count}', '1')"),
+        visible_two: visibleCount(2, false),
+        visible_one: visibleCount(1, false),
+        visible_of_four_closed: visibleCount(4, false),
+        visible_of_four_open: visibleCount(4, true),
+        expanded_state_cleared_by_stop: env9c.evaluate(
+            "(function () { UI_MODULES._liveOpsExpanded = true; UI_MODULES.stopLiveOps();" +
+            " return UI_MODULES._liveOpsExpanded; })()"
+        )
+    };
+
+    // A board of exactly two: rows, no toggle, and nothing hidden.
+    const short = bootBoard();
+    short.setResponder((url) => {
+        if (url.indexOf('/admin/active_sessions') >= 0) return { status: 200, body: sessionsNow().slice(0, 2) };
+        return responders(url);
+    });
+    await short.evaluate("UI.renderAdminTab('Live Ops')");
+    const pane = boardPane(short);
+    results.short_board = {
+        rows: sessionOrder(pane).length,
+        has_toggle: pane.indexOf('data-live-ops-toggle') >= 0,
+        has_table: pane.indexOf('data-live-ops-table') >= 0
     };
 }
 

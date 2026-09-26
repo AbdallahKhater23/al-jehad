@@ -58,6 +58,11 @@ const State = {
     liveOpsQuery: '',
     liveOpsSite: '',
     liveOpsSort: 'longest',
+    // The Shifts tab's own search and category. Held here rather than in the DOM for the same
+    // reason as the two above: every filter there repaints the tab from a string, and a
+    // selection that lived only in the markup would be lost on the next repaint.
+    shiftsQuery: '',
+    shiftsCategory: '',
     theme: localStorage.getItem('theme') || 'light',
 
     toggleTheme() {

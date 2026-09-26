@@ -147,6 +147,11 @@ FILE_TREES: Final = (
     ("main", "WORKER_PHOTOS_DIR", "photos", "WORKER_PHOTOS_DIR"),
     ("punch_frames", "FRAMES_DIR", "frames", "PUNCH_FRAMES_DIR"),
     ("quick_links", "PHOTOS_DIR", "quick_link_photos", "QUICK_LINK_PHOTOS_DIR"),
+    # Walk-up registration photos (``registrations``): the same treatment, and it needs it for
+    # the same reason - these are faces waiting for a reviewer, and a suite that stored them in
+    # the checkout would leave a directory of them beside the code, one import away from being
+    # read as a real applicant's evidence.
+    ("registrations", "PHOTOS_DIR", "registration_photos", "REGISTRATION_PHOTOS_DIR"),
     # The calibration corpus (``corpus``): the same treatment as the other four, and for a sharper
     # reason - these are faces kept for *measurement*, and a suite that stored them in the checkout
     # would leave a labelled corpus of synthetic JPEGs sitting in the repository, one import away
@@ -266,6 +271,7 @@ REFS_DIR = CURRENT_DIR / "refs"
 PHOTOS_DIR = CURRENT_DIR / "photos"
 FRAMES_DIR = CURRENT_DIR / "frames"
 QUICK_LINK_PHOTOS_DIR = CURRENT_DIR / "quick_link_photos"
+REGISTRATION_PHOTOS_DIR = CURRENT_DIR / "registration_photos"
 
 #: The embedding size this build's engine returns (``face_onnx.DIMENSIONS``), stated here so
 #: the seeded template has the shape the application writes. It was 4096 under VGG-Face and
@@ -763,6 +769,10 @@ ACTIVITY_TABLES: Final = (
     "corpus_capture_consents",  # per-worker opt-in to calibration capture. Real usage grants
                                 # and withdraws these; a suite testing the capture gate would
                                 # inherit a live "granted" row and read it as its own setup
+    "registration_requests",    # walk-up applications waiting for a decision, with a photo path on
+                                # each. A pending request is a face in a directory *and* a claim
+                                # on the next free account id, so a suite about the queue must
+                                # start from an empty one rather than inherit yesterday's
 )
 
 #: Tables left exactly as the live database have them: the two ledgers this application
@@ -805,7 +815,8 @@ def reference_path(user_id: str) -> Path:
     The name is the account's immutable biometric id, not the account id, so a test
     cannot build it by hand: ask ``biometrics`` - the module the application itself asks
     - and it answers with whichever name is really on disk (the id-named file, or a
-    legacy-named one it still reads while an upgrade catches up).
+    legacy-named one it still resolves to while an upgrade catches up, which the gate
+    refuses to *score* until that account is enrolled again).
 
     Seeded accounts are the exception, and deliberately so: their id is
     ``SEED_BIOMETRIC_IDS``, which is also what ``seed_database`` writes into the row, so

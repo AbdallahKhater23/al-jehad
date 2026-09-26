@@ -33,6 +33,10 @@ KIND_REVIEW_PENDING = "review_pending"
 KIND_LIVENESS_SPOOF = "liveness_spoof"
 KIND_LIVENESS_DEGRADED = "liveness_degraded"
 KIND_ENROLLMENT_COMPLETED = "enrollment_completed"
+#: A walk-up registration is waiting for a decision (``registrations``). Its own kind because
+#: the person is not an employee yet - there is no worker id to attach it to, and the action an
+#: administrator has to take (approve or reject) is not the one an enrollment notice asks for.
+KIND_REGISTRATION_SUBMITTED = "registration_submitted"
 KIND_OFFLINE_SYNC = "offline_sync"
 KIND_WORKER_NOTE = "worker_note"
 KIND_WORKER_NOTE_REOPENED = "worker_note_reopened"

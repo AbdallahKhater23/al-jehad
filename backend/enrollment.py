@@ -61,13 +61,14 @@ import notifications
 import textguard
 import uploads
 from config import PROJECT_ROOT, settings
-from database import db
+from database import db, immediate
 from rate_limit import limiter
 from security import (
     BCRYPT_MAX_BYTES,
     CurrentUser,
     admin_only,
     hash_password,
+    id_is_reserved,
     validate_password_strength,
     validate_user_id_for_role,
 )
@@ -519,7 +520,31 @@ async def create_invite(request: Request, payload: InviteCreate, current: Curren
     token = secrets.token_urlsafe(32)
     now = datetime.now()
     expires_at = (now + timedelta(hours=ttl)).strftime(_TS)
-    with db(write=True) as conn:
+    # ``BEGIN IMMEDIATE``: the reservation is only real if the check and the insert that
+    # writes it are one transaction. A registration invite's whole value is the id it holds,
+    # so two issues racing for the same id - or a walk-up approval running at the same
+    # moment - must not both win. See ``security.lowest_free_id`` for the other half.
+    with immediate() as conn:
+        if kind == KIND_REGISTER:
+            # Re-checked here and not only on the read above: an account created, or another
+            # invite issued, between that read and this write would otherwise be overwritten.
+            if conn.execute("SELECT id FROM users WHERE id = ?", (worker_id,)).fetchone() is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Account {worker_id} was created while this link was being issued. "
+                        "Reserve a different id."
+                    ),
+                )
+            if id_is_reserved(conn, worker_id, pending_role):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Account id {worker_id} is already reserved by a registration link "
+                        "that has not been used yet. Revoke that link first, or reserve a "
+                        "different id."
+                    ),
+                )
         cursor = conn.execute(
             "INSERT INTO enrollment_invites (token_hash, worker_id, created_by, created_at, expires_at, "
             "max_uses, note, kind, pending_name, pending_role, pending_email, pending_phone) "

@@ -305,9 +305,15 @@ def test_only_the_engine_calls_the_face_models():
         for path in sorted(harness.BACKEND_DIR.glob("*.py"))
         if path.name != "face_engine.py" and _model_references(path)
     }
-    # ``main`` is allowed exactly one call: the startup preload, which runs before the server
-    # accepts a request (nothing to bound, nothing else on the machine yet).
-    assert set(offenders) == {"main.py"}, offenders
+    # Two files are allowed to reach the models, and each for a stated reason:
+    #
+    #   * ``main`` gets exactly one call - the startup preload, which runs before the server
+    #     accepts a request (nothing to bound, nothing else on the machine yet);
+    #   * ``face_worker`` is the model *process* (``face_process``): reaching the models is
+    #     the whole of its job, and what it must not do is re-implement them - that rule is
+    #     pinned in ``tests/test_face_process.py``, which asserts the worker calls
+    #     ``face_engine._represent`` rather than the detector directly.
+    assert set(offenders) <= {"main.py", "face_worker.py"}, offenders
     calls = [item for item in offenders["main.py"] if not item.startswith("import")]
     assert len(calls) == 1 and "load_now" in calls[0], offenders["main.py"]
 

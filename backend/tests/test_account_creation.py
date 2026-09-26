@@ -387,6 +387,31 @@ def test_a_link_cannot_reserve_or_mint_what_it_should_not(client, jpeg):
     assert "1-499" in wrong_block.json()["detail"]
 
 
+def test_two_registration_links_cannot_reserve_one_id(client):
+    """The reservation lives on the invite row until the link is used, so a check that only
+    looked at ``users`` would let two live links promise the same number - and the second
+    visitor to arrive would be told their id is taken."""
+    first = issue_link(client, user_id=LINK_WORKER, name="First")
+    assert first.status_code == 200, first.text[:300]
+
+    second = issue_link(client, user_id=LINK_WORKER, name="Second")
+    assert second.status_code == 409, second.text[:300]
+    assert "reserved" in second.json()["detail"].lower()
+    assert db_scalar(
+        "SELECT COUNT(*) FROM enrollment_invites WHERE worker_id = ? AND kind = 'register'",
+        (LINK_WORKER,),
+    ) == 1
+
+    # Revoking the first releases the number, and the link can then be issued cleanly.
+    invite_id = db_scalar("SELECT id FROM enrollment_invites WHERE worker_id = ?", (LINK_WORKER,))
+    revoked = client.post(
+        f"/api/v1/admin/enrollment/invites/{invite_id}/revoke", headers=bearer(ADMIN)
+    )
+    assert revoked.status_code == 200, revoked.text[:300]
+    third = issue_link(client, user_id=LINK_WORKER, name="Third")
+    assert third.status_code == 200, third.text[:300]
+
+
 def test_an_enrollment_link_cannot_be_used_to_register(client, jpeg):
     """The two kinds are not interchangeable: one creates, the other must not."""
     enrollment_token = client.post(

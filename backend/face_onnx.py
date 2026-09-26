@@ -517,7 +517,25 @@ def set_engine(engine: OnnxFaceNetEngine | None) -> None:
 
 
 def load_now() -> dict:
-    """Build the shared engine eagerly and describe it. For a preload at startup."""
+    """Build the shared engine eagerly and describe it. For a preload at startup.
+
+    With ``FACE_ENGINE_PROCESS`` set this is answered by the child (``face_process``),
+    which is the whole point of the flag: this process must not be the one that opens the
+    87 MiB graph. The child loads **all three** models on a warm, because a preload that
+    loaded only the embedding would still leave the first punch of the day paying the
+    detector's ~104 MB spike; only the embedding's description is returned, which is what
+    this function has always returned.
+    """
+    from config import settings
+
+    if settings.face_engine_process:
+        import face_process
+
+        snapshot = face_process.client().warm()
+        embedding = snapshot.get("embedding") if isinstance(snapshot, dict) else None
+        if isinstance(embedding, dict):
+            return embedding
+        return {"model": MODEL_NAME, "dimensions": DIMENSIONS, "loaded": True, "error": None}
     engine = get_engine()
     engine.load()
     return engine.describe()

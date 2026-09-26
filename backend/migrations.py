@@ -35,7 +35,7 @@ from security import hash_password
 #: ``MIGRATIONS``. ``readiness`` refuses to start a deployment whose database is older, so a
 #: migration added without bumping this is a server that will not boot; the invariant is
 #: asserted in ``tests/test_site_shift_windows.py`` rather than left to memory.
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 25
 
 #: Magic number stamped into the SQLite header so we can recognise "this is our
 #: database" - cheap protection against pointing DATABASE_PATH at some other file.
@@ -1438,6 +1438,142 @@ def migration_23_corpus_capture_consents(conn: sqlite3.Connection) -> None:
     )
 
 
+def migration_24_walk_up_registration(conn: sqlite3.Connection) -> None:
+    """The request, not the account: a photograph and some details waiting for a decision.
+
+    WHY THIS EXISTS
+    ---------------
+    The registration *link* that already ships is issued per person: an administrator types the
+    name, the role and the account id, and the link reserves that id when it is created
+    (``enrollment.create_invite``). That is the right shape for one named hire and the wrong one
+    for a walk-up, where nobody has applied yet and so no id can be reserved. The account has to
+    be created later - and once an account can be created later it can also be refused, which is
+    the state this table records.
+
+    WHY THE ID ON THIS ROW IS NOT DECIDED UNTIL THE DECISION
+    -------------------------------------------------------
+    ``assigned_id`` stays NULL while the request is pending, deliberately. A proposed id would be
+    a promise this application cannot keep - one id per walk-up, and the applicant would be told a
+    number another request may take in the meantime. ``security.lowest_free_id`` decides at
+    approval, inside the same write transaction that inserts the account.
+
+    WHY ``photo_sha256`` IS UNIQUE WHILE PENDING
+    -------------------------------------------
+    A partial unique index: the *same* upload cannot become two requests. A script with one JPEG
+    gets one row instead of filling the review queue with copies of it, and an honest applicant
+    who taps submit three times gets one - the answer they need is "we have it", not three
+    identical faces for an administrator to read. It stops applying once a decision is made, so a
+    rejected applicant may apply again with the same photograph.
+
+    WHY THE PHOTO IS A PATH AND NOT A BLOB
+    --------------------------------------
+    The upload is streamed to disk under the policy in ``uploads`` and this row points at it. A
+    deployment that held every pending request's photo in memory would have a memory cost per
+    *applicant*, and nothing between submission and review needs the bytes.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS registration_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            status TEXT NOT NULL DEFAULT 'PENDING_REVIEW'
+                CHECK (status IN ('PENDING_REVIEW', 'APPROVED', 'REJECTED')),
+            full_name TEXT NOT NULL,
+            phone TEXT NOT NULL DEFAULT '',
+            email TEXT NOT NULL DEFAULT '',
+            requested_role TEXT NOT NULL,
+            work_details TEXT NOT NULL DEFAULT '',
+            -- The credential the applicant chose on the public form, hashed on the way in and
+            -- never held in the clear. Empty on a rejected request: the row stays as the record
+            -- of a refusal, and a refusal is not a reason to keep somebody's credential.
+            password_hash TEXT NOT NULL DEFAULT '',
+            photo_path TEXT NOT NULL,
+            photo_sha256 TEXT NOT NULL,
+            photo_bytes INTEGER NOT NULL DEFAULT 0,
+            photo_mime TEXT NOT NULL DEFAULT 'image/jpeg',
+            assigned_id TEXT,
+            submitted_ip TEXT,
+            consent_at DATETIME,
+            consent_version TEXT,
+            created_at DATETIME NOT NULL,
+            updated_at DATETIME NOT NULL,
+            reviewed_by TEXT,
+            reviewed_at DATETIME,
+            decision_note TEXT
+        )
+        """
+    )
+    # The review queue is "the pending ones, oldest first", which is the only read this table
+    # gets on a busy morning - so the index carries the status it is always filtered by.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_registration_requests_status "
+        "ON registration_requests(status, id)"
+    )
+    # One pending request per photograph. The status is in the predicate so the rule stops at the
+    # decision: a rejected applicant is allowed to apply again, with the same selfie or another.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_registration_requests_pending_photo "
+        "ON registration_requests(photo_sha256) WHERE status = 'PENDING_REVIEW'"
+    )
+
+
+#: The site categories a fresh installation opens with.
+#:
+#: Ops already groups its sites this way - a warehouse, a factory, a project - and a console
+#: that started with an empty list would ask the first administrator to retype the three words
+#: the company already uses. They are seeded *without* hours on purpose: a category with NULL
+#: hours inherits exactly what the site inherits today (the company window), so seeding changes
+#: no punch anywhere. ``INSERT OR IGNORE`` against the UNIQUE name keeps the step idempotent,
+#: which is what the migrator's contract requires and what lets an operator delete one without
+#: the next run putting it back twice.
+SEED_SITE_CATEGORIES: tuple[str, ...] = ("مخزن", "مصنع", "مشاريع")
+
+
+def migration_25_site_categories(conn: sqlite3.Connection) -> None:
+    """A category of sites that carries the clock-in window for every site inside it.
+
+    WHY A LAYER AND NOT A COPY
+    --------------------------
+    The obvious way to make "edit one warehouse, all its sites change" work is to write the
+    new hours into every member site when the category is saved. That is rejected, and the
+    reason is the console line it would break: ``GET /admin/sites`` publishes a resolved
+    window *and where each field came from* (``shift_windows.SOURCE_*``), because an
+    administrator looking at 04:00 has to know whether editing the site will change it. Copy
+    -on-save destroys that answer - every site would read "configured here" - and it also
+    lets the next category edit stamp over hours somebody deliberately set on one site.
+
+    So the category is *a layer*, tried between the site's own column and the company rules:
+    site -> category -> company. Nothing is backfilled and no existing site is touched: a
+    site with ``category_id`` NULL resolves exactly as it did before this migration.
+
+    WHY ``category_id`` AND NOT THE NAME
+    ------------------------------------
+    A foreign key by ``name`` would make renaming a category a rewrite of every member site,
+    and the name is the one field an operator will want to correct (a typo in a warehouse's
+    name is not a new warehouse). The id is the key; the name is a label.
+    """
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS site_categories (
+            category_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            clock_in_window_start TEXT {_hhmm_check('clock_in_window_start')},
+            clock_in_window_end TEXT {_hhmm_check('clock_in_window_end')},
+            site_timezone TEXT,
+            created_at DATETIME NOT NULL,
+            updated_at DATETIME NOT NULL
+        )
+        """
+    )
+    add_column(conn, "construction_sites", "category_id", "INTEGER")
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for name in SEED_SITE_CATEGORIES:
+        conn.execute(
+            "INSERT OR IGNORE INTO site_categories (name, created_at, updated_at) "
+            "VALUES (?, ?, ?)",
+            (name, stamp, stamp),
+        )
+
+
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "audit_notifications_shift_rules", migration_1_audit_notifications_shift_rules),
     (2, "provenance_columns_status_code", migration_2_provenance_columns),
@@ -1462,6 +1598,8 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (21, "overtime_authorisations", migration_21_overtime_authorisations),
     (22, "refused_punches", migration_22_refused_punches),
     (23, "corpus_capture_consents", migration_23_corpus_capture_consents),
+    (24, "walk_up_registration", migration_24_walk_up_registration),
+    (25, "site_categories", migration_25_site_categories),
 ]
 
 

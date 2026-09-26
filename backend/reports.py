@@ -451,17 +451,29 @@ def shift_timesheet_rows(
         # period, and a query per shift would be a query per shift.
         rules = _shift_rules(conn)
         try:
+            # Through ``SITE_ROW_SQL``: a timesheet has to grade an arrival by the same
+            # window the gate did, and when the site has no hours of its own that window is
+            # its category's (``shift_windows``). The category's *name* also travels on this
+            # row, which is what lets the board group and search by it without a second call.
             sites = {
                 str(row["site_name"]): row
-                for row in conn.execute(
-                    "SELECT site_name, clock_in_window_start, clock_in_window_end, site_timezone "
-                    "FROM construction_sites"
-                ).fetchall()
+                for row in conn.execute(shift_windows.SITE_ROW_SQL).fetchall()
             }
         except sqlite3.Error:
             # A database old enough to have no window columns at all still reports: every
             # arrival is then judged by the global rule, which is what it was judged by.
             sites = {}
+
+    def category_of(site_name: Any) -> str | None:
+        """The category name of the site a shift was worked at, or ``None`` when it has none.
+
+        Read off the site row fetched above, so the answer is the same one the window beside
+        it was resolved through: a shift cannot be reported under one site's category while
+        being graded by another's hours.
+        """
+        row = sites.get(str(site_name or ""))
+        name = row["category_name"] if row is not None else None
+        return str(name) if name else None
 
     rows: list[dict] = []
     approved_total = 0.0
@@ -489,6 +501,10 @@ def shift_timesheet_rows(
                 "worker_name": record["worker_name"],
                 "role": record["role"],
                 "site_name": record["site_name"],
+                # The site's category, so the board can group and search by it without asking
+                # for the site list as well - and so a "warehouse" filter counts the shifts a
+                # reader can see rather than the sites somebody configured.
+                "site_category": category_of(record["site_name"]),
                 # Where this shift's arrival fell relative to the site's window. The clock-in
                 # time travels with the verdict so an administrator can check the judgement
                 # against the clock rather than trusting it - and so "late by 12 min" can be
@@ -542,7 +558,25 @@ def shift_timesheet_rows(
         # who was late twice is two - it is a count of arrivals, not of people.
         "late_arrivals": sum(1 for row in rows if row["arrival_verdict"] == shift_windows.VERDICT_LATE),
     }
-    return {"rows": rows, "totals": totals}
+
+    # The categories this period actually contains, with their counts. The console's filter is
+    # built from this rather than from the site list, for two reasons: the count on a chip is
+    # then the number of rows behind it - so a chip cannot promise a table it will not fill -
+    # and a category whose sites worked nothing this period is not offered as a dead end. A
+    # site with no category contributes nothing here, exactly as it contributes no chip.
+    buckets: dict[str, dict] = {}
+    for row in rows:
+        name = row["site_category"]
+        if not name:
+            continue
+        bucket = buckets.setdefault(name, {"name": str(name), "shifts": 0, "hours": 0.0})
+        bucket["shifts"] += 1
+        bucket["hours"] += float(row["hours"] or 0.0)
+    categories = [
+        {**bucket, "hours": round(bucket["hours"], 4)}
+        for bucket in sorted(buckets.values(), key=lambda item: item["name"])
+    ]
+    return {"rows": rows, "totals": totals, "categories": categories}
 
 
 # ---------------------------------------------------------------------------

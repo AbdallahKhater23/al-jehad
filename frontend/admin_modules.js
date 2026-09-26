@@ -35,11 +35,24 @@ const UI_MODULES = {
     _liveOpsQuery: '',
     _liveOpsSite: '',
     _liveOpsSort: 'longest',
+    //: Whether the board is showing every open shift or only the first few.
+    //:
+    //: Held here rather than in the markup on purpose. ``paintLiveOps`` replaces the board's
+    //: innerHTML whole - on the 45 s poll, on Refresh, and on the 1 s tick - so a fold that
+    //: lived in a DOM attribute or a class name would snap shut under the operator's hands
+    //: while they were reading row five, which is worse than never opening at all.
+    _liveOpsExpanded: false,
 
     //: How often the session list is re-read. One request, and a repaint only
     //: when the answer differs - polling that repaints regardless is what makes
     //: a dashboard feel broken.
     LIVE_OPS_POLL_MS: 45000,
+
+    //: How many shifts the board shows before the fold. Two, because the board's job is the
+    //: shift that needs a decision and a five-row wall of "on site, fine" is what buries it -
+    //: and because two is also the number that fits above the fold on the phone this console is
+    //: usually opened on. The rest are one tap away, and the control says how many.
+    LIVE_OPS_FOLD: 2,
 
     /**
      * Inline SVG, never an emoji: an emoji is font-dependent, renders
@@ -544,7 +557,62 @@ const UI_MODULES = {
         const rows = this.liveOpsRows(data);
         const total = ((data && data.sessions) || []).length;
         if (rows.length === 0) return this.liveOpsEmptyHtml(total);
-        return Device.isMobile ? this.liveOpsCardsHtml(rows) : this.liveOpsTableHtml(rows);
+        const visible = this.liveOpsVisibleRows(rows);
+        const body = Device.isMobile ? this.liveOpsCardsHtml(visible) : this.liveOpsTableHtml(visible);
+        return `${body}${this.liveOpsFoldHtml(rows)}`;
+    },
+
+    /**
+     * The rows on the board: the first few, or all of them once the fold is opened.
+     *
+     * Outside the two list layouts on purpose, so the table and the phone's cards fold at
+     * exactly the same point - a fold implemented in each of them is a fold that will differ
+     * between them, and the operator on the phone is the one who would be told a different
+     * number of people are on site.
+     */
+    liveOpsVisibleRows(rows) {
+        if (this._liveOpsExpanded) return rows;
+        return rows.slice(0, this.LIVE_OPS_FOLD);
+    },
+
+    /**
+     * The fold's control, or nothing at all when the board already fits.
+     *
+     * It carries the number it is hiding - "Show more (2)" - because that is the question an
+     * operator asks before tapping it, and it is a *button* with ``aria-expanded`` rather than a
+     * styled link: a screen reader has to be able to say whether the list under it is open.
+     *
+     * The words are the fold's own, and never the filter's. "Showing 2 of 4" already means "a
+     * search or a site chip is narrowing this board", and a fold reported in that same sentence
+     * would leave an operator unable to tell a filter they set from a fold they forgot - the two
+     * look identical and mean opposite things about the figures above.
+     */
+    liveOpsFoldHtml(rows) {
+        if (rows.length <= this.LIVE_OPS_FOLD) return '';
+        const hidden = rows.length - this.LIVE_OPS_FOLD;
+        const expanded = !!this._liveOpsExpanded;
+        const label = expanded
+            ? I18n.__('liveOpsShowLess')
+            : I18n.__('liveOpsShowMore').replace('{count}', String(hidden));
+        return `
+            <div class="ops-fold">
+                <button type="button" class="ops-btn" data-live-ops-toggle
+                        aria-expanded="${expanded ? 'true' : 'false'}"
+                        onclick="UI_MODULES.toggleLiveOpsExpanded()">${this.escapeHtml(label)}</button>
+            </div>`;
+    },
+
+    /**
+     * One tap on the fold: remembered, then repainted from the read already in hand.
+     *
+     * No request and no full re-render of the tab - the rows being revealed are the ones the
+     * server already sent, so this is a repaint of the board, exactly like the poll. It
+     * returns the new state so a caller (and a test) can read it back.
+     */
+    toggleLiveOpsExpanded() {
+        this._liveOpsExpanded = !this._liveOpsExpanded;
+        if (this._liveOps) this.paintLiveOps(this._liveOps);
+        return this._liveOpsExpanded;
     },
 
     liveOpsFilterNoteHtml(data) {
@@ -681,6 +749,11 @@ const UI_MODULES = {
     stopLiveOps() {
         if (this._liveOpsTick !== null) { clearInterval(this._liveOpsTick); this._liveOpsTick = null; }
         if (this._liveOpsPoll !== null) { clearInterval(this._liveOpsPoll); this._liveOpsPoll = null; }
+        // A board somebody has left starts folded again. This is the only place the state is
+        // cleared (``startLiveOps`` calls this method), and it is deliberately *not* the poll
+        // or the tick: those repaint the board the operator is already reading, and the one
+        // thing that must not happen there is the list closing by itself.
+        this._liveOpsExpanded = false;
     },
 
     /**
@@ -1778,6 +1851,21 @@ const UI_MODULES = {
     //  long-press a spot in a maps app and copy two numbers, which is what the form
     //  now asks for and what the card now shows back.
 
+    /**
+     * The category picker: the categories, plus the choice of none.
+     *
+     * "No category" is first and selected by default, because it is what every site was
+     * before this feature existed - and a picker that silently chose the first category on the
+     * list would put a site into a warehouse the moment somebody moved its pin.
+     */
+    sitesCategoryOptionsHtml(selected) {
+        const chosen = selected === null || selected === undefined ? '' : String(selected);
+        const options = (this._siteCategories || []).map((category) =>
+            `<option value="${this.escapeHtml(String(category.category_id))}"${chosen === String(category.category_id) ? ' selected' : ''}>${this.escapeHtml(category.name)}</option>`
+        ).join('');
+        return `<option value=""${chosen === '' ? ' selected' : ''}>${this.escapeHtml(I18n.__('sitesCategoryNone'))}</option>${options}`;
+    },
+
     sitesCardHtml(site) {
         const name = String(site.site_name || '');
         const lat = Number(site.lat);
@@ -1789,6 +1877,10 @@ const UI_MODULES = {
             ? this.sitesEditHtml(site)
             : `
                 <div class="ui-facts" style="margin-top:14px">
+                    <div class="ui-fact">
+                        <span class="ops-stat-label">${this.escapeHtml(I18n.__('sitesCategory'))}</span>
+                        <span class="ui-fact-value" data-site-category="${this.escapeHtml(name)}">${this.escapeHtml(site.category || I18n.__('sitesCategoryNone'))}</span>
+                    </div>
                     <div class="ui-fact">
                         <span class="ops-stat-label">${this.escapeHtml(I18n.__('sitesRadius'))}</span>
                         <span class="ui-fact-value">${this.escapeHtml(`${site.radius} m`)}</span>
@@ -1848,8 +1940,14 @@ const UI_MODULES = {
      */
     windowOriginLabel(site, keys) {
         const source = ((site && site.window) || {}).source || {};
-        const fromSite = keys.some((key) => source[key] === 'site');
-        return fromSite ? I18n.__('sitesWindowFromSite') : I18n.__('sitesWindowFromCompany');
+        if (keys.some((key) => source[key] === 'site')) return I18n.__('sitesWindowFromSite');
+        // The category comes before the company in this sentence for the same reason it comes
+        // before it at the gate: a window that a warehouse's hours decided is not the company's,
+        // and telling an administrator it is would send them to the wrong screen to change it.
+        if (keys.some((key) => source[key] === 'category')) {
+            return I18n.__('sitesWindowFromCategory').replace('{category}', String(site.category || ''));
+        }
+        return I18n.__('sitesWindowFromCompany');
     },
 
     /**
@@ -1872,6 +1970,10 @@ const UI_MODULES = {
         const inherits = !raw('clock_in_window_start') && !raw('clock_in_window_end') && !raw('site_timezone');
         return `
             <form id="editSiteForm" class="ui-grid three" style="margin-top:14px">
+                <div style="grid-column:1/-1">
+                    <label class="ui-label" for="editSiteCategory">${this.escapeHtml(I18n.__('sitesCategory'))}</label>
+                    <select id="editSiteCategory" class="ui-field">${this.sitesCategoryOptionsHtml(site.category_id)}</select>
+                </div>
                 <div class="ui-grid three" style="grid-column:1/-1;gap:12px">
                     <div>
                         <label class="ui-label" for="editSiteLocation">${this.escapeHtml(I18n.__('sitesLocation'))}</label>
@@ -1891,9 +1993,16 @@ const UI_MODULES = {
                     </div>
                 </div>
                 <div style="grid-column:1/-1">
+                    <!-- Three cases, not two: a site with no hours of its own follows its
+                         category when it has one, and telling that administrator the hours are
+                         "the company's" would point them at the wrong screen to change them. -->
                     <p class="ui-section-note" id="editSiteWindowNotice">${this.escapeHtml(
                         inherits
-                            ? I18n.__('sitesWindowNoticeCompany').replace('{window}', this.windowLabel(site))
+                            ? (site.category
+                                ? I18n.__('sitesWindowNoticeCategory')
+                                    .replace('{category}', String(site.category))
+                                    .replace('{window}', this.windowLabel(site))
+                                : I18n.__('sitesWindowNoticeCompany').replace('{window}', this.windowLabel(site)))
                             : I18n.__('sitesWindowNoticeSite').replace('{window}', this.windowLabel(site))
                     )}</p>
                 </div>
@@ -1945,6 +2054,10 @@ const UI_MODULES = {
                         <input type="number" id="radius" class="ui-field" min="1" step="1" placeholder="100" required>
                     </div>
                     <div style="grid-column:1/-1">
+                        <label class="ui-label" for="siteCategory">${this.escapeHtml(I18n.__('sitesCategory'))}</label>
+                        <select id="siteCategory" class="ui-field">${this.sitesCategoryOptionsHtml(null)}</select>
+                    </div>
+                    <div style="grid-column:1/-1">
                         <p class="ui-section-note">${this.escapeHtml(I18n.__('sitesWindowHint'))}</p>
                     </div>
                     <div>
@@ -1968,6 +2081,96 @@ const UI_MODULES = {
             </section>`;
     },
 
+    /**
+     * The categories, and the honesty about their reach.
+     *
+     * Every row says how many sites follow it, because that is the figure that decides whether
+     * an edit here is a small correction or a retune of a whole class of sites - and it is the
+     * same number the server refuses a delete on.
+     */
+    sitesCategoriesHtml() {
+        const categories = this._siteCategories || [];
+        const editing = this._categoryEdit === null || this._categoryEdit === undefined
+            ? null : Number(this._categoryEdit);
+        const rows = categories.map((category) => {
+            const id = Number(category.category_id);
+            if (editing === id) {
+                return `<li class="ui-card" data-category-row="${id}">${this.siteCategoryFormHtml(category)}</li>`;
+            }
+            return `
+                <li class="ui-card" data-category-row="${id}">
+                    <div class="ui-spread">
+                        <div class="ops-who">
+                            <span class="ops-name">${this.escapeHtml(category.name)}</span>
+                            <span class="ops-sub">${this.escapeHtml(this.siteCategoryWindowLabel(category))} · ${this.escapeHtml(I18n.__('sitesCategorySiteCount').replace('{count}', String(category.site_count || 0)))}</span>
+                        </div>
+                        <div class="ui-row">
+                            <button type="button" class="ui-btn ui-btn-sm" data-category-edit="${id}">${this.escapeHtml(I18n.__('sitesEdit'))}</button>
+                            <button type="button" class="ui-btn ui-btn-danger ui-btn-sm" data-category-delete="${id}">${this.escapeHtml(I18n.__('sitesDelete'))}</button>
+                        </div>
+                    </div>
+                </li>`;
+        }).join('');
+        return `
+            <section class="ui-section" id="siteCategoriesPanel">
+                <div class="ui-section-head">
+                    <h3 class="ui-section-title">${this.escapeHtml(I18n.__('sitesCategories'))}</h3>
+                    <p class="ui-section-note">${this.escapeHtml(I18n.__('sitesCategoriesHint'))}</p>
+                </div>
+                ${categories.length === 0 ? '' : `<ul class="ui-stack" style="list-style:none;margin:0 0 14px;padding:0">${rows}</ul>`}
+                ${this.siteCategoryFormHtml(null)}
+            </section>`;
+    },
+
+    /** ``04:00-06:30``, or the word for "follows the company hours" when nothing is set. */
+    siteCategoryWindowLabel(category) {
+        const start = String((category && category.clock_in_window_start) || '');
+        const end = String((category && category.clock_in_window_end) || '');
+        if (!start && !end) return I18n.__('sitesCategoryNoHours');
+        return `${start || '00:00'}-${end || '23:59'}`;
+    },
+
+    /**
+     * One form for adding a category and for editing one in place.
+     *
+     * The same fields either way, because they are the same question - what is this class of
+     * sites called, and when does its day start - and a separate edit dialog is a second place
+     * for the two to disagree about which fields a blank box clears.
+     */
+    siteCategoryFormHtml(category) {
+        const raw = (key) => {
+            const value = category ? category[key] : null;
+            return value === null || value === undefined ? '' : String(value);
+        };
+        const id = category ? Number(category.category_id) : '';
+        return `
+            <form id="siteCategoryForm" class="ui-grid three" style="margin-top:10px">
+                <div>
+                    <label class="ui-label" for="siteCategoryName">${this.escapeHtml(I18n.__('sitesCategoryName'))}</label>
+                    <input type="text" id="siteCategoryName" class="ui-field" required value="${this.escapeHtml(raw('name'))}"
+                           placeholder="${this.escapeHtml(I18n.__('sitesCategoryNamePlaceholder'))}">
+                </div>
+                <div>
+                    <label class="ui-label" for="siteCategoryStart">${this.escapeHtml(I18n.__('sitesWindowStart'))}</label>
+                    <input type="time" id="siteCategoryStart" class="ui-field" value="${this.escapeHtml(raw('clock_in_window_start'))}">
+                </div>
+                <div>
+                    <label class="ui-label" for="siteCategoryEnd">${this.escapeHtml(I18n.__('sitesWindowEnd'))}</label>
+                    <input type="time" id="siteCategoryEnd" class="ui-field" value="${this.escapeHtml(raw('clock_in_window_end'))}">
+                </div>
+                <div>
+                    <label class="ui-label" for="siteCategoryTimezone">${this.escapeHtml(I18n.__('sitesWindowTimezone'))}</label>
+                    <input type="text" id="siteCategoryTimezone" class="ui-field" list="siteTimezoneOptions"
+                           placeholder="${this.escapeHtml(I18n.__('sitesWindowTimezonePlaceholder'))}" value="${this.escapeHtml(raw('site_timezone'))}">
+                </div>
+                <div style="grid-column:1/-1" class="ui-row">
+                    <button type="submit" class="ui-btn ui-btn-primary">${this.OPS_ICONS.check}${this.escapeHtml(category ? I18n.__('save') : I18n.__('sitesCategoryAdd'))}</button>
+                    <button type="button" class="ui-btn ui-btn-quiet" data-category-cancel="1"${category ? '' : ' hidden'}>${this.escapeHtml(I18n.__('cancel'))}</button>
+                    <p class="ui-section-note" style="margin:0">${this.escapeHtml(I18n.__('sitesCategoryFormHint'))}</p>
+                </div>
+            </form>`;
+    },
+
     sitesHtml(sites) {
         const list = sites.length === 0
             ? `<div class="ui-empty" data-sites-empty="true">
@@ -1980,6 +2183,7 @@ const UI_MODULES = {
                </ul>`;
         return `
             ${this.sitesAddHtml()}
+            ${this.sitesCategoriesHtml()}
             <section class="ui-section">
                 <div class="ui-section-head">
                     <h3 class="ui-section-title">${this.escapeHtml(I18n.__('sitesTitle'))}</h3>
@@ -1993,13 +2197,21 @@ const UI_MODULES = {
         if (!content) return;
         content.innerHTML = UI.consoleSkeletonHtml(I18n.__('sitesTitle'));
         let sites;
+        let categories;
         try {
-            sites = await API.request('/admin/sites');
+            // Read together, so the category pickers can be painted with the sites: a form that
+            // opened with an empty picker and filled itself a moment later is a form somebody
+            // has already chosen from.
+            [sites, categories] = await Promise.all([
+                API.request('/admin/sites'),
+                API.request('/admin/site_categories')
+            ]);
         } catch (err) {
             content.innerHTML = this.uiErrorHtml(err, "UI.renderAdminTab('Sites')");
             return;
         }
         this._sites = Array.isArray(sites) ? sites : [];
+        this._siteCategories = Array.isArray(categories) ? categories : [];
         this._sitesContent = content;
         this.paintSites(content);
     },
@@ -2018,6 +2230,15 @@ const UI_MODULES = {
         // document CSP keeps 'unsafe-inline' for (see docs/FRONTEND_RENDERING.md).
         const list = document.getElementById('sitesList');
         if (list) list.onclick = (event) => this.onSitesClick(event);
+        // The categories panel, bound the same way: the handler is attached to the container and
+        // the buttons carry ids, never a category name - a name is operator data, and handler
+        // text built from data is the sink the document CSP exists to close.
+        const panel = document.getElementById('siteCategoriesPanel');
+        if (panel) {
+            const categoryForm = document.getElementById('siteCategoryForm');
+            if (categoryForm) categoryForm.onsubmit = (event) => this.saveSiteCategory(event);
+            panel.onclick = (event) => this.onCategoriesClick(event);
+        }
     },
 
     /**
@@ -2043,6 +2264,107 @@ const UI_MODULES = {
     cancelSiteEdit() {
         this._siteEdit = null;
         this.paintSites();
+    },
+
+    /** The categories panel's buttons: edit, cancel, delete. */
+    onCategoriesClick(event) {
+        const target = event && event.target;
+        if (!target || typeof target.closest !== 'function') return undefined;
+        const edit = target.closest('[data-category-edit]');
+        if (edit) return this.openCategoryEdit(Number(edit.dataset.categoryEdit));
+        if (target.closest('[data-category-cancel]')) return this.cancelCategoryEdit();
+        const remove = target.closest('[data-category-delete]');
+        if (remove) return this.deleteSiteCategory(Number(remove.dataset.categoryDelete));
+        return undefined;
+    },
+
+    /**
+     * Which category the panel's one form is editing, or ``null`` when it is adding one.
+     *
+     * Held here rather than read back out of the rendered form, exactly as ``_siteEdit`` is:
+     * the form is a string until it is painted, so "which row is this?" is a fact about the
+     * console's own state, and reading it off an attribute is a second copy of that fact.
+     */
+    openCategoryEdit(categoryId) {
+        this._categoryEdit = Number(categoryId);
+        this.paintSites();
+        return undefined;
+    },
+
+    cancelCategoryEdit() {
+        this._categoryEdit = null;
+        this.paintSites();
+        return undefined;
+    },
+
+    /**
+     * Add a category, or save the one being edited.
+     *
+     * A blank time box is sent as ``null``, which means "follow the company hours" - so a
+     * category whose hours nobody set cannot freeze whatever the company window happened to be
+     * the day somebody typed its name.
+     */
+    async saveSiteCategory(event) {
+        if (event && event.preventDefault) event.preventDefault();
+        const value = (id) => {
+            const element = document.getElementById(id);
+            return element && element.value !== undefined ? String(element.value).trim() : '';
+        };
+        const id = this._categoryEdit === null || this._categoryEdit === undefined
+            ? null : Number(this._categoryEdit);
+        const body = {
+            name: value('siteCategoryName'),
+            clock_in_window_start: value('siteCategoryStart') || null,
+            clock_in_window_end: value('siteCategoryEnd') || null,
+            site_timezone: value('siteCategoryTimezone') || null
+        };
+        try {
+            if (id) {
+                await API.request('/admin/site_categories/edit', {
+                    method: 'POST', body: { category_id: id, ...body }
+                });
+            } else {
+                await API.request('/admin/site_categories/add', { method: 'POST', body });
+            }
+        } catch (err) {
+            Toast.error(err.message);
+            return null;
+        }
+        Toast.success(I18n.__(id ? 'sitesCategorySaved' : 'sitesCategoryAdded'));
+        this._categoryEdit = null;
+        UI.renderAdminTab('Sites');
+        return true;
+    },
+
+    /**
+     * Delete a category, once nothing is inside it.
+     *
+     * The confirmation leads with the count, because that is the fact that makes this dialog
+     * different from deleting a site: it says how many sites are deliberately left where they
+     * are. The server refuses while any remain, and its sentence (which names the count) is
+     * shown verbatim - so the refusal and the confirmation say the same thing.
+     */
+    async deleteSiteCategory(categoryId) {
+        const id = Number(categoryId);
+        const category = (this._siteCategories || []).find(
+            (row) => Number(row.category_id) === id
+        );
+        if (!category) return undefined;
+        const question = I18n.__('sitesCategoryDeleteConfirm')
+            .replace('{name}', category.name)
+            .replace('{sites}', String(category.site_count || 0));
+        if (!confirm(question)) return undefined;
+        const fd = new FormData();
+        fd.append('category_id', String(id));
+        try {
+            await API.request('/admin/site_categories/delete', { method: 'POST', body: fd });
+        } catch (err) {
+            Toast.error(err.message);
+            return undefined;
+        }
+        Toast.success(I18n.__('sitesCategoryDeleted'));
+        UI.renderAdminTab('Sites');
+        return true;
     },
 
     /**
@@ -2079,7 +2401,10 @@ const UI_MODULES = {
                 // following the company hours when those change.
                 clock_in_window_start: value('siteWindowStart') || null,
                 clock_in_window_end: value('siteWindowEnd') || null,
-                site_timezone: value('siteWindowTimezone') || null
+                site_timezone: value('siteWindowTimezone') || null,
+                // Sent as a number or as null; an empty option is "no category", which is what
+                // the column's NULL means and what an uncategorised site has always been.
+                category_id: value('siteCategory') ? Number(value('siteCategory')) : null
             }});
         } catch (err) {
             // The reason has to reach the admin: "Site name already exists." and "Invalid
@@ -2116,7 +2441,10 @@ const UI_MODULES = {
                 admin_id: State.user.id,
                 clock_in_window_start: value('editSiteWindowStart') || null,
                 clock_in_window_end: value('editSiteWindowEnd') || null,
-                site_timezone: value('editSiteTimezone') || null
+                site_timezone: value('editSiteTimezone') || null,
+                // Part of what this form saves: the picker is always on screen here, so what it
+                // holds is the answer - including "no category" after a move out of one.
+                category_id: value('editSiteCategory') ? Number(value('editSiteCategory')) : null
             }});
         } catch (err) {
             Toast.error(err.message);
@@ -4865,6 +5193,26 @@ const UI_MODULES = {
         return range.start > range.end ? null : range;
     },
 
+    /**
+     * The category carried in a URL fragment, or '' when there is none.
+     *
+     * Read off the fragment rather than matched against the chips, because the chips are built
+     * from the report - and the report is what this has to be set *before*: a link naming a
+     * category should arrive with that category already selected, so the table the reader sees
+     * is the table it was copied from.
+     */
+    shiftsCategoryFromUrl(url) {
+        const source = String(url === undefined ? window.location.hash : url);
+        const match = /(?:^|[#&])c=([^&]*)/.exec(source);
+        if (!match) return '';
+        try {
+            return decodeURIComponent(match[1]);
+        } catch (err) {
+            // A malformed escape ("%zz") must not take the whole page down with it.
+            return match[1];
+        }
+    },
+
     /** The search carried in a URL fragment, or '' when there is none. */
     shiftsQueryFromUrl(url) {
         const source = String(url === undefined ? window.location.hash : url);
@@ -4878,10 +5226,18 @@ const UI_MODULES = {
         }
     },
 
-    /** The fragment that describes a period and the search over it. */
+    /**
+     * The fragment that describes a period, the search and the category over it.
+     *
+     * The category travels too, and that is not decoration: a link that carried the search but
+     * dropped the category would show a colleague a *wider* table than the one it was copied
+     * from, with the same dates at the top of it.
+     */
     shiftsUrl(range, query) {
-        const base = `#shifts=${range.start}..${range.end}`;
-        return query ? `${base}&q=${encodeURIComponent(query)}` : base;
+        const parts = [`#shifts=${range.start}..${range.end}`];
+        if (query) parts.push(`q=${encodeURIComponent(query)}`);
+        if (this.shiftsCategory()) parts.push(`c=${encodeURIComponent(this.shiftsCategory())}`);
+        return parts.join('&');
     },
 
     /**
@@ -4917,6 +5273,7 @@ const UI_MODULES = {
         if (!range) return false;
         State.shiftsRange = range;
         State.shiftsQuery = this.shiftsQueryFromUrl();
+        State.shiftsCategory = this.shiftsCategoryFromUrl();
         State.adminTab = 'Shifts';
         return true;
     },
@@ -4948,6 +5305,75 @@ const UI_MODULES = {
         return State.shiftsQuery || '';
     },
 
+    /** The category being filtered by, or '' for all of them. */
+    shiftsCategory() {
+        return State.shiftsCategory || '';
+    },
+
+    /**
+     * One tap on a category: narrow the rows, change no figures' source.
+     *
+     * A repaint from the report already on screen, exactly like the search box - the categories
+     * being filtered by are in that report, so a filter that re-asked the server for the period
+     * would be a round trip to change nothing but which rows are drawn.
+     */
+    setShiftsCategory(name) {
+        // A category and a search narrow *together*, which is the useful behaviour: "this
+        // month's warehouse shifts by Ahmed" is a question somebody actually asks. Neither
+        // clears the other, and the filter note below the cards names both.
+        State.shiftsCategory = String(name === undefined || name === null ? '' : name);
+        return this.repaintShiftsFromCache();
+    },
+
+    /** Whether anything is narrowing the rows, the category included. */
+    shiftsFiltering() {
+        return this.shiftsQuery() !== '' || this.shiftsCategory() !== '';
+    },
+
+    /**
+     * Both filters as one string, for a file name.
+     *
+     * ``exportSlug`` keeps only ASCII, so an Arabic category contributes nothing to the name
+     * rather than turning into punctuation - the same thing that already happens to an Arabic
+     * search, and the period in the name still says which rows are in the file.
+     */
+    shiftsExportFilter() {
+        return [this.shiftsQuery(), this.shiftsCategory()].filter(Boolean).join(' ');
+    },
+
+    /** The filter, in one sentence, for the note under the cards and the printed sheet. */
+    shiftsFilterSentence() {
+        return [
+            this.shiftsQuery() ? `“${this.shiftsQuery()}”` : '',
+            this.shiftsCategory()
+                ? `${I18n.__('shiftsCategoryFilter')}: “${this.shiftsCategory()}”`
+                : ''
+        ].filter(Boolean).join(' \u00b7 ');
+    },
+
+    /**
+     * The category chips, built from the report on screen.
+     *
+     * Not from a list fetched separately: a chip for a category with no shifts this period
+     * filters to an empty table, and the count is the first thing a reader checks it against.
+     * The names are operator data (a category is whatever the company calls its sites), so
+     * they travel as ``data-category`` and are passed to the handler as an argument - never
+     * written into the handler text, which is what the CSP in this console forbids.
+     */
+    shiftsCategoryChipsHtml(report) {
+        const categories = (report && report.categories) || [];
+        if (categories.length === 0 && !this.shiftsCategory()) return '';
+        const active = this.shiftsCategory();
+        const rows = ((report && report.rows) || []).length;
+        const chip = (value, label, count) => `
+            <button type="button" class="ui-chip" data-category="${this.escapeHtml(value)}"
+                    data-active="${active === value ? 'true' : 'false'}"
+                    aria-pressed="${active === value ? 'true' : 'false'}"
+                    onclick="UI_MODULES.setShiftsCategory('${this.liveOpsInlineString(value)}')">${this.escapeHtml(`${label} (${count})`)}</button>`;
+        return chip('', I18n.__('shiftsAllCategories'), rows)
+            + categories.map((entry) => chip(entry.name, entry.name, entry.shifts)).join('');
+    },
+
     /** `2026-08-07` or `2026/08/07` typed into the box means "that day", not a filter. */
     shiftsSearchDay(query) {
         const match = /^(\d{4})[-/](\d{2})[-/](\d{2})$/.exec(String(query || '').trim());
@@ -4973,6 +5399,9 @@ const UI_MODULES = {
                 // arrives, the label is what is on screen - and "who was that administrator
                 // again" is asked by typing the word the table shows.
                 row.role, this.roleLabel(row.role),
+                // The site's category, so a search for the word an operator thinks in - "مخزن" -
+                // finds the shifts worked at every warehouse instead of none of them.
+                row.site_category,
                 this.arrivalWords(row)
             ].join(' ').toLowerCase();
             return terms.every((term) => haystack.indexOf(term) >= 0);
@@ -5052,7 +5481,7 @@ const UI_MODULES = {
         if (!content || !cached || cached.range.start !== range.start || cached.range.end !== range.end) {
             return UI.renderAdminTab('Shifts');
         }
-        this.paintShifts(content, this.shiftsToolbarHtml(range) + this.shiftsReportHtml(cached.report));
+        this.paintShifts(content, this.shiftsToolbarHtml(range, cached.report) + this.shiftsReportHtml(cached.report));
         return Promise.resolve();
     },
 
@@ -5102,9 +5531,17 @@ const UI_MODULES = {
         await this.loadShiftsReport(content);
     },
 
-    /** Everything above the figures: the period picker, the columns and the search box. */
-    shiftsToolbarHtml(range) {
-        return `${this.shiftsFilterHtml(range)}${this.shiftsColumnsHtml()}${this.shiftsSearchHtml()}`;
+    /**
+     * Everything above the figures: the period picker, the categories, the columns, the search.
+     *
+     * ``report`` is the report on screen, and it is what lets the category chips carry a count:
+     * the number of shifts behind each chip is the server's own per-period figure, so a chip can
+     * never promise a table it will not fill. It is optional because the first paint happens
+     * before the request comes back - the chips are simply absent until there is something to
+     * count, which is more honest than a row of zeros.
+     */
+    shiftsToolbarHtml(range, report) {
+        return `${this.shiftsFilterHtml(range, report)}${this.shiftsColumnsHtml()}${this.shiftsSearchHtml()}`;
     },
 
     /**
@@ -5213,7 +5650,7 @@ const UI_MODULES = {
      * current start (or the reverse) makes a legitimate move - "back to August" -
      * impossible from the UI, and the range is validated properly on submit anyway.
      */
-    shiftsFilterHtml(range) {
+    shiftsFilterHtml(range, report) {
         return `
             <form id="shiftsFilter" class="ui-row" style="align-items:flex-end;margin-bottom:12px">
                 <div>
@@ -5245,6 +5682,11 @@ const UI_MODULES = {
                     <button type="button" data-preset="${preset.key}" data-active="${preset.active}"
                             onclick="UI_MODULES.applyShiftsPreset('${preset.key}')"
                             class="ui-chip"${preset.active ? ' aria-pressed="true"' : ''}>${this.escapeHtml(I18n.__(preset.label))}</button>`).join('')}
+                <!-- The categories sit beside the periods rather than under the table, where an
+                     operator is already reading rows: this row is where "what am I looking at"
+                     is answered, and a warehouse filter is the same kind of choice as "this
+                     month". The count on each chip is the shifts behind it in *this* period. -->
+                ${this.shiftsCategoryChipsHtml(report)}
                 <button type="button" data-copy-link onclick="UI_MODULES.copyShiftsLink()"
                         class="ui-chip ui-push">${this.OPS_ICONS.copy}${this.escapeHtml(I18n.__('copyLink'))}</button>
             </div>`;
@@ -5255,13 +5697,13 @@ const UI_MODULES = {
         try {
             const report = await API.request(`/admin/reports/shifts?start=${range.start}&end=${range.end}`);
             this._shiftsReport = { range: { start: range.start, end: range.end }, report: report };
-            this.paintShifts(content, this.shiftsToolbarHtml(range) + this.shiftsReportHtml(report));
+            this.paintShifts(content, this.shiftsToolbarHtml(range, report) + this.shiftsReportHtml(report));
         } catch (err) {
             // No figures for this period, so nothing may be reused from an earlier one.
             this._shiftsReport = null;
             // The picker stays on screen with the error, so a rejected range (or a dead
             // server) is something the admin can correct and retry without leaving the tab.
-            this.paintShifts(content, this.shiftsToolbarHtml(range) +
+            this.paintShifts(content, this.shiftsToolbarHtml(range, null) +
                 `<p class="ui-note is-body is-danger">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`);
         }
     },
@@ -5275,7 +5717,7 @@ const UI_MODULES = {
         // list rather than standing there refusing to. No search ever re-asks the server for
         // a different period, so the period keeps meaning exactly what it says.
         const day = this.shiftsSearchDay(query);
-        const filtering = query !== '';
+        const filtering = this.shiftsFiltering();
         const shown = this.shiftsVisibleRows(report);
         const totals = filtering ? this.sumShiftsRows(shown) : (report.totals || {});
         const noMatches = filtering && rows.length > 0 && shown.length === 0;
@@ -5308,9 +5750,12 @@ const UI_MODULES = {
                     ${this.OPS_ICONS.table}${this.escapeHtml(I18n.__('shiftsShowDay'))} ${this.escapeHtml(day)}
                 </button>
             </div>` : '';
+        // The note names *what* is narrowing the rows, in the reader's words, because the
+        // cards above it are then a total over fewer rows than the period holds - and a figure
+        // nobody can account for is worse than no figure. Both filters are named when both are on.
         const filterNote = filtering ? `
             <p class="ui-section-note" data-filter-note style="margin-bottom:12px">
-                ${this.escapeHtml(I18n.__('shiftsFiltered'))}: “${this.escapeHtml(query)}” · ${shown.length} / ${rows.length} ${this.escapeHtml(I18n.__('shifts'))}.<br>
+                ${this.escapeHtml(I18n.__('shiftsFiltered'))}: ${this.escapeHtml(this.shiftsFilterSentence())} · ${shown.length} / ${rows.length} ${this.escapeHtml(I18n.__('shifts'))}.<br>
                 ${this.escapeHtml(I18n.__('shiftsFilteredTotals'))}
             </p>` : '';
         // With no match the cards are left out on purpose: a grid of zeros reads as "this
@@ -5666,7 +6111,7 @@ const UI_MODULES = {
         }
         PrintReport.sheet(
             this.shiftsPrintHtml(report, range),
-            this.shiftsExportName(range, this.shiftsQuery(), '')
+            this.shiftsExportName(range, this.shiftsExportFilter(), '')
         );
     },
 
@@ -5687,10 +6132,13 @@ const UI_MODULES = {
     shiftsPrintHtml(report, range) {
         const columns = this.shiftsColumns();
         const shown = this.shiftsVisibleRows(report);
-        const query = this.shiftsQuery();
-        const totals = query ? this.sumShiftsRows(shown) : (report.totals || {});
+        const filtering = this.shiftsFiltering();
+        const totals = filtering ? this.sumShiftsRows(shown) : (report.totals || {});
         const period = report.period || range;
-        const filterNote = query ? `${I18n.__('shiftsFiltered')}: ${query}` : '';
+        // The sheet carries the same filter sentence as the screen: it is printed to be read
+        // away from the tab, and a total over part of a period with nothing saying so is a
+        // number that will be trusted wrongly.
+        const filterNote = filtering ? `${I18n.__('shiftsFiltered')}: ${this.shiftsFilterSentence()}` : '';
         // The total, on paper only: a printed timesheet without one is a list, and the
         // figure is already computed for the cards above the table on screen.
         const totalsLine = `${this.escapeHtml(I18n.__('shiftsTotal'))}: <b>${this.escapeHtml(this.hoursLabel(totals.hours))} h</b>`
@@ -5702,7 +6150,7 @@ const UI_MODULES = {
             columns: columns.map((key) => this.shiftsColumnLabel(key)),
             rows: shown.map((row) => columns.map((key) => this.shiftsCellHtml(row, key))),
             totals: totalsLine,
-            empty: I18n.__(query ? 'shiftsNoMatches' : 'shiftsEmpty')
+            empty: I18n.__(filtering ? 'shiftsNoMatches' : 'shiftsEmpty')
         });
     },
 
@@ -5870,7 +6318,7 @@ const UI_MODULES = {
             return;
         }
         API.saveFile(
-            this.shiftsExportName(range, this.shiftsQuery()),
+            this.shiftsExportName(range, this.shiftsExportFilter()),
             this.shiftsCsv(this.shiftsRowsOnScreen())
         );
     },
@@ -5892,7 +6340,20 @@ const UI_MODULES = {
      */
     shiftsVisibleRows(report) {
         const rows = (report && report.rows) || [];
-        return this.shiftsMatches(rows, this.shiftsQuery());
+        return this.shiftsMatches(this.shiftsRowsInCategory(rows), this.shiftsQuery());
+    },
+
+    /**
+     * The rows at sites in the chosen category, or all of them when none is chosen.
+     *
+     * Matched on the name the server published on the row rather than by looking the site up:
+     * the timesheet already decided which category each shift belongs to, and a second lookup
+     * here could disagree with the column the reader is looking at.
+     */
+    shiftsRowsInCategory(rows) {
+        const category = this.shiftsCategory();
+        if (!category) return rows;
+        return rows.filter((row) => String(row.site_category || '') === category);
     },
 
     /** The rows the table is showing right now, for the period on screen. */
