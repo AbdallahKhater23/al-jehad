@@ -822,12 +822,11 @@ class UserEditRequest(BaseModel):
     * the **id**. It is the key every attendance row, punch, device key and audit entry is
       written against, so rewriting it would orphan a person's history rather than correct
       their record;
-    * the **role**. It is a function of that id: ``_validate_id_and_role`` puts workers at
-      1-499, lead workers at 500-999, admins at 1000-4999 and head admins at 5000+, which
-      is what lets an operator read a role off a number. No existing id admits another
-      role's range, so a "role change" could only ever be refused or be a lie. A
-      promotion is a new account with an id in the right block, and the old account keeps
-      the hours - which are the part that must not move.
+    * the **role**. Writing it in place would promote a working account into a tier that
+      reads the audit trail - from this form, with no new credential and no account of its
+      own; the promotion would be indistinguishable from what the account always was. A
+      promotion is a new account - created in the console, or approved from the walk-up
+      queue - and the old account keeps the hours, which are the part that must not move.
     """
 
     user_id: str
@@ -1391,19 +1390,19 @@ def send_whatsapp_alert(worker_id: str, worker_name: str, site_name: str, score:
 
 
 def _validate_id_and_role(user_id: str, role: str) -> None:
-    # One rule, one implementation. ``security`` owns the id bands and the list of roles no
-    # API may create; the range chain below used to be a second copy of those bands, and two
-    # copies is how the console and a registration link come to disagree about what an id may
-    # be. The refusal is explicit and by name, not an accident of a range that happens not to
-    # include the root band - an administrator who could create one could promote themselves
-    # into the tier that reads the audit trail.
+    # One rule, one implementation. ``security`` owns the list of roles no API may create,
+    # and the refusal is explicit and by name rather than an accident of a range that
+    # happens not to include the root band - an administrator who could create a developer
+    # account could promote themselves into the tier that reads the audit trail.
     security.refuse_developer_role(role)
-    security.validate_user_id_for_role(user_id, role)
+    # The per-role id bands are gone: an id no longer decides a role, and no id is refused
+    # for falling outside a block. What is left of that rule is the part every allocator in
+    # this application depends on - an account id is a whole number.
     try:
-        uid_int = int(user_id)
-    except ValueError:  # pragma: no cover - ``validate_user_id_for_role`` already refused it
+        int(str(user_id).strip())
+    except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="User ID must be a numeric integer.") from None
-    del uid_int, role  # kept for the signature's sake; the rules live in ``security``
+    del user_id, role  # kept for the signature's sake; the rules live in ``security``
 
 
 # ---------------------------------------------------------------------------

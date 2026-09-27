@@ -2,11 +2,11 @@
 
 WHY THIS EXISTS
 ---------------
-The registration link that already ships is *per person*: an administrator types the name, the
-role and the account id, and the link reserves that id when it is created. That is the right
+The registration link that already ships is *per person*, for an account an administrator has
+already created: whoever opens it registers their face against that account. That is the right
 shape for one named hire and the wrong one for a walk-up, where nobody has applied yet and so
-there is no id to reserve. This suite is about the second shape, and every assertion in it is a
-way that shape could be wrong and silent:
+there is no account to hold a face. This suite is about the second shape, and every assertion in
+it is a way that shape could be wrong and silent:
 
 1. **Nothing exists before the decision.** A submission writes a request and nothing else - no
    ``users`` row, no roster entry, no shift, no payroll row. The only thing that creates an
@@ -90,12 +90,23 @@ def stored_photo(request_id: int) -> str:
     return str(db_scalar("SELECT photo_path FROM registration_requests WHERE id = ?", (request_id,)) or "")
 
 
-def lowest_free_worker() -> int:
-    taken = {
-        int(row[0])
-        for row in harness.db_rows("SELECT id FROM users WHERE CAST(id AS INTEGER) BETWEEN 1 AND 499")
-    }
-    return next(value for value in range(1, 500) if value not in taken)
+def next_workforce_id() -> int:
+    """The number the next approval will be handed: one above the highest id in use.
+
+    The allocator's rule restated rather than a copy of its code, so a test that disagrees with
+    it fails here instead of silently passing.
+    """
+    highest = max(
+        [
+            int(row[0])
+            for row in harness.db_rows(
+                "SELECT id FROM users WHERE CAST(id AS INTEGER) BETWEEN 1 AND ?",
+                (registrations.WORKFORCE_ID_CEILING,),
+            )
+        ]
+        or [0]
+    )
+    return highest + 1
 
 
 def approve(client, request_id: int, *, as_user: str = ADMIN, note: str | None = None):
@@ -161,7 +172,8 @@ def test_a_submission_creates_a_request_and_never_an_account(client, intake, app
     # **Nothing** became an employee: no account, and no face template anywhere.
     assert db_scalar("SELECT COUNT(*) FROM users WHERE name = 'Walk Up'") == 0
     assert db_scalar(
-        "SELECT COUNT(*) FROM users WHERE CAST(id AS INTEGER) BETWEEN 1 AND 499 AND name = 'Walk Up'"
+        "SELECT COUNT(*) FROM users WHERE CAST(id AS INTEGER) BETWEEN 1 AND ? AND name = 'Walk Up'",
+        (registrations.WORKFORCE_ID_CEILING,),
     ) == 0
 
     assert db_scalar(
@@ -339,9 +351,12 @@ def test_the_photo_route_serves_the_bytes_and_stops_when_they_are_gone(client, i
 # ---------------------------------------------------------------------------
 # 3. approval
 # ---------------------------------------------------------------------------
-def test_approval_creates_the_account_with_the_lowest_free_id_and_files_the_face(client, intake, app_module):
+def test_approval_creates_the_account_with_the_next_id_and_files_the_face(client, intake, app_module):
     request_id = submit(client, name="Approved Worker", image=photo(51)).json()["request_id"]
-    expected_id = lowest_free_worker()
+    expected_id = next_workforce_id()
+    assert expected_id <= registrations.WORKFORCE_ID_CEILING, (
+        "the band has no room in this fixture, so this test would not be measuring the allocator"
+    )
     assert db_scalar("SELECT COUNT(*) FROM users WHERE id = ?", (str(expected_id),)) == 0
 
     response = approve(client, request_id, note="ID checked at the gate.")
@@ -377,54 +392,6 @@ def test_approval_creates_the_account_with_the_lowest_free_id_and_files_the_face
     assert db_scalar(
         "SELECT COUNT(*) FROM registration_requests WHERE status = 'PENDING_REVIEW'"
     ) == 0, "the request is still in the review queue after being decided"
-
-
-def issue_register_link(client, *, user_id, name="Invited Worker", role="worker", as_user=ADMIN):
-    return client.post(
-        "/api/v1/admin/enrollment/invites",
-        headers=bearer(as_user),
-        json={"worker_id": user_id, "kind": "register", "name": name, "role": role},
-    )
-
-
-def test_a_walk_up_approval_never_takes_an_id_a_live_invite_reserved(client, intake, jpeg):
-    """Both creation flows share one allocator, so a number a link is holding is not free.
-
-    The invite reserves an id at issue and keeps it only on the invite row; the walk-up
-    allocates at approval and scans ``users``. Without a shared set of reservations the
-    allocator calls the reserved number free and spends it, and the link the administrator
-    already sent to a real person is a dead end by the time they open it.
-    """
-    taken = {
-        int(row[0])
-        for row in harness.db_rows(
-            "SELECT id FROM users WHERE CAST(id AS INTEGER) BETWEEN 1 AND 499"
-        )
-    }
-    free = [value for value in range(1, 500) if value not in taken]
-    reserved, expected = str(free[0]), str(free[1])
-
-    issued = issue_register_link(client, user_id=reserved)
-    assert issued.status_code == 200, issued.text[:300]
-    token = issued.json()["token"]
-
-    request_id = submit(client).json()["request_id"]
-    approved = approve(client, request_id)
-    assert approved.status_code == 200, approved.text[:300]
-    assert approved.json()["worker_id"] == expected, (
-        "the walk-up was handed the id a live registration link was holding"
-    )
-    assert db_scalar("SELECT COUNT(*) FROM users WHERE id = ?", (reserved,)) == 0
-
-    # The reservation survived the walk-up: the link still creates its own account, under
-    # exactly the id it was promised, once its holder opens it.
-    claimed = client.post(
-        f"/api/v1/enroll/{token}/register",
-        data={"password": STRONG_PASSWORD},
-        files={"photo": ("photo.jpg", jpeg, "image/jpeg")},
-    )
-    assert claimed.status_code == 200, claimed.text[:300]
-    assert claimed.json()["worker_id"] == reserved
 
 
 def test_approval_destroys_the_reviewed_photograph_once_the_face_has_a_home(client, intake):
@@ -465,25 +432,28 @@ def test_an_approved_request_cannot_be_approved_or_rejected_again(client, intake
     assert db_scalar("SELECT COUNT(*) FROM registration_requests") == 1
 
 
-def test_a_moallem_is_approved_into_the_lead_worker_block(client, intake):
-    """An applicant may ask to be a moallem, and a moallem's number is in the 500s."""
+def test_a_moallem_is_approved_with_the_role_it_asked_for(client, intake):
+    """A walk-up may ask to be a moallem. Its id no longer says so - the row does."""
     request_id = submit(client, name="Lead Applicant", role="moallem", image=photo(81)).json()["request_id"]
     response = approve(client, request_id)
     assert response.status_code == 200, response.text[:300]
     worker_id = int(response.json()["worker_id"])
-    assert 500 <= worker_id <= 749, "the lead-worker block ends where the new role's begins"
+    assert response.json()["role"] == "moallem"
+    assert worker_id < registrations.ADMIN_TIER_ID_FLOOR, (
+        "an approval minted an id in an administrative tier"
+    )
     assert db_scalar("SELECT role FROM users WHERE id = ?", (str(worker_id),)) == "moallem"
 
 
-def test_an_off_office_worker_is_approved_into_the_upper_block(client, intake):
-    """The old moallem band's upper half is a role of its own, with numbers of its own."""
+def test_an_off_office_worker_is_approved_with_the_role_it_asked_for(client, intake):
     request_id = submit(
         client, name="Off-Office Applicant", role="off_office", image=photo(82)
     ).json()["request_id"]
     response = approve(client, request_id)
     assert response.status_code == 200, response.text[:300]
     worker_id = int(response.json()["worker_id"])
-    assert 750 <= worker_id <= 999, "an off-office worker is never handed a lead worker's number"
+    assert response.json()["role"] == "off_office"
+    assert worker_id < registrations.ADMIN_TIER_ID_FLOOR
     assert db_scalar("SELECT role FROM users WHERE id = ?", (str(worker_id),)) == "off_office"
 
 

@@ -54,11 +54,11 @@ from pydantic import BaseModel, Field
 import punch_frames
 from database import db, slow_queries as _slow_query_ring, connection_stats
 from security import (
+    DEVELOPER_ID_FLOOR,
     DEVELOPER_ROLE,
     CurrentUser,
     hash_password,
     require_developer,
-    validate_user_id_for_role,
 )
 
 logger = logging.getLogger("attendance.developer")
@@ -672,6 +672,27 @@ DEVELOPER_ID_DEFAULT = "309010401073"
 DEVELOPER_NAME_DEFAULT = "Developer"
 
 
+def _require_root_band_id(user_id: str) -> None:
+    """Refuse an account id below the root band. Raises ``HTTPException(400)``.
+
+    The root account sits far above every business account on purpose: an id inside a worker's
+    or an administrator's range would make the deployment's own root read as an ordinary
+    account in a log line, and would put it in the part of the id space an operator (or an
+    approval) is filling. This is what keeps ``DEVELOPER_ID_FLOOR`` a rule the seed enforces
+    rather than a convention it happens to follow - the per-role bands that used to be checked
+    alongside it are gone.
+    """
+    try:
+        value = int(str(user_id).strip())
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="User ID must be a numeric integer.") from None
+    if value < DEVELOPER_ID_FLOOR:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Developer ID must be {DEVELOPER_ID_FLOOR} or greater.",
+        )
+
+
 def seed_developer_account(
     *,
     password: str,
@@ -696,13 +717,14 @@ def seed_developer_account(
     reach the account. ``tools/seed_developer.py`` reads its value from the environment or
     generates one; the runtime never sees either.
 
-    The id is validated against ``security.ROLE_ID_RANGES``, so a seed pointed at a
-    business-band id is refused rather than planting root in a worker's range. Raises
-    ``ValueError`` for a refusal an operator should read, ``HTTPException(400)`` for a password
-    that fails the deployment's own policy (``hash_password`` enforces it).
+    The id is checked against the root band's floor (``security.DEVELOPER_ID_FLOOR``), so a seed
+    pointed at an ordinary account's id is refused rather than planting root among the business
+    accounts. Raises ``ValueError`` for a refusal an operator should read, ``HTTPException(400)``
+    for an id below the root band or a password that fails the deployment's own policy
+    (``hash_password`` enforces it).
     """
     target = str(user_id).strip()
-    validate_user_id_for_role(target, DEVELOPER_ROLE)
+    _require_root_band_id(target)
     if not password:
         raise ValueError(
             "a password is required: this seed has no default credential, on purpose"

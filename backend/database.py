@@ -308,12 +308,10 @@ def immediate(db_path: Path | None = None, *, timeout: float = 10.0):
     transaction at all. That is fine for a write that only depends on itself, and wrong for
     the writes this application has that **read before they write**:
 
-    * ``security.lowest_free_id`` - the number it hands back has to still be free when the
-      caller's ``INSERT`` runs, or two walk-up registrations are told one account id. It
-      counts an id a live registration invite is holding as taken, so the invite flow and the
-      walk-up flow are one allocator rather than two that disagree;
-    * ``enrollment.create_invite`` - the reserved id has to still be free when the invite that
-      reserves it is written, or two links promise one number;
+    * ``registrations._next_workforce_id`` - the number it hands back has to still be free when
+      the caller's ``INSERT`` runs, or two walk-up approvals are told one account id;
+    * ``enrollment.create_invite`` - the token and the audit row that records it are one write,
+      so an invite that exists is an invite an administrator can see;
     * the pending-registration cap - a ``COUNT(*)`` taken before the write is advice, so N
       concurrent submissions each read ``cap - 1`` and every one of them proceeds.
 

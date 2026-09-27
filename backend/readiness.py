@@ -935,7 +935,6 @@ PUBLIC_ROUTES: dict[str, str] = {
         "who has no account yet can open the link they were handed."
     ),
     "POST /api/v1/enroll/{token}": "the same invite token; submits the capture.",
-    "POST /api/v1/enroll/{token}/register": "the same invite token; claims the link.",
     "GET /api/v1/register": (
         "the walk-up registration link's own page reads the policy it has to satisfy - the "
         "upload ceiling, the accepted roles, the shortest password - before anybody has an "

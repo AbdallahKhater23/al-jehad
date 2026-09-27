@@ -249,21 +249,11 @@
   </div>
 
   <!--
-    Only a *registration* link asks for this: it is the one link that creates the
-    account, so its owner is the only person who may choose the password. On an
-    enrollment link the account already exists and asking would be a way to guess at
-    somebody else's.
+    No password field, and no account details either: an enrollment link is about a face.
+    The account it belongs to already exists, with a password an administrator set or its
+    owner chose through the site's registration link, and a way to *set* one from here would
+    be a way to guess at somebody else's.
   -->
-  <div class="card hidden" id="password-card">
-    <p class="note" id="password-hint" style="margin-top:0"></p>
-    <div class="row" style="margin-top:10px">
-      <input id="password" class="field" type="password" data-t-ph="enroll.password.placeholder"
-             placeholder="Choose a password" autocomplete="new-password" />
-      <input id="password2" class="field" type="password" data-t-ph="enroll.password2.placeholder"
-             placeholder="Type it again" autocomplete="new-password" />
-    </div>
-  </div>
-
   <div class="card">
     <div class="row">
       <input id="phone" class="field" type="tel" data-t-ph="enroll.phone.placeholder"

@@ -273,14 +273,42 @@ def test_every_creation_path_refuses_the_root_role_by_name(client, app_module):
     assert len(_rows("SELECT id FROM users WHERE CAST(id AS INTEGER) >= ?", (security.DEVELOPER_ID_FLOOR,))) == 1
 
 
-def test_a_registration_link_cannot_carry_the_root_role(client, app_module):
+def test_no_link_can_carry_a_role_any_more(client, app_module):
+    """The registration link that created accounts is gone, and with it the fields it was fed.
+
+    It was the one place an administrator could *name* a role for a link to hand out, and a link
+    that could name a role could name this one. An invite now carries an account id and a note:
+    the role in the answer below is the account's, read from ``users``, never the caller's to
+    choose. There is no route left on which a link creates an account at all.
+    """
+    import enrollment
+
     _seed()
-    refused = client.post(
+    assert not {"name", "role", "email", "phone"} & set(enrollment.InviteCreate.model_fields)
+
+    # A payload naming a role and no account id is refused outright: the id is the whole subject
+    # of an invite now, and there is no role on the request to name one with.
+    nameless = client.post(
         "/api/v1/admin/enrollment/invites",
         json={"user_id": developer.DEVELOPER_ID_DEFAULT, "role": "developer", "name": "x"},
         headers=bearer(HEAD_ADMIN),
     )
-    assert refused.status_code in (403, 409, 422), refused.text
+    assert nameless.status_code == 422, nameless.text[:300]
+
+    # ...and the same payload with an account id in it is issued as an enrollment link for that
+    # account: the role in the answer is read from ``users``, never the caller's to choose.
+    sent = client.post(
+        "/api/v1/admin/enrollment/invites",
+        json={"worker_id": developer.DEVELOPER_ID_DEFAULT, "role": "developer", "name": "x"},
+        headers=bearer(HEAD_ADMIN),
+    )
+    assert sent.status_code == 200, sent.text[:300]
+    assert sent.json()["kind"] == "enroll", (
+        "the request still produced a link that creates an account"
+    )
+    assert sent.json()["role"] == developer.DEVELOPER_ROLE, (
+        "the role in the answer has to be the account's, not one the caller asked for"
+    )
     assert not _rows("SELECT id FROM enrollment_invites WHERE pending_role = 'developer'")
 
 
@@ -333,15 +361,13 @@ def test_the_seed_refuses_what_it_must_refuse():
     # seeder is talked into a known password.
     with pytest.raises(ValueError):
         developer.seed_developer_account(password="")
-    # ``security`` owns the band, so an id outside the root band is refused with the same
-    # answer every other account-creation path gives - not a bespoke seeder error a caller
-    # would have to know about.
+    # ``security`` owns the root band's floor, so an id below it is refused rather than planting
+    # root among the business accounts - and the refusal names the floor, so an operator who hit
+    # it knows what to change.
     with pytest.raises(HTTPException) as band:
         developer.seed_developer_account(password=DEV_PASSWORD, user_id=ADMIN)
     assert band.value.status_code == 400
-    with pytest.raises(HTTPException) as wrong_role:
-        security.validate_user_id_for_role(DEV_ID, "admin")
-    assert wrong_role.value.status_code == 400
+    assert str(security.DEVELOPER_ID_FLOOR) in band.value.detail
 
     # An id in the root band that already belongs to an ordinary account is *not* promoted:
     # silently resolving that would turn a seeded id collision into an escalation.

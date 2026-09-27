@@ -18,9 +18,11 @@ It deliberately does **not** use ``/admin/enroll`` afterwards: ``create`` alread
 a second enrollment would bump ``template_version`` and rewrite the very file the punch is
 about to be measured against for no reason.
 
-The worker id band is ``1-499`` (``security.ROLE_ID_RANGES``). Account ids are recycled in
-this system, so the free ids are computed as the lowest unused numbers in that band rather
-than numbered lazily upward.
+The worker id band is ``1-499``. ``security``'s per-role ranges are gone, and the server's
+walk-up allocator counts upward from the highest id in use rather than scanning for the lowest
+free one, so a provisioning run and an approval can aim at the same number - in a load test that
+is one refused ``create``, not a wrong account. Account ids are recycled in this system, so the
+free ids here are the lowest unused numbers in that band rather than numbered lazily upward.
 
 Usage
 -----
