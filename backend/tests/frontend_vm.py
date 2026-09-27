@@ -122,6 +122,32 @@ function makeClassList() {
     };
 }
 
+function cssEscape(value) {
+    // The spec's algorithm, near enough to be the same answer for the ids this app escapes:
+    // alphanumerics, ``-``, ``_`` and anything non-ASCII are themselves, a control character
+    // and a leading digit become a hex escape, and everything else is backslashed.
+    const text = String(value);
+    let out = '';
+    for (let index = 0; index < text.length; index += 1) {
+        const ch = text[index];
+        const code = text.charCodeAt(index);
+        if (code === 0) { out += '\ufffd'; continue; }
+        if ((code >= 0x30 && code <= 0x39) || (code >= 0x41 && code <= 0x5a) ||
+            (code >= 0x61 && code <= 0x7a) || ch === '-' || ch === '_' || code >= 0x80) {
+            out += (index === 0 && code >= 0x30 && code <= 0x39)
+                ? ('\\' + code.toString(16) + ' ')
+                : ch;
+            continue;
+        }
+        if (code >= 0x01 && code <= 0x1f || code === 0x7f) {
+            out += '\\' + code.toString(16) + ' ';
+            continue;
+        }
+        out += '\\' + ch;
+    }
+    return out;
+}
+
 function makeElement(id) {
     const element = {
         id,
@@ -510,6 +536,12 @@ function boot(options) {
         crypto: require('crypto').webcrypto,
         setInterval: () => 1, clearInterval() {},
         URL: { createObjectURL: (blob) => { blobs.push(blob); return 'blob:stub'; }, revokeObjectURL() {} },
+        // ``CSS.escape``, as the browser has it. The console builds attribute selectors out
+        // of server values - ``[data-show-frame="${CSS.escape(id)}"]`` - so a stub without it
+        // does not test that code, it makes it throw. Modelled rather than worked around: the
+        // alternative in the app would be to stop escaping an id, and the reason the escape is
+        // there is that the selector is built from a value the server chose.
+        CSS: { escape: (value) => cssEscape(value) },
         // ``atob``/``btoa``: the push settings decode the VAPID public key from
         // URL-safe base64 into bytes the browser's ``PushManager.subscribe`` wants.
         // Node has both on the global since v16, so this is passing the real ones

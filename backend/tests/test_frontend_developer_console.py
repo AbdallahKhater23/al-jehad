@@ -83,6 +83,15 @@ const AUDIT = {
     alerts: [], security_actions: ['login']
 };
 
+const SESSIONS = [
+    { id: '309010401073', name: 'Developer', role: 'developer', status: 'active', token_version: 1,
+      last_login_at: '2026-09-26 22:48:00', last_login_ip: '10.0.0.1', active_devices: 0 },
+    { id: '5000', name: 'Head Admin', role: 'head_admin', status: 'active', token_version: 3,
+      last_login_at: '2026-09-26 21:00:00', last_login_ip: '10.0.0.2', active_devices: 2 },
+    { id: '1', name: 'Seed Worker', role: 'worker', status: 'active', token_version: 2,
+      last_login_at: null, last_login_ip: null, active_devices: 1 }
+];
+
 const requests = [];
 
 function responders(url, init) {
@@ -96,6 +105,7 @@ function responders(url, init) {
     if (url.indexOf('/developer/diagnostics/pool') >= 0) return { status: 200, body: POOL };
     if (url.indexOf('/developer/diagnostics/slow-queries') >= 0) return { status: 200, body: SLOW };
     if (url.indexOf('/developer/runtime') >= 0) return { status: 200, body: RUNTIME };
+    if (url.indexOf('/developer/sessions') >= 0) return { status: 200, body: SESSIONS };
     if (url.indexOf('/developer/alerts') >= 0) {
         return { status: 200, body: { alerts: ALERTS, unread: 2, kinds: { slow_query: 'One statement was slow.' } } };
     }
@@ -146,7 +156,7 @@ const results = {};
     const page = markup(env);
     results.render = {
         page_flag: page.indexOf('data-developer-console="true"') >= 0,
-        sections: ['runtime', 'alerts', 'diagnostics', 'audit'].filter(
+        sections: ['runtime', 'alerts', 'diagnostics', 'sessions', 'audit'].filter(
             (name) => page.indexOf('data-dev-section="' + name + '"') >= 0
         ),
         runtime_rows: ['maintenance_mode', 'log_level', 'auth_anomaly_alerts'].filter(
@@ -164,13 +174,15 @@ const results = {};
         flush_button: page.indexOf('data-dev-flush="true"') >= 0,
         endpoints: ['/developer/runtime', '/developer/alerts?limit=50',
                     '/developer/diagnostics/pool', '/developer/diagnostics/slow-queries?limit=20',
-                    '/developer/audit?limit=100'].filter(
+                    '/developer/audit?limit=100', '/developer/sessions'].filter(
             (path) => requests.some((r) => r.url === path)
         ),
         // Every action is a data- hook, never an inline handler. A count over the *markup*
         // would be unreliable - the escaped hostile summary legitimately contains the
+        // characters " onerror=" - so the source-level guard below is the real check.        // Every action is a data- hook, never an inline handler. A count over the *markup*
+        // would be unreliable - the escaped hostile summary legitimately contains the
         // characters " onerror=" - so the source-level guard below is the real check.
-        hooks: ['data-runtime-save', 'data-dev-alert-read', 'data-dev-explain',
+        hooks: ['data-runtime-save', 'data-dev-session-revoke', 'data-dev-alert-read', 'data-dev-explain',
                 'data-dev-flush', 'data-dev-audit-reload'].filter(
             (hook) => page.indexOf(hook) >= 0
         )
@@ -213,6 +225,75 @@ const results = {};
         runtime_heading: env.evaluate("I18n.__('devRuntime')")
     };
 }
+
+// 6. the tab wears the developer glyph, and the force-in roster never offers the root tier
+{
+    const env = consoleEnv(DEVELOPER);
+    await env.evaluate("UI.renderAdminTab('Developer')");
+    const nav = env.evaluate(
+        "adminVisibleTabs().filter((tab) => tab.id === 'Developer').map((tab) => tab.icon)[0]"
+    );
+    results.icon = {
+        icon_key: nav,
+        // The icon set carries the glyph, and it is not the Admin tab's sliders: two tabs
+        // wearing one picture read as one tab twice.
+        glyph_defined: env.evaluate("typeof ADMIN_ICONS.developer === 'string'").toString(),
+        is_brackets: env.evaluate("ADMIN_ICONS.developer.indexOf('m8 7-5 5 5 5') >= 0").toString(),
+        not_the_admin_icon: env.evaluate("ADMIN_ICONS.developer !== ADMIN_ICONS.admin").toString(),
+        svg: env.evaluate("ADMIN_ICONS.developer.indexOf('<svg') === 0").toString(),
+        aria_hidden: env.evaluate("ADMIN_ICONS.developer.indexOf('aria-hidden') >= 0").toString()
+    };
+
+    // The force-in roster: the developer must be filtered out like the head admin is.
+    const users = [
+        { id: '1', name: 'Seed Worker', role: 'worker', status: 'active' },
+        { id: '1000', name: 'Seed Admin', role: 'admin', status: 'active' },
+        { id: '5000', name: 'Head Admin', role: 'head_admin', status: 'active' },
+        { id: '309010401073', name: 'Developer', role: 'developer', status: 'active' }
+    ];
+    const sites = [{ site_name: 'Downtown Tower A' }];
+    const panel = env.evaluate(
+        "UI.forceInPanelHtml([], " + JSON.stringify(users) + ", " + JSON.stringify(sites) + ")"
+    );
+    const offered = (panel.match(/<option value="([^"]*)"/g) || [])
+        .map((attr) => /value="([^"]*)"/.exec(attr)[1]);
+    results.force_in_roster = {
+        offered: offered,
+        developer_listed: offered.indexOf('309010401073') >= 0,
+        head_admin_listed: offered.indexOf('5000') >= 0,
+        worker_listed: offered.indexOf('1') >= 0,
+        admin_listed: offered.indexOf('1000') >= 0
+    };
+}
+
+// 7. the sessions section: one row per account, a revoke lever per row
+{
+    const env = consoleEnv(DEVELOPER);
+    await env.evaluate("UI.renderAdminTab('Developer')");
+    const page = markup(env);
+    const section = page.slice(
+        page.indexOf('data-dev-section="sessions"'),
+        page.indexOf('data-dev-section="audit"')
+    );
+    const revokeIds = (section.match(/data-dev-session-revoke="([^"]*)"/g) || [])
+        .map((attr) => /data-dev-session-revoke="([^"]*)"/.exec(attr)[1]);
+    results.sessions = {
+        section_present: section.indexOf('ui-note') >= 0,
+        row_keys: (section.match(/data-dev-session="([^"]*)"/g) || []).length,
+        revoke_ids: revokeIds,
+        self_marked: section.indexOf('data-dev-session-self="true"') >= 0,
+        worker_listed: section.indexOf('Seed Worker') >= 0,
+        head_admin_listed: section.indexOf('Head Admin') >= 0,
+        dash_for_never_signed_in: section.indexOf('\u2014') >= 0
+    };
+
+    // The action, driven the way the binding drives it.
+    requests.length = 0;
+    await env.evaluate("UI_MODULES.revokeDevSession('1')");
+    results.session_revoke = {
+        asked: requests.filter((r) => r.url === '/developer/sessions/1/revoke' && r.method === 'POST').length
+    };
+}
 """
 
 
@@ -241,7 +322,7 @@ def test_the_console_is_the_root_tiers_and_no_one_elses(results):
 def test_opening_it_reads_every_surface_and_paints_them(results):
     render = results["render"]
     assert render["page_flag"], "the panel did not mark itself"
-    assert render["sections"] == ["runtime", "alerts", "diagnostics", "audit"], render["sections"]
+    assert render["sections"] == ["runtime", "alerts", "diagnostics", "sessions", "audit"], render["sections"]
     assert render["runtime_rows"] == ["maintenance_mode", "log_level", "auth_anomaly_alerts"]
     assert render["alert_cards"] == 3, render["alert_cards"]
     assert render["unread_chip"] and render["read_chip_on_8"], (
@@ -254,9 +335,9 @@ def test_opening_it_reads_every_surface_and_paints_them(results):
     assert render["endpoints"] == [
         "/developer/runtime", "/developer/alerts?limit=50",
         "/developer/diagnostics/pool", "/developer/diagnostics/slow-queries?limit=20",
-        "/developer/audit?limit=100",
+        "/developer/audit?limit=100", "/developer/sessions",
     ], render["endpoints"]
-    assert render["hooks"] == ["data-runtime-save", "data-dev-alert-read", "data-dev-explain",
+    assert render["hooks"] == ["data-runtime-save", "data-dev-session-revoke", "data-dev-alert-read", "data-dev-explain",
                                "data-dev-flush", "data-dev-audit-reload"], (
         f"a control is missing its data- hook: {render['hooks']}"
     )
@@ -299,3 +380,45 @@ def test_the_console_binds_its_controls_without_inline_handlers():
     handlers = re.findall(r"\son[a-z]+\s*=", section)
     assert handlers == [], f"the Developer console hand-rolled an inline handler: {handlers}"
     assert "bindDeveloperControls" in section, "nothing binds the panel's controls"
+
+
+def test_the_developer_tab_wears_the_developer_glyph(results):
+    """The root tier's own mark, and never the Admin tab's sliders a second time."""
+    icon = results["icon"]
+    assert icon["icon_key"] == "developer", icon
+    assert icon["glyph_defined"] == "true"
+    assert icon["is_brackets"] == "true", "the glyph is the angle brackets a developer reads"
+    assert icon["not_the_admin_icon"] == "true", "two tabs must not wear one picture"
+    assert icon["svg"] == "true", "icons are inline SVG (the icon-set rule), never emoji"
+    assert icon["aria_hidden"] == "true", "and decorative, announced by the label beside it"
+
+
+def test_the_force_in_roster_never_offers_the_developer(results):
+    """The root tier is not a rota, on screen exactly as the server refuses it.
+
+    A button that always answers 403 is a trap; the server is the enforcement and the
+    roster is the courtesy - the same split as the head admin's exclusion above it.
+    """
+    roster = results["force_in_roster"]
+    assert roster["worker_listed"], "a worker is exactly who the panel exists to offer"
+    assert roster["admin_listed"], "an administrator is offered to the root tier"
+    assert not roster["head_admin_listed"], "the head admin was never offered - unchanged"
+    assert not roster["developer_listed"], "and the developer joins that exclusion"
+
+
+def test_the_sessions_section_lists_every_account_with_its_lever(results):
+    """One row per account that could hold a token, newest sign-in first."""
+    sessions = results["sessions"]
+    assert sessions["section_present"]
+    assert sessions["row_keys"] == 3, sessions
+    assert sessions["worker_listed"] and sessions["head_admin_listed"]
+    # A worker who has never signed in is still on the list - that is the question it answers -
+    # so the never-signed-in fields read as an em dash rather than the string "null".
+    assert sessions["dash_for_never_signed_in"]
+    # The root tier's own row marks its lever as self-revoking.
+    assert sessions["self_marked"]
+
+
+def test_revoking_a_session_asks_the_server_for_exactly_one_account(results):
+    """The lever is per-row: one account per press, never a blast."""
+    assert results["session_revoke"]["asked"] == 1

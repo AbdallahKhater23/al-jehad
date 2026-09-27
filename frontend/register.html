@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#162F29" />
+<title>Register for an account — Site Attendance</title>
+<!--
+  The company's column in the tab and on the home screen. No ``../`` here, and that is the
+  difference between this page and the two link pages: they are served one segment deep under
+  a token (``/enroll/<token>``, ``/q/<token>``), so anything relative to them resolves into
+  the token segment. This page is served at ``/register``, at the root, so its assets are its
+  siblings and ``src="capture.js"`` is already the right URL.
+-->
+<link rel="icon" type="image/svg+xml" href="icon.svg">
+<link rel="apple-touch-icon" href="icon.svg">
+<meta name="apple-mobile-web-app-title" content="Al-Jehad">
+<style>
+  /* The company's palette, written out rather than linked, for the reason the two link pages
+     give: this is a page a stranger opens from a link, often on site cellular, and it has to
+     paint on the first frame whatever the connection is doing. A stylesheet is one more
+     round trip between a blank screen and the form - and the form is the whole page. */
+  :root {
+    --brand-green: #162F29;
+    --brand-green-2: #1B3A32;
+    --brand-green-ink: #102420;
+    --brand-cream: #EDE7D6;
+    --brand-gold: #DDC48C;
+    --brand-gold-hi: #FBF0CB;
+    --brand-gold-lo: #B9945A;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--brand-green); color: var(--brand-cream);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  .brand { flex: 1 1 100%; display: flex; align-items: center; gap: 10px; }
+  .brand-mark { flex: 0 0 auto; }
+  .brand-lockup { display: flex; flex-direction: column; align-items: flex-start; min-width: 0; }
+  .brand-name {
+    font-size: 16px; font-weight: 700; line-height: 1; letter-spacing: 0.14em;
+    padding-left: 0.14em;
+    background-image: linear-gradient(180deg, var(--brand-gold-hi), var(--brand-gold) 52%, var(--brand-gold-lo));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .brand-legal {
+    margin-top: 4px; font-size: 10px; line-height: 1; font-weight: 700; letter-spacing: 0.26em;
+    color: var(--brand-gold);
+  }
+  .brand-est {
+    display: flex; align-items: center; gap: 7px; margin-top: 3px; width: min(100%, 132px);
+    font-size: 10px; line-height: 1; font-weight: 700; letter-spacing: 0.24em; color: var(--brand-gold);
+  }
+  .brand-est::before, .brand-est::after { content: ''; flex: 1 1 auto; height: 1px; }
+  .brand-est::before { background: linear-gradient(90deg, transparent, rgba(221, 196, 140, 0.6)); }
+  .brand-est::after { background: linear-gradient(90deg, rgba(221, 196, 140, 0.6), transparent); }
+  /* ``90deg`` is a physical angle and a flex row is laid out from the other end in RTL, so in
+     Arabic and Urdu the two rules swap sides and their gradients do not: the line would come
+     out solid gold at the outer ends and invisible next to the word, which is the one thing
+     these rules exist to avoid. The same two rules, pointing the other way. */
+  html[dir="rtl"] .brand-est::before { background: linear-gradient(270deg, transparent, rgba(221, 196, 140, 0.6)); }
+  html[dir="rtl"] .brand-est::after { background: linear-gradient(270deg, rgba(221, 196, 140, 0.6), transparent); }
+  .brand-tagline {
+    margin-top: 3px; font-size: 10px; line-height: 1; letter-spacing: 0.18em; padding-left: 0.18em;
+    color: rgba(237, 231, 214, 0.82);
+  }
+  @media (max-width: 340px) {
+    body header .head { flex: 1 1 100%; }
+  }
+  .brand-mark img { display: block; width: 38px; height: auto; }
+  header {
+    padding: calc(18px + env(safe-area-inset-top, 0px)) 16px 10px;
+    display: flex; flex-wrap: wrap; gap: 10px 12px; align-items: flex-start;
+  }
+  header .head { flex: 1; min-width: 0; }
+  h1 { font-size: 1.15rem; margin: 0 0 4px; }
+  .sub { color: rgba(237, 231, 214, 0.74); font-size: .85rem; margin: 0; }
+  main { flex: 1; padding: 12px 16px 28px; display: flex; flex-direction: column; gap: 14px; }
+  .card { background: var(--brand-green-2); border: 1px solid rgba(237, 231, 214, 0.16); border-radius: 14px; padding: 14px; }
+  .card > * + * { margin-top: 12px; }
+  video, canvas, img.preview { width: 100%; border-radius: 12px; background: var(--brand-green-ink); display: block; }
+  img.preview { aspect-ratio: 3/4; object-fit: cover; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  button {
+    flex: 1 1 auto; min-height: 52px; border: 1px solid transparent; border-radius: 12px; font-size: 1rem;
+    font-weight: 600; color: var(--brand-green-ink); cursor: pointer;
+    background: linear-gradient(180deg, var(--brand-gold-hi), var(--brand-gold) 52%, var(--brand-gold-lo));
+  }
+  button.secondary {
+    background: rgba(237, 231, 214, 0.12); border-color: rgba(237, 231, 214, 0.26);
+    color: var(--brand-cream);
+  }
+  button[disabled] { opacity: .5; cursor: not-allowed; }
+  .langs { display: flex; gap: 4px; flex: 0 0 auto; }
+  .langs button {
+    flex: 0 0 auto; min-height: 30px; min-width: 32px; padding: 0 7px; border-radius: 999px;
+    background: rgba(237, 231, 214, 0.12); border-color: rgba(237, 231, 214, 0.26);
+    color: var(--brand-cream); font-size: .75rem; font-weight: 700; line-height: 1;
+  }
+  .langs button[aria-pressed="true"] {
+    background: linear-gradient(180deg, var(--brand-gold-hi), var(--brand-gold) 52%, var(--brand-gold-lo));
+    border-color: transparent; color: var(--brand-green-ink);
+  }
+  input[type=file] { display: none; }
+  /* The placeholder is this page's only label for most of the fields - there is no visible one
+     beside them - so it is set in the palette rather than left to the browser's default grey,
+     which is chosen for a white page and all but disappears on this one. */
+  input.field::placeholder, textarea.field::placeholder { color: rgba(237, 231, 214, 0.65); }
+  input.field, select.field, textarea.field {
+    flex: 1 1 140px; width: 100%; min-height: 48px; border-radius: 12px;
+    border: 1px solid rgba(237, 231, 214, 0.28);
+    background: var(--brand-green-ink); color: var(--brand-cream); padding: 0 12px;
+  }
+  select.field { min-height: 48px; }
+  textarea.field { min-height: 84px; padding: 10px 12px; line-height: 1.4; resize: vertical; }
+  /* The one field with a visible label. A ``<select>`` shows its own options, so its name
+     cannot live in a placeholder the way the others' do. */
+  .field-label { display: block; font-size: .8rem; color: rgba(237, 231, 214, 0.74); margin-bottom: 6px; }
+  /* The consent line: a box and the sentence it is about, on one line, box first in both
+     directions - the box is the thing being agreed to, not a word being read. */
+  label.check { display: flex; gap: 10px; align-items: flex-start; font-size: .85rem; cursor: pointer; }
+  label.check input { flex: 0 0 auto; width: 22px; height: 22px; margin: 0; accent-color: var(--brand-gold); }
+  label.file {
+    display: block; text-align: center; padding: 14px; border: 1px dashed rgba(237, 231, 214, 0.32);
+    border-radius: 12px; color: var(--brand-cream); cursor: pointer;
+  }
+  .note { font-size: .8rem; color: rgba(237, 231, 214, 0.74); }
+  .note.warn { color: #fca5a5; }
+  .msg { border-radius: 12px; padding: 12px; font-weight: 600; display: none; }
+  .msg.ok { display: block; background: rgba(22, 163, 74, 0.18); color: #86efac; border: 1px solid rgba(134, 239, 172, 0.4); }
+  .msg.err { display: block; background: rgba(220, 38, 38, 0.18); color: #fca5a5; border: 1px solid rgba(252, 165, 165, 0.4); }
+  .hidden { display: none !important; }
+  .credit {
+    margin: 0; padding: 0 16px calc(18px + env(safe-area-inset-bottom, 0px));
+    text-align: center; font-size: .78rem; color: rgba(237, 231, 214, 0.62);
+  }
+</style>
+</head>
+<body>
+<!--
+  English in the file, re-read into the reader's language by ``capture.js`` off the ``data-t``
+  keys - the same contract as the two link pages, and for the same reason: a script that does
+  not arrive leaves English, not key names.
+-->
+<header>
+  <!--
+    The company's mark, and the four lines the artwork sets, in its order. Deliberately not
+    translated: a wordmark, a legal suffix and a founding year are proper nouns, and a
+    translated wordmark is a different logo. ``test_quick_links`` holds this lockup to the
+    console's copy of it.
+  -->
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"><img src="logo-mark.svg" alt="" width="38" height="50"></span>
+    <span class="brand-lockup">
+      <span class="brand-name">AL-JEHAD</span>
+      <span class="brand-legal">INTERNATIONAL CO.</span>
+      <span class="brand-est">EST 1983</span>
+      <span class="brand-tagline">STONE . MARBLE . GRANITE</span>
+    </span>
+  </div>
+  <div class="head">
+    <h1 id="title" data-t="register.title">Register for an account</h1>
+    <p class="sub" id="who" data-t="register.sub">Applying to work here? Send this and an administrator will review it.</p>
+  </div>
+  <nav class="langs" id="langs" data-t-aria="language">
+    <button type="button" data-lang="en">EN</button>
+    <button type="button" data-lang="ar">ع</button>
+    <button type="button" data-lang="hi">हि</button>
+    <button type="button" data-lang="ur">UR</button>
+  </nav>
+</header>
+
+<main>
+  <div id="message" class="msg"></div>
+
+  <div class="card" id="step-intro">
+    <p class="note" data-t="register.intro">
+      An administrator reads every request. Filling this in creates no account, no shift and
+      no pay by itself: nothing you send here commits you to anything. Your photograph and
+      your details are kept only so that a person can decide.
+    </p>
+  </div>
+
+  <!--
+    The account this becomes, as far as the applicant knows it. No id: the number is minted at
+    approval, and one told to them here would be a promise the next approval could break.
+  -->
+  <div class="card" id="identity">
+    <div class="row">
+      <input id="full-name" class="field" type="text" autocomplete="name"
+             data-t-ph="register.name.placeholder" placeholder="Full name" />
+    </div>
+    <div class="row">
+      <input id="password" class="field" type="password" autocomplete="new-password"
+             data-t-ph="register.password.placeholder" placeholder="Choose a password" />
+      <input id="password2" class="field" type="password" autocomplete="new-password"
+             data-t-ph="register.password2.placeholder" placeholder="Repeat the password" />
+    </div>
+    <div>
+      <label class="field-label" for="role" data-t="register.role.label">Role</label>
+      <!-- Filled from the server's own list of what this link may register, so an option that
+           would be refused is never offered. -->
+      <select id="role" class="field"></select>
+    </div>
+    <div class="row">
+      <input id="phone" class="field" type="tel" inputmode="tel"
+             data-t-ph="register.phone.placeholder" placeholder="Phone (optional)" />
+      <input id="email" class="field" type="email"
+             data-t-ph="register.email.placeholder" placeholder="Email (optional)" />
+    </div>
+    <textarea id="work" class="field" rows="3"
+              data-t-ph="register.work.placeholder" placeholder="What work will you do? (optional)"></textarea>
+    <!--
+      The consent tick, as its own box rather than something the send implies: the server holds
+      the version of the sentence that was agreed to, and it refuses a submission that does not
+      carry one. The sentence is in a span so the translation pass replaces the words and not
+      the checkbox beside them.
+    -->
+    <label class="check" for="consent">
+      <input id="consent" type="checkbox" />
+      <span data-t="register.consent">I agree to my photograph and my details being kept so that an administrator can review this request.</span>
+    </label>
+  </div>
+
+  <div class="card" id="photo">
+    <video id="video" playsinline autoplay muted class="hidden"></video>
+    <img id="preview" class="preview hidden" data-t-alt="camera.preview.photo" alt="Your photo preview" />
+    <canvas id="canvas" class="hidden"></canvas>
+    <div class="row">
+      <button id="btn-start" data-t="camera.open">Open camera</button>
+      <button id="btn-shoot" class="secondary hidden" data-t="camera.shoot.photo">Take photo</button>
+      <button id="btn-retake" class="secondary hidden" data-t="camera.retake">Retake</button>
+    </div>
+    <!--
+      The sentence is in a span of its own, for the reason the link pages give: a translation
+      replaces an element's text, and doing that to the label would delete the file input the
+      page needs when the camera is refused.
+    -->
+    <label class="file" id="fallback-label">
+      <span data-t="register.fallback">Camera not available? Tap here to use the phone's gallery instead</span>
+      <input id="file" type="file" accept="image/jpeg,image/png,image/webp" />
+    </label>
+    <p class="note" id="photo-policy"></p>
+    <p class="note warn hidden" id="photo-problem"></p>
+  </div>
+
+  <div class="card">
+    <button id="btn-submit" style="width:100%" data-t="register.submit" disabled>Send my request</button>
+    <p class="note" id="status-line"></p>
+  </div>
+</main>
+
+<footer class="credit" id="credit">Powered by دوامك اسهل</footer>
+
+<!--
+  Three scripts, all siblings: this page is served at ``/register``, at the root. See the note
+  at the top for why that makes these names correct here and wrong on the link pages.
+-->
+<script src="api-config.js"></script>
+<script src="capture.js"></script>
+<script src="register.js"></script>
+</body>
+</html>

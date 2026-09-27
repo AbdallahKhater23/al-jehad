@@ -33,6 +33,13 @@ from datetime import datetime, timedelta
 import pytest
 from harness import ADMIN, DB_PATH, HEAD_ADMIN, MOALLEM, bearer, clock_in, db_scalar
 
+
+def developer_id() -> str:
+    """The root account's id, read from the module that owns the seeding convention."""
+    import developer
+
+    return developer.DEVELOPER_ID_DEFAULT
+
 TS = "%Y-%m-%d %H:%M:%S"
 SITE = "Downtown Tower A"
 #: The long shift every overtime case is built from: past a 8 h paid day, and past the
@@ -232,3 +239,55 @@ def test_a_workers_overtime_is_still_decided_by_any_administrator(client):
     decided = _decide(client, ADMIN, log_id, approve=True)
     assert decided.status_code == 200, decided.text[:300]
     assert db_scalar("SELECT reviewed_by FROM attendance_logs WHERE id = ?", (log_id,)) == ADMIN
+
+
+# ---------------------------------------------------------------------------
+# 3. the developer does not punch, by anyone's hand
+# ---------------------------------------------------------------------------
+#: A refusal every path to a shift answers identically: the root tier owns the deployment,
+#: not a rota, and an attendance row in its name is a figure somebody would have to review.
+DEVELOPER_REFUSAL = "The developer account does not check in or out."
+
+
+def test_the_developer_cannot_clock_in_or_out(client):
+    """Its own punch is refused before the geofence is even read."""
+    from harness import root_bearer
+
+    root = root_bearer()
+    for action in ("Clock In", "Clock Out"):
+        response = clock_in(client, developer_id(), action=action, headers=root)
+        assert response.status_code == 403, (action, response.text[:300])
+        assert response.json()["detail"] == DEVELOPER_REFUSAL
+    assert db_scalar(
+        "SELECT COUNT(*) FROM attendance_logs WHERE worker_id = ?", (developer_id(),)
+    ) == 0, "nothing may be recorded by the refused punches"
+
+
+@pytest.mark.parametrize("verb", ["in", "out"])
+def test_the_developer_cannot_be_forced_onto_or_off_a_shift(client, verb):
+    """The root tier is not a rota, so a forced shift in its name cannot exist.
+
+    Any administrator would do as the actor here - the refusal is about the *target*, not
+    the caller - and a head admin is the strongest one there is, so a head admin being
+    refused is the ceiling of the rule.
+    """
+    from harness import root_bearer
+
+    root_bearer()  # seed the account this test targets
+    if verb == "in":
+        response = _force_in(client, HEAD_ADMIN, developer_id())
+        assert response.status_code == 403, response.text[:300]
+        assert response.json()["detail"] == DEVELOPER_REFUSAL
+        assert db_scalar(
+            "SELECT COUNT(*) FROM active_sessions WHERE worker_id = ?", (developer_id(),)
+        ) == 0, "nothing may be written by the refused call"
+    else:
+        # The forced clock-out reads the session joined to the account, so the refusal has
+        # to hold even against a planted session - a row the account must never carry.
+        _plant_open_shift(developer_id(), 3.0)
+        response = _force_out(client, HEAD_ADMIN, developer_id())
+        assert response.status_code == 403, response.text[:300]
+        assert response.json()["detail"] == DEVELOPER_REFUSAL
+        assert db_scalar(
+            "SELECT COUNT(*) FROM active_sessions WHERE worker_id = ?", (developer_id(),)
+        ) == 1, "the planted row stays put: the refusal happened before anything was written"

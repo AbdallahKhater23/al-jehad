@@ -82,6 +82,10 @@ const SHIPPED = __SHIPPED__;
 let rules = RETUNED;
 let sessionsFail = false;
 let renamed = false;
+// The main fixture's ids are ``w1..w4``; the numeric-id scenario swaps in production-
+// shaped ones (this deployment's roster is ``1``, ``2``, ``4``...), which the responder
+// serves in place of the default sessions.
+let numericSessions = null;
 
 function sessionsNow() {
     return [
@@ -94,6 +98,7 @@ function sessionsNow() {
 
 function responders(url) {
     if (url.indexOf('/admin/active_sessions') >= 0) {
+        if (numericSessions) return { status: 200, body: numericSessions };
         return sessionsFail
             ? { status: 500, body: { detail: 'Database is locked.' } }
             : { status: 200, body: sessionsNow() };
@@ -120,6 +125,7 @@ function bootBoard(options) {
     rules = opts.rules || RETUNED;
     sessionsFail = !!opts.fail;
     renamed = !!opts.renamed;
+    numericSessions = opts.numericSessions || null;
     const env = boot();
     env.setResponder(responders);
     // ``actorRole`` because the panel is not the same panel for every reader: an administrator's
@@ -376,6 +382,41 @@ const results = {};
     };
     env2.evaluate("UI_MODULES.clearLiveOpsFilters()");
     results.site_filter_cleared = { rows: rowIds(env2) };
+}
+
+// 3b. a number in the box is somebody's id, not a digit of where they sit
+{
+    // Production shapes: this deployment's roster is ids like `1`, `2` and `4`, and one
+    // site's own name carries those digits - which is exactly what a substring match over
+    // the whole row cannot tell apart.
+    const numeric = [
+        // Worker 4 sits at a site with no digit in its name; the digit-bearing site belongs
+        // to worker 2. A whole-row substring match answers "worker 4" with BOTH rows - the
+        // site's 4 - which is exactly the ghost this rule removes.
+        { worker_id: '4', name: 'Ahmed', site_name: 'Downtown Tower A', clock_in_time: ago(6), role: 'worker', late_flag: 0 },
+        { worker_id: '2', name: 'abood', site_name: 'Salmiya Block 4', clock_in_time: ago(4), role: 'worker', late_flag: 0 }
+    ];
+    const envN = bootBoard({ numericSessions: numeric });
+    await envN.evaluate("UI.renderAdminTab('Live Ops')");
+    const read = () => rowIds(envN);
+    const search = async (q) => {
+        await envN.evaluate(`(async () => { await UI_MODULES.setLiveOpsQuery(${JSON.stringify(q)}); })()`);
+        return read();
+    };
+    results.numeric_search = {
+        all: read(),
+        by_id: await search('4'),
+        by_other_id: await search('2'),
+        // A number that names nobody: no site on this board carries it, but the *row*
+        // does not become a haystack for it either - the honest answer is no matches.
+        by_stranger: await search('7'),
+        // The words still find the place: the site with a digit in its name is searched
+        // by its words, which name abood's row.
+        by_site_words: await search('salmiya block'),
+        // Mixed: both terms about the same row - the number names the person, the word
+        // names where they are.
+        mixed: await search('4 ahmed'),
+    };
 }
 
 // 4. sorting: longest first by default, then name, then the toggle
@@ -776,6 +817,23 @@ def test_a_search_that_matches_nobody_says_so_and_offers_a_way_back(results):
     assert none["empty_state"] and none["has_clear"] and none["no_rows"], none
     assert none["note"] == "Showing 0 of 4"
     assert results["search_cleared"]["rows"] == ["w1", "w2", "w3", "w4"]
+
+
+def test_a_number_in_the_search_box_is_a_worker_id_and_not_a_digit_of_the_site(results):
+    """The Shifts tab and this board answer a query the same way.
+
+    This deployment's ids are `1`, `2`, `4` - and one site's own name carries those same
+    digits ("Salmiya Block 4"). A search that read the whole row as one haystack answered
+    "where is worker 4" with a second row for the site's 4, which is how a board of four
+    people grows a ghost.
+    """
+    ids = results["numeric_search"]
+    assert ids["all"] == ["4", "2"], "longest first, as ever"
+    assert ids["by_id"] == ["4"], "'4' is one worker, not the site that has a 4 in its name"
+    assert ids["by_other_id"] == ["2"]
+    assert ids["by_stranger"] == [], "a number that names nobody is no matches, not a ghost"
+    assert ids["by_site_words"] == ["2"], "the site is still findable - by its words"
+    assert ids["mixed"] == ["4"], "'4 ahmed': the number and the word name the same row"
 
 
 def test_the_site_picker_filters_and_shows_which_one_is_chosen(results):

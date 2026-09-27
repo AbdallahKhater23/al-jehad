@@ -395,10 +395,17 @@ def tensor_for_path(path: str | Path, *, contract: face_align.Contract, input_si
 # the galleries
 # ---------------------------------------------------------------------------
 def worker_ids(conn: sqlite3.Connection) -> list[str]:
-    """Accounts that can be in a gallery: live workers, ordered so a run is reproducible."""
+    """Accounts that can be in a gallery: live workers, ordered so a run is reproducible.
+
+    The columns are the schema's own - ``users.id`` and ``users.status``, which migration 2
+    added with a default of ``'active'``. These two queries used ``user_id`` and ``is_active``,
+    which no migration has ever created, so the backfill and the coverage denominator raised
+    ``no such column`` on every real database; a regression test in
+    ``tests/test_developer_diagnostics.py`` holds them to the live schema now.
+    """
     rows = conn.execute(
-        "SELECT user_id FROM users WHERE role = 'worker' AND COALESCE(NULLIF(is_active, 0), 1) = 1 "
-        "ORDER BY user_id"
+        "SELECT id FROM users WHERE role = 'worker' "
+        "AND COALESCE(NULLIF(status, ''), 'active') = 'active' ORDER BY id"
     ).fetchall()
     return [str(row[0]) for row in rows]
 
@@ -663,9 +670,17 @@ def load_gallery(
 
 
 def total_workers(conn: sqlite3.Connection) -> int:
-    """The workforce the coverage fraction is a fraction *of*."""
+    """The workforce the coverage fraction is a fraction *of*.
+
+    The same predicate as ``worker_ids``, and deliberately not a second opinion about who counts
+    as a worker: a denominator that disagreed with the gallery's numerator would make the
+    coverage fraction - the *first* gate the cutover has to pass - a number about this query
+    rather than about the migration. A deactivated account is excluded, which is the point: a
+    gallery cannot cover somebody who has left.
+    """
     row = conn.execute(
-        "SELECT COUNT(*) FROM users WHERE role = 'worker' AND COALESCE(NULLIF(is_active, 0), 1) = 1"
+        "SELECT COUNT(*) FROM users WHERE role = 'worker' "
+        "AND COALESCE(NULLIF(status, ''), 'active') = 'active'"
     ).fetchone()
     return int(row[0] or 0)
 

@@ -317,6 +317,34 @@ PAGES: tuple[Page, ...] = (
         why="the same two files, the same line, on the page nobody reported",
         answered="!/Checking/.test(document.getElementById('who').textContent)",
     ),
+    Page(
+        name="registration",
+        path="/register",
+        script="capture.js and register.js",
+        # The policy line is the module's own effect, and the second half is the page's: its
+        # first act is to ask the server what it may ask for, so "the script ran" is not
+        # settled until that answer has been painted. Both halves are in ``ran`` because
+        # ``ran`` is the expression this harness *waits* on - an ``answered`` on its own is
+        # read immediately afterwards, which would race a fetch that is still in flight.
+        ran=(
+            "typeof Capture !== 'undefined'"
+            " && document.getElementById('photo-policy').textContent.length > 0"
+            " && (document.getElementById('role').options.length > 0"
+            " || document.getElementById('message').textContent.length > 0)"
+        ),
+        why=(
+            "the third page built on the shared capture module, and the only one served at "
+            "the root rather than under a token - so its own script is the one asking for "
+            "assets as siblings, which is the mistake the other two pages had"
+        ),
+        # Whatever the switch is set to, the page has to have *heard* the answer: intake open
+        # means the server's role list is in the select, intake closed means the notice is in
+        # the message box. An empty pair is the page that asked and then stopped.
+        answered=(
+            "document.getElementById('role').options.length > 0"
+            " || document.getElementById('message').textContent.length > 0"
+        ),
+    ),
 )
 
 

@@ -1,0 +1,245 @@
+/**
+ * The page the walk-up registration link opens.
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * The registration intake has been complete on the server for as long as it has existed:
+ * ``GET /register`` publishes the policy, ``POST /register`` takes a submission and writes a
+ * *pending request*, and an administrator's decision is the only thing that creates an
+ * account. What was missing was the half a person uses - nobody without a session could fill
+ * anything in, so the queue could only be filled by hand.
+ *
+ * WHAT IT DOES NOT DO
+ * -------------------
+ * It creates nothing. The submission carries a name, a password, a role, contact details, an
+ * optional line about the work and a photograph, and the answer is "we have your request" -
+ * there is no id yet, because the id is minted inside the transaction that approves it. A
+ * number said here would be a promise the next approval could take back.
+ *
+ * ONE KIND OF DECIDING
+ * --------------------
+ * The page refuses only what it can decide alone: a missing name, a password under the floor
+ * the server published, two passwords that differ, an unticked consent line, and a photo that
+ * is not one. Everything else - the switch, the role, a duplicate photograph, a full queue -
+ * is the server's answer, and each one is spoken in the reader's language off its
+ * ``error_code`` (``Capture.serverMessage``) rather than off the English prose it arrives in.
+ *
+ * The camera, the photo policy and the language tables are ``capture.js``, shared with the
+ * two link pages; what is left here is this page's own flow.
+ */
+(function () {
+    "use strict";
+
+    //: Base URLs are owned by ``api-config.js``, loaded by the page before this file.
+    //: Endpoint paths here carry no ``/api/v1`` prefix - this constant owns it, exactly once.
+    var API = (typeof resolveAPIBase === "function")
+        ? resolveAPIBase()
+        : (location.origin + "/api/v1");
+
+    var $ = function (id) { return document.getElementById(id); };
+
+    //: The server's answer to ``GET /register``: the roles this link may register, the photo
+    //: policy, and the shortest password. Null until it arrives, which is why nothing the
+    //: applicant types is checked against it before then.
+    var policy = null;
+
+    //: Whether intake is open. The camera and the submit both wait on it, so a closed link
+    //: cannot be armed by a photo arriving later.
+    var open = false;
+
+    var camera = null;
+
+    //: How to write the message box's current sentence again, in whatever language is chosen
+    //: now: the box is not a ``data-t`` node, so the switch cannot repaint it on its own.
+    var resay = function () {};
+
+    function say(text, kind, again) {
+        var box = $("message");
+        box.className = "msg " + (kind || "");
+        box.textContent = text;
+        resay = again || function () {};
+    }
+
+    /** Says a sentence the page can produce again - a refusal, or a line about the form. */
+    function sayAgain(produce, kind) {
+        var again = function () { say(produce(), kind, again); };
+        again();
+    }
+
+    /** Says a sentence from the page's own table. */
+    function sayKey(key, kind, vars) {
+        sayAgain(function () { return Capture.t(key, vars); }, kind);
+    }
+
+    /** Says a refused answer, from the reason it carries rather than from its prose. */
+    function sayRefusal(body, fallbackKey) {
+        sayAgain(function () { return Capture.serverMessage(body, fallbackKey); }, "err");
+    }
+
+    /**
+     * Takes the page out of service: no form to fill, no camera, no submit.
+     *
+     * One shape for both ways this page can be closed - intake switched off, and a request
+     * that has already been sent - because they mean the same thing to the person holding the
+     * phone: there is nothing more to do here, and no second submission.
+     */
+    function disarm() {
+        open = false;
+        $("identity").classList.add("hidden");
+        $("photo").classList.add("hidden");
+        $("fallback-label").classList.add("hidden");
+        if (camera) camera.arm(false);
+    }
+
+    /**
+     * The roles this link may register, in the server's order and the reader's words.
+     *
+     * Built from the published list rather than written into the markup, so a role the server
+     * would refuse at submit is never offered here - and so a role added to the business set
+     * appears on this page without an edit. The names are words, so the language switch
+     * refills them.
+     */
+    function fillRoles(roles) {
+        var select = $("role");
+        select.innerHTML = "";
+        for (var i = 0; i < roles.length; i += 1) {
+            var option = document.createElement("option");
+            option.value = roles[i];
+            option.textContent = Capture.t("role." + roles[i]);
+            select.appendChild(option);
+        }
+    }
+
+    function loadPolicy() {
+        fetch(API + "/register")
+            .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
+            .then(function (res) {
+                if (!res.ok) {
+                    // A policy read that fails is not a closed intake: it is a page that
+                    // cannot know what it is allowed to ask for, so it asks for nothing.
+                    sayKey("offline", "err");
+                    disarm();
+                    return;
+                }
+                policy = res.body;
+                if (res.body.photo_policy) Capture.setPolicy(res.body.photo_policy);
+                Capture.applyPolicy();
+
+                if (!res.body.enabled) {
+                    // Off is the default, and the link is permanent: a page that has been
+                    // switched off has to be able to say so rather than look broken.
+                    sayKey("register.closed", "err");
+                    disarm();
+                    return;
+                }
+
+                fillRoles(res.body.roles || []);
+                open = true;
+                $("btn-submit").disabled = true;
+            })
+            .catch(function () {
+                sayKey("offline", "err");
+                disarm();
+            });
+    }
+
+    /**
+     * What the page refuses on its own, or an empty string when there is nothing to refuse.
+     *
+     * Asked fresh each time rather than remembered, so a refusal is written in the language
+     * that is chosen when it is read - and so fixing one thing cannot leave a stale sentence
+     * about the thing next to it.
+     */
+    function complaint() {
+        if (!$("full-name").value.trim()) return Capture.t("register.nameRequired");
+        var floor = (policy && policy.min_password_length) || 0;
+        if (floor && $("password").value.length < floor) {
+            return Capture.t("register.passwordShort", { n: floor });
+        }
+        if ($("password").value !== $("password2").value) return Capture.t("register.passwordMismatch");
+        if (!$("consent").checked) return Capture.t("register.consentRequired");
+        return "";
+    }
+
+    function submit() {
+        var problem = complaint() || camera.problem();
+        if (problem) {
+            // The photo line belongs to the photo policy and is written where the photo is;
+            // every other refusal is the form's and goes in the message box. One sentence in
+            // both places would read as two complaints about one tap.
+            var photoOnly = camera.problem();
+            camera.showProblem(photoOnly || "");
+            sayAgain(function () { return complaint() || camera.problem() || problem; }, "err");
+            return;
+        }
+
+        var form = new FormData();
+        form.append("full_name", $("full-name").value.trim());
+        form.append("password", $("password").value);
+        form.append("role", $("role").value);
+        form.append("phone", $("phone").value || "");
+        form.append("email", $("email").value || "");
+        form.append("work_details", $("work").value || "");
+        // Truthy by the server's own list, and a tick is the only thing that sets it.
+        form.append("consent", $("consent").checked ? "true" : "");
+        form.append("photo", camera.photo(), "photo.jpg");
+
+        if (camera) camera.arm(false);
+        $("status-line").textContent = Capture.t("register.sending");
+
+        fetch(API + "/register", { method: "POST", body: form })
+            .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
+            .then(function (res) {
+                $("status-line").textContent = "";
+                if (res.ok) {
+                    // The request exists now and nothing else does: the form goes away, so a
+                    // second tap cannot become a second request.
+                    disarm();
+                    sayKey("register.done", "ok");
+                    return;
+                }
+                sayRefusal(res.body && res.body.detail, "register.failed");
+                if (camera) camera.arm(true);
+            })
+            .catch(function () {
+                sayKey("register.uploadFailed", "err");
+                $("status-line").textContent = "";
+                if (camera) camera.arm(true);
+            });
+    }
+
+    function boot() {
+        Capture.applyDirection();
+        Capture.translate(document);
+        document.title = Capture.t("register.headTitle");
+        $("credit").textContent = Capture.credit();
+        Capture.wireLanguagePicker(function () {
+            document.title = Capture.t("register.headTitle");
+            $("credit").textContent = Capture.credit();
+            Capture.applyPolicy();
+            // The role names are words too, so the list is rebuilt in the new language.
+            if (policy) fillRoles(policy.roles || []);
+            // The message box is not a ``data-t`` node: a refusal written in the language it
+            // arrived in is the leak this closes.
+            resay();
+        });
+
+        camera = Capture.createCamera({
+            primary: "btn-submit",
+            family: "photo",
+            allow: function () { return open; },
+            onBlocked: function () { sayKey("camera.blocked.enroll", "err"); }
+        });
+
+        $("btn-start").addEventListener("click", function () { camera.start(); });
+        $("btn-shoot").addEventListener("click", function () { camera.shoot(); });
+        $("btn-retake").addEventListener("click", function () { camera.retake(); });
+        $("btn-submit").addEventListener("click", submit);
+        $("file").addEventListener("change", function (event) { camera.chooseFromInput(event.target); });
+
+        Capture.applyPolicy();
+        loadPolicy();
+    }
+
+    boot();
+})();

@@ -472,7 +472,7 @@ def test_the_edit_form_is_the_account_read_back_from_the_server(results):
     assert form["name"] == "Ana Torrez" and form["email"] == "ana@example.test"
     assert form["rate"] == "9.5", "the hourly rate is not on the roster, so it comes from here"
     assert form["role_shown"] == "moallem"
-    assert form["role_editable"] is False, "a role is fixed by the id block"
+    assert form["role_editable"] is False, "the role is chosen when the account is created"
     assert form["transit_present"] is True, "the grant is offered on the account's own form"
     assert form["transit_checked"] is False, "a fresh account does not hold the privilege"
     assert form["explains_id"] is True, "the form says why instead of showing a dead field"

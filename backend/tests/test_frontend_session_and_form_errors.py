@@ -211,7 +211,7 @@ function overlays(env) {
 {
     const env = envWithSession('head_admin');
     env.setResponder((url) => (url.indexOf('/admin/users/create') >= 0
-        ? { status: 409, body: { detail: 'User ID already exists.' } }
+        ? { status: 400, body: { detail: 'User ID already exists.' } }
         : { status: 200, body: url.indexOf('/admin/users') >= 0 ? [] : {} }));
     await env.evaluate("UI.renderAdminTab('Credentials')");
     await env.evaluate("UI_MODULES.openCredentialsMode('create')");

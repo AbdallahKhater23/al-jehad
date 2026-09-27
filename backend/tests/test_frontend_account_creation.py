@@ -23,7 +23,9 @@ So this suite drives the real ``admin_modules.js``:
 6. issuing a link posts an account id and *nothing else* - no name, no role, no contact
    details, because all of those belong to the account - and the answer is offered as a
    copyable URL, a WhatsApp message and a QR code;
-7. a server refusal (an id already taken) is reported as the reason, not as a success.
+7. a server refusal (an id already taken) is reported as the reason, not as a success - and
+   answered, because that one refusal is about a number: the form offers the next free id and
+   takes it in one tap.
 
 Node is optional; without it these skip rather than fail.
 """
@@ -31,10 +33,16 @@ Node is optional; without it these skip rather than fail.
 from __future__ import annotations
 
 import html as html_module
+import re
+from pathlib import Path
 
 import pytest
 
 import frontend_vm
+
+#: The console mirrors the server's taken-id sentence verbatim, so the two files are read
+#: together in the test below.
+BACKEND = Path(__file__).resolve().parents[1]
 
 pytestmark = pytest.mark.skipif(frontend_vm.NODE is None, reason="node is not installed")
 
@@ -57,6 +65,10 @@ const ROSTER = [ACTOR, OPERATOR];
 
 const createCalls = [];
 const inviteCalls = [];
+//: Ids the roster already carries, as the server's unique index would answer: 400, with the
+//: sentence ``/admin/users/create`` raises. The status matters as much as the text - the
+//: console has to be reacting to the refusal the server actually sends.
+const takenIds = [];
 let createFail = false;
 let inviteFail = false;
 
@@ -66,7 +78,10 @@ function responders(url, init) {
     if (url.indexOf('/admin/users/create') >= 0) {
         const body = (init && init.body) || null;
         createCalls.push({ url: String(url), method: (init && init.method) || 'GET', body: body, headers: (init && init.headers) || {} });
-        if (createFail) return { status: 409, body: { detail: 'User ID already exists.' } };
+        const wanted = body && body.get ? String(body.get('user_id')) : '';
+        if (createFail || takenIds.indexOf(wanted) >= 0) {
+            return { status: 400, body: { detail: 'User ID already exists.' } };
+        }
         return {
             status: 200,
             body: {
@@ -132,6 +147,7 @@ function consoleEnv(role) {
     // account" true only for whichever scenario ran first.
     createCalls.length = 0;
     inviteCalls.length = 0;
+    takenIds.length = 0;
     const env = boot();
     env.setResponder(responders);
     env.evaluate('State.saveUser(' + JSON.stringify({
@@ -469,6 +485,46 @@ const results = {};
     };
 }
 
+// 6c. a taken id comes back with a free one beside it, and one tap takes it
+{
+    const env = consoleEnv('head_admin');
+    await openCreate(env);
+    // 1000 is the standard admin on the roster: taken, and the walk starts above it.
+    takenIds.push('1000');
+    await fill(env, { credentialsNewId: '1000', credentialsNewName: 'Clashing Admin' });
+    const before = createCalls.length;
+    await env.evaluate("UI_MODULES.createCredentialsAccount()");
+    const markup = render(env);
+    results.id_taken = {
+        asked: createCalls.length - before,
+        server_said: env.evaluate('UI_MODULES.TAKEN_ID_REFUSAL'),
+        toast: toasts(env).slice(-1)[0],
+        note: attr(markup, 'data-id-taken="([^"]*)"'),
+        offers: attr(markup, 'data-use-free-id="([^"]*)"'),
+        highlighted: /id="credentialsNewId"[^>]*class="[^"]*is-danger/.test(markup),
+        // The sentence beside the field, with this id in it - the value the reader needs.
+        said: markup.indexOf(
+            env.evaluate("I18n.__('credentialsIdTaken')").replace('{id}', '1000')
+        ) >= 0,
+        // Nothing was created, and no password was revealed for an account that is not there.
+        created_panel: markup.indexOf('data-account-created') >= 0
+    };
+
+    // One tap: the field carries the free number, the refusal goes away with it, and the
+    // retry is a create rather than the same refusal again.
+    await env.evaluate('UI_MODULES.useSuggestedCredentialsId()');
+    const adoptedMarkup = render(env);
+    const sent = createCalls.length;
+    await env.evaluate('UI_MODULES.createCredentialsAccount()');
+    results.id_adopted = {
+        field: inputValue(adoptedMarkup, 'credentialsNewId'),
+        note_gone: adoptedMarkup.indexOf('data-id-taken') < 0,
+        still_highlighted: /id="credentialsNewId"[^>]*class="[^"]*is-danger/.test(adoptedMarkup),
+        created: createCalls.length - sent,
+        panel_for: attr(render(env), 'data-account-created="([^"]*)"')
+    };
+}
+
 // 7. the link needs an id and nothing else; without one nothing is sent
 {
     const env = consoleEnv('head_admin');
@@ -618,20 +674,89 @@ def test_a_refused_creation_is_reported_as_the_reason(results):
     assert "already exists" in refused["toast"]
 
 
-def test_an_id_outside_the_role_block_never_leaves_the_browser(results):
-    refused = results["range_refused"]
+def test_a_taken_id_comes_back_with_a_free_one_beside_it(results):
+    """The one refusal the form can answer itself, so it answers it.
+
+    An id already on the roster is the single 400 this endpoint returns that the console has
+    the answer to: the roster it is already holding says which numbers are free. The admin
+    still reads the server's sentence, and the fix is offered beside the box that has to
+    change rather than applied behind their back.
+    """
+    taken = results["id_taken"]
+    assert taken["asked"] == 1, "the server is still the authority on which ids are free"
+    assert taken["toast"] == taken["server_said"], "the admin reads the server's own sentence"
+    assert taken["note"] == "1000", "the note names the id that was refused"
+    assert taken["said"] is True, "and it says so in the reader's language, with the id in it"
+    assert taken["highlighted"] is True, "the box that has to change is pointed at"
+    assert taken["offers"] == "1001", "the next free number, out of the roster the panel holds"
+    assert taken["created_panel"] is False, "and no account was created"
+
+
+def test_the_suggested_id_is_taken_in_one_tap(results):
+    adopted = results["id_adopted"]
+    assert adopted["field"] == "1001", "one tap fills the id box"
+    assert adopted["note_gone"] is True, "the refusal was about an id that is no longer there"
+    assert adopted["still_highlighted"] is False, "so the highlight goes with it"
+    assert adopted["created"] == 1, "and the next click is a create"
+    assert adopted["panel_for"] == "1001", "for the account the form now names"
+
+
+def test_the_console_looks_for_the_sentence_the_server_actually_raises(results):
+    """The one thing here identified by its text, so both sides are pinned to each other.
+
+    ``/admin/users/create`` answers a duplicate id with a plain string and no error code, so
+    the sentence is the only thing there is to recognise the refusal by. That is the whole
+    risk in the feature: reword the server's answer and the form silently goes back to a
+    toast with no way out - which is why the string is read out of ``main.py`` here instead
+    of being asserted against a copy in this file.
+    """
+    server = (BACKEND / "main.py").read_text(encoding="utf-8")
+    # The endpoint that form posts to, and nothing else: the same duplicate-key shape is used
+    # for a site name and a category name, and those sentences are not this one.
+    route = server.index('@router.post("/admin/users/create")')
+    endpoint = server[route:server.index("@router.", route + 10)]
+    raised = set(
+        re.findall(
+            r'except sqlite3\.IntegrityError:\s*\n\s*raise HTTPException\(\s*'
+            r'status_code=400,\s*detail="([^"]*)"',
+            endpoint,
+        )
+    )
+    assert raised, "the create endpoint no longer refuses a duplicate id as a plain sentence"
+    assert raised == {results["id_taken"]["server_said"]}, (
+        f"the console looks for {results['id_taken']['server_said']!r} and the server answers "
+        f"{sorted(raised)}: the form would stop offering a free id"
+    )
+
+
+def test_an_id_that_is_not_a_whole_number_never_leaves_the_browser(results):
+    refused = results["id_refused"]
     assert refused["called"] == 0
-    assert "1-499" in refused["toast"]
+    assert refused["toast"] == refused["said"], (
+        "the refusal names the rule the server would have named"
+    )
     assert refused["panel"] is False
+
+
+def test_an_id_the_old_per_role_block_refused_is_created_anyway(results):
+    """The blocks are gone, and the form must not be the last place still enforcing them.
+
+    ``900`` is a worker in this scenario. The deleted blocks handed 750-999 to off-office
+    workers, so the console refused this id without asking, for a rule the server no longer
+    has; whether 900 is a free number is the server's answer, and the round trip happens.
+    """
+    sent = results["old_block_id"]
+    assert sent["called"] == 1, "the server is the authority on which ids it accepts"
+    assert sent["sent"] == "900"
+    assert sent["role"] == "worker"
 
 
 def test_the_form_keeps_what_was_typed_when_the_role_changes(results):
     draft = results["draft"]
     assert draft["keeps_id"] is True, "repainting must not empty a form the admin is filling in"
     assert draft["keeps_name"] is True
-    assert draft["role"] == "moallem"
-    assert draft["range_shown"] is True
-    assert draft["selected"] is True
+    assert draft["selected"] is True, "the role select follows the change"
+    assert draft["note_unchanged"] is True, "the id rule does not depend on the role"
 
 
 def test_the_new_account_password_can_be_typed_instead_of_generated(results):

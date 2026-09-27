@@ -139,7 +139,37 @@
             "enroll.unusable": "This link can no longer be used. Ask your administrator for a new one.",
             "enroll.retired": "This kind of link is not issued any more: it used to create the account itself. Ask your administrator to create your account, then to send you an enrollment link.",
             "enroll.uploadFailed": "Upload failed. Check your connection and try again.",
-            "enroll.fallback": "Camera not available? Tap here to use the phone's gallery instead"
+            "enroll.fallback": "Camera not available? Tap here to use the phone's gallery instead",
+
+            "register.title": "Register for an account",
+            "register.headTitle": "Register for an account — Site Attendance",
+            "register.sub": "Applying to work here? Send this and an administrator will review it.",
+            "register.intro": "An administrator reads every request. Filling this in creates no account, no shift and no pay by itself: nothing you send here commits you to anything. Your photograph and your details are kept only so that a person can decide.",
+            "register.name.placeholder": "Full name",
+            "register.password.placeholder": "Choose a password",
+            "register.password2.placeholder": "Repeat the password",
+            "register.phone.placeholder": "Phone (optional)",
+            "register.email.placeholder": "Email (optional)",
+            "register.work.placeholder": "What work will you do? (optional)",
+            "register.role.label": "Role",
+            "register.consent": "I agree to my photograph and my details being kept so that an administrator can review this request.",
+            "register.submit": "Send my request",
+            "register.sending": "Sending your request…",
+            "register.fallback": "Camera not available? Tap here to use the phone's gallery instead",
+            "register.done": "Your request has been received. An administrator will review it and tell you how to sign in once it is approved.",
+            "register.nameRequired": "Your full name is needed.",
+            "register.passwordShort": "The password needs at least {n} characters.",
+            "register.passwordMismatch": "The two passwords do not match.",
+            "register.closed": "Registration is closed at the moment. Ask your site administrator to open it.",
+            "register.roleNotAvailable": "This link cannot register an administrator. An administrator account is created by an administrator.",
+            "register.consentRequired": "Please read and tick the consent line before sending.",
+            "register.queueFull": "There are too many requests waiting for review. Try again later.",
+            "register.duplicate": "This photograph has already been sent and is waiting for review. You do not need to send it again.",
+            "register.failed": "The request was refused.",
+            "register.uploadFailed": "Your request did not reach the server. Check your connection and try again.",
+            "role.worker": "Worker",
+            "role.moallem": "Lead worker",
+            "role.off_office": "Off-office worker"
         },
 
         ar: {
@@ -219,7 +249,37 @@
             "enroll.unusable": "لم يعد هذا الرابط صالحًا. اطلب من مديرك رابطاً جديداً.",
             "enroll.retired": "هذا النوع من الروابط لم يعد يُصدر: كان ينشئ الحساب بنفسه. اطلب من مديرك إنشاء حسابك ثم إرسال رابط تسجيل صورتك.",
             "enroll.uploadFailed": "فشل الإرسال. تحقّق من اتصالك وحاول مرة أخرى.",
-            "enroll.fallback": "الكاميرا غير متاحة؟ اضغط هنا لاستخدام معرض الصور في هاتفك بدلاً منها"
+            "enroll.fallback": "الكاميرا غير متاحة؟ اضغط هنا لاستخدام معرض الصور في هاتفك بدلاً منها",
+
+            "register.title": "سجّل للحصول على حساب",
+            "register.headTitle": "سجّل للحصول على حساب — نظام حضور الموقع",
+            "register.sub": "تتقدّم للعمل هنا؟ أرسل هذا وسيراجعه المدير.",
+            "register.intro": "المدير يقرأ كل طلب. تعبئة هذا النموذج لا تنشئ حساباً ولا وردية ولا راتباً بحد ذاتها: لا شيء ترسله هنا يُلزمك بشيء. نحفظ صورتك وبياناتك فقط ليقرّر شخص ما.",
+            "register.name.placeholder": "الاسم الكامل",
+            "register.password.placeholder": "اختر كلمة مرور",
+            "register.password2.placeholder": "أعد كتابة كلمة المرور",
+            "register.phone.placeholder": "الهاتف (اختياري)",
+            "register.email.placeholder": "البريد الإلكتروني (اختياري)",
+            "register.work.placeholder": "ما نوع العمل الذي ستقوم به؟ (اختياري)",
+            "register.role.label": "الصلاحية",
+            "register.consent": "أوافق على حفظ صورتي وبياناتي ليراجع المدير هذا الطلب.",
+            "register.submit": "أرسل طلبي",
+            "register.sending": "جارٍ إرسال طلبك…",
+            "register.fallback": "الكاميرا غير متاحة؟ اضغط هنا لاستخدام معرض الصور في هاتفك بدلاً منها",
+            "register.done": "تم استلام طلبك. سيراجعه المدير ويخبرك كيف تسجّل الدخول بعد الموافقة.",
+            "register.nameRequired": "الاسم الكامل مطلوب.",
+            "register.passwordShort": "كلمة المرور تحتاج {n} حرفاً على الأقل.",
+            "register.passwordMismatch": "كلمتا المرور غير متطابقتين.",
+            "register.closed": "التسجيل مغلق حالياً. اطلب من مدير موقعك فتحه.",
+            "register.roleNotAvailable": "هذا الرابط لا يمكنه تسجيل حساب مدير. حساب المدير ينشئه مدير.",
+            "register.consentRequired": "اقرأ سطر الموافقة وحدّده قبل الإرسال.",
+            "register.queueFull": "هناك طلبات كثيرة في انتظار المراجعة. حاول لاحقاً.",
+            "register.duplicate": "هذه الصورة أُرسلت من قبل وتنتظر المراجعة. لا حاجة لإرسالها مرة أخرى.",
+            "register.failed": "تم رفض الطلب.",
+            "register.uploadFailed": "لم يصل طلبك إلى الخادم. تحقّق من اتصالك وحاول مرة أخرى.",
+            "role.worker": "عامل",
+            "role.moallem": "معلم",
+            "role.off_office": "عامل خارج الموقع"
         },
 
         hi: {
@@ -299,7 +359,37 @@
             "enroll.unusable": "यह लिंक अब काम नहीं करता। अपने एडमिन से नया लिंक मांगें।",
             "enroll.retired": "इस तरह का लिंक अब जारी नहीं होता: यह खाता खुद बना दिया करता था। अपने एडमिन से खाता बनवाएँ, फिर अपनी फ़ोटो रजिस्टर करने का लिंक माँगें।",
             "enroll.uploadFailed": "भेजना नहीं हुआ। कनेक्शन देखें और दोबारा कोशिश करें।",
-            "enroll.fallback": "कैमरा नहीं चल रहा? यहाँ दबाकर अपने फ़ोन की गैलरी इस्तेमाल करें"
+            "enroll.fallback": "कैमरा नहीं चल रहा? यहाँ दबाकर अपने फ़ोन की गैलरी इस्तेमाल करें",
+
+            "register.title": "खाते के लिए रजिस्टर करें",
+            "register.headTitle": "खाते के लिए रजिस्टर करें — साइट उपस्थिति",
+            "register.sub": "यहाँ काम के लिए आवेदन कर रहे हैं? यह भेजें और एडमिन इसकी समीक्षा करेगा।",
+            "register.intro": "हर अनुरोध एडमिन पढ़ता है। इसे भरने से अपने आप कोई खाता, कोई शिफ़्ट और कोई वेतन नहीं बनता: यहाँ भेजी कोई बात आपको किसी चीज़ के लिए बाध्य नहीं करती। आपकी फ़ोटो और जानकारी सिर्फ़ इसलिए रखी जाती है कि कोई व्यक्ति निर्णय ले सके।",
+            "register.name.placeholder": "पूरा नाम",
+            "register.password.placeholder": "पासवर्ड चुनें",
+            "register.password2.placeholder": "पासवर्ड दोबारा लिखें",
+            "register.phone.placeholder": "फ़ोन (वैकल्पिक)",
+            "register.email.placeholder": "ईमेल (वैकल्पिक)",
+            "register.work.placeholder": "आप कौन-सा काम करेंगे? (वैकल्पिक)",
+            "register.role.label": "भूमिका",
+            "register.consent": "मैं सहमत हूँ कि मेरी फ़ोटो और जानकारी इस अनुरोध की समीक्षा के लिए रखी जाए।",
+            "register.submit": "मेरा अनुरोध भेजें",
+            "register.sending": "आपका अनुरोध भेजा जा रहा है…",
+            "register.fallback": "कैमरा नहीं चल रहा? यहाँ दबाकर अपने फ़ोन की गैलरी इस्तेमाल करें",
+            "register.done": "आपका अनुरोध मिल गया है। एडमिन इसकी समीक्षा करेगा और मंज़ूरी के बाद बताएगा कि साइन इन कैसे करें।",
+            "register.nameRequired": "आपका पूरा नाम चाहिए।",
+            "register.passwordShort": "पासवर्ड में कम से कम {n} अक्षर चाहिए।",
+            "register.passwordMismatch": "दोनों पासवर्ड एक जैसे नहीं हैं।",
+            "register.closed": "इस समय रजिस्ट्रेशन बंद है। अपने साइट एडमिन से इसे खोलने को कहें।",
+            "register.roleNotAvailable": "यह लिंक एडमिन का खाता नहीं बना सकता। एडमिन का खाता एडमिन बनाता है।",
+            "register.consentRequired": "भेजने से पहले सहमति की पंक्ति पढ़ें और उस पर टिक करें।",
+            "register.queueFull": "समीक्षा के लिए बहुत सारे अनुरोध लंबित हैं। बाद में कोशिश करें।",
+            "register.duplicate": "यह फ़ोटो पहले ही भेजी जा चुकी है और समीक्षा में है। इसे दोबारा भेजने की ज़रूरत नहीं।",
+            "register.failed": "अनुरोध अस्वीकार हुआ।",
+            "register.uploadFailed": "आपका अनुरोध सर्वर तक नहीं पहुँचा। कनेक्शन जाँचकर दोबारा कोशिश करें।",
+            "role.worker": "वर्कर",
+            "role.moallem": "मोअल्लेम",
+            "role.off_office": "ऑफ़-ऑफ़िस वर्कर"
         },
         ur: {
             "credit": "{brand} کے تعاون سے",
@@ -378,7 +468,37 @@
             "enroll.unusable": "یہ لنک اب کام نہیں کرتا۔ اپنے ایڈمنسٹریٹر سے نیا مانگیں۔",
             "enroll.retired": "اس قسم کا لنک اب جاری نہیں ہوتا: یہ اکاؤنٹ خود بنا دیا کرتا تھا۔ اپنے ایڈمنسٹریٹر سے اکاؤنٹ بنوائیں، پھر تصویر رجسٹر کرنے کا لنک مانگیں۔",
             "enroll.uploadFailed": "اپ لوڈ ناکام ہو گیا۔ کنکشن دیکھیں اور دوبارہ کوشش کریں۔",
-            "enroll.fallback": "کیمرہ نہیں چل رہا؟ یہاں دبا کر اپنے فون کی گیلری استعمال کریں"
+            "enroll.fallback": "کیمرہ نہیں چل رہا؟ یہاں دبا کر اپنے فون کی گیلری استعمال کریں",
+
+            "register.title": "اکاؤنٹ کے لیے رجسٹر کریں",
+            "register.headTitle": "اکاؤنٹ کے لیے رجسٹر کریں — سائٹ حاضری",
+            "register.sub": "یہاں کام کے لیے درخواست دے رہے ہیں؟ یہ بھیجیں، ایڈمنسٹریٹر اس کا جائزہ لے گا۔",
+            "register.intro": "ہر درخواست ایڈمنسٹریٹر پڑھتا ہے۔ اسے بھرنے سے خود بخود کوئی اکاؤنٹ، کوئی شفٹ اور کوئی تنخواہ نہیں بنتی: یہاں بھیجی گئی کوئی بات آپ کو کسی چیز کا پابند نہیں کرتی۔ آپ کی تصویر اور تفصیلات صرف اس لیے رکھی جاتی ہیں کہ کوئی شخص فیصلہ کر سکے۔",
+            "register.name.placeholder": "پورا نام",
+            "register.password.placeholder": "پاس ورڈ منتخب کریں",
+            "register.password2.placeholder": "پاس ورڈ دوبارہ لکھیں",
+            "register.phone.placeholder": "فون (اختیاری)",
+            "register.email.placeholder": "ای میل (اختیاری)",
+            "register.work.placeholder": "آپ کون سا کام کریں گے؟ (اختیاری)",
+            "register.role.label": "کردار",
+            "register.consent": "میں رضامند ہوں کہ میری تصویر اور تفصیلات اس درخواست کے جائزے کے لیے رکھی جائیں۔",
+            "register.submit": "میری درخواست بھیجیں",
+            "register.sending": "آپ کی درخواست بھیجی جا رہی ہے…",
+            "register.fallback": "کیمرہ نہیں چل رہا؟ یہاں دبا کر اپنے فون کی گیلری استعمال کریں",
+            "register.done": "آپ کی درخواست موصول ہو گئی ہے۔ ایڈمنسٹریٹر اس کا جائزہ لے گا اور منظوری کے بعد بتائے گا کہ سائن اِن کیسے کرنا ہے۔",
+            "register.nameRequired": "آپ کا پورا نام درکار ہے۔",
+            "register.passwordShort": "پاس ورڈ میں کم از کم {n} حروف چاہیے۔",
+            "register.passwordMismatch": "دونوں پاس ورڈ ایک جیسے نہیں ہیں۔",
+            "register.closed": "اس وقت رجسٹریشن بند ہے۔ اپنے سائٹ ایڈمنسٹریٹر سے اسے کھلوانے کو کہیں۔",
+            "register.roleNotAvailable": "یہ لنک ایڈمنسٹریٹر کا اکاؤنٹ نہیں بنا سکتا۔ ایڈمنسٹریٹر کا اکاؤنٹ ایڈمنسٹریٹر بناتا ہے۔",
+            "register.consentRequired": "بھیجنے سے پہلے رضامندی کی سطر پڑھ کر اس پر نشان لگائیں۔",
+            "register.queueFull": "جائزے کے لیے بہت سی درخواستیں زیرِ التوا ہیں۔ بعد میں کوشش کریں۔",
+            "register.duplicate": "یہ تصویر پہلے بھیجی جا چکی ہے اور جائزے میں ہے۔ اسے دوبارہ بھیجنے کی ضرورت نہیں۔",
+            "register.failed": "درخواست مسترد ہوئی۔",
+            "register.uploadFailed": "آپ کی درخواست سرور تک نہیں پہنچی۔ کنکشن چیک کر کے دوبارہ کوشش کریں۔",
+            "role.worker": "ورکر",
+            "role.moallem": "لیڈ ورکر",
+            "role.off_office": "آف افس ورکر"
         }
     };
 
@@ -415,6 +535,19 @@
     //: one list here serves both pages and neither has to invent a mapping of its own.
     var REFUSALS = ["revoked", "expired", "used_up"];
 
+    //: The registration intake's own reasons, by the ``error_code`` the server sends. A second
+    //: list rather than more entries in the one above because they answer a different
+    //: question - a link that is dead, against a request that was refused for something the
+    //: applicant can fix (a missing tick, a password that is too short) or cannot (the queue
+    //: is full, registration is switched off).
+    var REGISTRATION_REFUSALS = {
+        registration_closed: "register.closed",
+        role_not_available: "register.roleNotAvailable",
+        consent_required: "register.consentRequired",
+        registration_queue_full: "register.queueFull",
+        registration_duplicate: "register.duplicate"
+    };
+
     /** The reason inside a refusal: ``link_expired`` and ``expired`` mean the same thing. */
     function refusalToken(detail) {
         if (!detail || typeof detail !== "object") return "";
@@ -434,7 +567,8 @@
     function serverMessage(detail, fallbackKey) {
         var token = refusalToken(detail);
         var key = REFUSALS.indexOf(token) >= 0 ? "refuse." + token
-            : (token === "unknown" ? "link.invalid" : "");
+            : (token === "unknown" ? "link.invalid"
+                : (REGISTRATION_REFUSALS[token] || ""));
         var code = detail && typeof detail === "object" ? detail.error_code || "" : "";
         if (key && has(key)) return code ? t(key) + " (" + code + ")" : t(key);
         if (detail && typeof detail === "object" && detail.message) return detail.message;

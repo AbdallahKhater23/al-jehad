@@ -23,7 +23,8 @@ use forged frames as a CPU exhaustion vector.
 FAILURE POLICY (the part that decides whether this is safe to ship)
 -------------------------------------------------------------------
 Every failure to *evaluate* is reported as ``available=False`` with a reason -
-never as "live". ``settings.liveness_mode`` then decides what that means:
+never as "live". ``settings.liveness_mode`` then decides what that means, unless the root
+tier has moved it at runtime (``runtime_override``, below):
 
 * ``off``       - not called at all.
 * ``advisory``  - the verdict is recorded and notified, the punch proceeds. This is
@@ -73,6 +74,11 @@ log = logging.getLogger("attendance.liveness")
 MODE_OFF = "off"
 MODE_ADVISORY = "advisory"
 MODE_ENFORCE = "enforce"
+
+#: Every mode this module will honour, in one place. ``mode()`` refuses anything else, and
+#: ``developer`` names its runtime override from the same three - restated there rather than
+#: imported, because the override is read *by* this module and the import would be a cycle.
+MODES: tuple[str, ...] = (MODE_OFF, MODE_ADVISORY, MODE_ENFORCE)
 
 VERDICT_LIVE = "live"
 VERDICT_SPOOF = "spoof"
@@ -334,7 +340,13 @@ def status() -> dict:
         except Exception:  # pragma: no cover - exotic runtime
             inputs = []
     return {
-        "mode": settings.liveness_mode,
+        # The *effective* mode, and then the two things it came from. An operator reading a
+        # panel during an incident has to be able to see both: "enforce, overridden to
+        # advisory" and "advisory, as configured" call for very different next steps, and a
+        # single field that folded them together could not tell them apart.
+        "mode": mode(),
+        "configured_mode": settings.liveness_mode,
+        "override": runtime_override(),
         "available": available,
         "model_path": str(settings.liveness_model_path),
         "model_fingerprint": _MODEL_FINGERPRINT,
@@ -486,9 +498,46 @@ def check_liveness(image_rgb: np.ndarray, *, size: int | None = None) -> Livenes
 # ---------------------------------------------------------------------------
 # policy
 # ---------------------------------------------------------------------------
+def runtime_override() -> str | None:
+    """The root tier's runtime override of the mode, or ``None`` when the setting decides.
+
+    WHY THIS MODULE READS ANOTHER MODULE'S STORE
+    --------------------------------------------
+    The mode is a *policy* decision, and the root tier keeps the policy it has changed
+    (``developer_config.liveness_mode_override``, written through
+    ``POST /developer/ml/liveness-mode``). Reading it here, rather than at the punch path that
+    wants a laxer mode for an hour, is what makes the override mean one thing to every caller:
+    the gate that decides a punch, the startup readiness verdict, and the mode this module
+    reports. Applied at the call site instead, readiness would still be reporting ``enforce``
+    - and, with no model, refusing to serve - while every punch in fact ran in ``advisory``.
+
+    Imported lazily, and every failure is ``None``: ``developer`` is a much larger module
+    (it imports the database layer, the security layer and the frame store), and a build
+    without the root tier, or a store that cannot be read, must fall back to the configured
+    mode exactly as this module behaved before the override existed.
+    """
+    try:
+        import developer
+
+        value = str(developer.liveness_override() or "").strip().lower()
+    except Exception:  # noqa: BLE001 - see the last paragraph above
+        return None
+    return value if value in MODES else None
+
+
 def mode() -> str:
+    """The mode in force: the root tier's runtime override, else ``LIVENESS_MODE``.
+
+    Reads the store on every call - one small SELECT through the same version-checked cache
+    ``developer.maintenance_mode`` reads through, on the same request paths. That cost is what
+    the override being *distributed* buys: the flag an operator flips at 07:00 reaches every
+    worker on its next read, rather than only the one that happened to serve the call.
+    """
+    override = runtime_override()
+    if override is not None:
+        return override
     value = (settings.liveness_mode or MODE_ADVISORY).lower()
-    return value if value in {MODE_OFF, MODE_ADVISORY, MODE_ENFORCE} else MODE_ADVISORY
+    return value if value in MODES else MODE_ADVISORY
 
 
 def gate(result: LivenessResult, *, mode_override: str | None = None) -> GateDecision:

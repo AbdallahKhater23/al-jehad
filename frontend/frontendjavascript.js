@@ -147,6 +147,10 @@ const State = {
     // selection that lived only in the markup would be lost on the next repaint.
     shiftsQuery: '',
     shiftsCategory: '',
+    //: How many walk-up applications are waiting on a decision. Read when the console paints
+    //: and when the tab is returned to, like the crossings count beside it - an applicant is
+    //: hired by *somebody else's* console as often as by this one.
+    registrationsWaiting: 0,
     theme: localStorage.getItem('theme') || 'light',
 
     toggleTheme() {
@@ -839,9 +843,17 @@ const ADMIN_ICONS = {
     sites: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 21s7-5.7 7-11a7 7 0 1 0-14 0c0 5.3 7 11 7 11Z"></path><circle cx="12" cy="10" r="2.5"></circle></svg>',
     shifts: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2"></rect><path d="M8 3v4M16 3v4M3 11h18"></path></svg>',
     credentials: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="15" r="4"></circle><path d="m11 12 8-8M17 6l2 2M15 8l2 2"></path></svg>',
+    //  A tray with something going into it: applications arriving, waiting to be read. Not
+    //  the check-circle (that is Approvals, and it means "decided") and not the key (that is
+    //  Credentials, and it means "access already given") - this is the pile before either.
+    registrations: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 13h4l1.5 3h7L17 13h4"></path><path d="M5.5 5h13l2.5 8v6H3v-6l2.5-8Z"></path><path d="M12 3.5v5"></path><path d="m10 6.5 2 2 2-2"></path></svg>',
     links: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.5 13.5a4.5 4.5 0 0 0 6.4 0l2.6-2.6a4.5 4.5 0 0 0-6.4-6.4l-1 1"></path><path d="M13.5 10.5a4.5 4.5 0 0 0-6.4 0l-2.6 2.6a4.5 4.5 0 0 0 6.4 6.4l1-1"></path></svg>',
     notes: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a8 8 0 0 1-8 8H8l-5 3 1.4-4.3A8 8 0 1 1 21 12Z"></path></svg>',
     admin: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h8M16 6h4M4 12h4M12 12h8M4 18h8M16 18h4"></path><circle cx="14" cy="6" r="2"></circle><circle cx="10" cy="12" r="2"></circle><circle cx="14" cy="18" r="2"></circle></svg>',
+    // The root tier's own glyph: angle brackets, the marks every developer reads. Deliberately
+    // not the admin sliders - the Developer tab is a different audience from the Admin one,
+    // and two tabs wearing one glyph read as one tab twice.
+    developer: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m8 7-5 5 5 5"></path><path d="m16 7 5 5-5 5"></path><path d="m13.5 5-3 14"></path></svg>',
     info: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="M12 11v5"></path><path d="M12 8h.01"></path></svg>',
     alert: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.3 4.3 2.6 17.5A2 2 0 0 0 4.3 20.5h15.4a2 2 0 0 0 1.7-3L13.7 4.3a2 2 0 0 0-3.4 0Z"></path><path d="M12 9v4"></path><path d="M12 16.5h.01"></path></svg>',
     // A bell rather than the triangle: the triangle is the "late" badge on the shift board,
@@ -1070,6 +1082,19 @@ const ADMIN_TABS = [
     // tab, whose single action was capturing an enrollment photo. Accounts, access and
     // passwords belong on one screen, so they are one tab now.
     { id: 'Credentials', key: 'credentials', hint: 'hintCredentials', group: 'navGroupPeople', icon: 'credentials' },
+    //  The walk-up queue: people who filled in the public form and are waiting to be
+    //  hired, each with a photograph and no account yet.
+    //
+    //  It sits immediately after Credentials because the account an approval creates is
+    //  read there, and because the two are the same act from two directions: Credentials
+    //  creates an account for somebody standing in front of you, this hires somebody who
+    //  submitted a face to a link. The id the approval minted is shown on the row, which
+    //  is the one number an administrator needs next - it is what the worker signs in
+    //  with, and what the roster and the gate know them by.
+    //
+    //  Offered to every console role (no ``rootOnly``): the route behind it is
+    //  ``admin_only``, so a site administrator is exactly who it is for.
+    { id: 'Registrations', key: 'registrations', hint: 'hintRegistrations', group: 'navGroupPeople', icon: 'registrations' },
     // Quick clock links: a link that clocks one named worker in and out with no password.
     // Sits beside Credentials because both tabs answer "how does this person get access",
     // and this is the answer that hands somebody a credential rather than a password.
@@ -1084,7 +1109,7 @@ const ADMIN_TABS = [
     // for the same reason the alert queue above is: none of it is a site
     // administrator's to read or act on, and every route behind it refuses
     // one. It is drawn last because it is the tab an operator opens least.
-    { id: 'Developer', key: 'developerConsole', hint: 'hintDeveloperConsole', group: 'navGroupConfig', icon: 'sliders', rootOnly: true }
+    { id: 'Developer', key: 'developerConsole', hint: 'hintDeveloperConsole', group: 'navGroupConfig', icon: 'developer', rootOnly: true }
 ];
 
 //: How the rail is grouped, in the order the rail shows them. Operations first
@@ -1297,17 +1322,19 @@ const UI = {
         this._unreadResyncBound = true;
         if (typeof window !== 'undefined' && window.addEventListener) {
             window.addEventListener('focus', () => this.resyncUnreadBadge());
-            // The same return-to-tab moments, for the console's crossings badge: a crossing
-            // answered from another admin's console is invisible to this one until it is
-            // re-asked, and "Approvals 3" pointing at a queue somebody already emptied is a
-            // badge that trains nobody to read it.
+            // The same return-to-tab moments, for the console's two queue badges: a crossing
+            // answered or an applicant hired from another admin's console is invisible to this
+            // one until it is re-asked, and "Approvals 3" pointing at a queue somebody already
+            // emptied is a badge that trains nobody to read it.
             window.addEventListener('focus', () => this.refreshApprovalsBadge());
+            window.addEventListener('focus', () => this.refreshRegistrationsBadge());
         }
         if (typeof document !== 'undefined' && document.addEventListener) {
             document.addEventListener('visibilitychange', () => {
                 if (document.visibilityState !== 'hidden') {
                     this.resyncUnreadBadge();
                     this.refreshApprovalsBadge();
+                    this.refreshRegistrationsBadge();
                 }
             });
         }
@@ -2828,6 +2855,7 @@ const UI = {
         if (Device.isMobile) this.renderAdminMobile();
         else this.renderAdminDesktop();
         this.refreshApprovalsBadge();
+        this.refreshRegistrationsBadge();
         return this.renderAdminTab(State.adminTab);
     },
 
@@ -2893,6 +2921,74 @@ const UI = {
                 badge.textContent = count > 99 ? '99+' : String(count);
                 badge.setAttribute('data-crossings-badge', String(count));
                 button.setAttribute('aria-label', `${I18n.__('pendingReviews')} - ${I18n.__('approvalsBadgeLabel')} ${count}`);
+            } else if (badge && typeof badge.remove === 'function') {
+                badge.remove();
+                button.removeAttribute('aria-label');
+            }
+        });
+    },
+
+    /**
+     * Read the pending-registration count and paint it on the Registrations tab.
+     *
+     * Asked with ``limit=1``: the queue's own endpoint already counts what is pending
+     * separately from the page it returns (a badge that said "3" because the page was
+     * truncated would be a badge that lies), so the count costs one request and no rows -
+     * there is no reason to make the badge fetch forty applications with photographs in
+     * front of them to paint a numeral.
+     *
+     * On the console only, and a failure is silence, for the reasons the crossings badge
+     * beside it gives: a worker's handset has no such tab and would be refused with 403, and
+     * a count that cannot be read is not worth replacing a screen that works.
+     */
+    async refreshRegistrationsBadge(force) {
+        const admin = !!State.user && !this.isHandsetRole(State.user.role);
+        if (!State.token || !admin) return;
+        if (typeof API === 'undefined' || !API.request) return;
+        const now = Date.now();
+        if (!force && now - this._registrationsResyncedAt < 1000) return;
+        this._registrationsResyncedAt = now;
+        try {
+            const data = await API.request('/admin/registrations?status=PENDING_REVIEW&limit=1');
+            State.registrationsWaiting = Math.max(0, Number(data && data.pending) || 0);
+        } catch (err) {
+            return; // keep the last painted count; the next return-to-tab retries
+        }
+        this.paintRegistrationsBadge();
+    },
+
+    //: The registrations badge's own throttle stamp, for the same reason the crossings one has
+    //: one: returning to the tab fires ``visibilitychange`` and ``focus``, which are two events
+    //: and must cost one request.
+    _registrationsResyncedAt: 0,
+
+    /**
+     * Repaint every Registrations tab button's badge in place.
+     *
+     * The same in-place repaint the crossings badge does, and for the same two reasons: the
+     * rail and the phone strip both draw the button and only one layout is up at a time, and a
+     * decision on the open tab must clear its own badge without rebuilding the nav under the
+     * operator's thumb. It also carries the one difference that screen needs - here the
+     * numeral is the *waiting* count, so deciding one drops it.
+     */
+    paintRegistrationsBadge() {
+        if (typeof document === 'undefined' || !document.querySelectorAll) return;
+        const count = Math.max(0, Number(State.registrationsWaiting) || 0);
+        document.querySelectorAll('[data-admin-tab="Registrations"]').forEach((button) => {
+            if (!button || typeof button.querySelector !== 'function') return;
+            let badge = null;
+            try { badge = button.querySelector('[data-registrations-badge]'); } catch (err) { badge = null; }
+            if (count > 0) {
+                if (!badge) {
+                    badge = document.createElement('span');
+                    badge.className = 'tab-count';
+                    badge.setAttribute('data-registrations-badge', 'true');
+                    badge.setAttribute('aria-hidden', 'true');
+                    if (typeof button.appendChild === 'function') button.appendChild(badge);
+                }
+                badge.textContent = count > 99 ? '99+' : String(count);
+                badge.setAttribute('data-registrations-badge', String(count));
+                button.setAttribute('aria-label', `${I18n.__('registrations')} - ${I18n.__('registrationsBadgeLabel')} ${count}`);
             } else if (badge && typeof badge.remove === 'function') {
                 badge.remove();
                 button.removeAttribute('aria-label');
@@ -3206,6 +3302,7 @@ const UI = {
                 case 'Alerts': await UI_MODULES.renderAlerts(content); break;
                 case 'Sites': await UI_MODULES.renderSites(content); break;
                 case 'Credentials': await UI_MODULES.renderCredentials(content); break;
+                case 'Registrations': await UI_MODULES.renderRegistrations(content); break;
                 case 'Links': await UI_MODULES.renderLinks(content); break;
                 case 'Notes': await UI_MODULES.renderNotes(content); break;
                 case 'Developer': await UI_MODULES.renderDeveloperConsole(content); break;
@@ -3253,8 +3350,10 @@ const UI = {
     forceInPanelHtml(sessions, users, sites) {
         const escapeHtml = UI_MODULES.escapeHtml.bind(UI_MODULES);
         const onShift = new Set((sessions || []).map((session) => String(session.worker_id)));
+        // The developer is a root tier, not a rota: never offered a forced shift, exactly
+        // as the head admin above it is not.
         const available = (users || []).filter((user) =>
-            user.role !== 'head_admin' &&
+            user.role !== 'head_admin' && user.role !== 'developer' &&
             UI_MODULES.mayActOnAccount(user) &&
             String(user.status || 'active').toLowerCase() === 'active' &&
             !onShift.has(String(user.id)));

@@ -202,14 +202,17 @@ def _require_liveness(image, *, stage: str) -> liveness.GateDecision:
 
     ``ENROLLMENT_LIVENESS_MODE=inherit`` (the default) means enrollment is never laxer
     than attendance, and an operator who installs the model can raise it to ``enforce``
-    without touching the attendance policy.
+    without touching the attendance policy. "Attendance" is ``liveness.mode()`` - the mode in
+    force, the root tier's runtime override included - rather than the setting beside it, so a
+    deployment running in an override does not leave enrolment checking against the mode it
+    was configured with.
 
     The model call is direct (not submitted) because every caller of this is either a
     face-engine job (``embed_reference``) or the bulk-import thread: the pool bounds the
     work at the entry point, and a job must not submit to its own engine.
     """
     configured = (settings.enrollment_liveness_mode or "inherit").lower()
-    mode = settings.liveness_mode if configured == "inherit" else configured
+    mode = liveness.mode() if configured == "inherit" else configured
     decision = liveness.inspect(np.array(image), mode_override=mode)
     if not decision.allowed and decision.blocked:
         raise HTTPException(

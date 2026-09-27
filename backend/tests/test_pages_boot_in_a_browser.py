@@ -179,12 +179,18 @@ def test_a_refusal_is_read_in_the_readers_language(browser, site, path):
 
 
 def test_the_paths_under_test_are_the_paths_the_product_sends(link_paths):
-    """The pages are opened at the *token* URLs the console issues, not at the files.
+    """The pages are opened at the URLs the product hands out, not at the files.
 
     Which is the whole trap: ``/q/<token>`` is one segment deep and that segment is a
     token, so a test that opened ``/quick.html`` would load the same markup with a URL
     where every relative path happens to resolve - and would have passed on the day both
     pages were dead in a browser.
+
+    The depth is the point of *those* two, and only of those two: a page reached through a
+    token resolves every relative path against the token segment, which is what makes a bare
+    ``src="quick.js"`` ask the token route for the page again. The registration page is the
+    company's one permanent link, served at the root, so for it the assertion is the first
+    one - a route, not a file - and the depth would be a claim about a URL nobody is sent.
     """
     assert link_paths["quick"].startswith("/q/")
     assert link_paths["enroll"].startswith("/enroll/")
@@ -196,4 +202,6 @@ def test_the_paths_under_test_are_the_paths_the_product_sends(link_paths):
             f"{page.name} would be opened at {opened}, which is the file rather than the "
             "route a worker is sent"
         )
+        if "{" not in page.path:
+            continue
         assert len(opened.split("/")) == 3, f"{page.name} is not one segment deep: {opened}"

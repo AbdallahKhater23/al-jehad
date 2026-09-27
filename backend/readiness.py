@@ -976,7 +976,9 @@ SELF_GATED_ROUTES: dict[str, str] = {
 #: Routes that answer without a session **and without any data of ours**: each serves an HTML
 #: file from ``frontend/``. Kept apart from the list above so that half stays a list of
 #: endpoints that deliberately parse a request.
-PAGE_ROUTES: frozenset[str] = frozenset({"GET /", "GET /enroll/{token}", "GET /q/{token}"})
+PAGE_ROUTES: frozenset[str] = frozenset(
+    {"GET /", "GET /enroll/{token}", "GET /q/{token}", "GET /register"}
+)
 
 
 def _check_api_routes_authorised(ctx: dict) -> Check:

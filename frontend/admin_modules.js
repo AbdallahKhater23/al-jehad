@@ -325,14 +325,21 @@ const UI_MODULES = {
                 if (value !== site) return false;
             }
             if (!query) return true;
-            // The role is in the haystack twice on purpose: as the wire code, and in the
-            // words this reader sees. The board shows "Administrator" - so an operator who
-            // types what is on the screen has to find the row, and one reading the console
-            // in Arabic has to find it by the Arabic word. The category is in it too, so a
-            // search for the word an operator thinks in finds every site of that kind.
-            return [session.name, session.worker_id, session.site_name, category, session.role,
-                this.roleLabel(session.role)]
-                .some((value) => String(value === null || value === undefined ? '' : value).toLowerCase().indexOf(query) >= 0);
+            // The same contract as the Shifts search (``shiftsMatches``), so one question
+            // gets one answer on both tabs: a term made only of digits is read as a worker
+            // id and matched against what the row *is* - name, id, role - and never against
+            // where the shift sits, whose site names carry the deployment's own digits
+            // ("Salmiya Block 4") and used to answer a search for worker 4 with a second
+            // row. Any other term - a word, or "block 4" inside a longer one - searches
+            // everything, site and category included, because "block 4" is a place and the
+            // words say so.
+            const identity = [session.name, session.worker_id, session.role, this.roleLabel(session.role)]
+                .map((value) => String(value === null || value === undefined ? '' : value).toLowerCase());
+            const where = [session.site_name, category]
+                .map((value) => String(value === null || value === undefined ? '' : value).toLowerCase());
+            return query.split(/\s+/).filter(Boolean).every((term) => (/^\d+$/.test(term)
+                ? identity.some((field) => field.indexOf(term) >= 0)
+                : identity.concat(where).some((field) => field.indexOf(term) >= 0)));
         });
         const sort = this._liveOpsSort || 'longest';
         rows.sort((a, b) => {
@@ -2674,6 +2681,348 @@ const UI_MODULES = {
     },
 
     // -----------------------------------------------------------------
+    //  Registrations - who is asking to join, and the two answers
+    //
+    //  The intake has been complete on the server for as long as it has existed: a
+    //  public form writes a pending row with a photograph, an approval allocates the id
+    //  and creates the account, a refusal keeps the row and destroys the face. What was
+    //  missing was a *person*: the queue could only be filled by hand and emptied by
+    //  curl, so nobody could see who was waiting, and nothing could decide them.
+    //
+    //  Three rules this screen is built on, and they are the server's own:
+    //
+    //  * **The photograph is fetched, never embedded.** A list of forty applications
+    //    would otherwise be forty faces in one response, and an ``<img src>`` cannot
+    //    carry a token anyway - a URL that worked in a ``src`` would be a URL that worked
+    //    for anybody. The bytes come from the per-request route with this session's
+    //    credential, one application at a time, when the reviewer asks to see it.
+    //  * **The order is the queue's, not this screen's.** Oldest first, straight from the
+    //    server: a queue nobody reads in order is a queue that starves whoever applied
+    //    first, and the first applicant is the one being phoned about.
+    //  * **The id an approval minted is the one number that matters.** It is what the new
+    //    worker signs in with and what the gate knows them by, so it is said out loud on
+    //    the card that replaces the row, not left in a toast that scrolls away.
+    // -----------------------------------------------------------------
+
+    /** The last read of the queue, and the last decision this console made. */
+    _registrations: null,
+    _registrationsLast: null,
+
+    //: How many applications one read carries. The server's own ceiling is higher, and the
+    //: count it reports is counted separately from the page it returns - so a truncated page
+    //: says so rather than pretending the queue ended here.
+    REGISTRATIONS_LIMIT: 200,
+
+    /** Seconds this application has been waiting, or null when its timestamp is unreadable. */
+    registrationsWaitingSeconds(request) {
+        const start = this.liveOpsStart(request && request.created_at);
+        return start ? Math.max(0, (Date.now() - start.getTime()) / 1000) : null;
+    },
+
+    /**
+     * The receipt for the last decision, kept above the queue.
+     *
+     *
+     * An approved application *leaves* the queue - the row is not pending any more, which is
+     * the whole point - so the id it was given would go with it. This is where that id stays
+     * until the next decision: the administrator who approved has to read it to the worker,
+     * and the row they read it from is gone.
+     *
+     * A template that could not be written is stated in the same place, because it changes
+     * what they do next: the account exists and cannot clock in until somebody enrolls it,
+     * and the console that made it is the console that can. It is not an error to retry -
+     * the account is real - so it is a warning on a receipt rather than a red failure.
+     */
+    registrationsNoticeHtml() {
+        const last = this._registrationsLast;
+        if (!last) return '';
+        const heading = `<p class="ops-stat-label">${this.escapeHtml(I18n.__('registrationsLast'))}</p>`;
+        if (last.action !== 'approve') {
+            // The server destroys the photograph of a refused application, and says so when it
+            // could not: a refusal is not the moment to claim a face is gone when it is still
+            // on disk for somebody to find.
+            const sentence = I18n.__(last.photo_destroyed === false ? 'registrationsPhotoKept' : 'registrationsRejected')
+                .replace('{request}', String(last.request_id));
+            return `
+                <div class="ui-card is-warn" data-registration-refused="${this.escapeHtml(last.request_id)}">
+                    ${heading}
+                    <p class="ui-note">${this.escapeHtml(sentence)}</p>
+                </div>`;
+        }
+        const warning = last.template_written
+            ? ''
+            : `<p class="ui-note is-warn" data-registration-template-warning="true">${this.OPS_ICONS.alert}${this.escapeHtml(I18n.__('registrationsTemplateWarning').replace('{id}', last.worker_id))}</p>`;
+        return `
+            <div class="ui-card is-ok" data-registration-minted="${this.escapeHtml(last.worker_id)}">
+                ${heading}
+                <p class="ui-fact-value" data-registration-minted-id>${this.escapeHtml(last.worker_id)}</p>
+                <p class="ui-note">${this.escapeHtml(I18n.__('registrationsApproved').replace('{id}', last.worker_id).replace('{name}', last.name))}</p>
+                ${warning}
+            </div>`;
+    },
+
+    /**
+     * One application, in the order a reviewer reads it: who is asking, how long they have
+     * waited, what they said about themselves, the face the form captured, and the two
+     * answers with the note that is recorded either way.
+     *
+     * An application past a day is drawn as a danger rather than as a warning. A day is where
+     * "we are working through the queue" turns into "this person has been waiting on us for a
+     * shift and a night", and the colour is never the only signal - the waiting figure beside
+     * it is the fact, and the card is announced by its own text.
+     */
+    registrationsCardHtml(request) {
+        const id = this.escapeHtml(request.id);
+        const seconds = this.registrationsWaitingSeconds(request);
+        const danger = seconds !== null && seconds >= 86400;
+        const waiting = seconds === null ? '\u2014' : this.liveOpsDuration(seconds);
+        const facts = [
+            { label: I18n.__('registrationsRole'), text: this.roleLabel(request.requested_role) },
+            { label: I18n.__('registrationsApplied'), text: String(request.created_at || '\u2014') },
+            {
+                label: I18n.__('registrationsContact'),
+                text: [request.phone, request.email].filter(Boolean).join(' \u00b7 ') || '\u2014'
+            }
+        ];
+        if (request.work_details) {
+            facts.push({ label: I18n.__('registrationsDetails'), text: String(request.work_details) });
+        }
+        return `
+            <article class="ui-card${danger ? ' is-danger' : ' is-warn'}" data-registration="${id}">
+                <div class="ui-spread">
+                    <div class="ops-row-main">
+                        <div class="ops-who">
+                            <span class="ops-name">${this.escapeHtml(request.full_name || '')}</span>
+                            <span class="ops-sub">${this.escapeHtml(this.roleLabel(request.requested_role))} \u00b7 #${id}</span>
+                        </div>
+                    </div>
+                    <span class="ui-badge${danger ? ' is-danger' : ' is-warn'}">${this.OPS_ICONS.alert}${this.escapeHtml(`${I18n.__('registrationsWaiting')} ${waiting}`)}</span>
+                </div>
+                <div class="ui-facts" style="margin-top:14px">
+                    ${facts.map((fact) => `
+                        <div class="ui-fact">
+                            <span class="ops-stat-label">${this.escapeHtml(fact.label)}</span>
+                            <span class="ui-fact-value" data-registration-fact>${this.escapeHtml(fact.text)}</span>
+                        </div>`).join('')}
+                </div>
+                <div class="ui-evidence-row" style="margin-top:14px">
+                    <div class="ui-evidence-media">
+                        <img id="registrationPhoto${id}" class="hidden ui-photo" alt="${this.escapeHtml(I18n.__('registrationsPhotoAlt'))}" />
+                    </div>
+                    <div class="ui-evidence-facts">
+                        <button type="button" class="ui-btn ui-btn-sm" data-registration-photo="${id}">${this.OPS_ICONS.eye}${this.escapeHtml(I18n.__('registrationsShowPhoto'))}</button>
+                    </div>
+                </div>
+                <label class="ui-label" for="registrationNote-${id}" style="margin-top:16px">${this.escapeHtml(I18n.__('registrationsNote'))}</label>
+                <textarea id="registrationNote-${id}" class="ui-field" rows="2"
+                          placeholder="${this.escapeHtml(I18n.__('registrationsNotePlaceholder'))}"></textarea>
+                <p class="ui-section-note" style="margin-top:6px">${this.escapeHtml(I18n.__('registrationsNoteUsed'))}</p>
+                <div class="ui-row" style="margin-top:12px">
+                    <button type="button" class="ui-btn ui-btn-primary" data-registration-approve="${id}">${this.OPS_ICONS.check}${this.escapeHtml(I18n.__('registrationsApprove'))}</button>
+                    <button type="button" class="ui-btn ui-btn-danger" data-registration-reject="${id}">${this.OPS_ICONS.close}${this.escapeHtml(I18n.__('registrationsReject'))}</button>
+                </div>
+            </article>`;
+    },
+
+    /**
+     * The queue itself: how many are waiting, then the cards oldest first.
+     *
+     * ``pending`` is the server's own total, counted apart from the page it sent. The two
+     * agree until the page is truncated, and when they do not the screen says so instead of
+     * ending at row two hundred as if the queue were empty behind it.
+     */
+    registrationsHtml(requests, pending) {
+        if (requests.length === 0) {
+            return `
+                <div class="ui-empty" data-registrations-empty="true">
+                    <span class="ui-empty-icon">${this.OPS_ICONS.check}</span>
+                    <p class="ui-empty-title">${this.escapeHtml(I18n.__('registrationsEmpty'))}</p>
+                    <p class="ui-empty-body">${this.escapeHtml(I18n.__('registrationsEmptyHint'))}</p>
+                </div>`;
+        }
+        const total = Number(pending) || requests.length;
+        const showing = total > requests.length
+            ? ` ${I18n.__('liveOpsShowing').replace('{shown}', String(requests.length)).replace('{total}', String(total))}`
+            : '';
+        const count = I18n.__('registrationsCount').replace('{count}', String(total));
+        return `
+            <p class="ui-section-note" data-registrations-count="${total}">${this.escapeHtml(count + showing)}</p>
+            <div class="ui-stack">${requests.map((request) => this.registrationsCardHtml(request)).join('')}</div>`;
+    },
+
+    /**
+     * The tab: one read of the pending queue, then the rows a reviewer works through.
+     *
+     * The read is also what the tab's badge is counted from, and the count is written back
+     * into ``State`` here - the badge and the screen are then one number rather than two
+     * that can disagree by a decision.
+     *
+     * Every control is bound with a delegated listener, not an inline handler, exactly like
+     * the approvals board: a repaint between paint and tap cannot orphan a listener, and the
+     * document CSP's allowance for inline attributes is something only ever given up.
+     */
+    async renderRegistrations(content) {
+        if (!content) return;
+        content.innerHTML = UI.consoleSkeletonHtml(I18n.__('registrationsTitle'));
+        let data;
+        try {
+            // The status is the server's own constant (``registrations.STATUS_PENDING``), not
+            // the word the console would have chosen: the endpoint validates it against the
+            // three it knows and answers 400 for anything else, and a queue screen that could
+            // not read its own queue would be a screen of "status must be one of ...".
+            data = await API.request(`/admin/registrations?status=PENDING_REVIEW&limit=${this.REGISTRATIONS_LIMIT}`);
+        } catch (err) {
+            content.innerHTML = this.uiErrorHtml(err, "UI.renderAdminTab('Registrations')");
+            return;
+        }
+        this._registrations = data;
+        const requests = Array.isArray(data && data.requests) ? data.requests : [];
+        const pending = Math.max(0, Number(data && data.pending) || 0);
+        State.registrationsWaiting = pending;
+        if (typeof UI !== 'undefined' && UI.paintRegistrationsBadge) UI.paintRegistrationsBadge();
+        // The intake switch, stated on the queue rather than left to the public form to
+        // explain: the applicants already in here are still decisions to make, and a queue
+        // that silently stops growing is a queue somebody believes is broken.
+        const closed = data && data.enabled === false
+            ? `<p class="ui-note is-warn" data-registrations-closed="true">${this.OPS_ICONS.alert}${this.escapeHtml(I18n.__('registrationsClosed'))}</p>`
+            : '';
+        content.innerHTML = `<div class="ui-page" data-registrations="true">${this.registrationsNoticeHtml()}${closed}${this.registrationsHtml(requests, pending)}</div>`;
+        if (typeof content.querySelectorAll === 'function') {
+            const bindEach = (selector, handler) => {
+                let nodes = [];
+                try {
+                    nodes = Array.from(content.querySelectorAll(selector) || []);
+                } catch (err) {
+                    nodes = [];
+                }
+                nodes.forEach((node) => {
+                    if (node && typeof node.addEventListener === 'function') handler(node);
+                });
+            };
+            bindEach('[data-registration-photo]', (button) => {
+                button.addEventListener('click', () => {
+                    this.showRegistrationPhoto(button.getAttribute('data-registration-photo'));
+                });
+            });
+            bindEach('[data-registration-approve]', (button) => {
+                button.addEventListener('click', () => {
+                    this.handleRegistration(button.getAttribute('data-registration-approve'), 'approve');
+                });
+            });
+            bindEach('[data-registration-reject]', (button) => {
+                button.addEventListener('click', () => {
+                    this.handleRegistration(button.getAttribute('data-registration-reject'), 'reject');
+                });
+            });
+        }
+    },
+
+    /**
+     * The submitted photograph, fetched with this session's credential.
+     *
+     * The endpoint is the per-request one rather than a field on the list, which is why this
+     * is a button: forty faces in one response was the thing the server was built to avoid,
+     * and the bytes are needed exactly once - by the reviewer looking at the application in
+     * front of them.
+     *
+     * A 404 is not a failure and does not read like one: the server destroys the photograph
+     * when an application is decided and when the retention sweep finds an orphan, so "there
+     * is no photograph any more" is a fact about the record. It is said in its own words.
+     */
+    async showRegistrationPhoto(requestId) {
+        const image = document.getElementById(`registrationPhoto${requestId}`);
+        const button = document.querySelector(`[data-registration-photo="${CSS.escape(String(requestId))}"]`);
+        const headers = {};
+        if (State.token) headers['Authorization'] = `Bearer ${State.token}`;
+        if (button) button.disabled = true;
+        try {
+            const response = await fetch(`${API.baseURL}/admin/registrations/${encodeURIComponent(requestId)}/photo`, { headers });
+            if (!response.ok) {
+                throw new Error(I18n.__(response.status === 404 ? 'registrationsPhotoGone' : 'registrationsPhotoFailed'));
+            }
+            const blob = await response.blob();
+            if (image) {
+                image.src = URL.createObjectURL(blob);
+                image.classList.remove('hidden');
+            }
+            if (button) button.remove();
+        } catch (err) {
+            Toast.error(err.message || I18n.__('registrationsPhotoFailed'));
+            if (button) button.disabled = false;
+        }
+    },
+
+    /**
+     * The two answers to one application, and what each of them does.
+     *
+     * **Approve** allocates the id, creates the account and files the face, and the answer
+     * carries the id it was given - which is kept on the screen (see
+     * ``registrationsNoticeHtml``) rather than only announced. **Refuse** keeps the row with
+     * the reason on it and destroys the photograph, and here the console asks for a reason
+     * before it sends: the server accepts a refusal without one, and the record that answers
+     * "why was I turned down" is the only place the answer can come from.
+     *
+     * Both buttons go down while the request is in flight: this is a round trip on a phone
+     * tether, and a card that took a second answer would be a second account or a second
+     * refusal for one decision. A 409 means somebody else decided it first, and the queue is
+     * re-read rather than left holding a button that can only fail again.
+     */
+    async handleRegistration(requestId, action) {
+        const approve = action === 'approve';
+        const field = document.getElementById(`registrationNote-${requestId}`);
+        const note = field ? String(field.value || '').trim() : '';
+        if (!approve && !note) {
+            Toast.error(I18n.__('registrationsRejectNeedsNote'));
+            return;
+        }
+        const card = typeof document.querySelector === 'function' ? document.querySelector(`[data-registration="${requestId}"]`) : null;
+        const buttons = card && card.querySelectorAll ? Array.from(card.querySelectorAll('button')) : [];
+        buttons.forEach((button) => { button.disabled = true; });
+        let answer = null;
+        try {
+            answer = await API.request(
+                `/admin/registrations/${encodeURIComponent(requestId)}/${approve ? 'approve' : 'reject'}`,
+                { method: 'POST', body: { note } }
+            );
+        } catch (err) {
+            buttons.forEach((button) => { button.disabled = false; });
+            Toast.error(err.message);
+            // Awaited, like the repaint below: a caller - or a suite - that awaited this
+            // decision is entitled to read the screen it produced, and the reputation of a
+            // stale row has a request in it.
+            if (err.status === 409) await UI.renderAdminTab('Registrations');
+            return;
+        }
+        const minted = String((answer && answer.worker_id) || '');
+        const named = String((answer && answer.name) || '');
+        const wroteTemplate = !(answer && answer.template_written === false);
+        const photoDestroyed = !(answer && answer.photo_destroyed === false);
+        this._registrationsLast = approve
+            ? { action: 'approve', request_id: requestId, worker_id: minted, name: named, template_written: wroteTemplate }
+            : { action: 'reject', request_id: requestId, photo_destroyed: photoDestroyed };
+        if (approve) {
+            Toast.success(
+                wroteTemplate
+                    ? I18n.__('registrationsApproved').replace('{id}', minted).replace('{name}', named)
+                    : I18n.__('registrationsTemplateWarning').replace('{id}', minted)
+            );
+        } else {
+            const refused = I18n.__(photoDestroyed ? 'registrationsRejected' : 'registrationsPhotoKept');
+            Toast.success(refused.replace('{request}', String(requestId)));
+        }
+        // The answer changed the count the badge carries, so the badge is re-asked (forced,
+        // past the throttle) before the tab repaints - the same order the crossings board
+        // uses, and for the same reason: the badge should not lag the card it was counted
+        // from by a whole repaint.
+        if (typeof UI !== 'undefined' && UI.refreshRegistrationsBadge) UI.refreshRegistrationsBadge(true);
+        // Awaited so that "the decision has been made" and "the screen shows it" are the same
+        // moment for whoever awaited this: the id stays in ``_registrationsLast`` either way,
+        // but a caller that reads the queue the instant this resolves would otherwise read the
+        // skeleton.
+        await UI.renderAdminTab('Registrations');
+    },
+
+    // -----------------------------------------------------------------
     //  Credentials - who can sign in, and with what
     //
     //  Replaces the enrollment dashboard. That screen listed accounts and could
@@ -2721,6 +3070,17 @@ const UI_MODULES = {
     _credentialsIssued: null,
 
     /**
+     * The id the server last refused for being taken, and the free number it could be.
+     *
+     * ``{id, free}`` while that refusal is worth showing, ``null`` otherwise. It survives a
+     * repaint - changing the role or picking a photo must not lose the answer to "which
+     * number, then?" - and a refusal that names its own id stays true while it is up, so it
+     * is only cleared by the things that settle the question: the number being taken, an
+     * account being created, or the form being opened or closed.
+     */
+    _credentialsIdTaken: null,
+
+    /**
      * The upload policy, mirroring ``backend/uploads.py``.
      *
      * 5 MB, JPEG/PNG/WebP, nothing else. Checked here so the admin is told before a
@@ -2742,6 +3102,20 @@ const UI_MODULES = {
         face_frame_max_pixels: 4000000,
         face_frame_max_edge_px: 2048
     },
+
+    /**
+     * The sentence ``/admin/users/create`` answers a taken id with, verbatim.
+     *
+     * The only refusal the create form can answer itself: every other 400 it can produce
+     * (a name that is blank, a password under the policy, an id that is not a number) needs
+     * the admin to change something the console cannot guess, and this one needs a number
+     * nobody is using - which the roster in hand already says. So it is the one refusal
+     * worth recognising, and the server sends it as a plain string with no error code, which
+     * leaves the text as the only thing to recognise it by. ``test_frontend_account_creation``
+     * pins this string against the one ``backend/main.py`` raises, so the two cannot drift
+     * into a form that quietly stops offering the fix.
+     */
+    TAKEN_ID_REFUSAL: 'User ID already exists.',
 
     credentialsQuery() {
         return State.credentialsQuery || '';
@@ -3185,8 +3559,8 @@ const UI_MODULES = {
      * each handler answers is "which account or which file" and the node already carries it.
      * Same idiom as the handset's export buttons.
      *
-     * All three of these are ``data-`` hooks rather than inline attributes. The document CSP
-     * has to allow ``script-src-attr 'unsafe-inline'`` for the handlers the console builds as
+     * All of these are ``data-`` hooks rather than inline attributes. The document CSP has to
+     * allow ``script-src-attr 'unsafe-inline'`` for the handlers the console builds as
      * strings, that allowance is pinned per file so it may only fall, and what it buys an
      * injected ``<img onerror>`` is exactly this - so a control added today binds its own
      * listener instead of widening it.
@@ -3221,6 +3595,19 @@ const UI_MODULES = {
             clear.addEventListener('click', (event) => {
                 event.preventDefault();
                 this.clearEditPhoto();
+            });
+        }
+        // The one-tap fix a taken-id refusal leaves behind. The number it offers is read out
+        // of state rather than off the node, so the handler stays the same shape as the four
+        // above; the node carries it too (``data-use-free-id``) for whoever is reading the
+        // panel rather than clicking it.
+        const adopts = scope.querySelectorAll('[data-use-free-id]');
+        for (let i = 0; i < adopts.length; i += 1) {
+            const adopt = adopts[i];
+            if (typeof adopt.addEventListener !== 'function') continue;
+            adopt.addEventListener('click', (event) => {
+                event.preventDefault();
+                this.useSuggestedCredentialsId();
             });
         }
     },
@@ -4282,6 +4669,8 @@ const UI_MODULES = {
         // server's policy by construction rather than by luck.
         if (this._credentialsMode === 'create') {
             this._credentialsNewPassword = this._credentialsNewPassword || this.generatePassword();
+            // A form the admin has just opened is not a form that was just refused.
+            this._credentialsIdTaken = null;
         }
         return this.repaintCredentialsFromCache();
     },
@@ -4294,6 +4683,7 @@ const UI_MODULES = {
         this._credentialsIssued = null;
         this._credentialsNewPhoto = null;
         this._credentialsPhotoError = '';
+        this._credentialsIdTaken = null;
         return this.repaintCredentialsFromCache();
     },
 
@@ -4327,6 +4717,53 @@ const UI_MODULES = {
     idIsWholeNumber(userId) {
         const text = String(userId === null || userId === undefined ? '' : userId).trim();
         return /^[+-]?\d+$/.test(text);
+    },
+
+    /** Whether the server's answer to a create attempt was the taken-id refusal. */
+    isTakenIdRefusal(message) {
+        const said = String(message === null || message === undefined ? '' : message).trim();
+        return said === this.TAKEN_ID_REFUSAL;
+    },
+
+    /**
+     * The lowest id above the refused one that no account on the roster is using.
+     *
+     * A suggestion and not a rule: the server accepts any free number, this is simply the
+     * one the admin most likely meant. Counting upward from the refused id rather than
+     * scanning from 1 keeps it beside the number they typed, which is where a mistyped
+     * neighbour is; every step either lands on a free number or skips one account, so the
+     * walk cannot outlast the roster. If somebody else takes this number first, the next
+     * refusal says so and offers the one after it - the server stays the authority on which
+     * ids are free.
+     */
+    nextFreeCredentialsId(refusedId, roster) {
+        const taken = new Set((roster || []).map((user) => String(user && user.id)));
+        const start = Math.max(0, Math.floor(Number(refusedId)) || 0);
+        let candidate = start;
+        while (candidate - start <= taken.size && taken.has(String(candidate + 1))) candidate += 1;
+        return String(candidate + 1);
+    },
+
+    /**
+     * Takes the free number the refusal offered: the id box gets it, ready to send again.
+     *
+     * One tap instead of a retype on a phone. The number goes into the draft the panel paints
+     * from and into the box itself, and the refusal is forgotten with it, because the id it
+     * was about is no longer the one being offered.
+     */
+    useSuggestedCredentialsId() {
+        const taken = this._credentialsIdTaken;
+        if (!taken) return Promise.resolve();
+        this.readCredentialsDraft();
+        const free = String(taken.free);
+        this._credentialsDraft.id = free;
+        // Into the box as well as the draft it paints from. The draft is what survives a
+        // repaint, but the field is what the admin reads back - and this method should not
+        // leave the two disagreeing for as long as a repaint takes.
+        const box = document.getElementById('credentialsNewId');
+        if (box && box.value !== undefined) box.value = free;
+        this._credentialsIdTaken = null;
+        return this.repaintCredentialsFromCache();
     },
 
     credentialsFieldClass() {
@@ -4469,13 +4906,14 @@ const UI_MODULES = {
         }
         const draft = this._credentialsDraft;
         const photo = this._credentialsNewPhoto;
+        const taken = this._credentialsIdTaken;
         return `
             <div class="${box}" data-create-panel="true">
                 <p class="ui-card-title">${I18n.__('credentialsNewAccount')}</p>
                 <p class="ui-note is-body">${I18n.__('credentialsNewAccountHint')}</p>
                 <div class="ui-grid two">
                     <input type="text" id="credentialsNewId" value="${this.escapeHtml(draft.id)}" inputmode="numeric"
-                           placeholder="${I18n.__('credentialsNewId')}" class="${field}">
+                           placeholder="${I18n.__('credentialsNewId')}" class="${field}${taken ? ' is-danger' : ''}">
                     <input type="text" id="credentialsNewName" value="${this.escapeHtml(draft.name)}"
                            placeholder="${I18n.__('name')}" class="${field}">
                     <select id="credentialsNewRole" onchange="UI_MODULES.credentialsRoleChanged(this.value)" class="${field}">
@@ -4494,6 +4932,10 @@ const UI_MODULES = {
                     <p class="ui-note" data-password-hint>${this.escapeHtml(I18n.__('credentialsPasswordManual'))}</p>
                 </div>
                 <p class="ui-note" data-id-rule="true">${this.escapeHtml(I18n.__('credentialsIdRule'))}</p>
+                ${taken ? `<p class="ui-note is-danger" data-id-taken="${this.escapeHtml(taken.id)}">
+                    ${this.escapeHtml(I18n.__('credentialsIdTaken').replace('{id}', taken.id))}
+                    <button type="button" class="${quiet}" data-use-free-id="${this.escapeHtml(taken.free)}">${this.escapeHtml(I18n.__('credentialsIdUseFree').replace('{id}', taken.free))}</button>
+                </p>` : ''}
                 <div class="ui-row">
                     <input type="file" id="credentialsNewPhoto" accept="image/jpeg,image/png,image/webp"
                            onchange="UI_MODULES.pickCredentialsPhoto(this)" class="ui-field">
@@ -4606,10 +5048,25 @@ const UI_MODULES = {
             this._credentialsNewPassword = '';
             this._credentialsNewPhoto = null;
             this._credentialsPhotoError = '';
+            this._credentialsIdTaken = null;
             this._credentialsDraft = { id: '', name: '', role: draft.role, email: '', phone: '' };
             Toast.success(I18n.__('credentialsCreatedToast'));
             await this.loadCredentials(document.getElementById('adminContent'));
         } catch (err) {
+            // A taken id is the one refusal this form can answer itself, and the answer is a
+            // number: the roster in hand says which ones are free. Offered rather than
+            // applied - the admin typed that id for a reason, and a form that silently
+            // rewrote it would be the range check again, wearing a helpful face. Without a
+            // roster there is nothing to suggest from, so the toast stands alone.
+            if (this._credentials && this.isTakenIdRefusal(err.message)) {
+                this._credentialsIdTaken = {
+                    id: draft.id,
+                    free: this.nextFreeCredentialsId(draft.id, this._credentials)
+                };
+                Toast.error(err.message);
+                await this.repaintCredentialsFromCache();
+                return;
+            }
             Toast.error(err.message);
         }
     },
@@ -4765,12 +5222,13 @@ const UI_MODULES = {
         this._devConsole = null;
         let runtime, alerts, pool, slow, audit;
         try {
-            [runtime, alerts, pool, slow, audit] = await Promise.all([
+            [runtime, alerts, pool, slow, audit, sessions] = await Promise.all([
                 API.request('/developer/runtime'),
                 API.request('/developer/alerts?limit=50'),
                 API.request('/developer/diagnostics/pool'),
                 API.request('/developer/diagnostics/slow-queries?limit=20'),
-                API.request('/developer/audit?limit=100')
+                API.request('/developer/audit?limit=100'),
+                API.request('/developer/sessions')
             ]);
         } catch (err) {
             content.innerHTML = this.uiErrorHtml(err, "UI.renderAdminTab('Developer')");
@@ -4778,7 +5236,7 @@ const UI_MODULES = {
         }
         this._devConsole = {
             runtime: runtime || {}, alerts: alerts || {}, pool: pool || {},
-            slow: slow || {}, audit: audit || {}
+            slow: slow || {}, audit: audit || {}, sessions: sessions || []
         };
         content.innerHTML = `<div class="ui-page" data-developer-console="true">${this.devConsoleHtml()}</div>`;
         this.bindDeveloperControls(content);
@@ -4793,6 +5251,7 @@ const UI_MODULES = {
             ${this.devRuntimeHtml()}
             ${this.devAlertsHtml()}
             ${this.devDiagnosticsHtml()}
+            ${this.devSessionsHtml()}
             ${this.devAuditHtml()}`;
     },
 
@@ -4912,6 +5371,50 @@ const UI_MODULES = {
             </section>`;
     },
 
+    /**
+     * Live sessions: who could be signed in, and the one lever that ends it.
+     *
+     * The server cannot list tokens - a bearer JWT is stateless, so "which sessions exist"
+     * is unknowable by design - and this section does not pretend otherwise. It shows who
+     * *could* act right now, when their credential was last minted (the audit ``login`` rows,
+     * the best evidence there is), and what revoking would do. The row is the revocation's
+     * own scope: one account per row, so the lever cannot be pulled at "everyone" by accident.
+     */
+    devSessionsHtml() {
+        const sessions = this._devConsole.sessions || [];
+        const me = (State.user || {}).id;
+        const rows = sessions.map((session) => {
+            const isSelf = String(session.id) === String(me);
+            return `
+                <tr data-dev-session="${this.escapeHtml(String(session.id))}" data-dev-session-role="${this.escapeHtml(String(session.role || ''))}">
+                    <td>${this.escapeHtml(String(session.id || ''))}</td>
+                    <td>${this.escapeHtml(String(session.name || ''))}</td>
+                    <td>${this.escapeHtml(this.roleLabel(session.role || ''))}</td>
+                    <td>${this.escapeHtml(String(session.last_login_at || '\u2014'))}</td>
+                    <td>${this.escapeHtml(String(session.last_login_ip || '\u2014'))}</td>
+                    <td>${this.escapeHtml(String(session.active_devices ?? 0))}</td>
+                    <td><button type="button" class="ui-btn ui-btn-sm ui-btn-quiet" data-dev-session-revoke="${this.escapeHtml(String(session.id))}" ${isSelf ? 'data-dev-session-self="true"' : ''}>${this.OPS_ICONS.logout}${this.escapeHtml(I18n.__('devSessionsRevoke'))}</button></td>
+                </tr>`;
+        }).join('');
+        return `
+            <section class="ui-stack" data-dev-section="sessions">
+                <h2 class="ui-section-title">${this.escapeHtml(I18n.__('devSessions'))}</h2>
+                <p class="ui-note">${this.escapeHtml(I18n.__('devSessionsHint'))}</p>
+                <table class="ui-table">
+                    <thead><tr>
+                        <th>${this.escapeHtml(I18n.__('devColActor'))}</th>
+                        <th>${this.escapeHtml(I18n.__('devSessionsColName'))}</th>
+                        <th>${this.escapeHtml(I18n.__('role'))}</th>
+                        <th>${this.escapeHtml(I18n.__('devSessionsColLastLogin'))}</th>
+                        <th>${this.escapeHtml(I18n.__('devSessionsColIp'))}</th>
+                        <th>${this.escapeHtml(I18n.__('devSessionsColDevices'))}</th>
+                        <th>${this.escapeHtml(I18n.__('devSessionsColAction'))}</th>
+                    </tr></thead>
+                    <tbody>${rows || `<tr><td colspan="7">${this.escapeHtml(I18n.__('devSessionsEmpty'))}</td></tr>`}</tbody>
+                </table>
+            </section>`;
+    },
+
     /** The raw appended history: security events, newest first, with the trace ids. */
     devAuditHtml() {
         const events = (this._devConsole.audit || {}).events || [];
@@ -4958,6 +5461,7 @@ const UI_MODULES = {
             });
         };
         on('[data-runtime-save]', 'data-runtime-save', (key) => this.saveRuntimeValue(key));
+        on('[data-dev-session-revoke]', 'data-dev-session-revoke', (id) => this.revokeDevSession(id));
         on('[data-dev-alert-read]', 'data-dev-alert-read', (id) => this.markDevAlertRead(id));
         on('[data-dev-explain]', 'data-dev-explain', (name) => this.explainDevQuery(name));
         on('[data-dev-flush]', 'data-dev-flush', () => this.flushDevCaches());
@@ -4981,6 +5485,30 @@ const UI_MODULES = {
             });
             Toast.success(I18n.__('devRuntimeSaved')
                 .replace('{key}', key).replace('{value}', String(value)));
+            return UI.renderAdminTab('Developer');
+        } catch (err) {
+            Toast.error((err && err.message) || I18n.__('error'));
+        }
+    },
+
+    /**
+     * Revoke one account's sessions.
+     *
+     * Confirm in the reader's own words, because the lever is quiet and permanent for the
+     * holder: every signed-in phone and browser of that account is signed out at its next
+     * request. Revoking *your own* sessions says so before the confirm, since this tab will
+     * not outlive the request that re-renders it.
+     */
+    async revokeDevSession(userId) {
+        const sessions = this._devConsole.sessions || [];
+        const target = sessions.find((session) => String(session.id) === String(userId)) || {};
+        const who = [target.name, userId].filter(Boolean).join(' · ');
+        const selfWarning = String(userId) === String((State.user || {}).id)
+            ? ` ${I18n.__('devSessionsSelfWarning')}` : '';
+        if (!confirm(`${I18n.__('devSessionsConfirm').replace('{who}', who)}${selfWarning}`)) return;
+        try {
+            await API.request(`/developer/sessions/${encodeURIComponent(userId)}/revoke`, { method: 'POST' });
+            Toast.success(I18n.__('devSessionsRevoked').replace('{who}', who));
             return UI.renderAdminTab('Developer');
         } catch (err) {
             Toast.error((err && err.message) || I18n.__('error'));

@@ -1717,6 +1717,10 @@ html.dark .ui-field { background: var(--ops-surface-2); }
 .ui-field::placeholder { color: var(--ops-muted); }
 .ui-field:focus-visible { outline: 2px solid var(--ops-primary); outline-offset: 1px; }
 .ui-field:disabled { opacity: 0.55; }
+/* A field the server refused for what is in it. The border is the whole signal - the sentence
+   beside the field says which value and what to do about it - so a red hairline is enough to
+   point at the box that has to change, and the field stays editable and focusable. */
+.ui-field.is-danger { border-color: var(--ops-danger); }
 select.ui-field { cursor: pointer; }
 /* A field that shares a row with buttons: ``width: 100%`` inside a flex row would
    fight the buttons for the whole line, so it takes a basis instead. */
