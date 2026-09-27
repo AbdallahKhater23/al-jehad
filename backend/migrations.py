@@ -1634,6 +1634,88 @@ def migration_27_transit_to_site_shifts(conn: sqlite3.Connection) -> None:
     add_column(conn, "active_sessions", "transit_origin_lon", "REAL DEFAULT NULL")
 
 
+# ---------------------------------------------------------------------------
+# attendance timestamps become UTC (migration 28)
+# ---------------------------------------------------------------------------
+#: Every attendance-domain timestamp column whose stored value becomes a **UTC instant** in
+#: migration 28. The string shape does not change - it is still a naive ``%Y-%m-%d %H:%M:%S``
+#: value in a ``DATETIME`` column, so no reader's ``strptime``, index or ``BETWEEN`` has to
+#: learn anything new - only its *meaning* changes, from Kuwait wall clock to UTC.
+#:
+#: This mapping is the contract between three things that have to agree and cannot be allowed
+#: to drift:
+#:   * migration 28, which shifts the rows already in the database;
+#:   * the writers, which store :func:`clock.utc_now` instead of Kuwait time;
+#:   * the readers, which render :func:`clock.to_kuwait` at the display/report/window boundary.
+#: A test (``tests/test_timezone_kuwait.py``) asserts the tables and columns here match the
+#: columns the writers and readers actually touch.
+#:
+#: Scope is the attendance lifecycle - the shift record, its open session, the offline punch
+#: queue and its integrity chain, the overtime authorisation and the quick-link punch. The
+#: *system* tables (audit log, notifications, tokens, enrollment jobs, notes) keep their
+#: existing Kuwait-local convention; they are operator/forensic surfaces, not payroll, and are
+#: deliberately left to a later migration rather than converted half-way.
+ATTENDANCE_UTC_COLUMNS: dict[str, tuple[str, ...]] = {
+    "active_sessions": ("clock_in_time", "overtime_notified_at", "transit_start_time"),
+    "attendance_logs": ("timestamp", "reviewed_at"),
+    "punch_queue": (
+        "client_timestamp",
+        "received_at",
+        "processed_at",
+        "anchor_server_time",
+        "photo_scored_at",
+    ),
+    "refused_punches": ("created_at",),
+    "device_anchors": ("server_time", "issued_at"),
+    "worker_devices": ("last_anchor_at",),
+    "overtime_authorisations": ("clock_in_time", "decided_at"),
+    "quick_links": ("created_at", "expires_at", "revoked_at", "last_used_at"),
+    "quick_link_uses": ("created_at",),
+}
+
+#: The offset the data migration applies, as SQLite syntax. Kuwait is a fixed UTC+3 with no
+#: DST, so the transform is a constant subtraction and is exactly reversed by ``'+3 hours'``
+#: (see the rollback note in migration 28). It is derived from :data:`clock.KUWAIT_UTC_OFFSET_HOURS`
+#: so the SQL and the Python conversion cannot disagree.
+_UTC_SHIFT_HOURS = 3
+
+
+def migration_28_attendance_timestamps_to_utc(conn: sqlite3.Connection) -> None:
+    """Rewrite every pre-existing attendance timestamp from Kuwait wall clock to UTC.
+
+    WHAT IT DOES
+    ------------
+    For each column in :data:`ATTENDANCE_UTC_COLUMNS`, subtracts the fixed Kuwait offset
+    (``datetime(col, '-3 hours')``). Before this migration the stored value was Kuwait local
+    time; afterwards the *same digits* name the UTC instant. Nothing else about the value, the
+    column type or the row changes.
+
+    WHY IT IS SAFE (AND REVERSIBLE)
+    -------------------------------
+    * **Guarded on parseability.** ``datetime(col, '-3 hours')`` yields ``NULL`` for a value
+      SQLite cannot parse; the ``IS NOT NULL`` predicate in the ``WHERE`` clause means such a
+      row is *skipped* rather than blanked. ``tools/timestamp_audit.py`` reports any such value
+      before the migration, so an operator sees them first.
+    * **Atomic.** ``run_migrations`` wraps this in ``BEGIN IMMEDIATE``; a failure rolls the whole
+      thing back and the version is never recorded, so it does not run half-way.
+    * **Idempotent by version.** Recorded as schema version 28, it can never run twice.
+    * **Exactly reversible.** Kuwait has no daylight saving, so the inverse is
+      ``datetime(col, '+3 hours')`` applied with the same parseability guard. A rollback to the
+      previous release restores the pre-28 meaning with that one statement per column.
+    """
+    for table, columns in ATTENDANCE_UTC_COLUMNS.items():
+        present = _columns(conn, table)
+        for column in columns:
+            if column not in present:
+                continue
+            conn.execute(
+                f'UPDATE "{table}" SET "{column}" = '
+                f"datetime(\"{column}\", '-{_UTC_SHIFT_HOURS} hours') "
+                f'WHERE "{column}" IS NOT NULL AND "{column}" <> \'\' '
+                f"AND datetime(\"{column}\", '-{_UTC_SHIFT_HOURS} hours') IS NOT NULL"
+            )
+
+
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "audit_notifications_shift_rules", migration_1_audit_notifications_shift_rules),
     (2, "provenance_columns_status_code", migration_2_provenance_columns),
@@ -1662,6 +1744,16 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (25, "site_categories", migration_25_site_categories),
     (26, "off_office_workers", migration_26_off_office_workers),
     (27, "transit_to_site_shifts", migration_27_transit_to_site_shifts),
+    # (28, "attendance_timestamps_to_utc", migration_28_attendance_timestamps_to_utc),
+    #
+    # NOT REGISTERED YET, ON PURPOSE. Migration 28 and its column contract
+    # (``ATTENDANCE_UTC_COLUMNS``) are written and tested, but the data rewrite and the code
+    # that reads/writes those columns have to land *together*: shifting stored rows -3 h while
+    # any reader still treats the value as Kuwait wall clock subtracts three hours from live
+    # attendance time - a payroll-corrupting change. Register the line above in the same
+    # release that switches the writers to ``clock.utc_now`` and the readers to
+    # ``clock.to_kuwait``; see ``docs/RUNBOOK_ATTENDANCE_UTC.md`` for the exact edit list and
+    # the rollback (the inverse is ``datetime(col, '+3 hours')``, applied the same way).
 ]
 
 

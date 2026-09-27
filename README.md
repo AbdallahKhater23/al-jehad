@@ -1659,6 +1659,24 @@ That is the point of a reset, and the panel says so before the button. A standar
 cannot change an administrator's password - the server answers 403, and the button is
 hidden for the same reason rather than shown and then refused.
 
+### The root tier (`developer`)
+
+One role sits above the administrators, and one account holds it. It is not a business role: it
+exists to *operate* the deployment - a runtime flag flipped without a redeploy, the
+infrastructure alert hub, database diagnostics, the raw audit stream and the refused-punch
+triage - and it is deliberately unreachable from below. `security.require_role` satisfies every
+guard for it (a wildcard evaluated in the guard, so it cannot go stale), while a route built
+from `require_developer` refuses every administrator. It is the *only* account that cannot be
+created through the API: every creation path refuses the role by name
+(`security.refuse_developer_role`), so nobody can promote themselves into a tier that reads the
+audit trail. It is minted by `backend/tools/seed_developer.py` and concealed from every
+administrator-facing read (`developer.hides`), so it appears in no roster and no count.
+
+Signing in, using it day to day, and rotating or revoking it safely are
+[`docs/RUNBOOK_DEVELOPER_ACCOUNT.md`](docs/RUNBOOK_DEVELOPER_ACCOUNT.md), kept honest by
+`backend/tests/test_developer_runbook.py` - which fails when a moved route, a removed runtime
+key or a renamed column makes a step in the procedure wrong.
+
 ### How the API decides who may do what
 
 Authorization here is three layers, and the third one is checked at startup rather than

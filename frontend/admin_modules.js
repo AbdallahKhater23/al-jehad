@@ -35,6 +35,10 @@ const UI_MODULES = {
     _liveOpsQuery: '',
     _liveOpsSite: '',
     _liveOpsSort: 'longest',
+    //: Which way the board is read: the site a shift is at, or the *category* those sites
+    //: belong to. Flipping it clears the filter, because a value that named a site names
+    //: nothing once the rows are grouped by category.
+    _liveOpsGroup: 'site',
     //: Whether the board is showing every open shift or only the first few.
     //:
     //: Held here rather than in the markup on purpose. ``paintLiveOps`` replaces the board's
@@ -276,20 +280,57 @@ const UI_MODULES = {
      * round trip per keystroke would be worse on the connection this console is
      * usually opened over.
      */
+    /** Which way the board is read: ``'site'`` (the default) or ``'category'``. */
+    liveOpsGroup() {
+        return this._liveOpsGroup === 'category' ? 'category' : 'site';
+    },
+
+    /**
+     * ``site_name`` -> category name, from the site list the board already read.
+     *
+     * Built once per read rather than looked up per row: the board polls, and a scan of the
+     * site list inside the row loop is the kind of quiet cost that only shows on the
+     * deployment with three hundred sites.
+     */
+    liveOpsCategoryMap(sites) {
+        const map = new Map();
+        for (const site of (sites || [])) {
+            const name = String((site && site.site_name) || '');
+            if (!name) continue;
+            map.set(name, String((site && site.category) || ''));
+        }
+        return map;
+    },
+
+    /** The category of the site a session is at, or ``''`` when it has none. */
+    liveOpsCategoryOf(map, session) {
+        return map.get(String((session && session.site_name) || '')) || '';
+    },
+
     liveOpsRows(data) {
         const query = String(this._liveOpsQuery || '').trim().toLowerCase();
         const site = this._liveOpsSite || '';
+        const group = this.liveOpsGroup();
+        const categories = this.liveOpsCategoryMap(data && data.sites);
         const elapsed = (facts) => (facts.seconds === null ? -1 : facts.seconds);
         const rows = ((data && data.sessions) || []).map((session) => ({
-            session, facts: this.liveOpsFacts(session, data && data.rules)
-        })).filter(({ session }) => {
-            if (site && String(session.site_name || '') !== site) return false;
+            session,
+            category: this.liveOpsCategoryOf(categories, session),
+            facts: this.liveOpsFacts(session, data && data.rules)
+        })).filter(({ session, category }) => {
+            // One field narrows the board either way: it holds a site in Site view and a
+            // category in Category view, so the chip row is still the one control.
+            if (site) {
+                const value = group === 'category' ? category : String(session.site_name || '');
+                if (value !== site) return false;
+            }
             if (!query) return true;
             // The role is in the haystack twice on purpose: as the wire code, and in the
             // words this reader sees. The board shows "Administrator" - so an operator who
             // types what is on the screen has to find the row, and one reading the console
-            // in Arabic has to find it by the Arabic word.
-            return [session.name, session.worker_id, session.site_name, session.role,
+            // in Arabic has to find it by the Arabic word. The category is in it too, so a
+            // search for the word an operator thinks in finds every site of that kind.
+            return [session.name, session.worker_id, session.site_name, category, session.role,
                 this.roleLabel(session.role)]
                 .some((value) => String(value === null || value === undefined ? '' : value).toLowerCase().indexOf(query) >= 0);
         });
@@ -306,10 +347,18 @@ const UI_MODULES = {
     },
 
     liveOpsStats(data) {
+        const group = this.liveOpsGroup();
+        const categories = this.liveOpsCategoryMap(data && data.sites);
         const rows = ((data && data.sessions) || []).map((session) => ({
-            session, facts: this.liveOpsFacts(session, data && data.rules)
+            session,
+            category: this.liveOpsCategoryOf(categories, session),
+            facts: this.liveOpsFacts(session, data && data.rules)
         }));
-        const sites = new Set(rows.map(({ session }) => String(session.site_name || '')).filter(Boolean));
+        // What the board says people are spread across: sites in Site view, categories in
+        // Category view - the same figure over the same rows, read in the chosen grouping.
+        const covered = new Set(rows.map((row) => (group === 'category'
+            ? row.category
+            : String(row.session.site_name || ''))).filter(Boolean));
         let longest = null;
         for (const row of rows) {
             if (row.facts.seconds === null) continue;
@@ -317,7 +366,8 @@ const UI_MODULES = {
         }
         return {
             onSite: rows.length,
-            sites: sites.size,
+            sites: covered.size,
+            group,
             longest,
             late: rows.filter((row) => row.facts.late).length,
             over: rows.filter((row) => row.facts.state === 'over' || row.facts.state === 'closing').length
@@ -334,7 +384,7 @@ const UI_MODULES = {
             <div class="ops-stat">
                 <span class="ops-stat-label">${this.escapeHtml(I18n.__('liveOpsOnSiteNow'))}</span>
                 <span class="ops-stat-value" data-stat="on-site">${stats.onSite}</span>
-                <span class="ops-stat-hint">${this.escapeHtml(`${I18n.__('liveOpsSitesCovered')}: ${stats.sites}`)}</span>
+                <span class="ops-stat-hint">${this.escapeHtml(`${I18n.__(stats.group === 'category' ? 'liveOpsCategoriesCovered' : 'liveOpsSitesCovered')}: ${stats.sites}`)}</span>
             </div>
             <div class="ops-stat">
                 <span class="ops-stat-label">${this.escapeHtml(I18n.__('liveOpsLongestShift'))}</span>
@@ -356,7 +406,7 @@ const UI_MODULES = {
     /** The sentence the live region announces: counts, never a bare number. */
     liveOpsStatusSentence(data) {
         const stats = this.liveOpsStats(data);
-        return I18n.__('liveOpsStatusLine')
+        return I18n.__(stats.group === 'category' ? 'liveOpsStatusLineCategories' : 'liveOpsStatusLine')
             .replace('{workers}', String(stats.onSite))
             .replace('{sites}', String(stats.sites));
     },
@@ -368,19 +418,27 @@ const UI_MODULES = {
     },
 
     liveOpsChipsHtml(data) {
+        const group = this.liveOpsGroup();
         const sessions = (data && data.sessions) || [];
+        const categories = this.liveOpsCategoryMap(data && data.sites);
+        // The attribute is the view's own: a chip that names a category is not a site chip,
+        // and the setter that keeps ``aria-pressed`` honest reads the one for the view.
+        const attr = group === 'category' ? 'data-category-chip' : 'data-site-chip';
         const counts = new Map();
         for (const session of sessions) {
-            const name = String(session.site_name || '');
+            const name = group === 'category'
+                ? this.liveOpsCategoryOf(categories, session)
+                : String(session.site_name || '');
+            if (!name) continue;   // a shift with no site / no category has no chip of its own
             counts.set(name, (counts.get(name) || 0) + 1);
         }
         const chip = (value, label, count) => `
-            <button type="button" class="ops-chip" data-site-chip="${this.escapeHtml(value)}"
+            <button type="button" class="ops-chip" ${attr}="${this.escapeHtml(value)}"
                     aria-pressed="${this._liveOpsSite === value ? 'true' : 'false'}"
                     onclick="UI_MODULES.setLiveOpsSite('${this.liveOpsInlineString(value)}')">${this.escapeHtml(`${label} (${count})`)}</button>`;
-        const all = chip('', I18n.__('liveOpsAllSites'), sessions.length);
-        const sites = Array.from(counts.keys()).sort().map((name) => chip(name, name, counts.get(name)));
-        return all + sites.join('');
+        const all = chip('', I18n.__(group === 'category' ? 'liveOpsAllCategories' : 'liveOpsAllSites'), sessions.length);
+        const names = Array.from(counts.keys()).sort();
+        return all + names.map((name) => chip(name, name, counts.get(name))).join('');
     },
 
     liveOpsSortSelectHtml() {
@@ -390,6 +448,23 @@ const UI_MODULES = {
             <select class="ops-sort" id="liveOpsSort" data-sort-select onchange="UI_MODULES.setLiveOpsSort(this.value)">
                 ${option('longest', 'liveOpsSortLongest')}${option('newest', 'liveOpsSortNewest')}${option('name', 'liveOpsSortName')}
             </select>`;
+    },
+
+    /**
+     * The Site / Category switch: read the board by where people are, or by the kind of
+     * place that is.
+     *
+     * A segmented pair rather than a select, because there are two views and both are worth
+     * naming on the screen. Bound by a ``data-`` hook through ``onLiveOpsClick``, like the
+     * fold: the toolbar is rebuilt often enough that the one inline allowance this file has
+     * should keep falling rather than grow.
+     */
+    liveOpsGroupToggleHtml() {
+        const group = this.liveOpsGroup();
+        const option = (value, key) => `
+            <button type="button" class="ops-seg-btn" data-live-ops-group="${value}"
+                    aria-pressed="${group === value ? 'true' : 'false'}">${this.escapeHtml(I18n.__(key))}</button>`;
+        return `<div class="ops-seg" role="group" aria-label="${this.escapeHtml(I18n.__('liveOpsViewBy'))}">${option('site', 'liveOpsGroupSite')}${option('category', 'liveOpsGroupCategory')}</div>`;
     },
 
     liveOpsSortButtonHtml(label, key) {
@@ -548,9 +623,37 @@ const UI_MODULES = {
             <div class="ops-empty" data-empty="${filtered ? 'filtered' : 'nobody'}">
                 <span class="ops-empty-icon">${filtered ? this.OPS_ICONS.search : this.OPS_ICONS.person}</span>
                 <p class="ops-empty-title">${this.escapeHtml(filtered ? I18n.__('liveOpsNoMatches') : I18n.__('noActiveShifts'))}</p>
-                <p class="ops-empty-body">${this.escapeHtml(filtered ? I18n.__('liveOpsNoMatchesHint') : I18n.__('liveOpsNobodyHint'))}</p>
+                <p class="ops-empty-body">${this.escapeHtml(filtered
+                    ? I18n.__(this.liveOpsGroup() === 'category' ? 'liveOpsNoMatchesHintCategory' : 'liveOpsNoMatchesHint')
+                    : I18n.__('liveOpsNobodyHint'))}</p>
                 ${action}
             </div>`;
+    },
+
+    /**
+     * The visible rows under their headings. One heading per category, or nothing at all.
+     *
+     * Category view is the only grouping: a site is already the row's own column in Site
+     * view, and a heading over every site would be a second copy of it. The uncategorised
+     * bucket sorts last, where the reader who is not looking for it can ignore it.
+     */
+    liveOpsGroups(rows) {
+        const group = this.liveOpsGroup();
+        const buckets = new Map();
+        for (const row of rows) {
+            const key = group === 'category' ? row.category : String(row.session.site_name || '');
+            if (!buckets.has(key)) buckets.set(key, { key, rows: [] });
+            buckets.get(key).rows.push(row);
+        }
+        return Array.from(buckets.values()).map((bucket) => ({
+            ...bucket,
+            label: bucket.key || I18n.__('sitesCategoryNone'),
+            count: bucket.rows.length
+        })).sort((a, b) => {
+            if (!a.key) return 1;
+            if (!b.key) return -1;
+            return a.label.localeCompare(b.label);
+        });
     },
 
     liveOpsBoardHtml(data) {
@@ -558,8 +661,32 @@ const UI_MODULES = {
         const total = ((data && data.sessions) || []).length;
         if (rows.length === 0) return this.liveOpsEmptyHtml(total);
         const visible = this.liveOpsVisibleRows(rows);
-        const body = Device.isMobile ? this.liveOpsCardsHtml(visible) : this.liveOpsTableHtml(visible);
+        const body = this.liveOpsGroup() === 'category'
+            ? this.liveOpsGroupedBoardHtml(visible)
+            : (Device.isMobile ? this.liveOpsCardsHtml(visible) : this.liveOpsTableHtml(visible));
         return `${body}${this.liveOpsFoldHtml(rows)}`;
+    },
+
+    /**
+     * The board under one heading per category.
+     *
+     * A single category - or none, on a board nobody has categorised - is the flat board:
+     * one heading over every row is a heading that tells the reader nothing. Either way the
+     * rows are drawn by the same table or cards the Site view uses, so a grouped board is
+     * never a second renderer that can drift from the first.
+     */
+    liveOpsGroupedBoardHtml(rows) {
+        const groups = this.liveOpsGroups(rows);
+        if (groups.length <= 1) {
+            return Device.isMobile ? this.liveOpsCardsHtml(rows) : this.liveOpsTableHtml(rows);
+        }
+        return groups.map((group) => `
+            <section class="ops-group" data-live-ops-group-section="${this.escapeHtml(group.key)}">
+                <h3 class="ops-group-head">${this.escapeHtml(group.label)}
+                    <span class="ops-group-count">${this.escapeHtml(I18n.__('liveOpsGroupCount').replace('{count}', String(group.count)))}</span>
+                </h3>
+                ${Device.isMobile ? this.liveOpsCardsHtml(group.rows) : this.liveOpsTableHtml(group.rows)}
+            </section>`).join('');
     },
 
     /**
@@ -627,6 +754,8 @@ const UI_MODULES = {
         const target = event && event.target;
         if (!target || typeof target.closest !== 'function') return undefined;
         if (target.closest('[data-live-ops-toggle]')) return this.toggleLiveOpsExpanded();
+        const group = target.closest('[data-live-ops-group]');
+        if (group) return this.setLiveOpsGroup((group.dataset || {}).liveOpsGroup);
         return undefined;
     },
 
@@ -666,8 +795,9 @@ const UI_MODULES = {
                                placeholder="${this.escapeHtml(I18n.__('liveOpsSearchPlaceholder'))}"
                                oninput="UI_MODULES.setLiveOpsQuery(this.value)" />
                     </label>
-                    <div class="ops-chips" role="group" aria-label="${this.escapeHtml(I18n.__('liveOpsSiteFilter'))}">${this.liveOpsChipsHtml(data)}</div>
+                    <div class="ops-chips" role="group" aria-label="${this.escapeHtml(I18n.__(this.liveOpsGroup() === 'category' ? 'liveOpsFilterByCategory' : 'liveOpsSiteFilter'))}">${this.liveOpsChipsHtml(data)}</div>
                     ${Device.isMobile ? this.liveOpsSortSelectHtml() : ''}
+                    ${this.liveOpsGroupToggleHtml()}
                 </div>
                 <details class="ops-panel" id="liveOpsForceIn"${this._forceInOpen ? ' open' : ''} ontoggle="UI_MODULES.liveOpsPanelToggled(this)">
                     <summary>${this.OPS_ICONS.person}<span>${this.escapeHtml(I18n.__('forceInTitle'))}</span></summary>
@@ -899,13 +1029,38 @@ const UI_MODULES = {
         this._liveOpsSite = String(site || '');
         State.liveOpsSite = this._liveOpsSite;
         if (!this._liveOps) return;
-        document.querySelectorAll('[data-site-chip]').forEach((chip) => {
-            chip.setAttribute('aria-pressed', chip.dataset.siteChip === this._liveOpsSite ? 'true' : 'false');
+        // The chip row carried the view's own attribute, so the pressed state is repainted
+        // on the chips that are actually on screen - site chips in Site view, category chips
+        // in Category view.
+        const attr = this.liveOpsGroup() === 'category' ? 'data-category-chip' : 'data-site-chip';
+        document.querySelectorAll(`[${attr}]`).forEach((chip) => {
+            chip.setAttribute('aria-pressed', (chip.getAttribute(attr) || '') === this._liveOpsSite ? 'true' : 'false');
         });
         const board = document.getElementById('liveOpsBoard');
         if (board) board.innerHTML = this.liveOpsBoardHtml(this._liveOps);
         const note = document.getElementById('liveOpsFilterNote');
         if (note) note.textContent = this.liveOpsFilterNoteHtml(this._liveOps);
+    },
+
+    /**
+     * Flip the board between sites and site categories.
+     *
+     * A full re-render rather than a patch of the board: the view changes the filter chips'
+     * values *and* the stats label beside them, which live in the toolbar this setter does
+     * not own - and a chip row still offering sites while the rows under it are grouped by
+     * category is the one thing this switch must never show. It drops any filter for the same
+     * reason a filter is unusable across the flip: the value that named a site names nothing
+     * once the rows are grouped by category.
+     */
+    setLiveOpsGroup(value) {
+        const group = value === 'category' ? 'category' : 'site';
+        if (group === this.liveOpsGroup()) return this.liveOpsGroup();
+        this._liveOpsGroup = group;
+        State.liveOpsGroup = group;
+        this._liveOpsSite = '';
+        State.liveOpsSite = '';
+        UI.renderAdminTab('Live Ops');
+        return this.liveOpsGroup();
     },
 
     setLiveOpsSort(key) {
@@ -934,7 +1089,8 @@ const UI_MODULES = {
         if (!this._liveOps) return;
         const search = document.getElementById('liveOpsQuery');
         if (search) search.value = '';
-        document.querySelectorAll('[data-site-chip]').forEach((chip) => chip.setAttribute('aria-pressed', chip.dataset.siteChip === '' ? 'true' : 'false'));
+        const chipAttr = this.liveOpsGroup() === 'category' ? 'data-category-chip' : 'data-site-chip';
+        document.querySelectorAll(`[${chipAttr}]`).forEach((chip) => chip.setAttribute('aria-pressed', (chip.getAttribute(chipAttr) || '') === '' ? 'true' : 'false'));
         const board = document.getElementById('liveOpsBoard');
         if (board) board.innerHTML = this.liveOpsBoardHtml(this._liveOps);
         const note = document.getElementById('liveOpsFilterNote');
@@ -4576,10 +4732,304 @@ const UI_MODULES = {
             moallem: 'roleMoallem',
             off_office: 'roleOffOffice',
             admin: 'roleAdmin',
-            head_admin: 'roleHeadAdmin'
+            head_admin: 'roleHeadAdmin',
+            developer: 'roleDeveloper'
         };
         return keys[role] ? I18n.__(keys[role]) : String(role || '');
     },
+
+    // =====================================================================
+    //  Developer - the root tier's own tools, in one place
+    // =====================================================================
+    //
+    // Four surfaces that existed only as endpoints until now: the runtime
+    // store (``/developer/runtime``), the deployment's private alert hub
+    // (``/developer/alerts``), database diagnostics (``/developer/diagnostics``)
+    // and the raw audit stream (``/developer/audit``). They are read-only-ish
+    // operator tools - a flag, a cache drop, an acknowledgement, a plan - and
+    // every one of them was reachable only with curl, which for the person who
+    // runs the deployment is the same as not being reachable at all.
+    //
+    // Three rules, the same ones the alert queue follows:
+    //
+    // 1. **Server text is escaped like any other text.** A summary, a runtime
+    //    document, a trace id - each is interpolated through ``escapeHtml``.
+    // 2. **No inline handler.** The document CSP still allows
+    //    ``script-src-attr 'unsafe-inline'`` and its per-file budget may only
+    //    fall, so every control is bound through ``bindDeveloperControls`` by a
+    //    ``data-`` hook rather than an ``onclick``.
+    // 3. **A failed read is a sentence, not a blank panel** - ``uiErrorHtml``,
+    //    like every other tab.
+
+    //: The last good read, so a repaint after an action does not re-fetch. Cleared
+    //: on every tab entry, because an operator arriving here wants the truth now.
+    _devConsole: null,
+
+    async renderDeveloperConsole(content) {
+        if (!content) return;
+        content.innerHTML = UI.consoleSkeletonHtml(I18n.__('developerConsole'));
+        this._devConsole = null;
+        let runtime, alerts, pool, slow, audit;
+        try {
+            [runtime, alerts, pool, slow, audit] = await Promise.all([
+                API.request('/developer/runtime'),
+                API.request('/developer/alerts?limit=50'),
+                API.request('/developer/diagnostics/pool'),
+                API.request('/developer/diagnostics/slow-queries?limit=20'),
+                API.request('/developer/audit?limit=100')
+            ]);
+        } catch (err) {
+            content.innerHTML = this.uiErrorHtml(err, "UI.renderAdminTab('Developer')");
+            return;
+        }
+        this._devConsole = {
+            runtime: runtime || {}, alerts: alerts || {}, pool: pool || {},
+            slow: slow || {}, audit: audit || {}
+        };
+        content.innerHTML = `<div class="ui-page" data-developer-console="true">${this.devConsoleHtml()}</div>`;
+        this.bindDeveloperControls(content);
+    },
+
+    devConsoleHtml() {
+        return `
+            <header class="ui-section-head">
+                <h1 class="ui-section-title">${this.escapeHtml(I18n.__('developerConsole'))}</h1>
+                <p class="ui-section-note">${this.escapeHtml(I18n.__('hintDeveloperConsole'))}</p>
+            </header>
+            ${this.devRuntimeHtml()}
+            ${this.devAlertsHtml()}
+            ${this.devDiagnosticsHtml()}
+            ${this.devAuditHtml()}`;
+    },
+
+    /** The runtime store: a value every worker picks up without a redeploy. */
+    devRuntimeHtml() {
+        const data = this._devConsole.runtime || {};
+        const values = data.values || {};
+        const defaults = data.defaults || {};
+        const docs = data.documentation || {};
+        const levels = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'];
+        const field = (key, value) => {
+            const name = ` data-runtime-input="${this.escapeHtml(key)}"`;
+            if (typeof value === 'boolean') {
+                return `<select class="ui-field"${name}><option value="true"${value ? ' selected' : ''}>true</option>` +
+                    `<option value="false"${value ? '' : ' selected'}>false</option></select>`;
+            }
+            if (key === 'log_level') {
+                return `<select class="ui-field"${name}>${levels.map((level) =>
+                    `<option value="${level}"${String(value) === level ? ' selected' : ''}>${level}</option>`).join('')}</select>`;
+            }
+            return `<input class="ui-field"${name} value="${this.escapeHtml(String(value))}">`;
+        };
+        const rows = Object.keys(values).sort().map((key) => `
+            <div class="ui-card" data-runtime="${this.escapeHtml(key)}">
+                <div class="ui-spread">
+                    <div class="ops-row-main">
+                        <span class="ops-name">${this.escapeHtml(key)}</span>
+                        <span class="ops-sub">${this.escapeHtml(I18n.__('devRuntimeDefault').replace('{value}', String(defaults[key])))}</span>
+                    </div>
+                    <button type="button" class="ui-btn ui-btn-sm" data-runtime-save="${this.escapeHtml(key)}">${this.escapeHtml(I18n.__('devRuntimeSave'))}</button>
+                </div>
+                <p class="ui-note is-body">${this.escapeHtml(docs[key] || '')}</p>
+                <div class="ui-row">
+                    ${field(key, values[key])}
+                    <input class="ui-field" data-runtime-note="${this.escapeHtml(key)}" placeholder="${this.escapeHtml(I18n.__('devRuntimeNote'))}">
+                </div>
+            </div>`).join('');
+        return `
+            <section class="ui-stack" data-dev-section="runtime">
+                <h2 class="ui-section-title">${this.escapeHtml(I18n.__('devRuntime'))}</h2>
+                <p class="ui-note">${this.escapeHtml(I18n.__('devRuntimeHint'))}</p>
+                <p class="ops-sub">${this.escapeHtml(I18n.__('devRuntimeVersion').replace('{version}', String(data.version ?? '')))}</p>
+                ${rows}
+            </section>`;
+    },
+
+    /** The private hub: what the deployment has said about itself, newest first. */
+    devAlertsHtml() {
+        const data = this._devConsole.alerts || {};
+        const alerts = data.alerts || [];
+        const kinds = data.kinds || {};
+        const rows = alerts.map((alert) => {
+            const severity = String(alert.severity || 'info');
+            const tone = severity === 'critical' ? ' is-danger' : (severity === 'warning' ? ' is-warn' : '');
+            const read = !!alert.read_at;
+            return `
+                <article class="ui-card${tone}" data-dev-alert="${this.escapeHtml(String(alert.id))}" data-dev-alert-unread="${read ? '0' : '1'}">
+                    <div class="ui-spread">
+                        <div class="ops-row-main">
+                            <span class="ui-badge${tone}">${this.escapeHtml(severity)}</span>
+                            <div class="ops-who">
+                                <span class="ops-name">${this.escapeHtml(alert.summary || '')}</span>
+                                <span class="ops-sub">${this.escapeHtml(`${alert.kind || ''} \u00b7 ${alert.created_at || ''}`)}</span>
+                            </div>
+                        </div>
+                        ${read
+                            ? `<span class="ui-badge" data-dev-alert-read-chip="true">${this.OPS_ICONS.check}${this.escapeHtml(I18n.__('devAlertsRead'))}</span>`
+                            : `<button type="button" class="ui-btn ui-btn-sm" data-dev-alert-read="${this.escapeHtml(String(alert.id))}">${this.escapeHtml(I18n.__('devAlertsMarkRead'))}</button>`}
+                    </div>
+                    <p class="ui-note is-body">${this.escapeHtml(kinds[alert.kind] || '')}</p>
+                </article>`;
+        }).join('');
+        return `
+            <section class="ui-stack" data-dev-section="alerts">
+                <h2 class="ui-section-title">${this.escapeHtml(I18n.__('devAlerts'))}</h2>
+                <p class="ops-sub">${this.escapeHtml(I18n.__('devAlertsUnread').replace('{count}', String(data.unread ?? 0)))}</p>
+                ${rows || `<p class="ui-empty">${this.escapeHtml(I18n.__('devAlertsEmpty'))}</p>`}
+            </section>`;
+    },
+
+    /** The write path's real counters, the slow statements, and a plan on demand. */
+    devDiagnosticsHtml() {
+        const pool = this._devConsole.pool || {};
+        const slow = this._devConsole.slow || {};
+        const recent = slow.recent || [];
+        const fields = Object.keys(pool).sort().map((key) =>
+            `<span class="ui-fact"><span class="ui-fact-sub">${this.escapeHtml(key)}</span>` +
+            `<span class="ui-fact-value">${this.escapeHtml(String(pool[key]))}</span></span>`).join('');
+        const slowRows = recent.map((row) => `<tr>
+                <td>${this.escapeHtml(String(row.operation || row.verb || ''))}</td>
+                <td>${this.escapeHtml(String(row.duration_ms ?? row.ms ?? ''))}</td>
+                <td>${this.escapeHtml(String(row.trace_id || ''))}</td>
+            </tr>`).join('');
+        const explainable = (slow.explainable || []).map((name) =>
+            `<button type="button" class="ui-btn ui-btn-sm" data-dev-explain="${this.escapeHtml(name)}">${this.escapeHtml(name)}</button>`).join('');
+        return `
+            <section class="ui-stack" data-dev-section="diagnostics">
+                <h2 class="ui-section-title">${this.escapeHtml(I18n.__('devDiagnostics'))}</h2>
+                <h3 class="ui-section-title">${this.escapeHtml(I18n.__('devPool'))}</h3>
+                <div class="ui-grid three">${fields}</div>
+                <p class="ui-note">${this.escapeHtml(pool.saturated ? I18n.__('devPoolSaturated') : I18n.__('devPoolHealthy'))}</p>
+                <h3 class="ui-section-title">${this.escapeHtml(I18n.__('devSlowQueries'))}</h3>
+                <p class="ops-sub">${this.escapeHtml(I18n.__('devSlowThreshold').replace('{ms}', String(slow.threshold_ms ?? '')))}</p>
+                <table class="ui-table">
+                    <thead><tr>
+                        <th>${this.escapeHtml(I18n.__('devColOperation'))}</th>
+                        <th>${this.escapeHtml(I18n.__('devColDuration'))}</th>
+                        <th>${this.escapeHtml(I18n.__('devColTrace'))}</th>
+                    </tr></thead>
+                    <tbody>${slowRows || `<tr><td colspan="3">${this.escapeHtml(I18n.__('devSlowEmpty'))}</td></tr>`}</tbody>
+                </table>
+                <p class="ui-note">${this.escapeHtml(I18n.__('devExplainHint'))}</p>
+                <div class="ui-row">${explainable}</div>
+                <pre class="ui-note" data-dev-plan="true"></pre>
+                <button type="button" class="ui-btn" data-dev-flush="true">${this.OPS_ICONS.refresh}${this.escapeHtml(I18n.__('devFlush'))}</button>
+                <p class="ui-note">${this.escapeHtml(I18n.__('devFlushHint'))}</p>
+            </section>`;
+    },
+
+    /** The raw appended history: security events, newest first, with the trace ids. */
+    devAuditHtml() {
+        const events = (this._devConsole.audit || {}).events || [];
+        const rows = events.map((event) => `<tr>
+                <td>${this.escapeHtml(String(event.created_at || ''))}</td>
+                <td>${this.escapeHtml(String(event.actor_id || ''))}</td>
+                <td>${this.escapeHtml(this.roleLabel(event.actor_role || ''))}</td>
+                <td>${this.escapeHtml(String(event.action || ''))}</td>
+                <td>${this.escapeHtml([event.entity, event.entity_id].filter(Boolean).join(' '))}</td>
+            </tr>`).join('');
+        return `
+            <section class="ui-stack" data-dev-section="audit">
+                <h2 class="ui-section-title">${this.escapeHtml(I18n.__('devAudit'))}</h2>
+                <p class="ui-note">${this.escapeHtml(I18n.__('devAuditHint'))}</p>
+                <table class="ui-table">
+                    <thead><tr>
+                        <th>${this.escapeHtml(I18n.__('devColWhen'))}</th>
+                        <th>${this.escapeHtml(I18n.__('devColActor'))}</th>
+                        <th>${this.escapeHtml(I18n.__('role'))}</th>
+                        <th>${this.escapeHtml(I18n.__('devColAction'))}</th>
+                        <th>${this.escapeHtml(I18n.__('devColEntity'))}</th>
+                    </tr></thead>
+                    <tbody>${rows || `<tr><td colspan="5">${this.escapeHtml(I18n.__('devAuditEmpty'))}</td></tr>`}</tbody>
+                </table>
+                <button type="button" class="ui-btn" data-dev-audit-reload="true">${this.OPS_ICONS.refresh}${this.escapeHtml(I18n.__('devAuditReload'))}</button>
+            </section>`;
+    },
+
+    /**
+     * Bind every control the panel drew, by its ``data-`` hook.
+     *
+     * One pass after the paint, the way ``bindAlertControls`` does it: a repaint
+     * between paint and tap cannot orphan a handler, and no inline ``onclick``
+     * joins the ones the document policy already tolerates. Guarded so a stub DOM
+     * without ``querySelectorAll`` - which every frontend suite runs against -
+     * can render the panel without throwing.
+     */
+    bindDeveloperControls(content) {
+        if (!content || typeof content.querySelectorAll !== 'function') return;
+        const on = (selector, attribute, handler) => {
+            content.querySelectorAll(selector).forEach((node) => {
+                if (typeof node.addEventListener !== 'function') return;
+                node.addEventListener('click', () => handler(node.getAttribute(attribute)));
+            });
+        };
+        on('[data-runtime-save]', 'data-runtime-save', (key) => this.saveRuntimeValue(key));
+        on('[data-dev-alert-read]', 'data-dev-alert-read', (id) => this.markDevAlertRead(id));
+        on('[data-dev-explain]', 'data-dev-explain', (name) => this.explainDevQuery(name));
+        on('[data-dev-flush]', 'data-dev-flush', () => this.flushDevCaches());
+        on('[data-dev-audit-reload]', 'data-dev-audit-reload', () => UI.renderAdminTab('Developer'));
+    },
+
+    /** Change one runtime value. The note is optional; the audit row is not. */
+    async saveRuntimeValue(key) {
+        const input = typeof document.querySelector === 'function'
+            ? document.querySelector(`[data-runtime-input="${key}"]`) : null;
+        if (!input) return;
+        const noteField = typeof document.querySelector === 'function'
+            ? document.querySelector(`[data-runtime-note="${key}"]`) : null;
+        let value = String(input.value);
+        if (value === 'true') value = true;
+        else if (value === 'false') value = false;
+        try {
+            await API.request(`/developer/runtime/${encodeURIComponent(key)}`, {
+                method: 'PATCH',
+                body: { value, note: noteField && String(noteField.value || '').trim() || null }
+            });
+            Toast.success(I18n.__('devRuntimeSaved')
+                .replace('{key}', key).replace('{value}', String(value)));
+            return UI.renderAdminTab('Developer');
+        } catch (err) {
+            Toast.error((err && err.message) || I18n.__('error'));
+        }
+    },
+
+    /** Acknowledge one alert in the private hub so the unread count falls. */
+    async markDevAlertRead(alertId) {
+        try {
+            await API.request(`/developer/alerts/${encodeURIComponent(alertId)}/read`, { method: 'POST' });
+            return UI.renderAdminTab('Developer');
+        } catch (err) {
+            Toast.error((err && err.message) || I18n.__('error'));
+        }
+    },
+
+    /** Ask SQLite for one named query's plan, and write it under the buttons. */
+    async explainDevQuery(name) {
+        const target = typeof document.querySelector === 'function'
+            ? document.querySelector('[data-dev-plan]') : null;
+        try {
+            const data = await API.request(`/developer/diagnostics/query-plan/${encodeURIComponent(name)}`);
+            const plan = (data && data.plan) || [];
+            if (target) {
+                target.textContent = `${I18n.__('devExplainResult').replace('{name}', name)}\n${plan.join('\n')}`;
+            }
+        } catch (err) {
+            Toast.error((err && err.message) || I18n.__('error'));
+        }
+    },
+
+    /** Drop the caches the deployment really has, and say how many went. */
+    async flushDevCaches() {
+        try {
+            const data = await API.request('/developer/diagnostics/caches/flush', { method: 'POST' });
+            const count = Array.isArray(data && data.flushed) ? data.flushed.length : 0;
+            Toast.success(I18n.__('devFlushed').replace('{count}', String(count)));
+            return UI.renderAdminTab('Developer');
+        } catch (err) {
+            Toast.error((err && err.message) || I18n.__('error'));
+        }
+    },
+
 
     /**
      * The shift rules this panel was last painted from, or ``null`` before the first
@@ -5044,6 +5494,10 @@ const UI_MODULES = {
             role: { label: 'role' },
             id: { label: 'userId' },
             site: { label: 'site' },
+            // The kind of place the site is (a warehouse, a factory). The filter row has
+            // always offered it; a filter whose value cannot be read on the row it selected
+            // is a filter the reader has to take on trust.
+            category: { label: 'sitesCategory' },
             arrival: { label: 'shiftsArrival' },
             hours: { label: 'hours' },
             awaiting: { label: 'shiftsPending' },
@@ -5053,7 +5507,7 @@ const UI_MODULES = {
 
     /** The order this tab was asked for, and the one Reset puts back. */
     defaultShiftsColumns() {
-        return ['date', 'employee', 'role', 'id', 'site', 'arrival', 'hours', 'awaiting', 'notes'];
+        return ['date', 'employee', 'role', 'id', 'site', 'category', 'arrival', 'hours', 'awaiting', 'notes'];
     },
 
     /**
@@ -6071,6 +6525,14 @@ const UI_MODULES = {
                 // in the record, and a blank reads as "this row has no site column".
                 return row.site_name
                     ? this.escapeHtml(row.site_name)
+                    : `<span class="ui-tone-faint">\u2014</span>`;
+            case 'category':
+                // The site's category as the server resolved it *on this row*, not a second
+                // lookup in the site list: the timesheet already decided which category each
+                // shift belongs to, and a lookup here could disagree with the chip that
+                // selected it. A site with no category reads as a gap, like a row with no site.
+                return row.site_category
+                    ? this.escapeHtml(row.site_category)
                     : `<span class="ui-tone-faint">\u2014</span>`;
             case 'arrival':
                 return this.arrivalCellHtml(row);

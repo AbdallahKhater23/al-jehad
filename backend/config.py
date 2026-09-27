@@ -27,11 +27,25 @@ from pathlib import Path
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
+# Imported for its side effect, and first among the application modules: importing it pins the
+# process's clock to ``Asia/Kuwait`` (see ``clock.py``) before configuration - and therefore
+# the app - can read a wall-clock time. ``config`` is imported by the server, the tools and the
+# tests alike, so this is the one place the bootstrap is guaranteed to have run first.
+import clock  # noqa: F401  (side effect: clock.install())
+
 BACKEND_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BACKEND_DIR.parent
 DEFAULT_ENV_FILE = PROJECT_ROOT / ".env"
 
 MIN_SECRET_LENGTH = 32
+
+#: How long a signed-in session lasts, in days. This is the primary knob for the login load:
+#: bcrypt is the one CPU-bound step on this deployment (~0.21 s, one core), and a phone that
+#: holds a token for a month only pays it when it truly signs in - not every morning. 30 days
+#: is long enough to cover a worker's whole roster of shifts without a re-login, and short
+#: enough that a lost phone's token lapses. Revocation is immediate regardless: a password
+#: change or a deactivation bumps ``users.token_version`` and invalidates every token at once.
+ACCESS_TOKEN_EXPIRE_DAYS = 30
 
 #: Values that look like a placeholder rather than a generated key.
 WEAK_SECRETS = frozenset(
@@ -126,7 +140,12 @@ PUSH_ENDPOINT_HOSTS: tuple[str, ...] = (
 class Settings(BaseModel):
     secret_key: str
     jwt_algorithm: str = "HS256"
-    jwt_ttl_hours: float = 12.0          # deliberately longer than the 11h shift cap
+    # 30 days, not the old 12 hours. The old value was chosen to outlast an 11 h shift, but it
+    # forced a fresh bcrypt login on every app open, and a shift start is exactly when the
+    # single core is busiest. A month-long token is only a *risk* if it cannot be revoked - and
+    # it can: ``token_version`` invalidates every outstanding token the moment credentials
+    # change or the account is deactivated (see ``security.get_current_user``).
+    jwt_ttl_hours: float = float(ACCESS_TOKEN_EXPIRE_DAYS * 24)
     jwt_leeway_seconds: int = 30
     database_path: Path
     backup_dir: Path
@@ -805,7 +824,10 @@ def build_settings(*, env_file: Path | None = None) -> Settings:
     return Settings(
         secret_key=_validate_secret(_env_str("SECRET_KEY")),
         jwt_algorithm=_env_str("JWT_ALGORITHM", "HS256") or "HS256",
-        jwt_ttl_hours=_env_float("JWT_TTL_HOURS", 12.0),
+        jwt_ttl_hours=_env_float(
+            "JWT_TTL_HOURS",
+            float(_env_int("ACCESS_TOKEN_EXPIRE_DAYS", ACCESS_TOKEN_EXPIRE_DAYS) * 24),
+        ),
         jwt_leeway_seconds=_env_int("JWT_LEEWAY_SECONDS", 30),
         database_path=database_path,
         backup_dir=backup_dir,
@@ -1022,7 +1044,8 @@ def write_env_file(path: Path | None = None, *, overwrite: bool = False) -> Path
         "# host here, or the allowlist above ends up checking the proxy's address.\n"
         "TRUSTED_PROXIES=127.0.0.1/32,::1/128\n"
         "ENABLE_API_DOCS=0\n"
-        "JWT_TTL_HOURS=12\n"
+        "# 30 days. Lower it to shorten every new session (existing tokens keep their exp):\n"
+        "ACCESS_TOKEN_EXPIRE_DAYS=30\n"
         "SCHEMA_GUARD_MODE=enforce_repair\n"
         "BACKUP_MAX_AGE_HOURS=24\n"
         "# Emergency only - both lines are required, and the reason is audited. Which faults\n"
