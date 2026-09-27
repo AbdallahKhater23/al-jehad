@@ -65,7 +65,6 @@ TOKEN_SCOPED_ROUTES = frozenset(
     {
         "GET /api/v1/enroll/{token}",
         "POST /api/v1/enroll/{token}",
-        "POST /api/v1/enroll/{token}/register",
         "GET /api/v1/q/{token}",
         "POST /api/v1/q/{token}",
         "GET /enroll/{token}",

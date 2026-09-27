@@ -322,24 +322,43 @@ def test_the_notification_body_carries_no_markup(client):
     assert any("Password reset" in body for body in bodies), bodies
 
 
-def test_an_enrollment_invite_cannot_name_a_worker_with_markup(client):
-    """``kind=register`` writes this name onto a new account; nothing else constrains it."""
-    response = client.post(
+def test_an_enrollment_invite_has_nowhere_to_put_a_name(client):
+    """The retired ``kind=register`` link was the one route a visitor's name travelled through.
+
+    It wrote the name an administrator typed onto the account it created, which made that field a
+    stored string on a public path. The field is gone from the request model, and the retired kind
+    is refused - so there is no route by which a name reaches an invite row at all.
+    """
+    refused = client.post(
         "/api/v1/admin/enrollment/invites",
         headers=bearer(ADMIN),
         json={
-            "worker_id": "400",
+            "worker_id": WORKER,
             "kind": "register",
             "name": "<script>alert(1)</script>",
             "role": "worker",
         },
     )
-    assert response.status_code == 422, response.text[:300]
-    # ``name`` on the request becomes ``pending_name`` on the row: the name is not written
-    # anywhere until the link is opened and the account is created.
+    assert refused.status_code == 400, refused.text[:300]
+
+    import enrollment
+
+    assert not {"name", "role", "email", "phone"} & set(enrollment.InviteCreate.model_fields), (
+        "an invite is an account id and a note: a name here would be a stored string with no "
+        "account behind it"
+    )
+
+    # Sending one anyway is ignored rather than stored - there is no column to land in.
+    accepted = client.post(
+        "/api/v1/admin/enrollment/invites",
+        headers=bearer(ADMIN),
+        json={"worker_id": WORKER, "name": "<script>alert(1)</script>"},
+    )
+    assert accepted.status_code == 200, accepted.text[:300]
     assert db_scalar(
         "SELECT COUNT(*) FROM enrollment_invites WHERE pending_name LIKE '%script%'"
     ) == 0
+    assert db_scalar("SELECT COUNT(*) FROM enrollment_invites WHERE note LIKE '%script%'") == 0
 
 
 def test_a_quick_links_note_is_prose_and_not_markup(client):

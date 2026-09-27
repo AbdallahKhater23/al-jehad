@@ -1,12 +1,12 @@
 """Walk-up registration: one permanent public link, one photograph, one administrator's decision.
 
-WHY THIS IS NOT THE REGISTRATION LINK THAT ALREADY SHIPS
---------------------------------------------------------
-``enrollment`` issues a link *per person*: an administrator types the name, the role and the
-account id, and the link reserves that id the moment it is created. That is the right shape for
-one named hire and the wrong one for a walk-up, where nobody has applied yet and so there is no
-id to reserve. Here there is one link for the whole site, anybody can submit to it, and nothing
-about the applicant is decided until an administrator reads the request.
+WHY THIS IS NOT A PER-PERSON INVITE
+-----------------------------------
+``enrollment`` issues a link *per person*, for an account that already exists: an administrator
+creates the account, and the link registers its owner's face. That is the right shape for one
+named hire and the wrong one for a walk-up, where nobody has applied yet and so there is no
+account to hold a face. Here there is one link for the whole site, anybody can submit to it, and
+nothing about the applicant is decided until an administrator reads the request.
 
 WHAT THE THREE PARTS ARE FOR
 ----------------------------
@@ -33,16 +33,17 @@ work is *for*.
 WHY THE ACCOUNT ID IS NOT PROMISED UNTIL THE DECISION
 -----------------------------------------------------
 The id is allocated at approval, inside the same write transaction that inserts the account, by
-``security.lowest_free_id``. A number told to the applicant at submission would be a promise this
-application cannot keep: ids are recycled, another request may take it in the meantime, and an
-applicant who was told "you are 43" and then hired as 51 is a worse experience than one who was
-told nothing. The answer they get is "we have your request", and the number arrives with the
-account.
+``_next_workforce_id``. A number told to the applicant at submission would be a promise this
+application cannot keep: another approval, or an administrator working in the console, may take it
+in the meantime, and an applicant who was told "you are 43" and then hired as 51 is a worse
+experience than one who was told nothing. The answer they get is "we have your request", and the
+number arrives with the account.
 
-The allocator is the same one the ``kind=register`` invite flow reserves through, and it counts a
-number a live invite is holding as taken (``security.reserved_account_ids``). A walk-up approval
-and an invite can therefore never be handed the same id, whichever order they run in: an id a link
-already promised is not "free" until that link is revoked, expires or is claimed.
+Nothing reserves a number any more, and this is the only allocator left. The range-scoped
+allocator in ``security`` and the account id a ``kind=register`` invite used to hold both went
+with the per-role id bands, because an invite now registers a face for an account that already
+exists. What an approval hands out is the next number below the administrative tiers, and a
+number above that floor cannot be minted here at all.
 
 ONE PHOTOGRAPH IS ONE REQUEST, ONE DECISION DESTROYS THE PHOTO
 --------------------------------------------------------------
@@ -81,13 +82,10 @@ from database import db, immediate
 from rate_limit import limiter
 from security import (
     CurrentUser,
-    IdSpaceExhausted,
     admin_only,
     hash_password,
-    lowest_free_id,
     refuse_developer_role,
     validate_password_strength,
-    validate_user_id_for_role,
 )
 
 log = logging.getLogger("attendance.registrations")
@@ -106,10 +104,25 @@ STATUS_APPROVED = "APPROVED"
 STATUS_REJECTED = "REJECTED"
 STATUSES = (STATUS_PENDING, STATUS_APPROVED, STATUS_REJECTED)
 
-#: What a walk-up may ask to be. ``enrollment``'s list rather than a copy of it: the reasoning
-#: is the same (nobody self-registers as an administrator, because an account that can read the
-#: audit trail is not something a forwarded link may mint) and two lists would drift apart.
-REGISTRATION_ROLES = enrollment.REGISTER_ROLES
+#: What a walk-up may ask to be, spelled out here rather than borrowed from the invite flow.
+#: These three roles are this form's own contract with a stranger: nobody self-registers as an
+#: administrator, because an account that can read the audit trail is not something a forwarded
+#: link may mint - and an invite that is allowed to enroll a different set of roles must not be
+#: able to change what a public form offers by being edited.
+WORKFORCE_ROLES: frozenset[str] = frozenset({"worker", "moallem", "off_office"})
+
+#: The same three in the order the public form offers them: the plainest role first. A set has no
+#: order of its own, and a list sorted for determinism would offer "moallem, off_office, worker".
+WORKFORCE_ROLES_IN_ORDER: tuple[str, ...] = ("worker", "moallem", "off_office")
+
+#: The first id of the administrative tiers (``admin`` 1000-4999, ``head_admin`` 5000+, and the
+#: root band far above both). An approval may never mint a number at or above this floor: an
+#: administrator account is created by an administrator in the console, and a queue anybody can
+#: submit to must not be able to produce one.
+ADMIN_TIER_ID_FLOOR = 1000
+
+#: The last id a walk-up approval may hand out - the workforce band's ceiling.
+WORKFORCE_ID_CEILING = ADMIN_TIER_ID_FLOOR - 1
 
 #: What counts as consent on the public form. Deliberately explicit: the field is a checkbox,
 #: but the value arrives as a string and ``"false"`` is a string that means no.
@@ -134,6 +147,65 @@ def photos_dir() -> str:
     """
     os.makedirs(PHOTOS_DIR, exist_ok=True)
     return PHOTOS_DIR
+
+
+# ---------------------------------------------------------------------------
+# the account id an approval mints
+# ---------------------------------------------------------------------------
+def _next_workforce_id(conn: sqlite3.Connection) -> str:
+    """The next account id below the administrative tiers. Refuses with ``409`` when the band is
+    full.
+
+    WHY THE CEILING IS THE POINT
+    ----------------------------
+    An approval is the one thing on this surface that creates an account, and it is driven by a
+    form a stranger can reach. So it may only ever mint a number inside the band that belongs to
+    business accounts: the administrative tiers begin at ``ADMIN_TIER_ID_FLOOR`` and this refuses
+    to reach them, rather than trusting that the ids it happens to hand out stay low.
+
+    A full band is reported instead of wrapped around: an id reused above an account that is
+    still in use would be a duplicate key, and one reused *for* a deleted account would hand a
+    recycled number to a new face without an operator ever deciding to. Answering 409 names the
+    band and leaves the choice - retire an account, or create this one in the console.
+
+    WHY THE NEXT NUMBER AND NOT THE LOWEST FREE ONE
+    -----------------------------------------------
+    The allocator that scanned for the lowest free number went with the per-role id bands. What
+    makes counting upward the right answer here is the queue itself: an applicant whose photograph
+    is waiting is *going to* need a number, so a number given back by a deleted account is not
+    free in any useful sense - it is a number this queue would have spent twice. Recycling a
+    retired number is a decision an administrator makes in the console, where the roster is in
+    front of them.
+
+    WHY THIS IS ONLY SAFE INSIDE THE CALLER'S WRITE TRANSACTION
+    ----------------------------------------------------------
+    This is a **read**. Two approvals that both read "highest is 7" both insert 8, and one of them
+    dies on the primary key. What makes the read-then-insert safe is the caller's
+    ``BEGIN IMMEDIATE`` (``database.immediate``): SQLite takes the single write lock *before* the
+    read, so the second caller cannot read until the first has committed and therefore sees the
+    row the first one wrote. The primary key stays the last line of defence.
+    """
+    row = conn.execute(
+        "SELECT MAX(CAST(id AS INTEGER)) FROM users WHERE CAST(id AS INTEGER) BETWEEN 1 AND ?",
+        (WORKFORCE_ID_CEILING,),
+    ).fetchone()
+    # ``CAST`` is 64-bit in SQLite and a non-numeric id casts to 0, which the ``BETWEEN`` above
+    # excludes - an account id that is not a number occupies no number in this band.
+    highest = int(row[0]) if row is not None and row[0] is not None else 0
+    candidate = highest + 1
+    if candidate > WORKFORCE_ID_CEILING:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error_code": "id_space_exhausted",
+                "message": (
+                    f"There is no free account id below {ADMIN_TIER_ID_FLOOR} any more: the "
+                    f"workforce band ends at {WORKFORCE_ID_CEILING}. Retire an account that is no "
+                    "longer needed, or create this account in the console."
+                ),
+            },
+        )
+    return str(candidate)
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +400,7 @@ async def registration_intake(request: Request):  # noqa: ARG001 - the limiter n
     """
     return {
         "enabled": bool(settings.registration_enabled),
-        "roles": list(REGISTRATION_ROLES),
+        "roles": list(WORKFORCE_ROLES_IN_ORDER),
         "photo_policy": uploads.policy(),
         "min_password_length": settings.min_password_length,
         "consent_version": CONSENT_VERSION,
@@ -387,7 +459,7 @@ async def submit_registration(
         raise textguard.http_error(exc) from None
 
     role = str(role or "").strip().lower()
-    if role not in REGISTRATION_ROLES:
+    if role not in WORKFORCE_ROLES:
         raise HTTPException(
             status_code=400,
             detail={
@@ -644,7 +716,7 @@ async def approve_registration(
         )
 
     role = str(row["requested_role"] or "").strip().lower()
-    if role not in REGISTRATION_ROLES:
+    if role not in WORKFORCE_ROLES:
         # Only reachable if the row was edited by hand. Refuse rather than mint an account in a
         # role this surface was never allowed to hand out.
         raise HTTPException(
@@ -697,23 +769,11 @@ async def approve_registration(
     assigned = ""
     try:
         with immediate() as conn:
-            try:
-                assigned = lowest_free_id(conn, role)
-            except IdSpaceExhausted as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "error_code": "id_space_exhausted",
-                        "message": (
-                            f"{exc} Approve (or free) an account in that range first, or widen "
-                            "the range in the configuration."
-                        ),
-                    },
-                ) from None
-            # The allocator is range-scoped by construction; this is the second half of the same
-            # rule, and the one the console and the roster import share, so an id cannot land in
-            # another role's block through this door either.
-            validate_user_id_for_role(assigned, role)
+            # The read and the INSERT below are one transaction (``BEGIN IMMEDIATE``), which is
+            # the whole reason two approvals cannot be handed the same number. The role is not an
+            # argument: the number comes from one band, and what the applicant may be is decided
+            # by ``WORKFORCE_ROLES`` long before this line.
+            assigned = _next_workforce_id(conn)
 
             claimed = conn.execute(
                 "UPDATE registration_requests SET status = ?, assigned_id = ?, reviewed_by = ?, "
@@ -770,9 +830,9 @@ async def approve_registration(
                 request=request,
             )
     except sqlite3.IntegrityError:
-        # ``lowest_free_id`` and its ``INSERT`` are one transaction, so this can only be a race
-        # with a writer that does not use this lock - the primary key is the last line of
-        # defence, and answering 409 says what actually happened.
+        # The allocator and its ``INSERT`` are one transaction, so this can only be a race with a
+        # writer that does not use this lock - the primary key is the last line of defence, and
+        # answering 409 says what actually happened.
         raise HTTPException(
             status_code=409,
             detail={

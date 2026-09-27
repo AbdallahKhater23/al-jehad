@@ -215,7 +215,9 @@ const results = {};
         on_site: statOf(markup, 'on-site'),
         longest: statOf(markup, 'longest'),
         late: statOf(markup, 'late'),
-        over: statOf(markup, 'over'),
+        // The "past the paid day" tile is gone: this deployment does not run payroll from
+        // this screen, so the figure is asserted *absent* rather than captured.
+        paid_day_tile: markup.indexOf('data-stat="over"') >= 0,
         filter_note: env.evaluate("UI_MODULES.liveOpsFilterNoteHtml(UI_MODULES._liveOps)"),
         order: sessionOrder(markup),
         aria_sort: /aria-sort="(ascending|descending)"/.test(markup),
@@ -361,16 +363,16 @@ const results = {};
     results.search_cleared = { rows: rowIds(env2) };
 
     env2.evaluate("UI_MODULES.setLiveOpsSite('Downtown Tower A')");
-    // The chips are what ``liveOpsChipsHtml`` paints into the toolbar - the same
-    // function, read back after the filter moved, so this is the state a screen
-    // reader would get (the stub DOM cannot be asked about aria-pressed itself).
-    const chips = env2.evaluate("UI_MODULES.liveOpsChipsHtml(UI_MODULES._liveOps)");
+    // The picker is what ``liveOpsFilterSelectHtml`` paints into the toolbar - the same
+    // function, read back after the filter moved, so this is the state a screen reader
+    // would get (the stub DOM cannot be asked which option is selected itself).
+    const picker = env2.evaluate("UI_MODULES.liveOpsFilterSelectHtml(UI_MODULES._liveOps)");
     results.site_filter = {
         rows: rowIds(env2),
         note: env2.evaluate("UI_MODULES.liveOpsFilterNoteHtml(UI_MODULES._liveOps)"),
-        chip_pressed_markup: /data-site-chip="Downtown Tower A"[^>]*aria-pressed="true"/.test(chips),
-        all_chip_unpressed: /data-site-chip=""[^>]*aria-pressed="false"/.test(chips),
-        chips: chips
+        selected_markup: /<option value="Downtown Tower A" selected>Downtown Tower A \\(2\\)<\\/option>/.test(picker),
+        all_option_unselected: /<option value="">All sites \\(4\\)<\\/option>/.test(picker),
+        picker: picker
     };
     env2.evaluate("UI_MODULES.clearLiveOpsFilters()");
     results.site_filter_cleared = { rows: rowIds(env2) };
@@ -638,7 +640,9 @@ def test_the_board_leads_with_the_figures_an_operator_came_for(results):
     assert board["on_site"] == "4"
     assert board["longest"] == "10h 0m", "the longest shift is the one that needs a decision"
     assert board["late"] == "1"
-    assert board["over"] == "2", "past the paid day, plus past the overtime line"
+    assert board["paid_day_tile"] is False, (
+        "the 'past the paid day' figure is gone: nothing on this screen is paid from here"
+    )
     assert board["filter_note"] == "4 open shifts"
 
 
@@ -774,15 +778,16 @@ def test_a_search_that_matches_nobody_says_so_and_offers_a_way_back(results):
     assert results["search_cleared"]["rows"] == ["w1", "w2", "w3", "w4"]
 
 
-def test_the_site_chips_filter_and_announce_which_one_is_on(results):
+def test_the_site_picker_filters_and_shows_which_one_is_chosen(results):
     site = results["site_filter"]
     assert site["rows"] == ["w1", "w3"], "only the Downtown Tower A shifts, longest first"
     assert site["note"] == "Showing 2 of 4"
-    assert site["chip_pressed_markup"], "the pressed chip says so for a screen reader"
-    assert site["all_chip_unpressed"], "and All sites is no longer pressed"
+    assert 'data-live-ops-filter' in site["picker"], "the picker is the delegated control"
+    assert site["selected_markup"], "the chosen site is the selected option"
+    assert site["all_option_unselected"], "and All sites is a plain option again"
     for label, count in (("All sites", 4), ("Downtown Tower A", 2), ("New Capital Zone B", 2)):
-        assert f"{label} ({count})" in site["chips"], (
-            f"each chip carries how many are on that site: {site['chips']}"
+        assert f"{label} ({count})" in site["picker"], (
+            f"every choice is listed, with how many are on it: {site['picker']}"
         )
     assert results["site_filter_cleared"]["rows"] == ["w1", "w2", "w3", "w4"]
 

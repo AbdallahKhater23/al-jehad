@@ -791,11 +791,13 @@ curl -X POST localhost:8000/api/v1/admin/sites/edit \
 * **Deleting is refused while sites still belong to it** (409, naming the count), rather than
   reassigning them: every destination would be a guess about those sites' opening hours. Move them
   to another category, or to none, first.
-* On the Shifts tab the categories appear as chips beside the period presets, each carrying the
-  number of shifts **in this period** behind it - so a chip cannot offer an empty table - and the
-  search box matches a site's category, so typing `مخزن` finds every warehouse shift. The chosen
-  category travels in the shareable link (`#shifts=…&q=…&c=…`) and narrows the printed and
-  downloaded timesheet exactly as it narrows the screen.
+* On the Shifts tab the categories appear as a **picker list** beside the period presets, each
+  option carrying the number of shifts **in this period** behind it - so no option can offer an
+  empty table - and the search box matches a site's category, so typing `مخزن` finds every
+  warehouse shift. A list rather than a row of chips, so the control stays one line as a company
+  adds categories and the chosen one is legible at a glance. The chosen category travels in the
+  shareable link (`#shifts=…&q=…&c=…`) and narrows the printed and downloaded timesheet exactly as
+  it narrows the screen.
 * The **Sites** tab gets a category picker on both forms - with *No category* first, which is what
   every existing site is - and a *Site categories* panel to add, rename, retune and delete them.
   A card names the category the site is in, and a window that came from a category says so.
@@ -1381,7 +1383,16 @@ worker id, role, site, day, approval state or arrival - every term has to match,
 one shift that is both. The totals above the list then cover only the shifts shown, and the
 card block is replaced by "no shift matches" rather than a grid of zeros. A day typed into
 the box filters the rows like any other term (a timesheet row *has* a date) and still
-offers a one-tap switch that moves the whole period onto it. Searching repaints from the
+offers a one-tap switch that moves the whole period onto it.
+
+A term made **only of digits** is read as a worker id and matched against what the row
+*is* - the name, the id, the role, the site and its category - never against the date it
+was worked on. This deployment hands out ids like `1`, `2` and `4`, and every date on a
+sheet carries those digits, so a plain substring match made `4` answer with every shift
+worked on the 4th and made a fragment of an id that names nobody answer with the whole
+period. A day is still searched by typing it with its dashes (`2026-08-07`), which is not
+a bare number; a number that names nobody is now a search with no matches, which is the
+honest answer to it. Searching repaints from the
 rows already in hand, so it costs no request - only a new period does.
 Hours still awaiting approval are shown beside the approved ones and never added to them.
 

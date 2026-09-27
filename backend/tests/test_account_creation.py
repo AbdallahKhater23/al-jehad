@@ -2,11 +2,12 @@
 
 WHY THIS EXISTS
 ---------------
-Two doors into the same room. An administrator can create an account in the Credentials
-tab - the id, the name, the role and a generated password, plus a photo that becomes the
-face reference that lets the person clock in at all. Or the administrator can send a
-one-time link and let the person do it themselves: they choose their own password and
-take their own photo, while the id and the role stay the administrator's decision.
+Two doors into one room, and only the first one creates the account. An administrator
+creates it in the Credentials tab - the id, the name, the role and a generated password,
+plus a photo that becomes the face reference that lets the person clock in at all - and can
+then send a one-time *enrollment* link, which registers the face of the account that already
+exists. No link creates an account any more: the walk-up registration queue does that, and
+only behind a review. So a link is a face, never an identity.
 
 What this file pins, because each of these is a way the feature could be wrong and silent:
 
@@ -17,12 +18,12 @@ What this file pins, because each of these is a way the feature could be wrong a
 2. **A created account is a working account.** The reference file lands where
    ``/attendance/verify`` looks for it, and the worker can clock in - or, with no photo,
    the account exists and honestly cannot clock in yet.
-3. **A failure costs a retry, not the link.** A link is consumed by a *successful*
-   registration, so a rejected password or an unreadable photo leaves it usable.
-4. **The link cannot mint what the admin would not hand out.** The id and the role come
-   from the row the administrator wrote; the visitor supplies only a password and a face,
-   and a link can never create an administrator or take an id that is already in use.
-5. **The public peek leaks nothing.** ``GET /enroll/{token}`` masks the name, because
+3. **The link cannot mint what the admin would not hand out.** An invite carries an
+   account id and nothing else - no name, no role, no password - so there is no field on it
+   that could be talked into creating an administrator, or an account at all. A row left by
+   the retired registration link cannot be used to enroll a face either, and the route that
+   claimed one is gone.
+4. **The public peek leaks nothing.** ``GET /enroll/{token}`` masks the name, because
    that endpoint is reachable by anyone holding a forwarded link and the URL sits in a
    browser history.
 """
@@ -96,11 +97,12 @@ def create_account(client, *, user_id=CREATED_WORKER, name="New Worker", role="w
     )
 
 
-def issue_link(client, *, user_id=LINK_WORKER, name="Link Worker", role="worker", as_role=ADMIN, **extra):
+def issue_link(client, *, user_id=LINK_WORKER, as_role=ADMIN, **extra):
+    """Issue an enrollment link: an account id, and nothing else."""
     return client.post(
         "/api/v1/admin/enrollment/invites",
         headers=bearer(as_role),
-        json={"worker_id": user_id, "kind": "register", "name": name, "role": role, **extra},
+        json={"worker_id": user_id, **extra},
     )
 
 
@@ -230,9 +232,13 @@ def test_a_moallem_can_be_created_in_its_own_id_block(client, jpeg):
 
 
 def test_creation_refuses_what_the_console_would_not_offer(client, jpeg):
-    wrong_block = create_account(client, user_id="900", role="worker", image=jpeg)
-    assert wrong_block.status_code == 400
-    assert "1-499" in wrong_block.json()["detail"]
+    # The per-role id bands are gone, so a worker may be numbered where a moallem once had to be -
+    # but an id is still a whole number, because that is the id space every allocator and every
+    # report reads.
+    not_a_number = create_account(client, user_id="worker-seventy", role="worker", image=jpeg)
+    assert not_a_number.status_code == 400
+    assert "numeric integer" in not_a_number.json()["detail"]
+    assert db_scalar("SELECT COUNT(*) FROM users WHERE id = ?", ("worker-seventy",)) == 0
 
     weak = create_account(client, user_id=CREATED_WORKER, password="1234", image=jpeg)
     assert weak.status_code == 400
@@ -268,179 +274,15 @@ def test_only_an_admin_can_create_an_account(client, jpeg):
 # ---------------------------------------------------------------------------
 # the registration link
 # ---------------------------------------------------------------------------
-def test_a_registration_link_creates_its_account(client, jpeg, app_module):
-    created = issue_link(client)
-    assert created.status_code == 200, created.text[:300]
-    invite = created.json()
-    token = invite["token"]
-    assert invite["kind"] == "register"
-    assert invite["max_uses"] == 1, "a link that creates accounts is single use, whatever was asked"
-    assert invite["url"].endswith(f"/enroll/{token}")
-    assert db_scalar("SELECT token_hash FROM enrollment_invites WHERE id = ?", (invite["invite_id"],)) == (
-        hashlib.sha256(token.encode()).hexdigest()
-    )
-    assert db_scalar("SELECT kind FROM enrollment_invites WHERE id = ?", (invite["invite_id"],)) == "register"
-    assert db_scalar("SELECT pending_name FROM enrollment_invites WHERE id = ?", (invite["invite_id"],)) == "Link Worker"
-    assert db_scalar("SELECT pending_role FROM enrollment_invites WHERE id = ?", (invite["invite_id"],)) == "worker"
+def _seed_retired_register_invite(token: str, *, expires_in_hours: int = 24) -> None:
+    """A ``kind='register'`` invite row, as a deployment that predates this change left it.
 
-    # The public peek says what kind of page to be, and masks the reserved name.
-    peek = client.get(f"/api/v1/enroll/{token}")
-    assert peek.status_code == 200
-    body = peek.json()
-    assert body["kind"] == "register"
-    assert body["usable"] is True
-    assert body["role"] == "worker"
-    assert body["photo_policy"]["max_bytes"] == LIMIT_BYTES
-    assert body["min_password_length"] >= 8
-    assert "Link Worker" not in json.dumps(body), "a forwarded link must not leak the reserved name"
-
-    registered = client.post(
-        f"/api/v1/enroll/{token}/register",
-        data={"password": STRONG_PASSWORD, "phone": "+201000000077"},
-        files={"photo": ("photo.jpg", jpeg, "image/jpeg")},
-    )
-    assert registered.status_code == 200, registered.text[:300]
-    assert registered.json()["worker_id"] == LINK_WORKER
-
-    assert db_scalar("SELECT name FROM users WHERE id = ?", (LINK_WORKER,)) == "Link Worker"
-    assert db_scalar("SELECT role FROM users WHERE id = ?", (LINK_WORKER,)) == "worker"
-    assert db_scalar("SELECT phone FROM users WHERE id = ?", (LINK_WORKER,)) == "+201000000077"
-    assert app_module.pwd_context.verify(
-        STRONG_PASSWORD, db_scalar("SELECT password_hash FROM users WHERE id = ?", (LINK_WORKER,))
-    ), "the password is the one the visitor chose, not a generated one"
-    assert harness.template_exists(LINK_WORKER)
-    assert db_scalar("SELECT uses FROM enrollment_invites WHERE id = ?", (invite["invite_id"],)) == 1
-    assert db_scalar("SELECT completed_at FROM enrollment_invites WHERE id = ?", (invite["invite_id"],))
-    assert db_scalar(
-        "SELECT COUNT(*) FROM audit_log WHERE action = 'user_create' AND entity_id = ?", (LINK_WORKER,)
-    ) == 1
-    assert db_scalar(
-        "SELECT COUNT(*) FROM admin_notifications WHERE kind = 'enrollment_completed' AND worker_id = ?",
-        (LINK_WORKER,),
-    ) == 1, "the administrator who sent the link should be told it was used"
-
-    reuse = client.post(
-        f"/api/v1/enroll/{token}/register",
-        data={"password": STRONG_PASSWORD},
-        files={"photo": ("photo.jpg", jpeg, "image/jpeg")},
-    )
-    assert reuse.status_code == 410
-    assert reuse.json()["detail"]["error_code"] == "invite_already_used"
-
-
-def test_a_link_is_burned_by_success_only(client, jpeg):
-    """Every rejection has to leave the link usable, or one typo costs a new link."""
-    token = issue_link(client).json()["token"]
-    invite_id = db_scalar("SELECT id FROM enrollment_invites WHERE worker_id = ?", (LINK_WORKER,))
-
-    short = client.post(
-        f"/api/v1/enroll/{token}/register",
-        data={"password": "1234"},
-        files={"photo": ("photo.jpg", jpeg, "image/jpeg")},
-    )
-    assert short.status_code == 400
-    assert "at least" in short.json()["detail"]
-
-    document = client.post(
-        f"/api/v1/enroll/{token}/register",
-        data={"password": STRONG_PASSWORD},
-        files={"photo": ("cv.jpg", a_pdf(), "image/jpeg")},
-    )
-    assert document.status_code == 415
-    assert document.json()["detail"]["error_code"] == "not_an_image"
-
-    huge = client.post(
-        f"/api/v1/enroll/{token}/register",
-        data={"password": STRONG_PASSWORD},
-        files={"photo": ("huge.jpg", oversize(), "image/jpeg")},
-    )
-    assert huge.status_code == 413
-
-    no_face = client.post(
-        f"/api/v1/enroll/{token}/register",
-        data={"password": STRONG_PASSWORD},
-        files={"photo": ("photo.jpg", jpeg, "image/jpeg")},
-    )
-    assert no_face.status_code == 200, no_face.text[:300]
-
-    assert db_scalar("SELECT uses FROM enrollment_invites WHERE id = ?", (invite_id,)) == 1, (
-        "three refusals and one success: the link was used exactly once"
-    )
-    assert db_scalar("SELECT COUNT(*) FROM users WHERE id = ?", (LINK_WORKER,)) == 1
-
-
-def test_a_link_cannot_reserve_or_mint_what_it_should_not(client, jpeg):
-    existing = issue_link(client, user_id=WORKER, name="Taken")
-    assert existing.status_code == 409
-    assert "already exists" in existing.json()["detail"]
-
-    as_admin = issue_link(client, role="admin")
-    assert as_admin.status_code == 400
-    assert "off-office worker" in as_admin.json()["detail"], (
-        "the refusal names the business roles a link may create, administrator not among them"
-    )
-
-    nameless = issue_link(client, name="   ")
-    assert nameless.status_code == 400
-    assert "name" in nameless.json()["detail"].lower()
-
-    wrong_block = issue_link(client, user_id="900", role="worker")
-    assert wrong_block.status_code == 400
-    assert "1-499" in wrong_block.json()["detail"]
-
-
-def test_two_registration_links_cannot_reserve_one_id(client):
-    """The reservation lives on the invite row until the link is used, so a check that only
-    looked at ``users`` would let two live links promise the same number - and the second
-    visitor to arrive would be told their id is taken."""
-    first = issue_link(client, user_id=LINK_WORKER, name="First")
-    assert first.status_code == 200, first.text[:300]
-
-    second = issue_link(client, user_id=LINK_WORKER, name="Second")
-    assert second.status_code == 409, second.text[:300]
-    assert "reserved" in second.json()["detail"].lower()
-    assert db_scalar(
-        "SELECT COUNT(*) FROM enrollment_invites WHERE worker_id = ? AND kind = 'register'",
-        (LINK_WORKER,),
-    ) == 1
-
-    # Revoking the first releases the number, and the link can then be issued cleanly.
-    invite_id = db_scalar("SELECT id FROM enrollment_invites WHERE worker_id = ?", (LINK_WORKER,))
-    revoked = client.post(
-        f"/api/v1/admin/enrollment/invites/{invite_id}/revoke", headers=bearer(ADMIN)
-    )
-    assert revoked.status_code == 200, revoked.text[:300]
-    third = issue_link(client, user_id=LINK_WORKER, name="Third")
-    assert third.status_code == 200, third.text[:300]
-
-
-def test_an_enrollment_link_cannot_be_used_to_register(client, jpeg):
-    """The two kinds are not interchangeable: one creates, the other must not."""
-    enrollment_token = client.post(
-        "/api/v1/admin/enrollment/invites",
-        headers=bearer(ADMIN),
-        json={"worker_id": WORKER},
-    ).json()["token"]
-
-    attempt = client.post(
-        f"/api/v1/enroll/{enrollment_token}/register",
-        data={"password": STRONG_PASSWORD},
-        files={"photo": ("photo.jpg", jpeg, "image/jpeg")},
-    )
-    assert attempt.status_code == 409
-    assert attempt.json()["detail"]["error_code"] == "invite_kind_mismatch"
-
-    # And the enrollment path still works afterwards: the refused call changed nothing.
-    submitted = client.post(
-        f"/api/v1/enroll/{enrollment_token}", files={"photo": ("photo.jpg", jpeg, "image/jpeg")}
-    )
-    assert submitted.status_code == 200, submitted.text[:300]
-
-
-def test_an_expired_link_cannot_create_an_account(client, jpeg):
+    Written straight into the table because nothing can issue one any more - and the point of the
+    two tests below is that such rows still exist and still say what they were for.
+    """
     from datetime import datetime, timedelta
 
-    token = "expired-registration-token"
+    now = datetime.now()
     _sql(
         "INSERT INTO enrollment_invites (token_hash, worker_id, created_by, created_at, expires_at, "
         "max_uses, kind, pending_name, pending_role) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -448,31 +290,59 @@ def test_an_expired_link_cannot_create_an_account(client, jpeg):
             hashlib.sha256(token.encode()).hexdigest(),
             LINK_WORKER,
             ADMIN,
-            (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d %H:%M:%S"),
-            (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S"),
+            now.strftime("%Y-%m-%d %H:%M:%S"),
+            (now + timedelta(hours=expires_in_hours)).strftime("%Y-%m-%d %H:%M:%S"),
             1,
             "register",
-            "Late Worker",
+            "Legacy Worker",
             "worker",
         ),
     )
-    peek = client.get(f"/api/v1/enroll/{token}")
-    assert peek.json()["status"] == "expired"
+
+
+def test_the_link_that_created_accounts_is_gone(client, jpeg):
+    """Both halves of one decision: the route is not served, and a row one left behind cannot be
+    turned into an enrollment - the account such a link reserved may never have been created."""
+    # No route claims a registration link any more: the path is not served by anything that takes
+    # a POST (the console's page handler answers 405 for an unrouted one).
+    assert client.post("/api/v1/enroll/whatever/register").status_code in (404, 405), (
+        "the route that claimed a registration link is still being served"
+    )
+
+    token = "retired-registration-token"
+    _seed_retired_register_invite(token)
+    assert client.get(f"/api/v1/enroll/{token}").json()["kind"] == "register", (
+        "a legacy row still says what it was for, so the page can refuse it rather than offer a "
+        "form with nowhere to submit it"
+    )
 
     attempt = client.post(
-        f"/api/v1/enroll/{token}/register",
-        data={"password": STRONG_PASSWORD},
-        files={"photo": ("photo.jpg", jpeg, "image/jpeg")},
+        f"/api/v1/enroll/{token}", files={"photo": ("photo.jpg", jpeg, "image/jpeg")}
+    )
+    assert attempt.status_code == 409
+    assert attempt.json()["detail"]["error_code"] == "invite_kind_mismatch"
+    assert db_scalar(
+        "SELECT uses FROM enrollment_invites WHERE token_hash = ?",
+        (hashlib.sha256(token.encode()).hexdigest(),),
+    ) == 0, "the refused call consumed the link"
+
+
+def test_an_expired_link_cannot_enroll(client, jpeg):
+    token = "expired-registration-token"
+    _seed_retired_register_invite(token, expires_in_hours=-24)
+    assert client.get(f"/api/v1/enroll/{token}").json()["status"] == "expired"
+
+    attempt = client.post(
+        f"/api/v1/enroll/{token}", files={"photo": ("photo.jpg", jpeg, "image/jpeg")}
     )
     assert attempt.status_code == 410
     assert attempt.json()["detail"]["error_code"] == "invite_expired"
-    assert db_scalar("SELECT COUNT(*) FROM users WHERE id = ?", (LINK_WORKER,)) == 0
 
 
-def test_a_worker_cannot_issue_a_registration_link(client):
+def test_only_an_admin_can_issue_an_enrollment_link(client):
     denied = issue_link(client, as_role=WORKER)
-    assert_denied(denied, endpoint="/admin/enrollment/invites", detail="a worker issued a registration link")
+    assert_denied(denied, endpoint="/admin/enrollment/invites", detail="a worker issued a link")
     denied_moallem = issue_link(client, as_role=MOALLEM)
     assert_denied(
-        denied_moallem, endpoint="/admin/enrollment/invites", detail="a moallem issued a registration link"
+        denied_moallem, endpoint="/admin/enrollment/invites", detail="a moallem issued a link"
     )

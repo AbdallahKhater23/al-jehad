@@ -1,4 +1,4 @@
-"""Site categories in the console: the chips on the Shifts board, and the forms that feed them.
+"""Site categories in the console: the picker on the Shifts board, and the forms that feed them.
 
 WHY THIS EXISTS
 ---------------
@@ -7,9 +7,9 @@ window for every site inside it (``shift_windows``). The backend half is pinned 
 ``test_site_categories``. This is the console half, and it is the half an operator actually
 touches:
 
-* the Shifts board offers a chip per category **present in the period**, with the number of
-  shifts behind it, because a chip that filters to an empty table is a dead end and a count is
-  the first thing a reader checks a filter against;
+* the Shifts board offers every category **present in the period**, in one picker, with the
+  number of shifts behind it, because an option that filters to an empty table is a dead end and
+  a count is the first thing a reader checks a filter against;
 * the search box finds a shift by its site's category, so an operator can type the word they
   think in ("مخزن") rather than the name of a site they have to remember;
 * a category travels in the link, as the period and the search do: a link that dropped it would
@@ -35,7 +35,7 @@ HARNESS = r"""
 // --- the server's answers, faked ----------------------------------------
 //
 // Two categories - one with hours and two sites in it, one empty and untuned - because the
-// chips, the panel and the picker all have to answer "and what about the empty one?".
+// picker, the panel and the site form all have to answer "and what about the empty one?".
 const CATEGORIES = [
     {
         category_id: 1, name: 'مخزن',
@@ -77,7 +77,7 @@ const SITES = [
 ];
 
 // One shift, with everything the timesheet row carries. ``site_category`` is the field the
-// chips and the search are built from, so it is on every row rather than looked up.
+// picker and the search are built from, so it is on every row rather than looked up.
 function shift(overrides) {
     return Object.assign({
         log_id: 900, date: '2026-09-07', timestamp: '2026-09-07 16:02:11',
@@ -159,12 +159,17 @@ function rowsShown(env) {
     return (markupOf(env).match(/data-shift="/g) || []).length;
 }
 
-function chipsOf(markup) {
-    const pattern = /data-category="([^"]*)"\s*data-active="(true|false)"[^>]*aria-pressed="(true|false)"[^>]*>([^<]*)</g;
+// The category choices, read out of the picker: every option, with the one the tab is
+// actually filtered to marked. The list is the control now, so "what can I choose, and what
+// am I looking at" is answered from the one place the reader sees.
+function optionsOf(markup) {
+    const block = /<select[^>]*data-shifts-category[^>]*>([\s\S]*?)<\/select>/.exec(markup);
+    if (!block) return [];
+    const pattern = /<option value="([^"]*)"([^>]*)>([^<]*)</g;
     const found = [];
     let match;
-    while ((match = pattern.exec(markup)) !== null) {
-        found.push({ value: match[1], active: match[2] === 'true', pressed: match[3] === 'true', label: match[4] });
+    while ((match = pattern.exec(block[1])) !== null) {
+        found.push({ value: match[1], selected: match[2].indexOf('selected') >= 0, label: match[3] });
     }
     return found;
 }
@@ -187,11 +192,11 @@ const results = {};
     await env.evaluate("UI.renderAdminTab('Shifts')");
     const markup = markupOf(env);
     results.board = {
-        chips: chipsOf(markup),
+        options: optionsOf(markup),
         rows: rowsShown(env),
-        // The chip row belongs to the period picker's own row, not to the table below it: this
+        // The picker belongs to the period picker's own row, not to the table below it: this
         // is where "what am I looking at" is answered on this tab.
-        chips_in_the_preset_row: /data-preset="thisWeek"[\s\S]*?data-category="/.test(markup),
+        picker_in_the_preset_row: /data-preset="thisWeek"[\s\S]*?data-shifts-category/.test(markup),
         has_copy_link: markup.indexOf('data-copy-link') >= 0
     };
 }
@@ -204,7 +209,7 @@ const results = {};
     await env.evaluate("UI_MODULES.setShiftsCategory('مخزن')");
     results.one_category = {
         rows: rowsShown(env),
-        chips: chipsOf(markupOf(env)),
+        options: optionsOf(markupOf(env)),
         note: filterNote(env),
         reads_before: readsBefore,
         reads_after: env.requests.filter((r) => r.url.indexOf('/admin/reports/shifts') >= 0).length,
@@ -340,28 +345,27 @@ def results() -> dict:
 # ---------------------------------------------------------------------------
 # the board
 # ---------------------------------------------------------------------------
-def test_the_board_offers_a_chip_for_every_category_in_the_period(results):
+def test_the_board_offers_every_category_in_the_period(results):
     board = results["board"]
-    labels = {chip["label"]: chip for chip in board["chips"]}
+    labels = {entry["label"]: entry for entry in board["options"]}
     assert labels["مخزن (2)"]["value"] == "مخزن"
     assert labels["مصنع (1)"]["value"] == "مصنع"
-    # The count is the shifts behind the chip, and the "all" chip counts every row on screen.
-    assert any(chip["label"] == "All categories (4)" for chip in board["chips"]), board["chips"]
-    assert len(board["chips"]) == 3, board["chips"]
+    # The count is the shifts behind the entry, and the "all" entry counts every row on screen.
+    assert any(entry["label"] == "All categories (4)" for entry in board["options"]), board["options"]
+    assert len(board["options"]) == 3, board["options"]
 
 
-def test_the_all_chip_is_the_one_pressed_when_the_tab_opens(results):
-    chips = results["board"]["chips"]
-    pressed = [chip for chip in chips if chip["pressed"]]
-    assert len(pressed) == 1 and pressed[0]["value"] == "", chips
-    assert all(chip["active"] == chip["pressed"] for chip in chips), chips
+def test_the_all_option_is_the_one_selected_when_the_tab_opens(results):
+    options = results["board"]["options"]
+    chosen = [entry for entry in options if entry["selected"]]
+    assert len(chosen) == 1 and chosen[0]["value"] == "", options
     assert results["board"]["rows"] == 4, "and nothing is filtered away yet"
 
 
-def test_the_chips_sit_in_the_period_row_rather_than_below_the_table(results):
+def test_the_picker_sits_in_the_period_row_rather_than_below_the_table(results):
     """The red square in the brief: the row that answers \"what am I looking at\"."""
-    assert results["board"]["chips_in_the_preset_row"], (
-        "the category chips must be in the preset row, not down beside the table"
+    assert results["board"]["picker_in_the_preset_row"], (
+        "the category picker must be in the preset row, not down beside the table"
     )
     assert results["board"]["has_copy_link"], "and the rest of that row is still there"
 
@@ -369,8 +373,8 @@ def test_the_chips_sit_in_the_period_row_rather_than_below_the_table(results):
 def test_choosing_a_category_narrows_the_rows_and_names_it_in_the_note(results):
     narrowed = results["one_category"]
     assert narrowed["rows"] == 2, "the two warehouse shifts, and neither of the others"
-    pressed = [chip for chip in narrowed["chips"] if chip["pressed"]]
-    assert len(pressed) == 1 and pressed[0]["value"] == "مخزن", narrowed["chips"]
+    selected = [entry for entry in narrowed["options"] if entry["selected"]]
+    assert len(selected) == 1 and selected[0]["value"] == "مخزن", narrowed["options"]
     assert "مخزن" in (narrowed["note"] or ""), narrowed["note"]
     assert "2 / 4" in (narrowed["note"] or ""), (
         f"the note has to say the figures are over part of the period: {narrowed['note']}"

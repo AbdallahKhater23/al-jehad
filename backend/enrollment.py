@@ -64,13 +64,8 @@ from config import PROJECT_ROOT, settings
 from database import db, immediate
 from rate_limit import limiter
 from security import (
-    BCRYPT_MAX_BYTES,
     CurrentUser,
     admin_only,
-    hash_password,
-    id_is_reserved,
-    validate_password_strength,
-    validate_user_id_for_role,
 )
 
 log = logging.getLogger("attendance.enrollment")
@@ -78,19 +73,15 @@ log = logging.getLogger("attendance.enrollment")
 router = APIRouter(prefix="/admin/enrollment", tags=["enrollment"])
 public_router = APIRouter(prefix="/enroll", tags=["enrollment"])
 
-#: Roles accepted from a roster, matching ``security.ROLE_ID_RANGES``.
+#: Roles accepted from a roster.
 VALID_ROLES = ("worker", "moallem", "off_office", "admin", "head_admin")
 
-#: Invite kinds. ``enroll`` registers a face for an account that already exists;
-#: ``register`` creates the account itself.
+#: The only kind of invite there is: ``enroll`` registers a face for an account that
+#: already exists. The ``register`` kind - a link that created the account itself, and the
+#: ``REGISTER_ROLES`` list of roles such a link might hand out - is gone. No link mints an
+#: account any more: an account is created by an administrator in the console, or by the
+#: walk-up registration queue, where a person reviews the photograph first.
 KIND_ENROLL = "enroll"
-KIND_REGISTER = "register"
-
-#: Roles a *link* may create. Deliberately not the full ``VALID_ROLES``: an invite is a
-#: bearer token sent over WhatsApp, and a token that mints an administrator is a
-#: privilege-escalation lever that leaks with the message. An admin account is created
-#: by an admin, in the console, with the roster in front of them.
-REGISTER_ROLES = ("worker", "moallem", "off_office")
 
 STAGING_ROOT = PROJECT_ROOT / "temp" / "enrollment_jobs"
 
@@ -328,17 +319,19 @@ def _invite_status(row: sqlite3.Row, now: datetime) -> tuple[bool, str]:
 
 
 def _invite_kind(row: sqlite3.Row) -> str:
-    """``'enroll'`` or ``'register'``, read defensively.
+    """The kind stored on the invite row, read defensively.
 
-    Every write sets the column explicitly; this only has to be right for a row read
-    from a database where migration 8 has not run yet, which must be treated as the
-    original kind rather than crashing the public page.
+    ``enroll`` is the only kind this module issues any more, but the *column* still carries
+    what a link issued before that was for, and the public capture route must not treat a
+    retired registration link as an enrollment link. So this reports the stored value rather
+    than assuming: only a row that cannot answer at all (a database where migration 8 has not
+    run) is treated as ``enroll``.
     """
     try:
-        value = str(row["kind"] or KIND_ENROLL).strip().lower()
+        value = str(row["kind"] or "").strip().lower()
     except (IndexError, KeyError):
         return KIND_ENROLL
-    return value if value in (KIND_ENROLL, KIND_REGISTER) else KIND_ENROLL
+    return value or KIND_ENROLL
 
 
 def _invite_missing() -> HTTPException:
@@ -395,19 +388,11 @@ class InviteCreate(BaseModel):
     #: prose, so apostrophes survive and markup does not. It is shown in the invite list.
     note: str | None = None
     base_url: str | None = None
-    #: ``enroll`` (default) registers a face for an account that exists; ``register``
-    #: creates the account itself, in which case the name and role below are required
-    #: and ``worker_id`` is the id being reserved for it.
+    #: ``enroll``, the only kind there is: the link registers a face for an account that
+    #: already exists. The field survives so that a caller still sending the retired
+    #: ``register`` kind is told so, rather than being handed an enrollment link for an
+    #: account id nobody holds.
     kind: str = KIND_ENROLL
-    #: The name written onto the account a ``register`` link creates. It is the *only*
-    #: name the visitor cannot choose - the public endpoint takes the id, the name and the
-    #: role from this row - which makes this the field that decides what a worker is called
-    #: on the roster, in the reports and in every notification about them. An identifier,
-    #: therefore, not prose.
-    name: str | None = None
-    role: str | None = None
-    email: str | None = None
-    phone: str | None = None
 
     @field_validator("note")
     @classmethod
@@ -418,29 +403,6 @@ class InviteCreate(BaseModel):
             value, field="Note", max_length=textguard.MAX_LABEL, allow_empty=True
         )
 
-    @field_validator("name")
-    @classmethod
-    def _plain_name(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        return textguard.identifier(
-            value, field="Name", max_length=textguard.MAX_NAME, allow_empty=True
-        )
-
-    @field_validator("email")
-    @classmethod
-    def _plain_email(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        return textguard.contact(value, field="Email")
-
-    @field_validator("phone")
-    @classmethod
-    def _plain_phone(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        return textguard.contact(value, field="Phone")
-
 
 # ---------------------------------------------------------------------------
 # self-service invites (admin)
@@ -449,71 +411,35 @@ class InviteCreate(BaseModel):
 async def create_invite(request: Request, payload: InviteCreate, current: CurrentUser = Depends(admin_only)):
     """Issue a one-time link (and QR) to send to somebody.
 
-    Two kinds, and the difference is what the link is allowed to do:
-
-    * ``enroll`` - the account exists; the link registers its owner's face.
-    * ``register`` - the account does **not** exist; the link creates it. This is the
-      "send this to the new man" link, so it is the more dangerous of the two and is
-      constrained accordingly: the role is chosen here by the admin (never by whoever
-      opens the link), it must be a worker, a moallem or an off-office worker, the id is
-      reserved here so the visitor cannot pick its own, and it is single-use whatever
-      ``max_uses`` says.
+    One kind of link, and it does one thing: ``enroll`` registers the face of an account
+    that already exists. The link that created the account itself - the "send this to the
+    new man" registration link, which reserved an account id before anybody had one - is
+    gone. An account is created by an administrator in the console, or by the walk-up
+    registration queue, where a person reviews the photograph before any row is written.
 
     The plaintext token is returned exactly once: only its hash is stored, so it cannot
     be recovered later - issue a new invite instead.
     """
     kind = str(payload.kind or KIND_ENROLL).strip().lower()
-    if kind not in (KIND_ENROLL, KIND_REGISTER):
-        raise HTTPException(status_code=400, detail=f"kind must be '{KIND_ENROLL}' or '{KIND_REGISTER}'.")
+    if kind != KIND_ENROLL:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"kind must be '{KIND_ENROLL}': an invite registers the face of an account that "
+                "already exists. Create the account first, or send the person the site's "
+                "registration link."
+            ),
+        )
     worker_id = str(payload.worker_id).strip()
 
-    pending_name = pending_role = None
     with db() as conn:
         user = conn.execute("SELECT id, name, role FROM users WHERE id = ?", (worker_id,)).fetchone()
 
-    if kind == KIND_ENROLL:
-        if user is None:
-            raise HTTPException(status_code=404, detail="Worker ID not found. Create the user first.")
-    else:
-        if user is not None:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"Account {worker_id} already exists. A registration link creates a new account, "
-                    "so reserve an id that is still free - or send an enrollment link for the "
-                    "existing one."
-                ),
-            )
-        pending_name = str(payload.name or "").strip()
-        if not pending_name:
-            raise HTTPException(status_code=400, detail="A registration link needs the person's name.")
-        pending_role = str(payload.role or "worker").strip().lower()
-        if pending_role not in REGISTER_ROLES:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "A registration link may only create a worker, a moallem or an off-office "
-                    "worker, with the role chosen here. An administrator account is created by an "
-                    "administrator in the console."
-                ),
-            )
-        # A standard admin cannot create an administrator anywhere else either; this is
-        # belt and braces, because the role is already restricted to the business roles.
-        if pending_role in ("admin", "head_admin") and current.role != "head_admin":
-            raise HTTPException(status_code=403, detail="Only a head administrator may create administrators.")
-        # One implementation for every path that mints an account - the console, the
-        # roster import and this link all ask ``security`` whether the id fits the
-        # role's range, so an id reserved here cannot land in another role's block.
-        validate_user_id_for_role(worker_id, pending_role)
+    if user is None:
+        raise HTTPException(status_code=404, detail="Worker ID not found. Create the user first.")
 
     ttl = int(payload.ttl_hours or settings.enrollment_token_ttl_hours)
-    default_uses = 1 if kind == KIND_REGISTER else settings.enrollment_token_max_uses
-    uses = int(payload.max_uses or default_uses)
-    if kind == KIND_REGISTER:
-        # Single use, always. A multi-use registration link is a link that creates N
-        # accounts for whoever has it, and the id it reserves can only be used once in
-        # any case - so the second use would fail after the visitor had filled the form.
-        uses = 1
+    uses = int(payload.max_uses or settings.enrollment_token_max_uses)
     if ttl <= 0 or ttl > 24 * 30:
         raise HTTPException(status_code=400, detail="ttl_hours must be between 1 and 720.")
     if uses <= 0 or uses > 10:
@@ -522,35 +448,14 @@ async def create_invite(request: Request, payload: InviteCreate, current: Curren
     token = secrets.token_urlsafe(32)
     now = datetime.now()
     expires_at = (now + timedelta(hours=ttl)).strftime(_TS)
-    # ``BEGIN IMMEDIATE``: the reservation is only real if the check and the insert that
-    # writes it are one transaction. A registration invite's whole value is the id it holds,
-    # so two issues racing for the same id - or a walk-up approval running at the same
-    # moment - must not both win. See ``security.lowest_free_id`` for the other half.
+    # ``BEGIN IMMEDIATE`` keeps the insert and its audit row in one transaction. Nothing is
+    # reserved any more - an account id no longer belongs to a link - so this is no longer
+    # the concurrency guard it was written as; what the row carries is the token, hashed.
     with immediate() as conn:
-        if kind == KIND_REGISTER:
-            # Re-checked here and not only on the read above: an account created, or another
-            # invite issued, between that read and this write would otherwise be overwritten.
-            if conn.execute("SELECT id FROM users WHERE id = ?", (worker_id,)).fetchone() is not None:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"Account {worker_id} was created while this link was being issued. "
-                        "Reserve a different id."
-                    ),
-                )
-            if id_is_reserved(conn, worker_id, pending_role):
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"Account id {worker_id} is already reserved by a registration link "
-                        "that has not been used yet. Revoke that link first, or reserve a "
-                        "different id."
-                    ),
-                )
         cursor = conn.execute(
             "INSERT INTO enrollment_invites (token_hash, worker_id, created_by, created_at, expires_at, "
-            "max_uses, note, kind, pending_name, pending_role, pending_email, pending_phone) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "max_uses, note, kind) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 _hash_token(token),
                 worker_id,
@@ -559,11 +464,7 @@ async def create_invite(request: Request, payload: InviteCreate, current: Curren
                 expires_at,
                 uses,
                 payload.note,
-                kind,
-                pending_name,
-                pending_role,
-                (payload.email or "").strip() or None,
-                (payload.phone or "").strip() or None,
+                KIND_ENROLL,
             ),
         )
         invite_id = int(cursor.lastrowid or 0)
@@ -574,12 +475,11 @@ async def create_invite(request: Request, payload: InviteCreate, current: Curren
             entity="enrollment_invites",
             entity_id=str(invite_id),
             after={
-                "kind": kind,
+                "kind": KIND_ENROLL,
                 "worker_id": worker_id,
                 "expires_at": expires_at,
                 "max_uses": uses,
                 "note": payload.note,
-                **({"name": pending_name, "role": pending_role} if kind == KIND_REGISTER else {}),
             },
             request=request,
         )
@@ -587,11 +487,11 @@ async def create_invite(request: Request, payload: InviteCreate, current: Curren
     url = f"{_public_base_url(request, payload.base_url)}enroll/{token}"
     return {
         "status": "success",
-        "kind": kind,
+        "kind": KIND_ENROLL,
         "invite_id": invite_id,
         "worker_id": worker_id,
-        "worker_name": user["name"] if user is not None else pending_name,
-        "role": user["role"] if user is not None else pending_role,
+        "worker_name": user["name"],
+        "role": user["role"],
         "url": url,
         "token": token,
         "expires_at": expires_at,
@@ -623,11 +523,10 @@ async def list_invites(active: int = 0, limit: int = 200, current: CurrentUser =
         item["state"] = state
         item["usable"] = usable
         item["kind"] = _invite_kind(row)
-        # What the link is for, in one field, so the dashboard does not have to know that
-        # a pending account keeps its name in a different column from an existing one.
-        item["subject_name"] = (
-            row["pending_name"] if item["kind"] == KIND_REGISTER else row["worker_name"]
-        ) or row["worker_id"]
+        # What the link is for, in one field, so the dashboard does not have to know that a
+        # link issued before the registration flow was removed kept its applicant's name on
+        # the invite's own row instead of finding it on a ``users`` row.
+        item["subject_name"] = row["worker_name"] or row["pending_name"] or row["worker_id"]
         output.append(item)
     return output
 
@@ -667,9 +566,11 @@ async def invite_info(request: Request, token: str):
     forwarded link knows their own name already - a stranger holding it does not need
     to learn one.
 
-    ``kind`` is the important field for the page that calls this: it decides whether
-    the visitor is registering their face for an account that exists (``enroll``) or
-    creating the account itself (``register``), and only the second asks for a password.
+    ``kind`` is still the field the page that calls this reads first: the only kind this
+    module issues now is ``enroll``, the link that registers a face for an account that
+    exists, and a link issued before the registration flow was removed still answers
+    ``register`` - which the page has to refuse rather than offering a form with nowhere
+    to submit it.
     """
     now = datetime.now()
     with db() as conn:
@@ -682,14 +583,16 @@ async def invite_info(request: Request, token: str):
         raise _invite_missing() from None
     usable, state = _invite_status(row, now)
     kind = _invite_kind(row)
-    reserved_name = row["pending_name"] if kind == KIND_REGISTER else row["worker_name"]
+    # An enrollment link names the account it is for; a retired registration link named its
+    # applicant on the invite row itself.
+    subject = row["worker_name"] or row["pending_name"]
     return {
         "status": state,
         "usable": usable,
         "kind": kind,
         "worker_id": row["worker_id"],
-        "worker_name": _mask_name(reserved_name),
-        "role": (row["pending_role"] if kind == KIND_REGISTER else None),
+        "worker_name": _mask_name(subject),
+        "role": (row["pending_role"] if kind != KIND_ENROLL else None),
         "expires_at": row["expires_at"],
         "remaining_uses": max(0, int(row["max_uses"]) - int(row["uses"])),
         "liveness_mode": settings.enrollment_liveness_mode,
@@ -698,190 +601,6 @@ async def invite_info(request: Request, token: str):
         # upload ceiling it will be held to, and the shortest password it may choose.
         "photo_policy": uploads.policy(),
         "min_password_length": settings.min_password_length,
-    }
-
-
-@public_router.post("/{token}/register")
-@limiter.limit(settings.enrollment_rate_limit)
-async def submit_registration(
-    request: Request,
-    token: str,
-    password: str = Form(...),
-    photo: UploadFile = File(...),
-    phone: str = Form(default=""),
-    email: str = Form(default=""),
-):
-    """Create the account a registration link was issued for, with its reference photo.
-
-    This is the one endpoint in the application that creates a user without a signed-in
-    administrator behind the request, so every part of it is constrained by the invite
-    rather than by the visitor: the id, the name and the role all come from the row the
-    administrator wrote, and the only choices left to whoever opens the link are their
-    own password and their own face.
-
-    The order is deliberate. Everything that can fail and leave nothing behind happens
-    first - the password policy, the photo policy, liveness, and the face embedding -
-    and the account row, the reference and the consumed token are written only once all
-    of them have passed. A failure therefore    costs the visitor a retry rather than costing them the link, and it cannot leave a
-    half-created account that can sign in but cannot clock in.
-
-    ``email`` and ``phone`` are the only free text such a visitor can set, and both are
-    written onto a new ``users`` row. A name or a role cannot be smuggled in here: they come
-    from the invite the administrator wrote, which is where they are vetted.
-    """
-    try:
-        email = textguard.contact(email, field="Email")
-        phone = textguard.contact(phone, field="Phone")
-    except ValueError as exc:
-        raise textguard.http_error(exc) from None
-
-    now = datetime.now()
-    with db() as conn:
-        row = conn.execute("SELECT * FROM enrollment_invites WHERE token_hash = ?", (_hash_token(token),)).fetchone()
-    if row is None:
-        raise _invite_missing() from None
-    usable, state = _invite_status(row, now)
-    if not usable:
-        raise HTTPException(
-            status_code=410,
-            detail={
-                "error_code": f"invite_{state}",
-                "message": f"This registration link is {state}. Ask your administrator for a new one.",
-            },
-        )
-    if _invite_kind(row) != KIND_REGISTER:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error_code": "invite_kind_mismatch",
-                "message": (
-                    "This link registers a face for an account that already exists, so it cannot "
-                    "create one. Open the enrollment page instead."
-                ),
-            },
-        )
-
-    # The same policy the console enforces when an administrator sets a password: the
-    # person choosing it here is no more trusted than an administrator is, and a weaker
-    # rule for the one password nobody can reset for them would be a hole with a name.
-    validate_password_strength(password)
-
-    worker_id = str(row["worker_id"])
-    role = str(row["pending_role"] or "worker")
-    name = str(row["pending_name"] or "").strip()
-    if not name or role not in REGISTER_ROLES:
-        # Only reachable if somebody edited the row by hand; refuse rather than mint an
-        # account with no name or a role this table was never allowed to hand out.
-        raise HTTPException(status_code=409, detail="This registration link is not complete. Ask for a new one.")
-    validate_user_id_for_role(worker_id, role)
-
-    # The free-id check happens before the photo work, not after: the id is the thing a
-    # link reserves, and finding out it was taken after the visitor has posed for a
-    # camera is a worse answer than finding out immediately. The insert re-checks it,
-    # because this read and that write are not one transaction.
-    with db() as conn:
-        taken = conn.execute("SELECT id FROM users WHERE id = ?", (worker_id,)).fetchone()
-    if taken is not None:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error_code": "id_taken",
-                "message": f"Account {worker_id} already exists. Ask your administrator for a new link.",
-            },
-        )
-
-    file_bytes = await uploads.read_photo(photo, field="photo")
-    # The same frame chain a punch uses (``uploads.face_frame``): what is embedded here is
-    # the reference every future punch is compared against.
-    image = uploads.face_frame(file_bytes, field="photo")
-    # Advisory by default, ``enforce`` when an operator says so - the same setting the
-    # self-service capture answers to, because the camera situation is identical. The
-    # embedding is computed here and written after the account exists: a photo that
-    # cannot become a template must not leave a file behind, and the template must never
-    # land on an id that is still somebody else's.
-    try:
-        decision, embedding = await face_engine.ENGINE.run_async(
-            embed_reference, image, stage="registration"
-        )
-    except face_engine.FaceEngineBusy as exc:
-        raise face_engine.busy_http_exception(exc) from None
-
-    with db(write=True) as conn:
-        try:
-            conn.execute(
-                "INSERT INTO users (id, name, email, phone, password_hash, role, status, enrolled_at, "
-                "template_version, biometric_id) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, 1, ?)",
-                (
-                    worker_id,
-                    name,
-                    (email or row["pending_email"] or "").strip(),
-                    (phone or row["pending_phone"] or "").strip(),
-                    hash_password(password),
-                    role,
-                    now.strftime(_TS),
-                    # The face this link is about to store is filed under an id minted
-                    # here, so it can never be confused with whoever held this account id
-                    # before (see ``biometrics.new_account_id``).
-                    biometrics.new_account_id(worker_id),
-                ),
-            )
-        except sqlite3.IntegrityError:
-            # The id was free when the link was issued and is not free now. Answering 409
-            # rather than 500 says the truth: the reservation lost a race.
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "error_code": "id_taken",
-                    "message": f"Account {worker_id} already exists. Ask your administrator for a link with a free id.",
-                },
-            )
-        conn.execute(
-            "UPDATE enrollment_invites SET uses = uses + 1, completed_at = ?, last_used_at = ?, last_used_ip = ? "
-            "WHERE id = ?",
-            (
-                now.strftime(_TS),
-                now.strftime(_TS),
-                request.client.host if request.client else None,
-                row["id"],
-            ),
-        )
-        _audit(
-            conn,
-            action="user_create",
-            actor=None,
-            entity="users",
-            entity_id=worker_id,
-            after={
-                "source": "registration_link",
-                "invite_id": row["id"],
-                "name": name,
-                "role": role,
-                "liveness": decision.as_payload(),
-            },
-            request=request,
-        )
-        notifications.notify(
-            conn,
-            kind=notifications.KIND_ENROLLMENT_COMPLETED,
-            severity=notifications.SEVERITY_INFO,
-            title="New account registered from a link",
-            body=(
-                f"{name} (id {worker_id}, {role}) created their own account with a registration "
-                "link and registered a reference photo."
-            ),
-            worker_id=worker_id,
-            payload={"invite_id": row["id"], "role": role, "liveness": decision.as_payload()},
-            dedupe_key=f"register_done:{row['id']}",
-        )
-
-    write_reference(worker_id, image, embedding)
-
-    return {
-        "status": "success",
-        "message": "Your account is ready. Sign in with your ID and the password you chose.",
-        "worker_id": worker_id,
-        "role": role,
-        "liveness": decision.as_payload(),
     }
 
 
@@ -929,8 +648,8 @@ async def submit_enrollment(
             detail={
                 "error_code": "invite_kind_mismatch",
                 "message": (
-                    "This link creates a new account, so it has to be finished on the registration "
-                    "page, where a password is chosen."
+                    "This is not an enrollment link, so there is no face to register here. Ask "
+                    "your administrator for a new link."
                 ),
             },
         )

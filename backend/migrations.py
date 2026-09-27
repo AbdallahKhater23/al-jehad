@@ -1443,19 +1443,19 @@ def migration_24_walk_up_registration(conn: sqlite3.Connection) -> None:
 
     WHY THIS EXISTS
     ---------------
-    The registration *link* that already ships is issued per person: an administrator types the
-    name, the role and the account id, and the link reserves that id when it is created
-    (``enrollment.create_invite``). That is the right shape for one named hire and the wrong one
-    for a walk-up, where nobody has applied yet and so no id can be reserved. The account has to
-    be created later - and once an account can be created later it can also be refused, which is
-    the state this table records.
+    The registration *link* that already ships is issued per person, for an account an
+    administrator has already created (``enrollment.create_invite``): whoever opens it registers
+    their face against that account. That is the right shape for one named hire and the wrong one
+    for a walk-up, where nobody has applied yet and so there is no account to enroll a face
+    against. The account has to be created later - and once an account can be created later it can
+    also be refused, which is the state this table records.
 
     WHY THE ID ON THIS ROW IS NOT DECIDED UNTIL THE DECISION
     -------------------------------------------------------
     ``assigned_id`` stays NULL while the request is pending, deliberately. A proposed id would be
     a promise this application cannot keep - one id per walk-up, and the applicant would be told a
-    number another request may take in the meantime. ``security.lowest_free_id`` decides at
-    approval, inside the same write transaction that inserts the account.
+    number another request may take in the meantime. ``registrations._next_workforce_id`` decides
+    at approval, inside the same write transaction that inserts the account.
 
     WHY ``photo_sha256`` IS UNIQUE WHILE PENDING
     -------------------------------------------
@@ -1579,12 +1579,13 @@ def migration_26_off_office_workers(conn: sqlite3.Connection) -> None:
 
     WHY A MIGRATION AND NOT JUST A NEW RANGE
     ----------------------------------------
-    A range in ``security.ROLE_ID_RANGES`` is a rule about ids an *API* may hand out; it says
-    nothing about rows already in ``users``. Once the range shrank, an account numbered 800
-    and still carrying ``role = 'moallem'`` would be a moallem outside the moallem band - the
-    one thing the ranges exist to make impossible, and invisible until somebody tried to edit
-    that account's id and was refused for a range that no longer contains the id they already
-    have. Rewriting the row is what makes the stored data and the range agree again.
+    A range in ``security.ROLE_ID_RANGES`` - the per-role bands that have since been removed,
+    together with the validator and the allocator that read them - was a rule about ids an *API*
+    may hand out; it said nothing about rows already in ``users``. Once the range shrank, an
+    account numbered 800 and still carrying ``role = 'moallem'`` would be a moallem outside the
+    moallem band, invisible until somebody tried to edit that account's id and was refused for a
+    range that no longer contained the id they already had. Rewriting the row is what made the
+    stored data and the range agree again.
 
     The threshold is the band boundary, not a curated list: every id that used to belong to
     moallem and now belongs to off-office moves, so the split is exactly the one the new ranges

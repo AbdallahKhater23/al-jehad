@@ -1029,6 +1029,13 @@ html.dark,
 .ops-chip:focus-visible { outline: 2px solid var(--ops-primary); outline-offset: 2px; }
 .ops-chip[aria-pressed='true'] { background: var(--ops-primary); border-color: var(--ops-primary); color: #fff; }
 .ops-sort { height: 40px; padding: 0 10px; border: 1px solid var(--ops-border); border-radius: 12px; background: var(--ops-surface); color: var(--ops-text); }
+/* The site / category list. A bounded width so a long site name cannot push the refresh
+   control off the row, and the same shape as the sort select beside it. */
+.ops-select {
+    height: 40px; max-width: 260px; padding: 0 10px;
+    border: 1px solid var(--ops-border); border-radius: 12px;
+    background: var(--ops-surface); color: var(--ops-text); font-size: 14px;
+}
 
 /* --- the Site / Category view switch ------------------------------------ */
 /* Two views, both named on the screen. The pressed half takes the primary fill the

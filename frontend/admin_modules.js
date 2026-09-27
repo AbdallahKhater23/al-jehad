@@ -369,8 +369,7 @@ const UI_MODULES = {
             sites: covered.size,
             group,
             longest,
-            late: rows.filter((row) => row.facts.late).length,
-            over: rows.filter((row) => row.facts.state === 'over' || row.facts.state === 'closing').length
+            late: rows.filter((row) => row.facts.late).length
         };
     },
 
@@ -396,11 +395,12 @@ const UI_MODULES = {
                 <span class="ops-stat-value" data-stat="late">${stats.late}</span>
                 <span class="ops-stat-hint">${this.escapeHtml(I18n.__('liveOpsLateHint'))}</span>
             </div>
-            <div class="ops-stat${stats.over ? ' is-danger' : ''}">
-                <span class="ops-stat-label">${this.escapeHtml(I18n.__('liveOpsOverDay'))}</span>
-                <span class="ops-stat-value" id="liveOpsStatOver" data-stat="over">${stats.over}</span>
-                <span class="ops-stat-hint">${this.escapeHtml(I18n.__('liveOpsOverDayHint'))}</span>
-            </div>`;
+            `;
+        // There is no "past the paid day" figure here on purpose. The deployment does not run
+        // payroll from this screen, so a count of shifts past a notional paid day was a number
+        // nobody acted on, sitting where three figures somebody does act on already are. The
+        // per-row state and the paid-hours line still say what a shift has run to; the board's
+        // headline figures are now the ones an operator is here for.
     },
 
     /** The sentence the live region announces: counts, never a bare number. */
@@ -417,28 +417,47 @@ const UI_MODULES = {
         return I18n.__('liveOpsUpdated').replace('{time}', `${pad(at.getHours())}:${pad(at.getMinutes())}`);
     },
 
-    liveOpsChipsHtml(data) {
+    /**
+     * The site (or category) picker: one list of everything that can be chosen.
+     *
+     * A row of chips was the wrong instrument for this. Chips were built from the shifts that
+     * happen to be running right now, so the site an operator was looking for and the site
+     * nobody is at looked exactly alike - both simply absent - and the row grew with the
+     * deployment instead of staying one control. The list is the whole of what can be chosen,
+     * with the number of people behind each entry, and it is one field either way: a site in
+     * Site view, a category in Category view.
+     */
+    liveOpsFilterSelectHtml(data) {
         const group = this.liveOpsGroup();
         const sessions = (data && data.sessions) || [];
         const categories = this.liveOpsCategoryMap(data && data.sites);
-        // The attribute is the view's own: a chip that names a category is not a site chip,
-        // and the setter that keeps ``aria-pressed`` honest reads the one for the view.
-        const attr = group === 'category' ? 'data-category-chip' : 'data-site-chip';
         const counts = new Map();
         for (const session of sessions) {
             const name = group === 'category'
                 ? this.liveOpsCategoryOf(categories, session)
                 : String(session.site_name || '');
-            if (!name) continue;   // a shift with no site / no category has no chip of its own
+            if (!name) continue;   // a shift with no site / no category has no entry of its own
             counts.set(name, (counts.get(name) || 0) + 1);
         }
-        const chip = (value, label, count) => `
-            <button type="button" class="ops-chip" ${attr}="${this.escapeHtml(value)}"
-                    aria-pressed="${this._liveOpsSite === value ? 'true' : 'false'}"
-                    onclick="UI_MODULES.setLiveOpsSite('${this.liveOpsInlineString(value)}')">${this.escapeHtml(`${label} (${count})`)}</button>`;
-        const all = chip('', I18n.__(group === 'category' ? 'liveOpsAllCategories' : 'liveOpsAllSites'), sessions.length);
+        const selected = this._liveOpsSite || '';
+        const option = (value, label) => `<option value="${this.escapeHtml(value)}"${selected === value ? ' selected' : ''}>${this.escapeHtml(label)}</option>`;
+        const all = I18n.__(group === 'category' ? 'liveOpsAllCategories' : 'liveOpsAllSites');
         const names = Array.from(counts.keys()).sort();
-        return all + names.map((name) => chip(name, name, counts.get(name))).join('');
+        const label = I18n.__(group === 'category' ? 'liveOpsFilterByCategory' : 'liveOpsSiteFilter');
+        return `<label class="sr-only" for="liveOpsFilter">${this.escapeHtml(label)}</label>
+            <select class="ops-select" id="liveOpsFilter" data-live-ops-filter>${option('', `${all} (${sessions.length})`)}${names.map((name) => option(name, `${name} (${counts.get(name)})`)).join('')}</select>`;
+    },
+
+    /**
+     * A change anywhere in the board's pane. The picker is the one delegated control that fires
+     * on ``change`` rather than ``click`` - a ``data-`` hook, like every other control this file
+     * gained, rather than an inline ``onchange`` the CSP's budget would have to grow for.
+     */
+    onLiveOpsChange(event) {
+        const target = event && event.target;
+        if (!target || typeof target.getAttribute !== 'function') return undefined;
+        if (target.getAttribute('data-live-ops-filter') === null) return undefined;
+        return this.setLiveOpsSite(target.value);
     },
 
     liveOpsSortSelectHtml() {
@@ -461,9 +480,9 @@ const UI_MODULES = {
      */
     liveOpsGroupToggleHtml() {
         const group = this.liveOpsGroup();
-        const option = (value, key) => `
-            <button type="button" class="ops-seg-btn" data-live-ops-group="${value}"
-                    aria-pressed="${group === value ? 'true' : 'false'}">${this.escapeHtml(I18n.__(key))}</button>`;
+        // ``data-live-ops-group`` and ``aria-pressed`` stay adjacent and in that order: the
+        // suite reads which half is pressed off exactly that pair.
+        const option = (value, key) => `<button type="button" class="ops-seg-btn" data-live-ops-group="${value}" aria-pressed="${group === value ? 'true' : 'false'}">${this.escapeHtml(I18n.__(key))}</button>`;
         return `<div class="ops-seg" role="group" aria-label="${this.escapeHtml(I18n.__('liveOpsViewBy'))}">${option('site', 'liveOpsGroupSite')}${option('category', 'liveOpsGroupCategory')}</div>`;
     },
 
@@ -660,10 +679,17 @@ const UI_MODULES = {
         const rows = this.liveOpsRows(data);
         const total = ((data && data.sessions) || []).length;
         if (rows.length === 0) return this.liveOpsEmptyHtml(total);
+        // Category view is grouped *whole* and never folded. The fold exists to keep a flat
+        // list of forty names from being a wall; a board with a heading per kind of place is
+        // read one heading at a time, and folding the list *before* grouping is worse than
+        // either - the first few rows belong to whichever category the first person happens to
+        // be at, so the board would show one heading and hide every other category behind a
+        // "Show more" that looks like it is about people rather than about kinds of place.
+        if (this.liveOpsGroup() === 'category') {
+            return this.liveOpsGroupedBoardHtml(rows);
+        }
         const visible = this.liveOpsVisibleRows(rows);
-        const body = this.liveOpsGroup() === 'category'
-            ? this.liveOpsGroupedBoardHtml(visible)
-            : (Device.isMobile ? this.liveOpsCardsHtml(visible) : this.liveOpsTableHtml(visible));
+        const body = Device.isMobile ? this.liveOpsCardsHtml(visible) : this.liveOpsTableHtml(visible);
         return `${body}${this.liveOpsFoldHtml(rows)}`;
     },
 
@@ -795,7 +821,7 @@ const UI_MODULES = {
                                placeholder="${this.escapeHtml(I18n.__('liveOpsSearchPlaceholder'))}"
                                oninput="UI_MODULES.setLiveOpsQuery(this.value)" />
                     </label>
-                    <div class="ops-chips" role="group" aria-label="${this.escapeHtml(I18n.__(this.liveOpsGroup() === 'category' ? 'liveOpsFilterByCategory' : 'liveOpsSiteFilter'))}">${this.liveOpsChipsHtml(data)}</div>
+                    ${this.liveOpsFilterSelectHtml(data)}
                     ${Device.isMobile ? this.liveOpsSortSelectHtml() : ''}
                     ${this.liveOpsGroupToggleHtml()}
                 </div>
@@ -873,6 +899,10 @@ const UI_MODULES = {
         // rather than added, like the Shifts tab's, so a repaint cannot leave the previous
         // paint's listener behind on the same element.
         content.onclick = (event) => this.onLiveOpsClick(event);
+        // The picker fires on ``change``, not ``click``: one delegated listener beside the
+        // click one, assigned rather than added for the same reason - a repaint must not leave
+        // the previous paint's listener behind on the same element.
+        content.onchange = (event) => this.onLiveOpsChange(event);
         this.startLiveOps();
     },
 
@@ -948,13 +978,11 @@ const UI_MODULES = {
             }
         });
 
-        // The headline figures move too - a shift crossing the line changes what
-        // the longest row and the "past the paid day" count mean.
+        // The headline figures move too: a shift crossing the line changes what the longest
+        // row means, and which shift that is.
         const stats = this.liveOpsStats(data);
         const longest = document.getElementById('liveOpsStatLongest');
         if (longest) longest.textContent = stats.longest ? this.liveOpsDuration(stats.longest.facts.seconds) : '\u2014';
-        const over = document.getElementById('liveOpsStatOver');
-        if (over) over.textContent = String(stats.over);
     },
 
     /**
@@ -1029,13 +1057,10 @@ const UI_MODULES = {
         this._liveOpsSite = String(site || '');
         State.liveOpsSite = this._liveOpsSite;
         if (!this._liveOps) return;
-        // The chip row carried the view's own attribute, so the pressed state is repainted
-        // on the chips that are actually on screen - site chips in Site view, category chips
-        // in Category view.
-        const attr = this.liveOpsGroup() === 'category' ? 'data-category-chip' : 'data-site-chip';
-        document.querySelectorAll(`[${attr}]`).forEach((chip) => {
-            chip.setAttribute('aria-pressed', (chip.getAttribute(attr) || '') === this._liveOpsSite ? 'true' : 'false');
-        });
+        // The picker already holds the value the reader chose - it is the control that called
+        // this - so only the board and the sentence under it are repainted.
+        const select = document.getElementById('liveOpsFilter');
+        if (select) select.value = this._liveOpsSite;
         const board = document.getElementById('liveOpsBoard');
         if (board) board.innerHTML = this.liveOpsBoardHtml(this._liveOps);
         const note = document.getElementById('liveOpsFilterNote');
@@ -1054,13 +1079,14 @@ const UI_MODULES = {
      */
     setLiveOpsGroup(value) {
         const group = value === 'category' ? 'category' : 'site';
-        if (group === this.liveOpsGroup()) return this.liveOpsGroup();
+        if (group === this.liveOpsGroup()) return undefined;
         this._liveOpsGroup = group;
         State.liveOpsGroup = group;
         this._liveOpsSite = '';
         State.liveOpsSite = '';
-        UI.renderAdminTab('Live Ops');
-        return this.liveOpsGroup();
+        // The render is returned so a caller - and the suite that drives this file - can wait
+        // for the board it asked for, exactly like ``renderAdminTab`` itself.
+        return UI.renderAdminTab('Live Ops');
     },
 
     setLiveOpsSort(key) {
@@ -1089,8 +1115,8 @@ const UI_MODULES = {
         if (!this._liveOps) return;
         const search = document.getElementById('liveOpsQuery');
         if (search) search.value = '';
-        const chipAttr = this.liveOpsGroup() === 'category' ? 'data-category-chip' : 'data-site-chip';
-        document.querySelectorAll(`[${chipAttr}]`).forEach((chip) => chip.setAttribute('aria-pressed', (chip.getAttribute(chipAttr) || '') === '' ? 'true' : 'false'));
+        const select = document.getElementById('liveOpsFilter');
+        if (select) select.value = '';
         const board = document.getElementById('liveOpsBoard');
         if (board) board.innerHTML = this.liveOpsBoardHtml(this._liveOps);
         const note = document.getElementById('liveOpsFilterNote');
@@ -2691,7 +2717,7 @@ const UI_MODULES = {
     /** The account just created: its password is readable here once, then never again. */
     _credentialsCreated: null,
 
-    /** The registration link just issued - the plaintext token exists only in this object. */
+    /** The enrollment link just issued - the plaintext token exists only in this object. */
     _credentialsIssued: null,
 
     /**
@@ -4116,9 +4142,9 @@ const UI_MODULES = {
      * Saves the edit, and shows the server's refusal as the reason it gave.
      *
      * The refusals are all actionable and all different ("Name must not be empty.",
-     * "Standard Admins cannot edit administrator accounts.", "Worker ID must be in range
-     * 1-499 for role 'worker'."), so none of them is replaced with a generic failure: an
-     * admin who fixes what the message named gets a saved account on the next click.
+     * "Standard Admins cannot edit administrator accounts.", "User ID not found."), so
+     * none of them is replaced with a generic failure: an admin who fixes what the
+     * message named gets a saved account on the next click.
      */
     async saveUserEdit() {
         const user = this._credentialsEdit;
@@ -4228,10 +4254,11 @@ const UI_MODULES = {
     //  Two flows, one question. **New account** creates it here: the admin types the id,
     //  the name and the role, the password is generated, and a photo - if there is one -
     //  is turned into the face reference that lets this person clock in at all.
-    //  **Registration link** hands the same job to the person it belongs to: a one-time
-    //  link where they choose their own password and take their own photo. The id and
-    //  the role stay the admin's choice, because whoever ends up holding the link must
-    //  not be able to pick either.
+    //  **Enrollment link** hands the *photo* to the person it belongs to: a one-time link
+    //  that registers that account's face, taken where they actually clock in. It creates
+    //  nothing - an account is created here, or approved from the site's registration link
+    //  after somebody has looked at the applicant's photograph - so the link carries an
+    //  account id and no other field at all.
     //
     //  The upload rule is the server's, restated here so a 6 MB photo is refused before
     //  it is uploaded over a phone tether: 5 MB, JPEG/PNG/WebP, nothing else. This is a
@@ -4242,8 +4269,8 @@ const UI_MODULES = {
     /** The create form's fields, kept so that a repaint never loses what was typed. */
     _credentialsDraft: { id: '', name: '', role: 'worker', email: '', phone: '' },
 
-    /** The registration-link form's fields, for the same reason. */
-    _credentialsInviteDraft: { id: '', name: '', role: 'worker', email: '', phone: '' },
+    /** The enrollment-link form's one field, for the same reason. */
+    _credentialsInviteDraft: { id: '' },
 
     openCredentialsMode(mode) {
         const wanted = String(mode || '');
@@ -4271,11 +4298,12 @@ const UI_MODULES = {
     },
 
     /**
-     * The roles this admin may hand out, and the id range each one owns.
+     * The roles this admin may hand out.
      *
      * A standard admin cannot create administrators anywhere on the server, so the
      * option is absent rather than present-and-403 - the same reason the password button
-     * is hidden for an administrator's row.
+     * is hidden for an administrator's row. The list is the whole rule: the role chosen
+     * here is what the account becomes, and no id picks it for them.
      */
     creatableRoles() {
         const actor = State.user || {};
@@ -4284,33 +4312,21 @@ const UI_MODULES = {
         return roles;
     },
 
-    /** Roles a *link* may create - the server's narrower list, said out loud here. */
-    linkRoles() {
-        return ['worker', 'moallem', 'off_office'];
-    },
-
-    /** The id block a role owns, so a wrong id is caught before the round trip. */
-    roleRange(role) {
-        const ranges = {
-            worker: { min: 1, max: 499 },
-            moallem: { min: 500, max: 749 },
-            off_office: { min: 750, max: 999 },
-            admin: { min: 1000, max: 4999 },
-            head_admin: { min: 5000, max: null }
-        };
-        return ranges[role] || ranges.worker;
-    },
-
-    roleRangeHint(role) {
-        const range = this.roleRange(role);
-        return range.max ? `${range.min}-${range.max}` : `${range.min}+`;
-    },
-
-    idFitsRole(userId, role) {
-        const value = Number(String(userId).trim());
-        if (!Number.isInteger(value)) return false;
-        const range = this.roleRange(role);
-        return value >= range.min && (range.max === null || value <= range.max);
+    /**
+     * Whether an id is the kind of number the server accepts.
+     *
+     * This mirrors ``main._validate_id_and_role`` and nothing else. The per-role id blocks
+     * are gone server-side: an id no longer decides a role, and refusing one for falling
+     * outside a block is how this form came to reject accounts the server would have
+     * created happily. What is left of that old rule is the part every allocator in the
+     * application depends on - an account id is a whole number - so it is caught here
+     * rather than by a doomed round trip. Whether the id is *free* stays the server's
+     * answer to give: the roster in hand can be a moment out of date, and a second
+     * administrator creating the same id is exactly what the 400 is for.
+     */
+    idIsWholeNumber(userId) {
+        const text = String(userId === null || userId === undefined ? '' : userId).trim();
+        return /^[+-]?\d+$/.test(text);
     },
 
     credentialsFieldClass() {
@@ -4381,13 +4397,10 @@ const UI_MODULES = {
         return this.repaintCredentialsFromCache();
     },
 
+    /** The role select belongs to the create form: a link hands out no role at all. */
     credentialsRoleChanged(role) {
         this.readCredentialsDraft();
-        if (this._credentialsMode === 'invite') {
-            this._credentialsInviteDraft.role = role;
-        } else {
-            this._credentialsDraft.role = role;
-        }
+        this._credentialsDraft.role = role;
         return this.repaintCredentialsFromCache();
     },
 
@@ -4407,18 +4420,20 @@ const UI_MODULES = {
         return this._credentialsDraft;
     },
 
+    /**
+     * The one field the link form has: the account the link is for.
+     *
+     * Nothing else travels, because nothing else may be chosen here any more. The name, the
+     * role and the contact details all belong to the account that already exists, and the
+     * server reads them off that row - a form that could send a name would be a form that
+     * could send a *different* one.
+     */
     readInviteDraft() {
         if (this._credentialsMode !== 'invite' || this._credentialsIssued) return this._credentialsInviteDraft;
-        const value = (id) => {
-            const element = document.getElementById(id);
-            return element && element.value !== undefined ? String(element.value) : null;
-        };
-        ['id', 'name', 'email', 'phone'].forEach((key) => {
-            const raw = value(`credentialsLink${key.charAt(0).toUpperCase()}${key.slice(1)}`);
-            if (raw !== null) this._credentialsInviteDraft[key] = raw.trim();
-        });
-        const role = value('credentialsLinkRole');
-        if (role && this.linkRoles().indexOf(role) >= 0) this._credentialsInviteDraft.role = role;
+        const element = document.getElementById('credentialsLinkId');
+        if (element && element.value !== undefined) {
+            this._credentialsInviteDraft.id = String(element.value).trim();
+        }
         return this._credentialsInviteDraft;
     },
 
@@ -4478,9 +4493,7 @@ const UI_MODULES = {
                     </div>
                     <p class="ui-note" data-password-hint>${this.escapeHtml(I18n.__('credentialsPasswordManual'))}</p>
                 </div>
-                <p class="ui-note" data-id-range="${this.escapeHtml(draft.role)}">
-                    ${I18n.__('credentialsIdRange')}: ${this.roleRangeHint(draft.role)}
-                </p>
+                <p class="ui-note" data-id-rule="true">${this.escapeHtml(I18n.__('credentialsIdRule'))}</p>
                 <div class="ui-row">
                     <input type="file" id="credentialsNewPhoto" accept="image/jpeg,image/png,image/webp"
                            onchange="UI_MODULES.pickCredentialsPhoto(this)" class="ui-field">
@@ -4521,22 +4534,10 @@ const UI_MODULES = {
             <div class="${box}" data-invite-panel="true">
                 <p class="ui-card-title">${I18n.__('credentialsLinkTitle')}</p>
                 <p class="ui-note is-body">${I18n.__('credentialsLinkHint')}</p>
-                <div class="ui-grid two">
+                <div class="ui-row">
                     <input type="text" id="credentialsLinkId" value="${this.escapeHtml(draft.id)}" inputmode="numeric"
                            placeholder="${I18n.__('credentialsNewId')}" class="${field}">
-                    <input type="text" id="credentialsLinkName" value="${this.escapeHtml(draft.name)}"
-                           placeholder="${I18n.__('name')}" class="${field}">
-                    <select id="credentialsLinkRole" onchange="UI_MODULES.credentialsRoleChanged(this.value)" class="${field}">
-                        ${this.linkRoles().map((role) => `<option value="${role}" ${role === draft.role ? 'selected' : ''}>${this.escapeHtml(this.roleLabel(role))}</option>`).join('')}
-                    </select>
-                    <input type="text" id="credentialsLinkEmail" value="${this.escapeHtml(draft.email)}"
-                           placeholder="${I18n.__('emailOrPhone')}" class="${field}">
-                    <input type="text" id="credentialsLinkPhone" value="${this.escapeHtml(draft.phone)}"
-                           placeholder="${I18n.__('phone')}" class="${field}">
                 </div>
-                <p class="ui-note" data-id-range="${this.escapeHtml(draft.role)}">
-                    ${I18n.__('credentialsIdRange')}: ${this.roleRangeHint(draft.role)}
-                </p>
                 <div class="ui-row">
                     <button type="button" onclick="UI_MODULES.issueCredentialsLink()" class="ui-btn ui-btn-primary">${I18n.__('credentialsLinkCreate')}</button>
                     <button type="button" onclick="UI_MODULES.closeCredentialsMode()" class="${quiet}">${I18n.__('cancel')}</button>
@@ -4576,8 +4577,8 @@ const UI_MODULES = {
             Toast.error(I18n.__('credentialsCreateNeedsIdAndName'));
             return;
         }
-        if (!this.idFitsRole(draft.id, draft.role)) {
-            Toast.error(`${I18n.__('credentialsIdRange')}: ${this.roleRangeHint(draft.role)}`);
+        if (!this.idIsWholeNumber(draft.id)) {
+            Toast.error(I18n.__('credentialsIdWholeNumber'));
             return;
         }
         if (!password) {
@@ -4614,7 +4615,11 @@ const UI_MODULES = {
     },
 
     /**
-     * Issues the one-time registration link.
+     * Issues the one-time enrollment link for an account that already exists.
+     *
+     * The account id is the whole request. An id no account carries is the server's answer
+     * to give (404), and deliberately not a range check here: the console does not know the
+     * roster, and what a link is about is a person who is already on it.
      *
      * The token comes back exactly once and is not stored in readable form anywhere - it
      * is a hash in ``enrollment_invites`` - so the panel keeps it on screen until it is
@@ -4622,25 +4627,14 @@ const UI_MODULES = {
      */
     async issueCredentialsLink() {
         const draft = this.readInviteDraft();
-        if (!draft.id || !draft.name) {
-            Toast.error(I18n.__('credentialsLinkNeedsIdAndName'));
-            return;
-        }
-        if (!this.idFitsRole(draft.id, draft.role)) {
-            Toast.error(`${I18n.__('credentialsIdRange')}: ${this.roleRangeHint(draft.role)}`);
+        if (!draft.id) {
+            Toast.error(I18n.__('credentialsLinkNeedsId'));
             return;
         }
         try {
             this._credentialsIssued = await API.request('/admin/enrollment/invites', {
                 method: 'POST',
-                body: {
-                    worker_id: draft.id,
-                    kind: 'register',
-                    name: draft.name,
-                    role: draft.role,
-                    email: draft.email,
-                    phone: draft.phone
-                }
+                body: { worker_id: draft.id }
             });
             Toast.success(I18n.__('credentialsLinkReady'));
         } catch (err) {
@@ -5050,9 +5044,9 @@ const UI_MODULES = {
      * version of a screen that already existed: three boxes and no role choice, against a
      * Credentials form that takes the id, the name, the contact details, the password *and*
      * the face in one step. Two places to create an account is one place too many, so the
-     * panel is gone and the note below says where the job actually lives. What stays is the
-     * one thing that was not a duplicate: the id ranges, which are the whole permission
-     * model (1000-4999 an admin, 5000 and above a head admin).
+     * panel is gone and the note below says where the job actually lives - including which
+     * of its two boxes decides what an administrator may do, because the id no longer
+     * does: the role selected on the Credentials form is the whole of it.
      */
     async renderAdminManagement(content, knownRules, knownBranding) {
         // ``knownRules`` and ``knownBranding`` are passed back after a save, so the panel
@@ -5851,26 +5845,37 @@ const UI_MODULES = {
     },
 
     /**
-     * The category chips, built from the report on screen.
+     * The category picker, built from the report on screen.
      *
-     * Not from a list fetched separately: a chip for a category with no shifts this period
-     * filters to an empty table, and the count is the first thing a reader checks it against.
-     * The names are operator data (a category is whatever the company calls its sites), so
-     * they travel as ``data-category`` and are passed to the handler as an argument - never
-     * written into the handler text, which is what the CSP in this console forbids.
+     * Not from a list fetched separately, and a list rather than a row of chips. Built from the
+     * report, a category that worked nothing this period is simply not offered - a chip or an
+     * option that filters to an empty table is a dead end - and the count beside each entry is
+     * the number of shifts behind it, which is the first thing a reader checks a filter
+     * against. A list rather than chips, so the control does not grow row by row as a company
+     * adds categories and so the one that is *chosen* is legible even when the row is long.
      */
-    shiftsCategoryChipsHtml(report) {
+    shiftsCategorySelectHtml(report) {
         const categories = (report && report.categories) || [];
         if (categories.length === 0 && !this.shiftsCategory()) return '';
         const active = this.shiftsCategory();
         const rows = ((report && report.rows) || []).length;
-        const chip = (value, label, count) => `
-            <button type="button" class="ui-chip" data-category="${this.escapeHtml(value)}"
-                    data-active="${active === value ? 'true' : 'false'}"
-                    aria-pressed="${active === value ? 'true' : 'false'}"
-                    onclick="UI_MODULES.setShiftsCategory('${this.liveOpsInlineString(value)}')">${this.escapeHtml(`${label} (${count})`)}</button>`;
-        return chip('', I18n.__('shiftsAllCategories'), rows)
-            + categories.map((entry) => chip(entry.name, entry.name, entry.shifts)).join('');
+        const option = (value, label) => `<option value="${this.escapeHtml(value)}"${active === value ? ' selected' : ''}>${this.escapeHtml(label)}</option>`;
+        return `<div>
+                <label class="ui-label" for="shiftsCategoryFilter">${this.escapeHtml(I18n.__('sitesCategory'))}</label>
+                <select class="ui-field" id="shiftsCategoryFilter" data-shifts-category>${option('', `${I18n.__('shiftsAllCategories')} (${rows})`)}${categories.map((entry) => option(entry.name, `${entry.name} (${entry.shifts})`)).join('')}</select>
+            </div>`;
+    },
+
+    /**
+     * A change anywhere in the Shifts tab. The category picker is delegated here rather than
+     * carrying an inline ``onchange``: a category name is operator data, and the CSP's
+     * per-file allowance for inline handlers may only fall.
+     */
+    onShiftsChange(event) {
+        const target = event && event.target;
+        if (!target || typeof target.getAttribute !== 'function') return undefined;
+        if (target.getAttribute('data-shifts-category') === null) return undefined;
+        return this.setShiftsCategory(target.value);
     },
 
     /** `2026-08-07` or `2026/08/07` typed into the box means "that day", not a filter. */
@@ -5887,13 +5892,20 @@ const UI_MODULES = {
      * widening it, and a day typed in finds that day's shifts without asking the server for
      * a different period. Substring and case-insensitive: an admin knows a name, not its
      * exact spelling.
+     *
+     * The one term that is not a substring search is a number: it is read as a worker id
+     * and matched against what the row *is* rather than against the date it was worked on.
+     * The rule is stated where it is applied.
      */
     shiftsMatches(rows, query) {
         const terms = String(query || '').toLowerCase().split(/\s+/).filter(Boolean);
         if (terms.length === 0) return rows;
         return rows.filter((row) => {
-            const haystack = [
-                row.worker_name, row.worker_id, row.site_name, row.date, row.timestamp, row.status,
+            // What the row *is*, with the calendar kept out of it: the two are one haystack
+            // for every search except the numeric one below, and that exception is the
+            // reason they are written apart.
+            const identity = [
+                row.worker_name, row.worker_id, row.site_name, row.status,
                 // The role in both forms, like the credentials roster: the code is how it
                 // arrives, the label is what is on screen - and "who was that administrator
                 // again" is asked by typing the word the table shows.
@@ -5903,7 +5915,17 @@ const UI_MODULES = {
                 row.site_category,
                 this.arrivalWords(row)
             ].join(' ').toLowerCase();
-            return terms.every((term) => haystack.indexOf(term) >= 0);
+            const calendar = [row.date, row.timestamp].join(' ').toLowerCase();
+            return terms.every((term) => (
+                // A number is somebody's id, not the fourth digit of a date. This deployment
+                // hands out ids like `1`, `2` and `4`, and every row carries those digits in
+                // its own date - so searching for worker 4 used to answer with the whole
+                // timesheet. A *day* is still searchable: it is typed with its dashes
+                // (`2026-08-07`), which is not a bare number, and matches below.
+                /^\d+$/.test(term)
+                    ? identity.indexOf(term) >= 0
+                    : `${identity} ${calendar}`.indexOf(term) >= 0
+            ));
         });
     },
 
@@ -6102,6 +6124,8 @@ const UI_MODULES = {
         // Assigned rather than added, like the two forms above, so repainting the tab
         // cannot leave the previous paint's listener behind on the same element.
         content.onclick = (event) => this.onShiftsClick(event);
+        // The category picker fires on ``change``: one delegated listener beside the click one.
+        content.onchange = (event) => this.onShiftsChange(event);
     },
 
     /**
@@ -6181,11 +6205,13 @@ const UI_MODULES = {
                     <button type="button" data-preset="${preset.key}" data-active="${preset.active}"
                             onclick="UI_MODULES.applyShiftsPreset('${preset.key}')"
                             class="ui-chip"${preset.active ? ' aria-pressed="true"' : ''}>${this.escapeHtml(I18n.__(preset.label))}</button>`).join('')}
-                <!-- The categories sit beside the periods rather than under the table, where an
-                     operator is already reading rows: this row is where "what am I looking at"
-                     is answered, and a warehouse filter is the same kind of choice as "this
-                     month". The count on each chip is the shifts behind it in *this* period. -->
-                ${this.shiftsCategoryChipsHtml(report)}
+                <!-- The category picker sits beside the periods rather than under the table,
+                     where an operator is already reading rows: this row is where "what am I
+                     looking at" is answered, and a warehouse filter is the same kind of choice
+                     as "this month". The count on each option is the shifts behind it in *this*
+                     period. A list rather than a quick search, so a long category name cannot
+                     scroll out of reach and the chosen one is legible at a glance. -->
+                ${this.shiftsCategorySelectHtml(report)}
                 <button type="button" data-copy-link onclick="UI_MODULES.copyShiftsLink()"
                         class="ui-chip ui-push">${this.OPS_ICONS.copy}${this.escapeHtml(I18n.__('copyLink'))}</button>
             </div>`;

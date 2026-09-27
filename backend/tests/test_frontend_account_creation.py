@@ -2,9 +2,9 @@
 
 WHY THIS EXISTS
 ---------------
-The Credentials tab can now start an account in the two ways an administrator actually
-needs: type it in here (id, name, role, generated password, and a photo that registers the
-face), or send a one-time link and let the person do it themselves. The API tests in
+The Credentials tab can start an account in the two ways an administrator actually needs:
+type it in here (id, name, role, generated password, and a photo that registers the face),
+or send a one-time *enrollment* link for an account that already exists. The API tests in
 ``test_account_creation.py`` prove the server does the right thing; what they cannot see is
 whether the screen reaches it - which fields travel, whether the photo is attached, whether
 the password is shown once, and whether a 6 MB photo is refused before it is uploaded.
@@ -18,9 +18,11 @@ So this suite drives the real ``admin_modules.js``:
    screen, and the account is not sent at all;
 4. creating posts a multipart body carrying every field and the photo itself, and shows the
    password exactly once afterwards - then forgets it when the panel closes;
-5. an id outside the role's range never leaves the browser;
-6. issuing a link posts the register kind with the admin's name and role, and the answer is
-   offered as a copyable URL, a WhatsApp message and a QR code;
+5. an id that is not a whole number never leaves the browser, and one the deleted per-role
+   id blocks would have refused does - the server is the authority on which ids it accepts;
+6. issuing a link posts an account id and *nothing else* - no name, no role, no contact
+   details, because all of those belong to the account - and the answer is offered as a
+   copyable URL, a WhatsApp message and a QR code;
 7. a server refusal (an id already taken) is reported as the reason, not as a success.
 
 Node is optional; without it these skip rather than fail.
@@ -78,11 +80,11 @@ function responders(url, init) {
     }
     if (url.indexOf('/admin/enrollment/invites') >= 0) {
         inviteCalls.push({ url: String(url), method: (init && init.method) || 'GET', body: (init && init.body) || null, headers: (init && init.headers) || {} });
-        if (inviteFail) return { status: 409, body: { detail: 'Account 77 already exists. Reserve a free id.' } };
+        if (inviteFail) return { status: 404, body: { detail: 'Worker ID not found. Create the user first.' } };
         return {
             status: 200,
             body: {
-                status: 'success', kind: 'register', invite_id: 9, worker_id: '77',
+                status: 'success', kind: 'enroll', invite_id: 9, worker_id: '77',
                 worker_name: 'Link Worker', role: 'worker',
                 url: 'https://site.example.test/enroll/tok-one-time',
                 token: 'tok-one-time', expires_at: '2026-09-18 12:00:00', max_uses: 1,
@@ -174,12 +176,13 @@ const results = {};
         // referencing them directly.
         create_labelled: markup.indexOf(env.evaluate("I18n.__('credentialsNewAccount')")) >= 0,
         invite_labelled: markup.indexOf(env.evaluate("I18n.__('credentialsLink')")) >= 0,
+        invite_is_an_enrollment_link: env.evaluate("I18n.__('credentialsLink')").indexOf('Registration') < 0,
         no_create_form_yet: markup.indexOf('data-create-panel') < 0,
         requests: env.requests.map((r) => r.url.replace(/^.*\/api\/v1/, ''))
     };
 }
 
-// 2. the create panel: a generated password, the upload rule, the id range
+// 2. the create panel: a generated password, the upload rule, and the id rule
 {
     const env = consoleEnv('head_admin');
     await env.evaluate("UI.renderAdminTab('Credentials')");
@@ -192,9 +195,12 @@ const results = {};
         accept: attr(markup, 'id="credentialsNewPhoto"[^>]*accept="([^"]*)"'),
         states_5mb: markup.indexOf('5 MB') >= 0,
         states_photos_only: /JPEG, PNG/.test(markup),
-        id_range: attr(markup, 'data-id-range="([^"]*)"'),
-        range_shown: markup.indexOf('1-499') >= 0,
+        // The rule the server enforces, in one sentence that does not change with the
+        // role - because neither does the rule.
+        id_rule: markup.indexOf(env.evaluate("I18n.__('credentialsIdRule')")) >= 0,
+        names_no_band: /(1-499|500-749|750-999|1000-4999|5000\+)/.test(markup) === false,
         roles: optionsOf(markup, 'credentialsNewRole'),
+        selected_role: attr(markup, '<option value="([^"]*)" selected>'),
         requests: env.requests.length - rosterOnly
     };
     // A standard admin cannot create administrators anywhere on the server, so the option
@@ -348,22 +354,41 @@ const results = {};
     };
 }
 
-// 5. an id outside the role's range never leaves the browser
+// 5. an id that is not a whole number is refused before the round trip
 {
     const env = consoleEnv('head_admin');
     await openCreate(env);
-    await fill(env, { credentialsNewId: '900', credentialsNewName: 'Wrong Block' });
+    await fill(env, { credentialsNewId: '12a', credentialsNewName: 'Not a Number' });
     const before = createCalls.length;
     await env.evaluate("UI_MODULES.createCredentialsAccount()");
-    results.range_refused = {
+    results.id_refused = {
         toast: toasts(env).slice(-1)[0],
+        said: env.evaluate("I18n.__('credentialsIdWholeNumber')"),
         called: createCalls.length - before,
         // And nothing was created, so the roster still shows the accounts it had.
         panel: render(env).indexOf('data-account-created') >= 0
     };
 }
 
-// 5b. the panel keeps what was typed when the role - and therefore the hint - changes
+// 5a. the blocks are gone: an id they refused is sent, and the server decides
+{
+    const env = consoleEnv('head_admin');
+    await openCreate(env);
+    // 750-999 belonged to off-office workers, so this was refused here for a worker
+    // without the server ever seeing it.
+    await fill(env, { credentialsNewId: '900', credentialsNewName: 'Out of the Old Block' });
+    const before = createCalls.length;
+    await env.evaluate("UI_MODULES.createCredentialsAccount()");
+    const calls = createCalls.slice(before);
+    const last = calls.length ? calls[calls.length - 1] : null;
+    results.old_block_id = {
+        called: calls.length,
+        sent: last ? last.body.get('user_id') : null,
+        role: last ? last.body.get('role') : null
+    };
+}
+
+// 5b. the panel keeps what was typed when the role changes
 {
     const env = consoleEnv('head_admin');
     await openCreate(env);
@@ -373,13 +398,12 @@ const results = {};
     results.draft = {
         keeps_id: markup.indexOf('value="642"') >= 0,
         keeps_name: markup.indexOf('value="Lead Worker"') >= 0,
-        role: attr(markup, 'data-id-range="([^"]*)"'),
-        range_shown: markup.indexOf('500-749') >= 0,
-        selected: /<option value="moallem" selected>/.test(markup)
+        selected: /<option value="moallem" selected>/.test(markup),
+        note_unchanged: markup.indexOf(env.evaluate("I18n.__('credentialsIdRule')")) >= 0
     };
 }
 
-// 6. the registration link: what is posted, and what is offered back
+// 6. the enrollment link: what is posted, and what is offered back
 {
     const env = consoleEnv('head_admin');
     await env.evaluate("UI.renderAdminTab('Credentials')");
@@ -388,15 +412,15 @@ const results = {};
     const markup = render(env);
     results.invite_panel = {
         has_panel: markup.indexOf('data-invite-panel') >= 0,
-        roles: optionsOf(markup, 'credentialsLinkRole'),
+        id_field: markup.indexOf('credentialsLinkId') >= 0,
+        // The fields the retired registration link was fed, and which no longer exist: a
+        // name or a role written here would be a second place to set what the account
+        // already says.
+        has_name_field: markup.indexOf('credentialsLinkName') >= 0,
+        has_role_field: markup.indexOf('credentialsLinkRole') >= 0,
         requests: afterOpening(env, rosterOnly)
     };
-    await fill(env, {
-        credentialsLinkId: '77',
-        credentialsLinkName: 'Link Worker',
-        credentialsLinkEmail: 'link@example.test',
-        credentialsLinkPhone: '+201000000077'
-    });
+    await fill(env, { credentialsLinkId: '77' });
     await env.evaluate("UI_MODULES.issueCredentialsLink()");
 
     const call = inviteCalls[inviteCalls.length - 1];
@@ -405,12 +429,8 @@ const results = {};
         count: inviteCalls.length,
         path: call.url.replace(/^.*\/api\/v1/, ''),
         method: call.method,
-        kind: sent.kind,
+        sent_keys: Object.keys(sent).sort(),
         worker_id: sent.worker_id,
-        name: sent.name,
-        role: sent.role,
-        email: sent.email,
-        phone: sent.phone,
         authorized: call.headers['Authorization']
     };
 
@@ -439,7 +459,7 @@ const results = {};
 {
     const env = consoleEnv('head_admin');
     await openInvite(env);
-    await fill(env, { credentialsLinkId: '77', credentialsLinkName: 'Link Worker' });
+    await fill(env, { credentialsLinkId: '77' });
     inviteFail = true;
     await env.evaluate("UI_MODULES.issueCredentialsLink()");
     results.invite_refused = {
@@ -449,15 +469,19 @@ const results = {};
     };
 }
 
-// 7. the link only needs an id and a name; without them nothing is sent
+// 7. the link needs an id and nothing else; without one nothing is sent
 {
     const env = consoleEnv('head_admin');
     await openInvite(env);
     const before = inviteCalls.length;
     await env.evaluate("UI_MODULES.issueCredentialsLink()");
+    const empty = inviteCalls.length - before;
+    const emptyToast = toasts(env).slice(-1)[0];
     await fill(env, { credentialsLinkId: '77' });
     await env.evaluate("UI_MODULES.issueCredentialsLink()");
-    results.invite_needs_name = {
+    results.invite_needs_id = {
+        calls_before_an_id: empty,
+        empty_toast: emptyToast,
         calls: inviteCalls.length - before,
         toast: toasts(env).slice(-1)[0]
     };
@@ -503,6 +527,9 @@ def test_both_ways_to_start_an_account_are_on_the_credentials_tab(results):
     assert results["entry"]["invite_button"] is True
     assert results["entry"]["create_labelled"] is True
     assert results["entry"]["invite_labelled"] is True
+    assert results["entry"]["invite_is_an_enrollment_link"] is True, (
+        "the button is an enrollment link now: nothing on this screen creates an account from a link"
+    )
     assert results["entry"]["no_create_form_yet"] is True, "the form opens on request, not by default"
     assert results["entry"]["requests"] == ["/admin/users"], "opening a tab fetches the roster and nothing else"
 
@@ -517,8 +544,13 @@ def test_the_create_panel_states_the_policy_and_picks_a_password(results):
     )
     assert panel["states_5mb"] is True
     assert panel["states_photos_only"] is True
-    assert panel["id_range"] == "worker"
-    assert panel["range_shown"] is True, "the id block for the chosen role, before the server has to say it"
+    assert panel["id_rule"] is True, "the panel states the rule the server applies: a whole number"
+    assert panel["names_no_band"] is True, (
+        "the deleted per-role id blocks must not survive on screen: the server refuses no id "
+        "for falling outside one, and a form that says otherwise sends the admin looking for "
+        "a block that no longer exists"
+    )
+    assert panel["selected_role"] == "worker", "the default role, before anything is chosen"
     assert panel["roles"] == ["worker", "moallem", "off_office", "admin", "head_admin"]
     assert panel["requests"] == 0, "rendering a form is not a reason to talk to the server"
 
@@ -614,24 +646,22 @@ def test_the_new_account_password_can_be_typed_instead_of_generated(results):
     assert typed["sent"] != typed["generated"], "and not the one the field opened on"
 
 
-def test_a_registration_link_is_issued_with_the_admins_own_id_name_and_role(results):
+def test_an_enrollment_link_is_issued_for_an_account_that_already_exists(results):
     panel = results["invite_panel"]
     assert panel["has_panel"] is True
-    assert panel["roles"] == ["worker", "moallem", "off_office"], (
-        "a link may only create the business roles"
-    )
+    assert panel["id_field"] is True, "the account the link is for is the panel's one field"
+    assert panel["has_name_field"] is False, "a name here would be a second place to write one"
+    assert panel["has_role_field"] is False, "a link hands out no role: the account's role is its own"
     assert panel["requests"] == 0
 
     call = results["invite_call"]
     assert call["count"] == 1
     assert call["path"].endswith("/admin/enrollment/invites")
     assert call["method"] == "POST"
-    assert call["kind"] == "register"
+    assert call["sent_keys"] == ["worker_id"], (
+        "the id is the whole request: no name, no role, no kind, nothing a link could mint with"
+    )
     assert call["worker_id"] == "77"
-    assert call["name"] == "Link Worker"
-    assert call["role"] == "worker"
-    assert call["email"] == "link@example.test"
-    assert call["phone"] == "+201000000077"
     assert call["authorized"] == "Bearer tok-5000"
 
 
@@ -653,12 +683,14 @@ def test_a_refused_link_does_not_pretend_to_exist(results):
     refused = results["invite_refused"]
     assert refused["calls"] == 1
     assert refused["panel"] is False
-    assert "already exists" in refused["toast"]
+    assert "not found" in refused["toast"], "the server's reason, not a success"
 
 
-def test_a_link_needs_an_id_and_a_name(results):
-    assert results["invite_needs_name"]["calls"] == 0
-    assert "ID and a name" in results["invite_needs_name"]["toast"]
+def test_a_link_needs_an_id_and_nothing_else(results):
+    needed = results["invite_needs_id"]
+    assert needed["calls_before_an_id"] == 0, "an empty form is not worth a request"
+    assert "ID" in needed["empty_toast"], "and the admin is told what is missing"
+    assert needed["calls"] == 1, "the id alone is enough to issue a link"
 
 
 def test_closing_a_panel_returns_to_the_roster_untouched(results):
