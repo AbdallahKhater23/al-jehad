@@ -1412,7 +1412,11 @@ name of whoever it belongs to.
 names the person, the site, the clock-in time and how long they have been on site, and the
 role is on the row - `Administrator · 1000`, not `admin · 1000` - and on the phone cards,
 which previously showed no role at all. The board's filter matches the role in both forms as
-well. A board where an administrator's own shift reads like anybody else's is a board whose
+well, and it reads a query by the same rule the Shifts search does: a term made only of
+digits is a worker id, matched against the person - name, id, role - and never against the
+site they sit at, whose names carry the deployment's own digits. A word, or a site name
+typed in full ("salmiya block 4"), still finds the place. One question, one answer, on both
+tabs. A board where an administrator's own shift reads like anybody else's is a board whose
 reader has to recognise a name before they can tell who is on site, and the role is the one
 fact that decides who reviews the hours afterwards.
 

@@ -55,6 +55,21 @@ DEVELOPER_ROLE = "developer"
 #: ``require_role`` below is the other half of the same decision.
 ADMIN_ROLES: frozenset[str] = frozenset({"admin", "head_admin", DEVELOPER_ROLE})
 
+#: The one narrowed scope a token can carry: a session that may read and may not write.
+#:
+#: It exists for the root tier's impersonation token (``developer.mint_impersonation_token``),
+#: whose whole purpose is to see what an account sees. A token minted with the target's own
+#: role would be a *full* session for that account - and in this application a worker's session
+#: can clock a punch in, which is a payable row attributed to the worker and to nobody else.
+#: "Do not mutate business timesheets" written in a response body is a promise; refusing the
+#: write at the door is a control, and only one of the two survives being ignored.
+READONLY_SCOPE = "readonly"
+
+#: The methods a read-only session may use. The safe set from RFC 9110, minus nothing: this is
+#: an allow-list, so a method nobody thought about (a future ``PATCH``, a webhook's ``POST``)
+#: is refused rather than permitted by omission.
+SAFE_METHODS: frozenset[str] = frozenset({"GET", "HEAD", "OPTIONS"})
+
 #: The roles a *business* administrator audience is made of - what a route declares, and what
 #: the audience matrix in ``tests/test_role_audience.py`` holds to the shape of the API.
 #:
@@ -183,7 +198,17 @@ def create_access_token(
     token_version: int = 0,
     *,
     ttl_hours: float | None = None,
+    scope: str | None = None,
 ) -> tuple[str, datetime]:
+    """Mint a bearer token. ``scope`` narrows it; ``None`` is an ordinary session.
+
+    A scope is a *restriction the token carries*, not a permission it grants: every existing
+    token omits the claim and is therefore unrestricted, and the only value this build honours
+    is ``READONLY_SCOPE``, which ``get_current_user`` enforces against the request's method.
+    The claim travels in the token rather than in a server-side table because these tokens are
+    stateless by design - a revocation surface that stores sessions would be a second source
+    of truth about who is signed in, which is the thing ``users.token_version`` avoids.
+    """
     issued = int(time.time())
     expires = issued + int((ttl_hours if ttl_hours is not None else settings.jwt_ttl_hours) * 3600)
     payload = {
@@ -194,6 +219,8 @@ def create_access_token(
         "exp": expires,
         "jti": uuid.uuid4().hex,
     }
+    if scope is not None:
+        payload["scope"] = str(scope)
     token = jwt.encode(payload, settings.secret_key, algorithm=settings.jwt_algorithm)
     return token, datetime.fromtimestamp(expires, tz=timezone.utc)
 
@@ -255,6 +282,19 @@ async def get_current_user(
             status_code=401,
             detail="Credentials changed. Please sign in again.",
             headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # A narrowed session is refused here, at the one door every authenticated route goes
+    # through, rather than in the handlers a caller might forget to guard. The method is the
+    # whole test: this dependency does not know or care which route is about to run, so
+    # "reads are fine and writes are not" holds for endpoints that do not exist yet.
+    if claims.get("scope") == READONLY_SCOPE and request.method not in SAFE_METHODS:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "This is a read-only session: it can read what this account sees and cannot "
+                f"change anything ({request.method} is refused)."
+            ),
         )
 
     return CurrentUser(

@@ -53,6 +53,19 @@ DEVELOPER_ROUTES = (
     "/api/v1/developer/diagnostics/pool",
     "/api/v1/developer/diagnostics/slow-queries",
     "/api/v1/developer/audit",
+    # The revocation surface: who could hold a token, and the lever that ends it.
+    "/api/v1/developer/sessions",
+    # The diagnostic domains: the models and their bands, the database and its journal, the
+    # process that owns the models, and the offline protocol's devices. Added here as well as in
+    # their own suite because *this* list is the one that fails when a route is added to the
+    # module and nothing thinks about who may reach it.
+    "/api/v1/developer/ml/diagnostics",
+    "/api/v1/developer/ml/shadow-summary",
+    "/api/v1/developer/db/stats",
+    "/api/v1/developer/db/integrity",
+    "/api/v1/developer/engine/process-stats",
+    "/api/v1/developer/offline/devices",
+    "/api/v1/developer/offline/tamper-alerts",
 )
 
 
@@ -155,8 +168,23 @@ def test_the_developer_surface_is_closed_to_every_door_the_console_uses(client, 
         "/api/v1/developer/diagnostics/caches/flush",
         "/api/v1/developer/alerts/1/read",
         "/api/v1/developer/diagnostics/query-plan/attendance_by_site",
+        # The levers, which is where an escalation would actually land: a liveness mode moved to
+        # ``off`` is the safety policy switched off, and a checkpoint under load is an outage.
+        "/api/v1/developer/ml/liveness-mode",
+        "/api/v1/developer/db/wal-checkpoint",
+        "/api/v1/developer/engine/restart-worker",
+        # ...and the tools, which are the same kind of lever with worse failure modes: a snapshot
+        # of the payroll database, every face template rewritten by hand, and a *session* for
+        # somebody else's account. A lock with those behind it is not a lock.
+        "/api/v1/developer/db/backup",
+        "/api/v1/developer/geo/test-point",
+        "/api/v1/developer/biometrics/reindex",
+        f"/api/v1/developer/auth/impersonate/{WORKER}",
     ):
-        assert client.post(path, headers=head).status_code in (403, 405), path
+        assert client.post(path, json={"mode": "off", "reason": "probe"}, headers=head).status_code in (
+            403,
+            405,
+        ), path
     patch = client.patch(
         "/api/v1/developer/runtime/maintenance_mode", json={"value": True}, headers=head
     )
@@ -435,3 +463,92 @@ def test_every_response_carries_the_trace_id_an_alert_row_is_joined_by(client, a
     alert = _rows("SELECT trace_id, detail_json FROM developer_alerts WHERE kind = 'developer_account_seeded'")
     assert alert and alert[0]["detail_json"], alert
     assert DEV_PASSWORD not in alert[0]["detail_json"]
+
+
+# ---------------------------------------------------------------------------
+# live sessions: the list, and the lever
+# ---------------------------------------------------------------------------
+def test_the_session_list_names_every_account_that_could_hold_a_token(client, app_module):
+    _seed()
+    listed = client.get("/api/v1/developer/sessions", headers=_bearer_as_developer())
+    assert listed.status_code == 200, listed.text
+    rows = {str(row["id"]): row for row in listed.json()}
+
+    # Every operator role is on it - the roster of who *could* act, not who is.
+    for user_id in (WORKER, ADMIN, HEAD_ADMIN, DEV_ID):
+        assert user_id in rows, f"{user_id} is missing from the session list"
+    # The projection is named, and no row carries a credential or a token.
+    row = rows[WORKER]
+    for field in ("id", "name", "role", "status", "token_version", "last_login_at", "last_login_ip", "active_devices"):
+        assert field in row, field
+    blob = str(listed.json())
+    assert "password_hash" not in blob and "token" not in blob.lower().replace("token_version", "")
+
+
+def test_revoking_signs_the_account_out_everywhere(client, app_module):
+    _seed()
+    root = _bearer_as_developer()
+    live = bearer(WORKER)  # a real session, minted the way login mints one
+    assert client.get("/api/v1/auth/me", headers=live).status_code == 200
+
+    # An unrevoked offline signing key: the second credential a phone holds.
+    with db(write=True) as conn:
+        conn.execute(
+            "INSERT INTO worker_devices (device_id, worker_id, key_salt, key_epoch, created_at) "
+            "VALUES ('dev-revoke-test', ?, 'salt', 1, ?)",
+            (WORKER, datetime.now().strftime(TS)),
+        )
+
+    before_version = int(_user(WORKER)["token_version"])
+    revoked = client.post(f"/api/v1/developer/sessions/{WORKER}/revoke", headers=root)
+    assert revoked.status_code == 200, revoked.text
+    body = revoked.json()
+    assert body["token_version"] == before_version + 1
+    assert body["devices_revoked"] == 1
+
+    # The live session is dead at its next request - the whole point of the lever.
+    assert client.get("/api/v1/auth/me", headers=live).status_code in (401, 403)
+    # The offline key cannot outlive it either.
+    assert _rows(
+        "SELECT revoked_at FROM worker_devices WHERE device_id = 'dev-revoke-test'"
+    )[0]["revoked_at"] is not None
+    # The account is untouched: a sign-out, not a deactivation.
+    after = _user(WORKER)
+    assert after["status"] == "active"
+    assert int(after["token_version"]) == before_version + 1
+    # And the decision is on the trail, with the version it moved from and to.
+    trail = _rows(
+        "SELECT before_json, after_json FROM audit_log WHERE action = 'sessions_revoked' AND entity_id = ?",
+        (WORKER,),
+    )
+    assert trail, "the revocation left no audit row"
+    assert f'"token_version": {before_version}' in trail[0]["before_json"]
+    assert f'"token_version": {before_version + 1}' in trail[0]["after_json"]
+
+
+def test_revoking_refuses_what_it_must_refuse(client, app_module):
+    _seed()
+    root = _bearer_as_developer()
+    unknown = client.post("/api/v1/developer/sessions/999999/revoke", headers=root)
+    assert unknown.status_code == 404, unknown.text
+
+    # A deactivated account holds no sessions: its sign-out already happened.
+    with db(write=True) as conn:
+        conn.execute("UPDATE users SET status = 'inactive' WHERE id = ?", (MOALLEM,))
+    gone = client.post(f"/api/v1/developer/sessions/{MOALLEM}/revoke", headers=root)
+    assert gone.status_code == 409, gone.text
+    assert "deactivated" in gone.json()["detail"].lower()
+
+
+def test_a_developer_session_may_be_revoked_like_any_other(client, app_module):
+    """The root tier gets no exception - which is what makes the lever trustworthy."""
+    _seed()
+    root = _bearer_as_developer()
+    assert client.get("/api/v1/developer/runtime", headers=root).status_code == 200
+
+    revoked = client.post(f"/api/v1/developer/sessions/{DEV_ID}/revoke", headers=root)
+    assert revoked.status_code == 200, revoked.text
+    # The session that pulled the lever is signed out with itself.
+    assert client.get("/api/v1/developer/runtime", headers=root).status_code in (401, 403)
+    # ...and the account is still the root tier, still reachable by a fresh credential.
+    assert client.get("/api/v1/developer/runtime", headers=_bearer_as_developer()).status_code == 200

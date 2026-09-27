@@ -461,10 +461,14 @@ def password_of(results) -> str:
 def test_the_console_has_one_account_tab_and_no_enroll_dashboard(results):
     """Three tabs, one of them dead and one of them an enroll form: now one screen."""
     ids = [entry[0] for entry in results["tabs"]]
-    # ``Notes``, ``Links``, ``Alerts`` and (the root tier's own) ``Developer`` joined later and
-    # are their own screens (see test_frontend_notes.py, test_frontend_quick_links.py,
-    # test_frontend_admin_alerts.py and test_frontend_developer_console.py); none of them
-    # reinstates the enrollment dashboard this test is about.
+    # ``Notes``, ``Links``, ``Alerts``, ``Registrations`` and (the root tier's own) ``Developer``
+    # joined later and are their own screens (see test_frontend_notes.py,
+    # test_frontend_quick_links.py, test_frontend_admin_alerts.py,
+    # test_frontend_registrations_queue.py and test_frontend_developer_console.py); none of them
+    # reinstates the enrollment dashboard this test is about - ``Registrations`` is the closest
+    # of the five, and it is the *opposite*: the walk-up form has already been filled in and
+    # photographed by the time that tab sees it, so it creates an account from a submission
+    # rather than offering a console form to capture a face with.
     assert ids == [
         "Live Ops",
         "Approvals",
@@ -472,6 +476,7 @@ def test_the_console_has_one_account_tab_and_no_enroll_dashboard(results):
         "Sites",
         "Shifts",
         "Credentials",
+        "Registrations",
         "Links",
         "Notes",
         "Admin",

@@ -344,25 +344,36 @@ BUILD_INFO = _gauge(
 _build_info_published = False
 
 
-def publish_build_info() -> None:
-    """Publish the build and the policy it runs with, once.
+def publish_build_info(*, refresh: bool = False) -> None:
+    """Publish the build and the policy it runs with, once - or again, when told to.
 
     Called from ``instrument_app`` rather than at import: importing ``migrations`` from module
     level would drag the whole application graph (config, database, security) into the import
     of a metrics module, and a cycle is exactly how a module that must never break the app ends
     up breaking it.
+
+    ``refresh`` exists for the one label that can move at runtime. ``liveness_mode`` carries
+    the mode *in force* (``liveness.mode()``, the root tier's override included), and the root
+    tier can change that with one call - so a gauge set once at boot would keep advertising the
+    configured mode for as long as the process lives, which is exactly the window an override
+    is set in. The old series is dropped first: a re-labelled gauge that left its previous
+    child behind would report *both* modes, and an alert built on the wrong one would be worse
+    than no label at all.
     """
     global _build_info_published
-    if not AVAILABLE or _build_info_published:
+    if not AVAILABLE or (_build_info_published and not refresh):
         return
     _build_info_published = True
     try:
+        import liveness
         import migrations
 
+        if refresh:
+            BUILD_INFO.clear()
         BUILD_INFO.labels(
             version=str(settings.app_version),
             schema_version=str(migrations.SCHEMA_VERSION),
-            liveness_mode=str(settings.liveness_mode),
+            liveness_mode=str(liveness.mode()),
             face_inference_concurrency=str(settings.face_inference_concurrency),
         ).set(1)
     except Exception as exc:  # pragma: no cover - a label must never stop the app serving

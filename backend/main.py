@@ -2393,6 +2393,14 @@ async def verify_worker(
     if user_row is None:
         # The token names an account that is gone: the session is dead, not the form.
         raise HTTPException(status_code=401, detail="Invalid token")
+    if current.is_developer:
+        # The root tier owns the deployment, not a rota: it has no shifts to open or end,
+        # and an attendance row in its name would be a figure somebody has to review.
+        # Every other surface stays open to it - this is the one thing it must not do.
+        raise HTTPException(
+            status_code=403,
+            detail="The developer account does not check in or out.",
+        )
 
     lat, lon = parse_location_input(location_input)
     validate_plausible_coordinates(lat, lon)
@@ -4923,6 +4931,14 @@ async def force_clock_in(
             raise HTTPException(status_code=404, detail="Worker ID not found.")
         _guard_standard_admin(current, worker, "force clock in")
 
+        if worker["role"] == security.DEVELOPER_ROLE:
+            # The root tier is not a rota: a forced shift would put an attendance row in the
+            # developer's name, which the account must never carry (see ``/attendance/verify``).
+            raise HTTPException(
+                status_code=403,
+                detail="The developer account does not check in or out.",
+            )
+
         if conn.execute("SELECT worker_id FROM active_sessions WHERE worker_id = ?", (req.worker_id,)).fetchone():
             raise HTTPException(status_code=400, detail="Worker is already clocked in.")
 
@@ -4984,6 +5000,13 @@ async def force_clock_out(
         ).fetchone()
         if session is None:
             raise HTTPException(status_code=404, detail="Worker is not currently clocked in.")
+        if session["role"] == security.DEVELOPER_ROLE:
+            # Same rule as the forced clock-in: the developer has no shifts to end, so a
+            # session in its name cannot exist to be closed here.
+            raise HTTPException(
+                status_code=403,
+                detail="The developer account does not check in or out.",
+            )
         _guard_standard_admin(current, session, "force clock out")
 
         clock_in_time = _parse_ts(session["clock_in_time"]) or now
@@ -5997,6 +6020,26 @@ async def enrollment_page(token: str):  # noqa: ARG001 - the token is read by th
     page = os.path.join(FRONTEND_DIR, "enroll.html")
     if not os.path.exists(page):  # pragma: no cover - packaging accident
         return {"error": f"enroll.html not found in {FRONTEND_DIR}"}
+    return FileResponse(page)
+
+
+@app.get("/register", include_in_schema=False)
+async def registration_page():
+    """Serve the walk-up registration form - the one permanent public link.
+
+    Its own page for the same reason ``/enroll`` and ``/q`` have one: the person filling it in
+    has no account, which is the entire point of the form, so it cannot load the console's
+    bundle or show them a sign-in screen. Unlike those two it is served at the root rather
+    than under a token - the link is one static URL the company prints - so its assets are
+    its siblings and the page asks for them without a ``../``.
+
+    Serving it says nothing about whether it accepts anything: the switch is
+    ``settings.registration_enabled`` (off by default), and ``GET /api/v1/register`` is what
+    the page reads that from. A link that has been switched off still has to answer.
+    """
+    page = os.path.join(FRONTEND_DIR, "register.html")
+    if not os.path.exists(page):  # pragma: no cover - packaging accident
+        return {"error": f"register.html not found in {FRONTEND_DIR}"}
     return FileResponse(page)
 
 

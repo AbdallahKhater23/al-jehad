@@ -357,44 +357,64 @@ class ShadowScorer:
 
     # -- reporting ------------------------------------------------------------
     def summary(self) -> dict[str, Any]:
-        try:
-            with sqlite3.connect(self._db_path, timeout=5.0) as conn:
-                conn.row_factory = sqlite3.Row
-                row = conn.execute(
-                    """
-                    SELECT COUNT(*) AS events,
-                           SUM(outcome = 'shadow_ok')      AS ok,
-                           SUM(outcome = 'shadow_error')   AS errors,
-                           SUM(outcome = 'shadow_skipped') AS skipped,
-                           AVG(enforced_ms) AS enforced_ms,
-                           AVG(shadow_ms)   AS shadow_ms
-                      FROM shadow_scores
-                    """
-                ).fetchone()
-                paired = conn.execute(
-                    """
-                    SELECT COUNT(*) AS n,
-                           AVG(CASE WHEN enforced_verdict = shadow_verdict THEN 1.0 ELSE 0.0 END) AS agreement
-                      FROM shadow_scores
-                     WHERE outcome = 'shadow_ok'
-                       AND enforced_dist IS NOT NULL AND shadow_dist IS NOT NULL
-                    """
-                ).fetchone()
-        except sqlite3.Error as exc:
-            raise ShadowError(f"could not read the shadow log: {exc}") from exc
-        events = int(row["events"] or 0)
-        errors = int(row["errors"] or 0)
-        return {
-            "events": events,
-            "ok": int(row["ok"] or 0),
-            "errors": errors,
-            "skipped": int(row["skipped"] or 0),
-            "error_rate": round(errors / events, 4) if events else 0.0,
-            "paired_samples": int(paired["n"] or 0),
-            "verdict_agreement": round(float(paired["agreement"] or 0.0), 4),
-            "enforced_ms_mean": round(float(row["enforced_ms"] or 0.0), 3),
-            "shadow_ms_mean": round(float(row["shadow_ms"] or 0.0), 3),
-        }
+        """This session's paired log. ``summary_of`` owns the query and the arithmetic."""
+        return summary_of(self._db_path)
+
+
+def summary_of(db_path: str | Path) -> dict[str, Any]:
+    """One paired log's health and its threshold-free comparison, read by path alone.
+
+    Module level, and beside ``ShadowScorer.summary`` rather than only on it, for the caller
+    that must not prepare anything: constructing a scorer runs ``SCHEMA`` against the path it
+    is given, so a *diagnostics* endpoint that wanted this summary would have had to create the
+    very log it is reporting on - and a monitoring route that creates a file on every call is
+    how a deployment ends up with an empty shadow log an operator believes is real. This only
+    SELECTs, and raises ``ShadowError`` rather than reporting a missing table as a quiet zero.
+
+    The existence check is not politeness: ``sqlite3.connect`` *creates* the file it is given, so
+    a caller that opened a path nobody had written yet would leave a zero-byte log behind - and
+    the endpoint reporting that log would then be reporting a deployment state it had invented.
+    """
+    if not Path(db_path).exists():
+        raise ShadowError(f"no paired log at {db_path}")
+    try:
+        with sqlite3.connect(str(db_path), timeout=5.0) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS events,
+                       SUM(outcome = 'shadow_ok')      AS ok,
+                       SUM(outcome = 'shadow_error')   AS errors,
+                       SUM(outcome = 'shadow_skipped') AS skipped,
+                       AVG(enforced_ms) AS enforced_ms,
+                       AVG(shadow_ms)   AS shadow_ms
+                  FROM shadow_scores
+                """
+            ).fetchone()
+            paired = conn.execute(
+                """
+                SELECT COUNT(*) AS n,
+                       AVG(CASE WHEN enforced_verdict = shadow_verdict THEN 1.0 ELSE 0.0 END) AS agreement
+                  FROM shadow_scores
+                 WHERE outcome = 'shadow_ok'
+                   AND enforced_dist IS NOT NULL AND shadow_dist IS NOT NULL
+                """
+            ).fetchone()
+    except sqlite3.Error as exc:
+        raise ShadowError(f"could not read the shadow log: {exc}") from exc
+    events = int(row["events"] or 0)
+    errors = int(row["errors"] or 0)
+    return {
+        "events": events,
+        "ok": int(row["ok"] or 0),
+        "errors": errors,
+        "skipped": int(row["skipped"] or 0),
+        "error_rate": round(errors / events, 4) if events else 0.0,
+        "paired_samples": int(paired["n"] or 0),
+        "verdict_agreement": round(float(paired["agreement"] or 0.0), 4),
+        "enforced_ms_mean": round(float(row["enforced_ms"] or 0.0), 3),
+        "shadow_ms_mean": round(float(row["shadow_ms"] or 0.0), 3),
+    }
 
 
 # ---------------------------------------------------------------------------

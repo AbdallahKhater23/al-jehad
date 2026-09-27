@@ -34,7 +34,9 @@ import io
 import json
 import os
 import random
+import re
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 from PIL import Image
@@ -333,6 +335,41 @@ def test_the_queue_lists_what_is_pending_oldest_first(client, intake):
     assert str(registrations.photos_dir()) not in json.dumps(body), (
         "the queue leaked the photo's path; the bytes are fetched through their own route"
     )
+
+
+#: The console's own read of this queue. ``test_frontend_registrations_queue`` owns the panel
+#: and pins the status it asks for against the constants below; what no frontend suite can do is
+#: ask the *real* endpoint, because it stubs a server. This is that half, and it is here because
+#: the two sides disagreeing is not hypothetical: the panel asked for ``status=PENDING``, which
+#: is not one of ``STATUSES`` - the stored value is ``PENDING_REVIEW`` - so the screen an
+#: administrator opened said "status must be one of PENDING_REVIEW, APPROVED, REJECTED or 'all'"
+#: instead of drawing the queue.
+CONSOLE = Path(__file__).resolve().parents[2] / "frontend" / "admin_modules.js"
+
+
+def test_the_query_the_console_sends_is_one_this_endpoint_accepts(client, intake):
+    source = CONSOLE.read_text(encoding="utf-8")
+    statuses = sorted(set(re.findall(r"/admin/registrations\?status=([A-Z_]+)", source)))
+    page = re.search(r"REGISTRATIONS_LIMIT:\s*(\d+)", source)
+    assert statuses, "the console names no status, so its queue read depends on the default"
+    assert page, "the console's page size is gone and this test no longer knows what it asks for"
+    request_id = submit(client, name="Query Check", image=photo(41)).json()["request_id"]
+
+    for value in statuses:
+        answer = client.get(
+            f"{REVIEW}?status={value}&limit={page.group(1)}", headers=bearer(ADMIN)
+        )
+        assert answer.status_code == 200, (
+            f"the console asks for status={value}&limit={page.group(1)} and the endpoint answers "
+            f"{answer.status_code}: {answer.text[:200]}"
+        )
+        body = answer.json()
+        assert [item["id"] for item in body["requests"]] == [request_id]
+        assert body["pending"] == 1, "the count the tab's badge is painted from"
+        # The fields every card reads. A rename on either side is a blank line on the screen,
+        # and the panel's own suite cannot see this half of it either.
+        for field in ("id", "full_name", "phone", "email", "requested_role", "work_details", "created_at"):
+            assert field in body["requests"][0], f"the console reads {field} and the queue stopped sending it"
 
 
 def test_the_photo_route_serves_the_bytes_and_stops_when_they_are_gone(client, intake):

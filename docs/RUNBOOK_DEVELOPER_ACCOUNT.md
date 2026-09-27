@@ -62,6 +62,20 @@ the role existed. It is strictly above `admin`: the admin-targeted guards test
 restrictions that bind a standard admin do not bind it. On the handset side,
 `UI.handsetRoles = ['admin', 'developer']`, so the worker clock-in UI opens for it.
 
+**The one thing it must not do is check in or out.** The developer owns the deployment, not a
+rota, so an attendance row in its name would be a figure somebody has to review for a person
+who does not work sites. Three paths to a shift answer the same refusal
+(`403`, *"The developer account does not check in or out."*):
+
+* `POST /api/v1/attendance/verify` — its own punch, refused before the geofence is read;
+* `POST /api/v1/admin/force_clock_in` with `worker_id` = the developer id — refused even to a
+  head admin, because the rule is about the *target*, not the caller;
+* `POST /api/v1/admin/force_clock_out` with `worker_id` = the developer id — same rule, and it
+  holds even against a planted `active_sessions` row.
+
+The Live Ops force-in roster filters the account out on screen to match — a button that always
+answers 403 is a trap, so it is absent rather than present-and-refused.
+
 The reverse is not true and is the point of the tier: a route built from `require_developer`
 refuses every administrator, because their role is not in the set and they are not the
 developer.
@@ -85,6 +99,8 @@ Every route below is guarded by `security.require_developer`. All are mounted un
 | `POST` | `/api/v1/developer/diagnostics/caches/{name}/flush` |
 | `POST` | `/api/v1/developer/diagnostics/caches/flush` |
 | `GET` | `/api/v1/developer/audit` |
+| `GET` | `/api/v1/developer/sessions` |
+| `POST` | `/api/v1/developer/sessions/{user_id}/revoke` |
 | `GET` | `/api/v1/developer/refused-punches` |
 | `GET` | `/api/v1/developer/refused-punches/{refusal_id}/frame` |
 | `POST` | `/api/v1/developer/refused-punches/{refusal_id}/clear` |
@@ -169,9 +185,27 @@ it, so it neither summarises nor hides the developer's own actions from the deve
 projects a named field set (`SELECT *` is never used) and carries **no hash and no token**. The
 `security_actions` it highlights are `developer.SECURITY_ACTIONS`: `login`, `login_failed`,
 `password_reset`, `password_change_self`, `user_create`, `user_delete`, `user_edit`,
-`user_status`, `role_change`, `startup_override`, `notification_acknowledge`, `retention_sweep`,
+`user_status`, `role_change`, `sessions_revoked`, `startup_override`, `notification_acknowledge`, `retention_sweep`,
 `biometric_enroll`, `review_approve`, `review_reject`. Trace ids link an audit row to the alert
 raised for the same failure.
+
+### Live sessions
+
+`GET /api/v1/developer/sessions` is a **revocation surface, not a session log**: bearer tokens
+are stateless JWTs the server never stores, so "which tokens exist" is unknowable by design.
+What the list shows is every account that *could* hold a live token — its role, when its
+credential was last minted (the best evidence there is: the latest `login` row in the audit
+log, with its IP) and how many unrevoked offline devices it holds.
+
+`POST /api/v1/developer/sessions/{user_id}/revoke` is the lever: it bumps the account's
+`token_version`, so **every outstanding token stops verifying at its next request**, revokes
+the offline signing keys on any phone (a queued punch cannot outlive the session) and revokes
+open enrollment links. It is a sign-out, not a deactivation — password, role and history are
+touched by nothing. A deactivated account answers `409` (its sign-out already happened), an
+unknown id answers `404`, and the revocation is audited as `sessions_revoked` with the version
+it moved *from* and *to*. A developer session may be revoked like any other — a lost laptop
+does not get an exception for wearing the root tier. The console shows the same list with a
+revoke button per row (§ the Developer tab).
 
 ### Refused punches
 
