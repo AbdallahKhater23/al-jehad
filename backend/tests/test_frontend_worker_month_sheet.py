@@ -333,8 +333,12 @@ const results = {};
             nothing_printed: env.printed.length === before.printed,
             no_request: env.requests.length === before.requests
         };
+        // Two row controls are delegated through the same ``closest``; the stub has to answer
+        // each selector the way the DOM would - the edit control is not this button, so a
+        // print click must fall through the edit branch and land on the print one.
         await env.evaluate(
-            "UI_MODULES.onShiftsClick({ target: { closest: () => ({ dataset: { printWorker: '600' } }) } })"
+            "UI_MODULES.onShiftsClick({ target: { closest: (sel) => sel === '[data-print-worker]'"
+            + " ? { dataset: { printWorker: '600' } } : null } })"
         );
         results.click.printed = env.printed.length - before.printed;
         results.click.worker = (monthRequest(env, before.requests) || {}).worker;

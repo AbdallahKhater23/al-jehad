@@ -35,6 +35,8 @@ from typing import Any, Final, Iterable, Sequence
 
 import numpy as np
 
+import clock
+
 from facenet_ort import DimensionMismatch, EmbeddingError, FaceNetORT, cosine_distance
 
 log = logging.getLogger("attendance.shadow")
@@ -279,7 +281,7 @@ class ShadowScorer:
         enforced_elapsed = (time.perf_counter() - enforced_started) * 1000.0
         enforced_reading = self._read(self.enforced_gallery, enforced_embedding)
         record = ShadowRecord(
-            created_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+            created_at=clock.now_str(),
             site=self.site,
             worker_id=worker_id,
             enforced_model=self.enforced.model_id,

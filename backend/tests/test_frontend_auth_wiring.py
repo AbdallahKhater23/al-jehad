@@ -279,7 +279,10 @@ function defaultResponder(url) {
         const header = env.requests.filter((r) => r.url.includes('/admin/logs')).map((r) => r.headers.Authorization)[0];
         results.login = {
             token_after_login: tokenAfterLogin,
-            session_persisted: !!env.evaluate("(JSON.parse(sessionStorage.getItem('user')) || {}).token"),
+            // The session now lives in ``localStorage`` (key ``session``) so it survives the
+            // tab/PWA closing - the whole point of the 30-day token. See the note in
+            // ``frontendjavascript.js``.
+            session_persisted: !!env.evaluate("((JSON.parse(localStorage.getItem('session')) || {}).user || {}).token"),
             authorization_header: header,
             stored_user_has_token: env.evaluate('!!(State.user && State.user.token)'),
             toasts: env.toasts
@@ -319,7 +322,7 @@ function defaultResponder(url) {
         results.expired = {
             message,
             signed_out: env.evaluate('State.user === null'),
-            session_cleared: env.evaluate("sessionStorage.getItem('user') === null")
+            session_cleared: env.evaluate("localStorage.getItem('session') === null")
         };
     }
 
@@ -461,8 +464,16 @@ def test_authenticated_requests_carry_the_real_token(results):
     assert results["login"]["toasts"] == [], f"no error was expected: {results['login']['toasts']}"
 
 
-def test_a_restored_session_without_a_token_is_discarded(results):
-    assert results["restored_session"]["before"] == "600", "the harness must restore a session"
+def test_a_stored_session_without_a_token_is_never_restored(results):
+    """A stored session that cannot authenticate anything must not be restored at all.
+
+    It used to be loaded and then cleared, so the login screen briefly rendered from a user
+    object no request could use. The persistent-session loader rejects it at the door: it is
+    dropped (and the worker told) before any screen is drawn from it.
+    """
+    assert results["restored_session"]["before"] is None, (
+        "a tokenless stored session must not become State.user"
+    )
     assert results["restored_session"]["logged_out"] is True
     assert results["restored_session"]["after"] is None
     shown = results["restored_session"]["toasts"] + results["restored_session"]["alerts"]

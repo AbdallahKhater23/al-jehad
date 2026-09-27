@@ -26,13 +26,20 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    TZ=Asia/Kuwait
 
 WORKDIR /app
 
 # System libraries the runtime manifest cannot name:
 #   libgl1, libglib2.0-0 — what ``import cv2`` dynamically loads (see above);
 #   libjemalloc2         — the allocator this deployment runs on (see below);
+#   tzdata               — the IANA zone database. The company is in Kuwait and the host this
+#                          runs on is not: without it ``ZoneInfo("Asia/Kuwait")`` raises and
+#                          every stored punch, shift window and monthly total is measured on
+#                          the *server's* clock. The last line links the system clock at the
+#                          zone too, so the container's C library (and SQLite's 'localtime')
+#                          agree with ``ENV TZ`` — belt and braces on top of ``clock.py``.
 #   curl                 — the container HEALTHCHECK probe (Railway uses its own
 #                          healthcheckPath and ignores this one; it is for local runs).
 RUN apt-get update \
@@ -40,7 +47,10 @@ RUN apt-get update \
         libgl1 \
         libglib2.0-0 \
         libjemalloc2 \
+        tzdata \
         curl \
+ && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
+ && printf '%s\n' "$TZ" > /etc/timezone \
  && rm -rf /var/lib/apt/lists/*
 
 # Allocator: jemalloc, not glibc's malloc.

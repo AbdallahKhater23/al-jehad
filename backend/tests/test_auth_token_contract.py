@@ -21,7 +21,9 @@ symptom stays reproducible instead of a mystery.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 
+import config
 from harness import EMAILS, MOALLEM, PASSWORDS, bearer, clock_in, db_scalar
 
 #: Any authenticated role may read this, so a 403 from a role rule can never be
@@ -87,3 +89,44 @@ def test_clocking_in_with_the_login_token_works_and_with_the_placeholder_it_does
     assert db_scalar(
         "SELECT COUNT(*) FROM attendance_logs WHERE worker_id = ? AND action = 'Clock In'", (MOALLEM,)
     ) == 1
+
+
+# ---------------------------------------------------------------------------
+# persistent sessions: a 30-day token and a password-free refresh
+# ---------------------------------------------------------------------------
+def test_the_login_token_lasts_thirty_days(client):
+    """The whole point of the change: a phone signs in once a month, not once a day.
+
+    Pinned because the TTL is the *only* lever on bcrypt load here - the login route itself
+    is unchanged - and a quiet revert to hours would silently restore the every-morning login
+    that saturates the single core.
+    """
+    body = _login(client).json()
+    assert body["expires_in"] == config.ACCESS_TOKEN_EXPIRE_DAYS * 24 * 3600
+    when = datetime.fromisoformat(body["expires_at"])
+    remaining = when - datetime.now(timezone.utc)
+    assert timedelta(days=29, hours=23) < remaining <= timedelta(days=30)
+
+
+def test_refresh_reissues_a_working_token_without_a_password(client):
+    """A valid session can be slid forward with no credential beyond the token itself.
+
+    This is what keeps a daily user from ever reaching the login screen: the phone refreshes
+    long before expiry, and neither call touches bcrypt.
+    """
+    token = _login(client).json()["token"]
+    refreshed = client.post(
+        "/api/v1/auth/refresh", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert refreshed.status_code == 200, refreshed.text[:300]
+    body = refreshed.json()
+    new_token = body["token"]
+    assert new_token and new_token != token, "a refresh must mint a fresh token (new jti)"
+    assert body["expires_in"] == config.ACCESS_TOKEN_EXPIRE_DAYS * 24 * 3600
+    allowed = client.get(AUTHENTICATED_PATH, headers={"Authorization": f"Bearer {new_token}"})
+    assert allowed.status_code == 200, allowed.text[:200]
+
+
+def test_refresh_needs_a_session(client):
+    """No bearer token, no refresh - it must not be a second way to log in."""
+    assert client.post("/api/v1/auth/refresh").status_code == 401

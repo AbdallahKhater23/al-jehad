@@ -21,6 +21,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable
 
+import clock
 import telemetry
 from config import settings
 
@@ -82,7 +83,7 @@ def record_statement(operation: str, seconds: float) -> None:
         {
             "operation": operation,
             "seconds": round(seconds, 4),
-            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "at": clock.now_str(),
             "trace_id": _trace_id(),
         }
     )

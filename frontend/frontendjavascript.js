@@ -34,10 +34,94 @@ const Device = {
 };
 
 // =====================================================================
+//  Session persistence
+// =====================================================================
+//  A worker's day starts with a phone that has been in a pocket since yesterday. The
+//  session used to live in ``sessionStorage``, which the browser drops when the tab - or
+//  the installed PWA - closes, so every morning began with ``POST /auth/login``. Bcrypt is
+//  the one thing on this single-core container that does not scale (measured ~4.75
+//  logins/s), and a 40-worker shift start is exactly when it is asked for most. Persisting
+//  the token lets the phone skip the login and go straight to the punch.
+//
+//  ``localStorage`` rather than a native keychain: this is a web PWA, so there is no OS
+//  secure store to use, and the JWT is readable by any script on the origin. The
+//  compensating controls are server-side: a 30-day ``exp``, and ``token_version``, which
+//  revokes every outstanding token the moment a password changes or an account is
+//  deactivated. (The strictly safer browser transport is an httpOnly cookie, which no
+//  script can read; it needs a same-origin deployment and CSRF handling, so it is a
+//  follow-up, not a swap.)
+const SESSION_KEY = 'session';
+//: Refuse a stored session whose own stamp is absurdly far out - a hand-edited clock must
+//: not mint immortality. The server's ``exp`` is the real bound; this is belt-and-braces.
+const SESSION_MAX_MS = 31 * 24 * 3600 * 1000;
+//: Set when a session *was* stored but could not be used (expired, or carrying no token).
+//: ``UI.init`` reads it to say why the sign-in screen is back, once, instead of leaving a
+//: worker wondering whether the app forgot them.
+let SESSION_DROPPED = false;
+
+function isStoredSessionExpired(expiresAt) {
+    if (!expiresAt) return false;   // no stamp: let the server's 401 decide
+    const when = Date.parse(expiresAt);
+    if (!isFinite(when)) return false;
+    if (when - Date.now() > SESSION_MAX_MS) return true;
+    return when - Date.now() <= 0;
+}
+
+function saveStoredSession(stored) {
+    try { localStorage.setItem(SESSION_KEY, JSON.stringify(stored)); } catch (err) { /* private mode / quota */ }
+}
+
+function clearStoredSession() {
+    try { localStorage.removeItem(SESSION_KEY); } catch (err) { /* ignore */ }
+    try { sessionStorage.removeItem('user'); } catch (err) { /* ignore */ }
+}
+
+/** The persisted session, or ``null``. Migrates the old per-tab key once, so the upgrade
+ *  that is meant to keep people signed in does not sign everyone out. */
+function loadStoredSession() {
+    let raw = null;
+    try { raw = localStorage.getItem(SESSION_KEY); } catch (err) { raw = null; }
+    let stored = null;
+    if (raw) { try { stored = JSON.parse(raw); } catch (err) { stored = null; } }
+    let hadStored = Boolean(raw);
+    if (!stored) {
+        try {
+            const legacy = sessionStorage.getItem('user');
+            if (legacy) {
+                hadStored = true;
+                const user = JSON.parse(legacy);
+                if (user && user.token) {
+                    stored = { user: user, expires_at: null };
+                    saveStoredSession(stored);
+                }
+                sessionStorage.removeItem('user');
+            }
+        } catch (err) { /* bad JSON / private mode: fall through to the login screen */ }
+    }
+    if (!stored || !stored.user || !stored.user.token) {
+        // A stored session that cannot authenticate anything is not a session. It is never
+        // restored, so no screen is ever drawn from it.
+        if (hadStored) SESSION_DROPPED = true;
+        return null;
+    }
+    if (isStoredSessionExpired(stored.expires_at)) {
+        clearStoredSession();
+        SESSION_DROPPED = true;
+        return null;
+    }
+    return stored;
+}
+
+const STORED_SESSION = loadStoredSession();
+
+// =====================================================================
 //  State
 // =====================================================================
 const State = {
-    user: JSON.parse(sessionStorage.getItem('user')) || null,
+    user: STORED_SESSION ? STORED_SESSION.user : null,
+    //: When the current token expires (ISO string from the server), or ``null`` when the
+    //: stored session predates the stamp - the server's 401 is the fallback authority.
+    sessionExpiresAt: STORED_SESSION ? STORED_SESSION.expires_at : null,
     mediaStream: null,
     gpsCoords: null,
     workerTab: localStorage.getItem('workerTab') || 'clock',
@@ -77,17 +161,26 @@ const State = {
         const meta = document.querySelector('meta[name="theme-color"]');
         if (meta) meta.setAttribute('content', dark ? '#111827' : '#2563eb');
     },
-    /** The bearer token. It lives inside the stored user object so a reload keeps it. */
+    /** The bearer token. It lives inside the persisted user object so a reload keeps it. */
     get token() {
         return (this.user && this.user.token) || null;
     },
-    saveUser(userData) {
+    /** True when the stored token is inside its refresh window (7 days), so a worker who
+     *  uses the app daily never sees the login screen at all. */
+    sessionNeedsRefresh() {
+        if (!this.sessionExpiresAt) return false;
+        const when = Date.parse(this.sessionExpiresAt);
+        return isFinite(when) && (when - Date.now()) < 7 * 24 * 3600 * 1000;
+    },
+    saveUser(userData, expiresAt) {
         this.user = userData;
-        sessionStorage.setItem('user', JSON.stringify(userData));
+        if (expiresAt) this.sessionExpiresAt = expiresAt;
+        saveStoredSession({ user: userData, expires_at: this.sessionExpiresAt || null });
     },
     clearUser() {
         this.user = null;
-        sessionStorage.removeItem('user');
+        this.sessionExpiresAt = null;
+        clearStoredSession();
         // Whoever signs in next is a different account, and the handset choice belonged to
         // the last one. A stored session is not a screen anybody was looking at.
         this.handsetMode = false;
@@ -985,7 +1078,13 @@ const ADMIN_TABS = [
     // because the most common request - "my password stopped working" - is answered
     // with that tab's reset, straight from the note.
     { id: 'Notes', key: 'notes', hint: 'hintNotes', group: 'navGroupPeople', icon: 'notes' },
-    { id: 'Admin', key: 'admin', hint: 'hintAdmin', group: 'navGroupConfig', icon: 'admin' }
+    { id: 'Admin', key: 'admin', hint: 'hintAdmin', group: 'navGroupConfig', icon: 'admin' },
+    // the root tier's own tools: runtime flags, the deployment's private
+    // alert hub, database diagnostics and the raw audit stream. ``rootOnly``
+    // for the same reason the alert queue above is: none of it is a site
+    // administrator's to read or act on, and every route behind it refuses
+    // one. It is drawn last because it is the tab an operator opens least.
+    { id: 'Developer', key: 'developerConsole', hint: 'hintDeveloperConsole', group: 'navGroupConfig', icon: 'sliders', rootOnly: true }
 ];
 
 //: How the rail is grouped, in the order the rail shows them. Operations first
@@ -1125,7 +1224,17 @@ const UI = {
         if (State.user && !State.token) {
             State.clearUser();
             Toast.info(I18n.__('sessionExpiredSignInAgain'));
+        } else if (SESSION_DROPPED) {
+            // Dropped at load: an expired 30-day token, or a stored session with no token.
+            Toast.info(I18n.__('sessionExpiredSignInAgain'));
         }
+        // A restored session is trusted for the first paint, then confirmed against the
+        // server in the background. The token may have been revoked since this phone last
+        // spoke (a password change or a deactivation bumps ``token_version``), and the
+        // worker should learn that from the login screen rather than from a punch. The check
+        // is ``/auth/me`` - a JWT decode and one row read, no password, no bcrypt - so it
+        // costs nothing next to the punch it is protecting.
+        if (State.user && State.token) this.confirmRestoredSession();
         // Re-render when the viewport crosses the mobile/desktop breakpoint
         // (phone rotate, window resize, tablet keyboard, ...).
         Device.watch(() => this.renderApp());
@@ -1224,6 +1333,34 @@ const UI = {
         return Array.prototype.some.call(fields, (field) => String(field.value || '') !== '');
     },
 
+    /**
+     * Confirm a session restored from storage, and slide its expiry when it is close.
+     *
+     * Both calls are password-free, so neither touches bcrypt: ``/auth/me`` decodes the
+     * bearer token and reads one user row, and ``/auth/refresh`` re-signs the same claims
+     * with a new ``exp``. Together they are what lets a worker who uses the app every day
+     * never sign in again - the 30-day token is renewed long before it lapses.
+     *
+     * A 401 is already handled globally by ``API.request`` (session cleared, login drawn),
+     * so this catch is only for the dead-network case: a phone with no bars at 06:00 keeps
+     * its session, which is the whole point of persisting it.
+     */
+    async confirmRestoredSession() {
+        try {
+            const me = await API.request('/auth/me');
+            if (me && me.id) {
+                State.saveUser({ ...State.user, id: me.id, name: me.name, role: me.role });
+            }
+            if (State.sessionNeedsRefresh()) {
+                const res = await API.request('/auth/refresh', { method: 'POST' });
+                const token = res.token || res.access_token;
+                if (token) State.saveUser({ ...State.user, token }, res.expires_at);
+            }
+        } catch (err) {
+            // Network failure only; a 401 has already signed the session out above.
+        }
+    },
+
     renderApp() {
         const container = this.appContainer;
         if (!State.user) {
@@ -1259,11 +1396,13 @@ const UI = {
     // -----------------------------------------------------------------
     //  The console, and the handset an administrator may step onto
     // -----------------------------------------------------------------
-    //: Roles that run the console *and* work a shift of their own. ``worker`` is absent
+    //: Roles that run the console *and* may step onto the handset. ``worker`` is absent
     //: because the handset is already where it lives, and ``head_admin`` is absent on
-    //: purpose: it is the role that owns the deployment rather than a rota. Adding one
+    //: purpose: it is the role that owns the deployment rather than a rota. ``developer``
+    //: is here because the tier that can do everything an administrator can - including
+    //: work a shift - is not a role the console should refuse the clock to. Adding one
     //: here is the whole change - every control below reads this list.
-    handsetRoles: ['admin'],
+    handsetRoles: ['admin', 'developer'],
 
     /** Does this account reach the console but still clock in? */
     canOpenHandset() {
@@ -1340,7 +1479,8 @@ const UI = {
             moallem: 'roleMoallem',
             off_office: 'roleOffOffice',
             admin: 'roleAdmin',
-            head_admin: 'roleHeadAdmin'
+            head_admin: 'roleHeadAdmin',
+            developer: 'roleDeveloper'
         };
         return keys[role] ? I18n.__(keys[role]) : String(role || '');
     },
@@ -1487,7 +1627,10 @@ const UI = {
                 // res.user is what left every later request unauthenticated.
                 const token = res.token || res.access_token;
                 if (!token) throw new Error(I18n.__('loginNoToken'));
-                State.saveUser({ ...res.user, token });
+                // Keep the server's ``expires_at`` beside the token so the app knows when to
+                // slide it, and so a stored session can be discarded after it has lapsed
+                // without a round trip.
+                State.saveUser({ ...res.user, token }, res.expires_at);
                 this.renderApp();
                 // Signed in over a working connection: this is the cheapest moment to
                 // register the device and pick up a time anchor.
@@ -1780,7 +1923,8 @@ const UI = {
     renderWorkerProfile(container) {
         const roleLabel = I18n.__(State.user.role === 'moallem' ? 'roleMoallem'
             : State.user.role === 'off_office' ? 'roleOffOffice'
-                : (State.user.role === 'admin' ? 'admin' : 'roleWorker'));
+                : State.user.role === 'developer' ? 'roleDeveloper'
+                    : (State.user.role === 'admin' ? 'admin' : 'roleWorker'));
         container.innerHTML = `
             <section class="hand-card">
                 <div class="hand-section-head">
@@ -3064,6 +3208,7 @@ const UI = {
                 case 'Credentials': await UI_MODULES.renderCredentials(content); break;
                 case 'Links': await UI_MODULES.renderLinks(content); break;
                 case 'Notes': await UI_MODULES.renderNotes(content); break;
+                case 'Developer': await UI_MODULES.renderDeveloperConsole(content); break;
                 case 'Admin': await UI_MODULES.renderAdminManagement(content); break;
                 case 'Shifts': await UI_MODULES.renderShifts(content); break;
                 default:

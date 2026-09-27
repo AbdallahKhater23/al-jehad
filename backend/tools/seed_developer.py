@@ -39,6 +39,10 @@ Exit codes
     0  the account exists and the credential is in place (created, rotated, or already set)
     1  refused or failed - nothing was written, or the answer is in the output above
 
+The whole procedure - what the account can reach, how it is used day to day, and how it is
+rotated or revoked safely - is ``docs/RUNBOOK_DEVELOPER_ACCOUNT.md``, kept true to this tool and
+to the routes by ``backend/tests/test_developer_runbook.py``.
+
 Notes
 -----
 The id is a 64-bit value (default ``309010401073``) and that is safe rather than merely large:

@@ -461,9 +461,10 @@ def password_of(results) -> str:
 def test_the_console_has_one_account_tab_and_no_enroll_dashboard(results):
     """Three tabs, one of them dead and one of them an enroll form: now one screen."""
     ids = [entry[0] for entry in results["tabs"]]
-    # ``Notes``, ``Links`` and ``Alerts`` joined later and are their own screens (see
-    # test_frontend_notes.py, test_frontend_quick_links.py and test_frontend_admin_alerts.py);
-    # none of them reinstates the enrollment dashboard this test is about.
+    # ``Notes``, ``Links``, ``Alerts`` and (the root tier's own) ``Developer`` joined later and
+    # are their own screens (see test_frontend_notes.py, test_frontend_quick_links.py,
+    # test_frontend_admin_alerts.py and test_frontend_developer_console.py); none of them
+    # reinstates the enrollment dashboard this test is about.
     assert ids == [
         "Live Ops",
         "Approvals",
@@ -474,6 +475,7 @@ def test_the_console_has_one_account_tab_and_no_enroll_dashboard(results):
         "Links",
         "Notes",
         "Admin",
+        "Developer",
     ]
     assert "Enroll" not in ids and "Users" not in ids and "Pass" not in ids
     assert "Credentials" in results["labels"], "the tab is labelled, not left as a key"

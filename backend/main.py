@@ -345,6 +345,10 @@ def _seconds_on_site(clock_in_time: Any, now: datetime | None = None) -> int | N
     the client never has to know what zone the digits were written in: it starts from this
     number and adds only the seconds it has watched pass.
 
+    "This host's zone" is the company's zone now: ``clock.py`` pins the process (and the
+    container pins the image) to ``Asia/Kuwait``, so the stored digits, this counter and the
+    wall clock at the gate all agree.
+
     The same function the clock-out path measures a closed shift with
     (``shift_hours.elapsed_seconds``), so the counter on the card and the hours that are
     actually recorded cannot disagree about what "so far" means.
@@ -1591,6 +1595,33 @@ async def whoami(current: CurrentUser = Depends(any_authenticated)):
     return {"id": current.id, "name": current.name, "role": current.role}
 
 
+@router.post("/auth/refresh")
+async def refresh_session(current: CurrentUser = Depends(any_authenticated)):
+    """Re-issue this session's token with a fresh expiry, without a password.
+
+    This is what turns a 30-day token into a session a worker never has to think about.
+    A phone that opens the app daily renews here long before the token lapses, so the
+    only time ``/auth/login`` (and therefore bcrypt) runs is a genuinely new device or
+    a sign-out. It costs one JWT signature: the presented token is validated in memory by
+    :func:`security.decode_access_token` and the account re-read for ``token_version`` -
+    **zero password hashing**.
+
+    It deliberately does not extend a revoked session: ``get_current_user`` has already
+    refused a token whose ``token_version`` no longer matches, so a password change or a
+    deactivation cannot be refreshed past ('Credentials changed. Please sign in again.').
+    """
+    token, expires = create_access_token(current.id, current.role, current.token_version)
+    return {
+        "status": "success",
+        "user": {"id": current.id, "name": current.name, "role": current.role},
+        "token": token,
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_at": expires.isoformat(),
+        "expires_in": int(settings.jwt_ttl_hours * 3600),
+    }
+
+
 # ---------------------------------------------------------------------------
 # worker endpoints
 # ---------------------------------------------------------------------------
@@ -1615,9 +1646,15 @@ async def get_worker_stats(worker_id: str, current: CurrentUser = Depends(admin_
             FROM attendance_logs
             WHERE worker_id = ?
               AND action = ?
-              AND strftime('%Y-%m', timestamp) = strftime('%Y-%m', 'now', 'localtime')
+              AND strftime('%Y-%m', timestamp) = ?
             """,
-            (worker_id, ACTION_CLOCK_OUT),
+            # The current month, from the application's own clock, not SQLite's
+            # ``'now','localtime'``. SQLite's localtime follows the *host's* C library, so on a
+            # server outside Kuwait it filtered on the server's month - at the month boundary
+            # that is the wrong month's hours entirely. The month comes from ``datetime.now()``
+            # (naive Kuwait wall clock, pinned by ``clock.py``/the container), which is the same
+            # clock ``timestamp`` was written with - and it stays patchable by the tests.
+            (worker_id, ACTION_CLOCK_OUT, datetime.now().strftime("%Y-%m")),
         ).fetchone()
 
     # The worker's own open shift travels with their own totals, so the clock panel
