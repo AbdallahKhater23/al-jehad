@@ -16,22 +16,22 @@ finished and do nothing:
    bound with delegated listeners on the pane - the document policy has no room for new
    inline handlers. A typo in the selector, or a listener attached to a pane that has already
    been replaced, is invisible to every VM suite in this repo.
-3. **the photograph decodes.** It is fetched with the session credential and handed to the
-   page as an object URL (an ``<img src>`` cannot carry a token), then revealed by removing a
-   class: an object URL revoked too early, or a hidden class never removed, leaves a
-   working-looking card with no face on it. The size the browser decodes is asserted against
-   the size this test submitted.
-4. **the id an approval minted is the account that exists.** The number is read off the
-   screen and then looked up in the database, so "the console said 1042" and "1042 is a user
-   row" have to agree - and a refusal's reason has to be the reason on the record.
+3. **the face decodes.** It is fetched with the session credential and handed to the page as
+   an object URL (an ``<img src>`` cannot carry a token), then revealed by removing a class: an
+   object URL revoked too early, or a hidden class never removed, leaves a working-looking card
+   with no face on it. The size the browser decodes is asserted against the size this test
+   submitted.
+4. **the account a decision was about is the account that exists.** The number is read off the
+   screen and then looked up in the database, so "the console said 12" and "12 is a user row"
+   have to agree - and a refusal's reason has to outlive the account it deleted.
 
 WHAT IS ASSERTED
 ----------------
 Two applications are submitted through the **real intake** (the public multipart endpoint,
-which is what writes the photograph and the pending row), and one browser session signs in as
-the administrator: the badge already reads two, one application's photograph is fetched and
-decoded at the size that was stored, one application is refused with a reason and one is
-approved with a note. Neither decision is written by the test.
+which is what writes the account, files the face and holds it for approval), and one browser
+session signs in as the administrator: the badge already reads two, one application's face is
+fetched and decoded at the size that was stored, one application is refused with a reason and
+one is approved with a note. Neither decision is written by the test.
 
 Runs with the browser the machine has - see ``browser.py``. With none installed, it skips and
 names ``python -m playwright install chromium``.
@@ -40,6 +40,7 @@ names ``python -m playwright install chromium``.
 from __future__ import annotations
 
 import io
+import json
 import random
 
 import pytest
@@ -78,8 +79,9 @@ def _photo(seed: int = 0) -> bytes:
 
     Seeded noise rather than a flat colour, and that is load-bearing rather than fussy: a
     uniformly flat image quantises a shade apart to the *same* coefficients, so two "different"
-    flat colours come out byte-identical - and the pending-photo unique index is keyed on the
-    digest, so the second application would be refused as a duplicate of the first.
+    flat colours come out byte-identical - and two applications that are the same photograph are
+    two applications nothing else can tell apart, which would make "the first card" and "the
+    second card" a question about the queue's order alone.
     """
     rng = random.Random(seed)
     image = Image.new("RGB", PHOTO_SIZE)
@@ -95,9 +97,9 @@ def _photo(seed: int = 0) -> bytes:
 def two_applications(app_module, client, monkeypatch):
     """Two applications in the queue, submitted through the endpoint that takes them.
 
-    Through the public intake rather than a hand-written row: the photograph on disk, its
-    digest, the consent stamp and the pending status are the intake's own work, and a row
-    inserted by the test would prove only that the console can read a row the test invented.
+    Through the public intake rather than a hand-written pair of rows: the account, the id, the
+    face reference and the ``pending_approval`` status are the intake's own work, and rows
+    inserted by the test would prove only that the console can read rows the test invented.
 
     The suite's autouse reset has already run by the time this fixture body executes, so what
     is written here is what the browser finds.
@@ -118,8 +120,8 @@ def two_applications(app_module, client, monkeypatch):
             files={"photo": ("selfie.jpg", _photo(index), "image/jpeg")},
         )
         assert submitted.status_code == 200, submitted.text[:400]
-        ids.append(submitted.json()["request_id"])
-    assert len(set(ids)) == 2, "the two submissions became one request"
+        ids.append(submitted.json()["user_id"])
+    assert len(set(ids)) == 2, "the two submissions became one account"
     return ids
 
 
@@ -294,19 +296,24 @@ def test_the_console_works_the_registration_queue(
         f"the refused application is still on the queue screen.\n{seen.describe()}"
     )
     assert "refused" in queue["refused_receipt"].lower(), queue["refused_receipt"]
+    # The refusal deleted the account and wiped its face, and the reason outlived both of them
+    # in the audit trail - which is the only copy a deleted row could not be.
     with app_module.db() as conn:
-        rejected = conn.execute(
-            "SELECT status, decision_note, photo_path FROM registration_requests WHERE id = ?",
-            (second,),
+        assert conn.execute(
+            "SELECT 1 FROM users WHERE id = ?", (second,)
+        ).fetchone() is None, "the browser refused an account and it is still on the roster"
+        audit = conn.execute(
+            "SELECT after_json FROM audit_log WHERE action = 'registration_rejected_purged' "
+            "AND entity_id = ?",
+            (str(second),),
         ).fetchone()
-    assert rejected is not None
-    assert rejected["status"] == "REJECTED", "the browser's refusal did not reach the row"
-    assert rejected["decision_note"] == "No formwork experience", (
+    assert audit is not None, "the browser's refusal left no record behind"
+    assert json.loads(audit["after_json"])["note"] == "No formwork experience", (
         f"the reason typed into the card is not the reason on the record: "
-        f"{rejected['decision_note']!r}"
+        f"{audit['after_json']!r}"
     )
-    assert not rejected["photo_path"], (
-        "the refused application still points at a photograph - a refusal destroys the face"
+    assert not harness.template_exists(second), (
+        "the refused applicant's face is still on disk - a refusal destroys the reference"
     )
 
     # The approval: the id on the screen is the account that exists.

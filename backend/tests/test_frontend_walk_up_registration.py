@@ -57,6 +57,10 @@ REGISTER_KEYS = (
     "register.sending",
     "register.fallback",
     "register.done",
+    "register.doneTitle",
+    "register.doneId",
+    "register.doneHint",
+    "register.doneLogin",
     "register.nameRequired",
     "register.passwordShort",
     "register.passwordMismatch",
@@ -64,7 +68,8 @@ REGISTER_KEYS = (
     "register.roleNotAvailable",
     "register.consentRequired",
     "register.queueFull",
-    "register.duplicate",
+    "register.conflict",
+    "register.photoUnreadable",
     "register.failed",
     "register.uploadFailed",
 )
@@ -186,8 +191,8 @@ def test_the_page_has_every_element_the_shared_module_reaches_for():
 def test_the_form_posts_the_fields_the_intake_takes():
     """Every field the endpoint declares, and nothing invented.
 
-    A missing one is a 422 the applicant cannot read; the photograph is the request, so it
-    goes last and carries a filename rather than a form field.
+    A missing one is a 422 the applicant cannot read; the photograph is the account's face, so
+    it goes last and carries a filename rather than a form field.
     """
     flow = flow_body()
     expected = (
@@ -206,18 +211,30 @@ def test_the_form_posts_the_fields_the_intake_takes():
     assert 'form.append("photo"' in flow, "the photograph is the request"
 
 
-def test_the_page_never_promises_an_account_id():
-    """The id is minted at approval, so there is no field for it and no control for it.
+def test_the_receipt_puts_the_id_the_server_answers_with_on_the_screen():
+    """The id is the point of the new shape, and this is the only place it is ever said.
 
-    This is the one thing the applicant must not be told: a number said at submission is a
-    promise the next approval can take back, which is why ``registrations`` allocates it
-    inside the transaction that creates the account.
+    A submission creates the account and answers with its id, so the page has to put that number
+    in front of the person who has to keep it - in the largest type on the page, with the one
+    thing left to do beside it (go and sign in), and with the caveat that will refuse them at a
+    gate until an administrator approves them.
+
+    What it must **not** do is invent one: nothing here sends an account id, and the only id ever
+    shown is ``res.body.user_id``.
     """
     body = page_body()
     flow = flow_body()
-    assert 'id="id"' not in body and 'id="account-id"' not in body
-    assert "assigned_id" not in flow and 'form.append("user_id"' not in flow, (
-        "the page sends or shows an account id; the server picks it at approval"
+    assert 'id="done-id"' in body and 'id="done"' in body, (
+        "the page has nowhere to show the id it is handed"
+    )
+    assert 'id="btn-login"' in body and 'href="/"' in body, (
+        "the receipt has no way to the sign-in screen"
+    )
+    for key in ("register.doneTitle", "register.doneId", "register.doneHint", "register.doneLogin"):
+        assert f'data-t="{key}"' in body, f"the receipt never says {key}"
+    assert "answer.user_id" in flow, "the receipt is not filled from the server's answer"
+    assert 'form.append("user_id"' not in flow and "assigned_id" not in flow, (
+        "the page sends an account id; the server is what assigns it"
     )
 
 

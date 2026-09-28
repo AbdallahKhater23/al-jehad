@@ -140,8 +140,8 @@ function bootBoard(options) {
 //
 // The stub DOM does not parse innerHTML, so the assertion surface is the markup
 // string the renderer returned - and for the parts the board repaints in place
-// (only the board and the stats are ever replaced) the element the stub hands
-// back, which keeps whatever the app assigned to it.
+// (the board, the stats, and the force-in panel's body once its roster lands) the
+// element the stub hands back, which keeps whatever the app assigned to it.
 
 function rendered(env) {
     return env.evaluate("document.getElementById('adminContent').innerHTML");
@@ -149,6 +149,12 @@ function rendered(env) {
 
 function boardPane(env) {
     return env.evaluate("document.getElementById('liveOpsBoard').innerHTML");
+}
+
+// The force-in panel's body, after it has been filled - which is the only way to read the
+// roster: it is fetched when the panel is opened, so it is not in ``rendered`` at all.
+function forceInBody(env) {
+    return env.evaluate("document.getElementById('liveOpsForceInBody').innerHTML");
 }
 
 // The board as a *fresh* render left it.
@@ -225,6 +231,10 @@ const results = {};
         // this screen, so the figure is asserted *absent* rather than captured.
         paid_day_tile: markup.indexOf('data-stat="over"') >= 0,
         filter_note: env.evaluate("UI_MODULES.liveOpsFilterNoteHtml(UI_MODULES._liveOps)"),
+        // This responder answers the counted read with an empty object, which is not a count of
+        // zero: the board falls back to counting the rows it is drawing (see ``scenario 10``
+        // for the counted path, and ``liveOpsCountedRead`` for the rule).
+        counted_flag: env.evaluate("UI_MODULES.liveOpsStats(UI_MODULES._liveOps).counted"),
         order: sessionOrder(markup),
         aria_sort: /aria-sort="(ascending|descending)"/.test(markup),
         icons_are_svg: /<svg/.test(markup),
@@ -260,11 +270,27 @@ const results = {};
         panel_is_disclosure: /<details[^>]*id="liveOpsForceIn"/.test(markup),
         panel_has_note: markup.indexOf('data-force-in-note') >= 0,
         panel_offers_the_free_worker: markup.indexOf('<option value="w9">') >= 0,
-        panel_hides_the_one_on_shift: markup.indexOf('<option value="w1">') < 0,
-        panel_hides_the_admin: markup.indexOf('<option value="a1">') < 0,
+        // The panel's body is a roster, and a roster is exactly what the board does *not*
+        // carry: what is on the page until somebody opens it is the loading state its own panel
+        // uses. The roster itself is read in ``panel``, below, once the disclosure is open.
+        panel_body_unopened: markup.indexOf('data-force-in-note') < 0,
+        panel_body_is_lazy: markup.indexOf('id="liveOpsForceInBody"') >= 0
+    };
+
+    // 1b. the force-in panel, opened: its own roster arrives then, and only then
+    await env.evaluate("UI_MODULES.openForceIn()");
+    // The roster fetch resolves on a microtask; a turn of the event loop is what lets it paint.
+    await env.evaluate("new Promise((resolve) => setTimeout(resolve, 0))");
+    const opened = forceInBody(env);
+    results.board.panel = {
+        asked_for: env.requests.map((r) => r.url.replace(/^https?:\\/\\/[^/]*\\/api\\/v1/, '')).sort(),
+        has_note: opened.indexOf('data-force-in-note') >= 0,
+        offers_the_free_worker: opened.indexOf('<option value="w9">') >= 0,
+        hides_the_one_on_shift: opened.indexOf('<option value="w1">') < 0,
+        hides_the_admin: opened.indexOf('<option value="a1">') < 0,
         // An `admin`-role account is a different question from the `head_admin` above, and this
         // reader is a head admin: a peer is offered to them, and only to them.
-        panel_offers_the_peer_administrator: markup.indexOf('<option value="a2">') >= 0
+        offers_the_peer_administrator: opened.indexOf('<option value="a2">') >= 0
     };
 }
 
@@ -302,7 +328,10 @@ const results = {};
 {
     const peer = bootBoard({ actorRole: 'admin' });
     await peer.evaluate("UI.renderAdminTab('Live Ops')");
-    const markup = rendered(peer);
+    // The panel, opened: same panel, same lazy roster, a different reader.
+    await peer.evaluate("UI_MODULES.openForceIn()");
+    await peer.evaluate("new Promise((resolve) => setTimeout(resolve, 0))");
+    const markup = forceInBody(peer);
     results.peer_panel = {
         hides_the_administrator: markup.indexOf('<option value="a2">') < 0,
         offers_the_worker: markup.indexOf('<option value="w9">') >= 0,
@@ -452,7 +481,10 @@ const results = {};
         on_site: statOf(markup, 'on-site'),
         longest: statOf(markup, 'longest'),
         status_sentence: env4.evaluate("UI_MODULES.liveOpsStatusSentence(UI_MODULES._liveOps)"),
-        panel_still_there: markup.indexOf('data-force-in-note') >= 0
+        // The panel is reachable without its roster: the disclosure and the body it will fill
+        // are on the page, and the roster is a fetch away (the same lazy body as always).
+        panel_still_there: /<details[^>]*id="liveOpsForceIn"/.test(markup)
+            && markup.indexOf('id="liveOpsForceInBody"') >= 0
     };
 }
 
@@ -640,7 +672,117 @@ const results = {};
     };
 }
 
-// 10. every new string exists in all three languages
+// 10. the figures are the *server's* count of the board, not a count of the payload
+//
+// The board used to answer "how many people are on site" by downloading the roster and the
+// shift list and counting what came back. It now asks for the count (``/admin/live_ops/count``,
+// counted in SQL with the rows' own join), and the count here deliberately *disagrees* with the
+// rows the same responder serves: a board that counted its payload would print 4, 1 and 10h.
+// The quiet and moved polls below are the other half of the same decision - the steady state is
+// one counted read and no rows at all.
+{
+    const counted = bootBoard();
+    let rows = sessionsNow();
+    let count = {
+        as_of: '2026-09-29 06:12:03',
+        on_site: 9,
+        late: 3,
+        sites: [
+            { site_name: 'Downtown Tower A', workers: 2 },
+            { site_name: 'New Capital Zone B', workers: 7 }
+        ],
+        worker_ids: ['w1', 'w2', 'w3', 'w4', 'w5', 'w6', 'w7', 'w8', 'w9'],
+        longest: {
+            worker_id: 'w5', name: 'Salma Nabil', site_name: 'New Capital Zone B',
+            clock_in_time: ago(11), seconds_on_site: 11 * 3600
+        }
+    };
+    const merged = (changes) => Object.assign({}, count, changes);
+    counted.setResponder((url) => {
+        if (url.indexOf('/admin/live_ops/count') >= 0) return { status: 200, body: count };
+        if (url.indexOf('/admin/active_sessions') >= 0) return { status: 200, body: rows };
+        return responders(url);
+    });
+    await counted.evaluate("UI.renderAdminTab('Live Ops')");
+    const markup = rendered(counted);
+    const reads = (needle) => counted.requests.filter((r) => r.url.indexOf(needle) >= 0).length;
+    const statsHtml = () => counted.evaluate("document.getElementById('liveOpsStats').innerHTML");
+    results.counted = {
+        on_site: statOf(markup, 'on-site'),
+        late: statOf(markup, 'late'),
+        longest: statOf(markup, 'longest'),
+        longest_hint: markup.indexOf('Salma Nabil') >= 0,
+        status_sentence: counted.evaluate("UI_MODULES.liveOpsStatusSentence(UI_MODULES._liveOps)"),
+        counted_flag: counted.evaluate("UI_MODULES.liveOpsStats(UI_MODULES._liveOps).counted"),
+        // The board is still a board: the rows it draws are its own read, not the count's.
+        rows: sessionOrder(markup),
+        counts_read: reads('/admin/live_ops/count'),
+        sessions_read: reads('/admin/active_sessions')
+    };
+
+    // 10a. a poll that finds the same board: one counted read, no rows, no repaint. The clock
+    // moved (``as_of``), which is not the board moving.
+    counted.evaluate("UI_MODULES._liveOpsRowsProbe = UI_MODULES._liveOps.sessions");
+    count = merged({ as_of: '2026-09-29 06:12:48' });
+    await counted.evaluate("UI_MODULES.pollLiveOps()");
+    results.counted.quiet_poll = {
+        counts_read: reads('/admin/live_ops/count') - results.counted.counts_read,
+        sessions_read: reads('/admin/active_sessions') - results.counted.sessions_read,
+        rows_untouched: counted.evaluate("UI_MODULES._liveOps.sessions === UI_MODULES._liveOpsRowsProbe"),
+        // A fresh render leaves the by-id board empty in this stub; it is filled only by a
+        // repaint in place, so "still empty" is "nothing was repainted".
+        pane_untouched: boardPane(counted) === ''
+    };
+
+    // 10b. somebody else clocks in: the count moves, and *then* the rows are read again
+    rows = rows.concat([{
+        worker_id: 'w5', name: 'Salma Nabil', site_name: 'New Capital Zone B',
+        clock_in_time: ago(0.5), role: 'worker', late_flag: 0
+    }]);
+    count = merged({ on_site: 5, worker_ids: ['w1', 'w2', 'w3', 'w4', 'w5'] });
+    await counted.evaluate("UI_MODULES.pollLiveOps()");
+    results.counted.moved_poll = {
+        counts_read: reads('/admin/live_ops/count') - results.counted.counts_read,
+        sessions_read: reads('/admin/active_sessions') - results.counted.sessions_read,
+        rows_replaced: counted.evaluate("UI_MODULES._liveOps.sessions !== UI_MODULES._liveOpsRowsProbe"),
+        // The board is folded, and the new shift is the newest of five - so it is in the board's
+        // state and behind the fold, which is exactly where a freshly-read board puts it.
+        rows_in_the_read: counted.evaluate("UI_MODULES._liveOps.sessions.length"),
+        drawn_rows: (boardPane(counted).match(/data-session=/g) || []).length,
+        on_site: statOf(statsHtml(), 'on-site'),
+        fold_intact: boardPane(counted).indexOf('data-live-ops-toggle') >= 0
+    };
+}
+
+// 11. "late" is the sentence the server writes, not a boolean it never sends
+//
+// ``active_sessions.late_flag`` holds ``shift_windows.describe``'s prose - "outside Downtown
+// Tower A's 05:00-06:00 window" - or nothing at all. The board used to test for ``true`` or
+// ``'1'``, which no real deployment ever writes, so its late badge and its late count were
+// both quietly zero; the rule is now the one ``live_ops._LATE_SQL`` counts with.
+{
+    const LATE = "outside Downtown Tower A's 05:00-06:00 window";
+    const isLate = (flag) => env.evaluate('UI_MODULES.liveOpsIsLate(' + JSON.stringify({ late_flag: flag }) + ')');
+    const factsLate = (flag) => env.evaluate(
+        'UI_MODULES.liveOpsFacts(' + JSON.stringify({ clock_in_time: ago(3), late_flag: flag }) + ', {}).late'
+    );
+    results.late_rule = {
+        sentence: isLate(LATE),
+        one: isLate(1),
+        true_flag: isLate(true),
+        zero: isLate(0),
+        empty: isLate(''),
+        false_text: isLate('false'),
+        null_flag: isLate(null),
+        missing: isLate(undefined),
+        // The badge on the row is drawn from the same rule, or the two would disagree about
+        // the same shift.
+        badge: factsLate(LATE),
+        badge_on_a_zero: factsLate(0)
+    };
+}
+
+// 12. every new string exists in all three languages
 {
     results.translations = JSON.parse(env.evaluate(
         "JSON.stringify(Object.keys(TRANSLATIONS).map((lang) => [lang," +
@@ -670,10 +812,107 @@ def results() -> dict:
 # ---------------------------------------------------------------------------
 # What the operator sees
 # ---------------------------------------------------------------------------
-def test_the_board_asks_for_the_shift_list_the_roster_the_sites_and_the_rules(results):
+def test_the_board_asks_for_its_rows_its_counted_figures_and_the_rules(results):
+    """What a board cannot be drawn without - and the counted read that replaces counting."""
     asked = results["board"]["asked_for"]
-    for path in ("/admin/active_sessions", "/admin/users", "/admin/sites", "/admin/shift_rules"):
+    for path in ("/admin/active_sessions", "/admin/live_ops/count", "/admin/sites", "/admin/shift_rules"):
         assert path in asked, f"the board is missing {path}: {asked}"
+
+
+def test_the_board_counts_its_own_rows_when_the_counted_read_answers_nothing(results):
+    """The fallback, and the reason it is not a zero standing in for a failed read.
+
+    A responder that answers everything with ``{}`` is what an endpoint the server does not
+    have looks like. The board must not read that as "nobody is on site": it counts the rows
+    it was already sent, which is what every console did before the counted read existed.
+    """
+    board = results["board"]
+    assert board["counted_flag"] is False
+    assert board["on_site"] == "4", "the fallback counts the four rows it has"
+    assert board["late"] == "1"
+    assert board["longest"] == "10h 0m"
+
+
+def test_the_boards_figures_are_the_servers_count_of_the_board(results):
+    """The switch-over: the numbers on the board are the counted read's, not the payload's.
+
+    The responder serves a count that disagrees with the rows on purpose - nine on site, three
+    late, a longest shift that is not in the rows at all - so a board that went back to
+    counting what it downloaded would print four, one and ten hours instead.
+    """
+    counted = results["counted"]
+    assert counted["counted_flag"] is True, "the board did not use the counted read it was served"
+    assert counted["on_site"] == "9", "the on-site figure is the server's count"
+    assert counted["late"] == "3", "and so is the late count"
+    assert counted["longest"] == "11h 0m", counted
+    assert counted["longest_hint"] is True, "the longest shift is named, not just timed"
+    assert counted["status_sentence"] == "On site now: 9. Sites with people: 2.", counted["status_sentence"]
+    # ...and the board is still a board: the rows are its own read of the shift list.
+    assert counted["rows"] == ["w1", "w2"]
+    assert counted["counts_read"] == 1 and counted["sessions_read"] == 1
+
+
+def test_a_poll_that_finds_the_same_board_reads_no_rows(results):
+    """One counted read, no row payload, no repaint - the steady state of an open board.
+
+    The count here is the same board with only ``as_of`` moved, which is the clock and not the
+    board: a poll that repainted for that would be the board that twitches every 45 seconds.
+    """
+    quiet = results["counted"]["quiet_poll"]
+    assert quiet["counts_read"] == 1, "the poll asks the counted read once"
+    assert quiet["sessions_read"] == 0, (
+        "the poll downloaded the rows to find out that nothing had changed"
+    )
+    assert quiet["rows_untouched"] is True
+    assert quiet["pane_untouched"] is True, "a poll that found nothing must not repaint"
+
+
+def test_a_poll_that_finds_a_change_reads_the_rows_and_repaints(results):
+    """The count is what tells the poll to pay for the rows - and then it pays once."""
+    moved = results["counted"]["moved_poll"]
+    # Both figures are deltas since the render: two polls, two counted reads, and the row
+    # payload paid for exactly once - by the poll that found a change.
+    assert moved["counts_read"] == 2, "one counted read per poll"
+    assert moved["sessions_read"] == 1, "and one row read, when the board moved"
+    assert moved["rows_replaced"] is True, "the new shift has to be in the board's state"
+    assert moved["rows_in_the_read"] == 5
+    assert moved["drawn_rows"] == 2, "the repaint is the board element's, so the fold stays shut"
+    assert moved["on_site"] == "5", "and the figures are the fresh count's"
+    assert moved["fold_intact"] is True
+
+
+def test_late_is_the_sentence_the_server_writes(results):
+    """``late_flag`` is prose or nothing: a ``true``/``'1'`` test counts nobody, ever.
+
+    ``shift_windows.describe`` writes "outside <site>'s <window> window" when an arrival missed
+    the window and ``NULL`` when it did not, so the board's old ``=== true || === '1'`` was
+    right for a fixture and wrong for the deployment - the late badge and the late count were
+    both quietly zero. The rule is now the one ``live_ops._LATE_SQL`` counts with.
+    """
+    late = results["late_rule"]
+    assert late["sentence"] is True, "the sentence the server writes is the flag that means late"
+    assert late["one"] is True and late["true_flag"] is True
+    for falsy in ("zero", "empty", "false_text", "null_flag", "missing"):
+        assert late[falsy] is False, f"{falsy} is not a late arrival"
+    assert late["badge"] is True, "and the row's own badge reads it the same way"
+    assert late["badge_on_a_zero"] is False
+
+
+def test_the_board_does_not_carry_the_roster_until_the_panel_is_opened(results):
+    """The roster is the expensive payload, and the board has no business holding it.
+
+    ``/admin/users`` answers ``password_set`` per row and joins the audit log for every
+    account's last password change, so a board that fetches it to say "12 on site" pays a
+    price that grows with the number of *accounts*. The force-in panel is the one place that
+    genuinely needs a roster, so it is the one place that reads one - when it is opened.
+    """
+    board = results["board"]
+    assert "/admin/users" not in board["asked_for"], (
+        f"the board still reads the whole roster to draw its own figures: {board['asked_for']}"
+    )
+    assert "/admin/users" in board["panel"]["asked_for"], (
+        "opening the force-in panel has to load the roster it offers"
+    )
 
 
 def test_the_board_leads_with_the_figures_an_operator_came_for(results):
@@ -1030,17 +1269,23 @@ def test_icons_are_vectors_and_never_emoji(results):
 
 def test_the_force_in_panel_is_a_disclosure_that_stays_in_the_document(results):
     board = results["board"]
+    panel = board["panel"]
     assert board["panel_is_disclosure"], "progressive disclosure keeps the board the subject"
-    assert board["panel_has_note"], "and it still explains itself"
-    assert board["panel_offers_the_free_worker"], "the worker with no shift is the point of it"
-    assert board["panel_hides_the_one_on_shift"], (
+    assert board["panel_body_is_lazy"], "and its roster has somewhere to land when it is opened"
+    assert board["panel_body_unopened"], (
+        "the unopened panel is carrying the roster: a board nobody opened a picker on has no "
+        "business holding every account in the deployment"
+    )
+    assert panel["has_note"], "opened, it still explains itself"
+    assert panel["offers_the_free_worker"], "the worker with no shift is the point of it"
+    assert panel["hides_the_one_on_shift"], (
         "someone already on shift is on the board; the panel is for the ones who are not"
     )
-    assert board["panel_hides_the_admin"], (
+    assert panel["hides_the_admin"], (
         "a head admin owns the deployment rather than a rota: no punch card, so no shift of "
         "theirs to be forced onto one"
     )
-    assert board["panel_offers_the_peer_administrator"], (
+    assert panel["offers_the_peer_administrator"], (
         "an administrator who works a site is put on shift by a head admin - it used to be "
         "nobody at all"
     )

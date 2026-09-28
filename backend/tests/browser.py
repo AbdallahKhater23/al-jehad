@@ -441,7 +441,16 @@ def boot(
         context.add_init_script(GEOLOCATION_SPY)
     try:
         tab = context.new_page()
-        tab.on("console", lambda msg: console_errors.append(msg.text) if msg.type == "error" else None)
+        tab.on(
+            "console",
+            lambda msg: console_errors.append(
+                f"{msg.text} <- {msg.location.get('url', '')}"
+            )
+            if msg.type == "error"
+            else None,
+        )
+
+
         tab.on("pageerror", lambda exc: page_errors.append(str(exc)))
         tab.on(
             "response",
@@ -564,7 +573,16 @@ def sign_in(
     context = width.context(browser)
     try:
         tab = context.new_page()
-        tab.on("console", lambda msg: console_errors.append(msg.text) if msg.type == "error" else None)
+        tab.on(
+            "console",
+            lambda msg: console_errors.append(
+                f"{msg.text} <- {msg.location.get('url', '')}"
+            )
+            if msg.type == "error"
+            else None,
+        )
+
+
         tab.on("pageerror", lambda exc: page_errors.append(str(exc)))
         tab.on(
             "response",

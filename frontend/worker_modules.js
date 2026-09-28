@@ -37,6 +37,12 @@ const WORKER_MODULES = {
         let paidDayHours = null;
         let autoCloses = false;
         let flagged = false;
+        //: ``pending_approval`` when this account was created by the public registration form and
+        //: no administrator has approved it yet. Read from the server's own answer rather than
+        //: remembered from the sign-in response: an approval can happen while the phone is
+        //: sitting on this screen, and a banner that outlived the state it describes would be a
+        //: worker told they cannot clock in while an administrator is looking at their approval.
+        let approvalStatus = "";
 
         try {
             // One self-scoped call. The two earlier ones were admin-only routes, so a
@@ -54,6 +60,7 @@ const WORKER_MODULES = {
             // Clock-out is refused while a shift is awaiting review, so say so on the
             // panel instead of letting the worker find out by selfie.
             flagged = !!stats.flagged_for_review;
+            approvalStatus = String(stats.approval_status || "");
             // An older server may not send this yet; keep the documented default.
             if (Number(stats.overtime_notify_hours) > 0) {
                 overtimeNotifyHours = Number(stats.overtime_notify_hours);
@@ -70,7 +77,13 @@ const WORKER_MODULES = {
                     // The count travels with the stamp: a shift re-rendered from this
                     // cache hours later still ticks from the server's own origin rather
                     // than from the digits, which mean something else in another zone.
-                    seconds_on_site: active ? active.seconds_on_site : null
+                    seconds_on_site: active ? active.seconds_on_site : null,
+                    // The transit state travels too. A shift with no signal that is still
+                    // unconfirmed has to keep saying so: the note below and the button beside
+                    // it are about a state the phone cannot re-derive from a site name, and a
+                    // worker reading "In Transit" off a cache with no flag would be shown
+                    // neither. Off the cached object it is read back exactly like this one.
+                    in_transit: active ? !!active.in_transit : false
                 }).catch(() => {});
             }
         } catch (err) {
@@ -95,7 +108,8 @@ const WORKER_MODULES = {
             breakAfterHours,
             paidDayHours,
             autoCloses,
-            flagged
+            flagged,
+            approvalStatus
         };
     },
 
@@ -251,6 +265,129 @@ const WORKER_MODULES = {
         this._elapsedTimer = null;
     },
 
+    // ==========================================================================
+    // The first thing a new worker is told
+    // ==========================================================================
+
+    /**
+     * The welcome an approval wrote for this account, while it is still unread.
+     *
+     * It arrives in the *sign-in answer* (``POST /auth/login`` answers ``welcome``) and lives
+     * in the session rather than in this module, which is what makes it survive a reload, a
+     * second phone and a reinstall: the worker who has not been told their id yet is still
+     * that person on the next device. Reading it is therefore synchronous and free - there is
+     * no request behind this card and nothing to wait for before the first paint of the one
+     * screen a brand-new account has ever seen.
+     *
+     * ``notice_id`` is required, not optional: dismissing the card marks *that* notice read,
+     * and a welcome without one could only ever be cleared on this device.
+     */
+    welcomeNotice() {
+        const user = (typeof State !== 'undefined' && State.user) || null;
+        const welcome = user && user.welcome;
+        return welcome && welcome.notice_id ? welcome : null;
+    },
+
+    /**
+     * The welcome card: this worker's id, and the sentence an approval wrote for them.
+     *
+     * WHY THE ID IS NOT ONLY INSIDE THE SENTENCE
+     * ------------------------------------------
+     * The body is the server's own notice, printed verbatim, because that is the one place the
+     * instructions already exist: how to sign in with the id, which contact the sign-in screen
+     * matches on, and that the password is the one chosen on the form. Putting it in the markup
+     * instead would be a second copy of the same three facts, and the two would drift.
+     *
+     * The id is drawn as a *fact* above it all the same, because of who is reading: somebody
+     * who has never seen this application before is being asked to remember a number while
+     * standing at a gate, and a number inside a paragraph is a number that gets read past. This
+     * is the one card in the app that repeats something the sentence already says, and it
+     * repeats it for the reason the console's receipt does - the reader is the only person who
+     * can carry it away.
+     *
+     * Absent when there is nothing to show: a worker hired from the console, a worker who has
+     * already read this, and every administrator gets the clock panel alone.
+     */
+    welcomeHtml() {
+        const welcome = this.welcomeNotice();
+        if (!welcome) return '';
+        const user = (typeof State !== 'undefined' && State.user) || {};
+        const name = user.name || '';
+        return `
+            <section class="hand-welcome" data-worker-welcome="true">
+                <p class="hand-welcome-title">${HAND_ICONS.key}<span>${this.escapeHtml(I18n.__('welcomeTitle'))}</span></p>
+                ${name ? `<p class="hand-welcome-lead">${this.escapeHtml(I18n.__('welcomeSignedIn').replace('{name}', String(name)))}</p>` : ''}
+                <div class="hand-welcome-id">
+                    <span class="hand-welcome-id-label">${this.escapeHtml(I18n.__('welcomeWorkerId'))}</span>
+                    <span class="hand-welcome-id-value">${this.escapeHtml(user.id)}</span>
+                </div>
+                <p class="hand-welcome-body">${this.escapeHtml(welcome.body || '')}</p>
+                <button type="button" class="ui-btn ui-btn-primary hand-welcome-ok" data-worker-welcome-dismiss>${this.escapeHtml(I18n.__('welcomeDismiss'))}</button>
+                <p class="hand-welcome-kept">${this.escapeHtml(I18n.__('welcomeKept'))}</p>
+            </section>`;
+    },
+
+    /**
+     * Paint the card into the host the clock panel leaves at the top of itself.
+     *
+     * The host is filled here rather than written into the panel's markup for the same reason
+     * the alerts band is: there is then exactly one place that draws it, so dismissing it and
+     * the first paint cannot disagree. Bound once per host, because the host is new on every
+     * render - and bound with a *delegated* listener, since an ``onclick`` in the markup is an
+     * inline event handler, which the document's CSP and ``test_frontend_xss`` both count.
+     */
+    paintWelcome() {
+        const host = document.getElementById('workerWelcome');
+        if (!host) return;
+        host.innerHTML = this.welcomeHtml();
+        if (!host.__welcomeBound && host.addEventListener) {
+            // The promise is *returned* rather than dropped: the same listener is what the
+            // suite drives, and an acknowledgement that settles after the assertion is a card
+            // that looks like it did not leave.
+            host.addEventListener('click', (event) => {
+                if (event.target.closest('[data-worker-welcome-dismiss]')) return this.dismissWelcome();
+                return undefined;
+            });
+            host.__welcomeBound = true;
+        }
+    },
+
+    /**
+     * Acknowledge the welcome: the card goes, and the notice it is made of becomes read.
+     *
+     * The session is cleared first and unconditionally. The card *is* the worker's own
+     * acknowledgement of something now in front of them, and it must not stay up because a
+     * request failed - a phone on site cellular is allowed to lose this one write. What a
+     * failure costs is honest and small: the notice is still unread, so the card is back the
+     * next time this account signs in, which is the behaviour the read state is there for.
+     *
+     * After the write, the count is **re-read** rather than decremented: the badge came from the
+     * server, this notice is one of the rows in it, and the inbox the console-side desktop layout
+     * may already be showing holds a copy of that row - so both are moved to the truth instead of
+     * to arithmetic that only this screen can check. No toast: the card leaving the screen is the
+     * acknowledgement, and a toast about a welcome is noise in the middle of a punch.
+     */
+    async dismissWelcome() {
+        const welcome = this.welcomeNotice();
+        if (typeof State !== 'undefined' && State.user) {
+            State.saveUser({ ...State.user, welcome: null });
+        }
+        this.paintWelcome();
+        if (!welcome) return;
+        try {
+            await API.request(
+                `/worker/me/notifications/read?notification_id=${encodeURIComponent(welcome.notice_id)}`,
+                { method: 'POST' }
+            );
+        } catch (err) {
+            Toast.error(err.message);
+            return;
+        }
+        this.markReadLocally([Number(welcome.notice_id)]);
+        await this.refreshAlerts().catch(() => {});
+        await this.repaintAlerts();
+    },
+
     /**
      * The check-in card. One primary action is derived from the shift status so a
      * worker can never tap the wrong button by accident.
@@ -277,13 +414,25 @@ const WORKER_MODULES = {
         try {
             status = await this.fetchStatus();
         } catch (err) {
-            container.innerHTML = `<p class="ui-note is-body is-danger">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`;
+            // The welcome goes on the error card too. It is the one thing on this screen that
+            // does not depend on the request that just failed - it came in with the sign-in
+            // answer - and a brand-new worker whose first screen says an error is exactly the
+            // reader who cannot afford to lose the number they were hired under.
+            container.innerHTML = `<div id="workerWelcome"></div>
+                <p class="ui-note is-body is-danger">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`;
+            this.paintWelcome();
             return;
         }
         await alerts;
 
         const compact = !Device.isMobile;
         const active = status.active;
+        // An account created by the public form and not yet approved by anybody. It is a *user*:
+        // it can sign in, read this card and see its own history - what it cannot do is record
+        // attendance, and the server refuses that at the punch itself. So the button below is
+        // drawn disabled rather than the tap being answered with a refusal nobody can act on:
+        // there is nothing the worker can do differently, and nothing they did wrong.
+        const pendingApproval = status.approvalStatus === 'pending_approval';
         const action = status.nextAction || (active ? 'Clock Out' : 'Clock In');
         const actionKey = action === 'Clock Out' ? 'clockOut' : 'clockIn';
         // Only a known clock-in time can be counted from; an offline cache without
@@ -291,6 +440,13 @@ const WORKER_MODULES = {
         const clockInTime = active && active.clock_in_time ? active.clock_in_time : null;
 
         container.innerHTML = `
+            ${/* The welcome, above everything: before the shift, before the review alert and
+                 before the inbox band, because it is the only thing on this card that is about
+                 the account rather than about today's shift - and because a worker who has just
+                 been hired is meeting all of it for the first time. Filled from ``State`` by
+                 ``paintWelcome`` right after this markup lands, exactly like the band below. */ ''}
+            <div id="workerWelcome"></div>
+
             <div class="hand-hero ${active ? 'is-live' : ''}">
                 <div class="hand-hero-top">
                     <p class="hand-hero-status">
@@ -333,10 +489,32 @@ const WORKER_MODULES = {
                 ${status.stale ? `<p class="hand-hero-meta is-warn">${this.escapeHtml(I18n.__('lastKnownStatus'))}</p>` : ''}
             </div>
 
+            ${/* Above the review alert because it is the more fundamental fact about the
+                 account: an unapproved account is not waiting on a decision about a shift, it is
+                 waiting on a decision about the person. Said in the server's own words, and it
+                 is the whole reason the button below is disabled. */ ''}
+            ${pendingApproval ? `
+                <div class="hand-alert is-danger" data-approval-pending>
+                    ${HAND_ICONS.alert}
+                    <p><strong>${this.escapeHtml(I18n.__('accountPendingTitle'))}</strong> ${this.escapeHtml(I18n.__('accountPendingBody'))}</p>
+                </div>` : ''}
+
             ${status.flagged ? `
                 <div class="hand-alert" data-flagged-for-review>
                     ${HAND_ICONS.alert}
                     <p>${this.escapeHtml(I18n.__('flaggedForReview'))}</p>
+                </div>` : ''}
+
+            ${/* The road, said out loud. An unconfirmed shift is the one state where the
+                 primary button below is *not* always the answer: inside a fence it confirms the
+                 arrival and closes the day, outside one it is refused (the server will not let a
+                 shift no site has authorised be ended from the field). A worker who is not told
+                 that reads the refusal as a broken app - and then finds the way out, which is the
+                 button under this note, by accident. */ ''}
+            ${active && active.in_transit ? `
+                <div class="hand-note" data-transit-pending>
+                    <p class="hand-note-title">${HAND_ICONS.alert}<span>${this.escapeHtml(I18n.__('transitPendingTitle'))}</span></p>
+                    <p class="hand-note-sub">${this.escapeHtml(I18n.__('transitPendingBody'))}</p>
                 </div>` : ''}
 
             ${/* The inbox's own band, above the button and below the review alert: same
@@ -348,10 +526,20 @@ const WORKER_MODULES = {
             <div id="workerAlertsBanner"></div>
 
             <button type="button" class="clock-button hand-clock ${active ? 'out' : 'in'} ${compact ? 'compact' : ''}"
+                    ${pendingApproval ? 'disabled data-approval-blocked="true"' : ''}
                     onclick="WORKER_MODULES.handleClock('${action}')">
                 ${action === 'Clock Out' ? HAND_ICONS.clockOut : HAND_ICONS.clockIn}
                 <span>${this.escapeHtml(I18n.__(actionKey))}</span>
             </button>
+
+            ${/* The way out of the refusal above, offered before the tap rather than after it. It
+                 is a ``data-`` hook and not an ``onclick``: this file's inline-handler budget may
+                 only fall (see ``test_frontend_xss``), and the handler is bound below, once the
+                 markup is in the document. */ ''}
+            ${active && active.in_transit ? `
+                <button type="button" class="ui-btn ui-btn-quiet is-block" data-request-checkout>
+                    ${this.escapeHtml(I18n.__('transitRequestCheckout'))}
+                </button>` : ''}
 
             ${this.offlinePanelHtml(status)}
 
@@ -369,8 +557,25 @@ const WORKER_MODULES = {
             </div>
         `;
 
-        // The banner host is in the document now, so the notice line can be drawn into it.
+        // The welcome and the banner are in the document now, so both can be drawn into them.
+        this.paintWelcome();
         this.paintAlertBadges();
+
+        // ... and the way out of an unconfirmed shift, which exists only on this card. One
+        // delegated listener per host, marked on the element exactly as the alerts band is:
+        // the button comes and goes with the shift, the host outlives both, and a listener
+        // added on every repaint would be re-added on every repaint - one tap, several
+        // requests. The handler hands its promise back so a caller can wait for the request;
+        // ``addEventListener`` ignores that, and nothing in the app depends on it.
+        if (container.addEventListener && !container.__checkoutBound) {
+            container.addEventListener('click', (event) => {
+                const target = event.target && event.target.closest
+                    ? event.target.closest('[data-request-checkout]')
+                    : null;
+                if (target) return this.requestCheckout(target);
+            });
+            container.__checkoutBound = true;
+        }
 
         // Last: the card has to be in the document before the first tick looks for it.
         this.startElapsedTimer(status.active, {
@@ -380,6 +585,30 @@ const WORKER_MODULES = {
             paidDayHours: status.paidDayHours,
             autoCloses: status.autoCloses
         });
+    },
+
+    /**
+     * Ask an administrator to close a shift that cannot be closed from here.
+     *
+     * The off-site Clock Out is refused by the server, and the refusal carries the request as
+     * its way out - so this is not a convenience, it is the only ending the worker can reach
+     * from the road. One tap, one alert per shift (the server dedupes on the shift, not on the
+     * tap), and the answer says the part a worker would otherwise learn by tapping Clock Out
+     * again: the shift is *still running* until an administrator closes it.
+     *
+     * Disabled while the request is in flight, because a double tap here is one alert either
+     * way and a button that stays live through a slow request is a button somebody taps twice.
+     */
+    async requestCheckout(button) {
+        if (button) button.disabled = true;
+        try {
+            const answer = await API.request('/worker/me/request_checkout', { method: 'POST' });
+            Toast.success((answer && answer.message) || I18n.__('transitRequestSent'));
+        } catch (err) {
+            Toast.error(`${I18n.__('attendanceError')}: ${err.message}`);
+        } finally {
+            if (button) button.disabled = false;
+        }
     },
 
     /** Kept for backwards compatibility with older callers. */

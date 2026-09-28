@@ -49,6 +49,13 @@ KIND_SHIFT_AUTO_CLOSED = "shift_auto_closed"
 #: it needs to know the link reached a working phone, and a tap after that is an ordinary
 #: punch whose record is the link's own list of uses.
 KIND_QUICK_LINK = "quick_link"
+#: A worker whose shift is open away from every site is asking an administrator to close it.
+#: The request is a notification rather than an approval because the punch itself is refused:
+#: a shift that has not been authorised by a site is not the worker's to end (see the transit
+#: milestone in ``main``), so the closing is the administrator's act, and this is the queue it
+#: lands in. ``critical``, and one per shift, because an off-site shift nobody ends is a shift
+#: nobody is paid for and nobody can start the next day.
+KIND_CHECKOUT_REQUEST = "checkout_request"
 #: The worker's own alert: their shift has passed the overtime line. Kind for
 #: ``worker_notifications`` - there is no admin equivalent, because the administrator gets
 #: ``KIND_OVERTIME_EXCEEDED`` for the same event.
@@ -72,6 +79,21 @@ KIND_WORKER_OVERTIME_AUTHORISED = "overtime_authorised"
 #: neither counted nor translated as either - the same reason the auto-close's notice is not the
 #: crossing's.
 KIND_WORKER_OVERTIME_DECLINED = "overtime_declined"
+#: The worker's own notice that a travel shift *arrived*: the moment the shift stops being
+#: unconfirmed and the site it reached is named on it. The punch's own response says it on the
+#: screen, and this is the record of it - the inbox survives the tap, the toast and the phone
+#: (see ``push``), and it is the only place the worker can read afterwards that the travel time
+#: they were worried about was credited.
+KIND_WORKER_TRANSIT_ARRIVED = "transit_arrived"
+#: The worker's own welcome, and the one notice nothing else could carry: an administrator
+#: approved their walk-up registration, so an account now exists and the number it was minted
+#: under is what they sign in with. Written in the same transaction as the account itself (see
+#: ``registrations.approve_registration``), which is what stops a notice existing for an account
+#: that does not. It says how to sign in for the first time, because that is the half the
+#: applicant cannot look up: they chose the password on the form, but the id and the contact the
+#: sign-in screen matches on are only decided at approval. No admin twin - the administrator who
+#: approved is the one looking at the number in the console, and the console says it out loud.
+KIND_WORKER_ACCOUNT_APPROVED = "account_approved"
 KIND_STARTUP_DEGRADED = "startup_degraded"
 KIND_STARTUP_OVERRIDE = "startup_override"
 KIND_SCHEMA_REPAIR = "schema_repair"
@@ -280,5 +302,50 @@ def worker_unread_count(conn: sqlite3.Connection, worker_id: str) -> int:
         )
     except sqlite3.Error:
         return 0
+
+
+def worker_welcome(conn: sqlite3.Connection, worker_id: str) -> dict | None:
+    """The unread account-approval notice for this worker, or ``None``.
+
+    WHY A FIRST SIGN-IN ASKS THIS
+    -----------------------------
+    The notice ``registrations.approve_registration`` writes is the only place the id and the
+    way back in are recorded for somebody who, at the moment of approval, has no account, no
+    session and no subscription. So the *first* screen that account ever sees is the one place
+    it can be handed over rather than left as a badge on a tab nobody opened.
+
+    READ STATE IS THE GATE, NOT A LOGIN COUNTER
+    -------------------------------------------
+    There is no "has this account signed in before" flag to consult, and this does not invent
+    one: the notice is unread until the worker acknowledges it, which makes the gate "they have
+    not been told yet" rather than "this is the first time". That survives a reload, a second
+    phone and a reinstall - all of which a per-device flag would lose - and it cannot return
+    afterwards, because reading the notice is the only thing that clears it. An account created
+    in the console has no such notice and so has no welcome card, which is correct: the
+    administrator who typed that account handed the credential over in person.
+
+    Scoped by ``worker_id`` here, like :func:`worker_unread_count`, and read on the caller's own
+    connection so it costs one indexed lookup - the inbox index is ``(worker_id, created_at)``.
+    A database that cannot answer is answered as "nothing to welcome": a sign-in must not fail
+    because a courtesy could not be read.
+    """
+    try:
+        row = conn.execute(
+            "SELECT id, kind, title, body, created_at FROM worker_notifications "
+            "WHERE worker_id = ? AND kind = ? AND read_at IS NULL "
+            "ORDER BY id DESC LIMIT 1",
+            (str(worker_id), KIND_WORKER_ACCOUNT_APPROVED),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    return {
+        "notice_id": row["id"],
+        "kind": row["kind"],
+        "title": row["title"],
+        "body": row["body"],
+        "created_at": row["created_at"],
+    }
 
 

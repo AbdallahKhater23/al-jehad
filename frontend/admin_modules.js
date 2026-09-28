@@ -32,6 +32,9 @@ const UI_MODULES = {
     _liveOpsPoll: null,
     //: Guards against a slow render landing after a newer one (rapid tab clicks).
     _liveOpsRun: 0,
+    //: The same guard for the force-in panel's roster, which is fetched on open: a panel
+    //: opened, closed and reopened must not take the first answer's word for it.
+    _forceInRun: 0,
     _liveOpsQuery: '',
     _liveOpsSite: '',
     _liveOpsSort: 'longest',
@@ -47,9 +50,10 @@ const UI_MODULES = {
     //: while they were reading row five, which is worse than never opening at all.
     _liveOpsExpanded: false,
 
-    //: How often the session list is re-read. One request, and a repaint only
-    //: when the answer differs - polling that repaints regardless is what makes
-    //: a dashboard feel broken.
+    //: How often the board asks whether anything has moved. One *counted* read, and the rows
+    //: behind it only when the answer is yes - polling that repaints regardless is what makes
+    //: a dashboard feel broken, and polling that re-reads the rows to find out is what makes
+    //: it cost the same as the list it is drawing.
     LIVE_OPS_POLL_MS: 45000,
 
     //: How many shifts the board shows before the fold. Two, because the board's job is the
@@ -155,6 +159,24 @@ const UI_MODULES = {
     },
 
     /**
+     * Whether this arrival was flagged late.
+     *
+     * ``active_sessions.late_flag`` is either ``NULL`` (the arrival was inside the site's
+     * window) or the *sentence* ``shift_windows.describe`` wrote when it was not - prose for a
+     * notification body, never a boolean. This used to read ``late_flag === true || String(...) === '1'``,
+     * which is right for a test's ``0``/``1`` and wrong for every value the server writes, so
+     * the late badge and the late count were both quietly zero on a real deployment. The rule
+     * is now the one ``live_ops._LATE_SQL`` counts with: something was written, and it is not
+     * one of the two spellings of "no".
+     */
+    liveOpsIsLate(session) {
+        const flag = session && session.late_flag;
+        if (flag === null || flag === undefined || flag === false) return false;
+        const text = String(flag).trim().toLowerCase();
+        return text !== '' && text !== '0' && text !== 'false';
+    },
+
+    /**
      * What one open shift means *right now*.
      *
      * ``state`` is the line the shift has crossed, and it is the whole point of
@@ -185,7 +207,7 @@ const UI_MODULES = {
         // limit is long enough to have contained one.
         const closingOffset = daySeconds / 3600 >= breakAfter ? daySeconds + breakSeconds : daySeconds;
 
-        const late = !!(session && (session.late_flag === true || String(session.late_flag || '') === '1'));
+        const late = this.liveOpsIsLate(session);
         const at = now === undefined ? Date.now() : Number(now);
         const start = this.liveOpsStart(session && session.clock_in_time);
         // Where the count starts. The server's own ``seconds_on_site`` is the figure the
@@ -353,6 +375,36 @@ const UI_MODULES = {
         return rows;
     },
 
+    /**
+     * The board's three figures, and the shift they are about.
+     *
+     * **Counted by the server when it can be** (``GET /admin/live_ops/count``): the same join
+     * the rows use, in SQL, so these numerals no longer cost a roster-sized payload to
+     * produce. The server answers the sites people are spread across - the *same figure* in
+     * either grouping, mapped here through the category map the rows are grouped by - and the
+     * longest open shift as a row reference, because "longest" is elapsed time and elapsed
+     * time is computed from a stamp (see ``seconds_on_site``).
+     *
+     * **Counting the rows is the fallback, not the plan**: a counted read that cannot be
+     * answered (a blip, an older server) leaves the board doing what every console did before
+     * it existed, over the rows it is already showing. ``counted`` says which of the two the
+     * caller got, which is what the tests hold, and the numerals are never a zero standing in
+     * for a read that failed - the fallback *knows* the answer, it just worked it out here.
+     */
+    /**
+     * Whether an answer really is the board's counted read, rather than an empty one.
+     *
+     * The figures are a *number* and nothing else passes: an empty object (an endpoint that
+     * does not exist yet, a responder that answers everything with ``{}``) must not be read as
+     * "nobody is on site", which is the one output that reads as good news. A body without the
+     * count is not a count of zero, so the board falls back to counting its own rows - which it
+     * can do, and which is what it did before the read existed.
+     */
+    liveOpsCountedRead(value) {
+        return !!value && typeof value === 'object' && !Array.isArray(value)
+            && typeof value.on_site === 'number' && isFinite(value.on_site);
+    },
+
     liveOpsStats(data) {
         const group = this.liveOpsGroup();
         const categories = this.liveOpsCategoryMap(data && data.sites);
@@ -363,9 +415,23 @@ const UI_MODULES = {
         }));
         // What the board says people are spread across: sites in Site view, categories in
         // Category view - the same figure over the same rows, read in the chosen grouping.
-        const covered = new Set(rows.map((row) => (group === 'category'
-            ? row.category
-            : String(row.session.site_name || ''))).filter(Boolean));
+        const coveredOf = (pairs) => new Set(pairs.map(({ site_name }) => (group === 'category'
+            ? this.liveOpsCategoryOf(categories, { site_name: site_name })
+            : String(site_name || ''))).filter(Boolean));
+        const count = data && this.liveOpsCountedRead(data.count) ? data.count : null;
+        if (count) {
+            const longestRow = count.longest ? Object.assign({ role: null, late_flag: null }, count.longest) : null;
+            return {
+                onSite: Number(count.on_site) || 0,
+                sites: coveredOf(count.sites || []).size,
+                group,
+                longest: longestRow
+                    ? { session: longestRow, facts: this.liveOpsFacts(longestRow, data.rules) }
+                    : null,
+                late: Number(count.late) || 0,
+                counted: true
+            };
+        }
         let longest = null;
         for (const row of rows) {
             if (row.facts.seconds === null) continue;
@@ -373,10 +439,11 @@ const UI_MODULES = {
         }
         return {
             onSite: rows.length,
-            sites: covered.size,
+            sites: coveredOf(rows.map((row) => row.session)).size,
             group,
             longest,
-            late: rows.filter((row) => row.facts.late).length
+            late: rows.filter((row) => row.facts.late).length,
+            counted: false
         };
     },
 
@@ -834,7 +901,7 @@ const UI_MODULES = {
                 </div>
                 <details class="ops-panel" id="liveOpsForceIn"${this._forceInOpen ? ' open' : ''} ontoggle="UI_MODULES.liveOpsPanelToggled(this)">
                     <summary>${this.OPS_ICONS.person}<span>${this.escapeHtml(I18n.__('forceInTitle'))}</span></summary>
-                    ${UI.forceInPanelHtml(data.sessions || [], data.users || [], data.sites || [])}
+                    <div id="liveOpsForceInBody">${this.liveOpsForceInBodyHtml(data)}</div>
                 </details>
                 <p class="ops-note" id="liveOpsFilterNote">${this.escapeHtml(this.liveOpsFilterNoteHtml(data))}</p>
                 <div id="liveOpsBoard">${this.liveOpsBoardHtml(data)}</div>
@@ -865,24 +932,52 @@ const UI_MODULES = {
             </div>`;
     },
 
-    /** The four reads the board needs, and the rules that say when a day ends. */
+    /**
+     * The board's own reads: the rows it draws, the figures it counts, and the two rules.
+     *
+     * **The roster is not one of them.** It used to be - the whole ``/admin/users`` payload,
+     * whose rows each carry ``password_set`` and an audit-log join for the last password
+     * change, fetched so that a board of who is *on site* could fill a picker of who is not.
+     * That panel is a roster and it loads like one: when somebody opens it (see
+     * ``liveOpsPanelToggled``). What is left here is what the board cannot be drawn without -
+     * the open shifts, the sites (a picker and a category map, one row per *site*), the shift
+     * rules (one row) and the counted figures.
+     *
+     * Two of the four may fail without taking the screen with them, and each for its own
+     * reason: ``rules`` has documented defaults, and a counted read that cannot be answered
+     * leaves ``liveOpsStats`` counting the rows instead (which is what this console did
+     * before the read existed).
+     */
     async fetchLiveOps() {
-        const [sessions, users, sites, rules] = await Promise.all([
+        const [sessions, count, sites, rules] = await Promise.all([
             API.request('/admin/active_sessions'),
-            API.request('/admin/users'),
+            API.request('/admin/live_ops/count').catch(() => null),
             API.request('/admin/sites'),
-            // A board without the rules still works (documented defaults), so a
-            // failure here must not take the screen with it.
             API.request('/admin/shift_rules').catch(() => ({}))
         ]);
         const list = (value) => (Array.isArray(value) ? value : []);
         return {
             sessions: list(sessions),
-            users: list(users),
+            count: this.liveOpsCountedRead(count) ? count : null,
             sites: list(sites),
             rules: rules && typeof rules === 'object' && !Array.isArray(rules) ? rules : {},
             at: Date.now()
         };
+    },
+
+    /**
+     * The force-in panel's body: the roster, which is the one payload a board should not carry.
+     *
+     * Drawn from the count the board already has for everything else - the panel needs the
+     * people who are *not* on shift, which is a list of accounts, so it is fetched when the
+     * panel is opened rather than with every render, Refresh and poll of the board behind it.
+     * Until then this is the same ``loadingHtml`` the links panel and the credentials panel
+     * put in a panel they are about to fill, and it costs one line of markup on a screen
+     * nobody has opened.
+     */
+    liveOpsForceInBodyHtml(data) {
+        if (!data || !data.users) return UI.loadingHtml();
+        return UI.forceInPanelHtml(data.sessions || [], data.users || [], data.sites || []);
     },
 
     async renderLiveOps(content) {
@@ -911,6 +1006,10 @@ const UI_MODULES = {
         // the previous paint's listener behind on the same element.
         content.onchange = (event) => this.onLiveOpsChange(event);
         this.startLiveOps();
+        // A panel that was open when the tab was left is open again, and its roster is the one
+        // thing this render did not fetch: a disclosure already open fires no ``toggle``, so
+        // nothing else would ever ask for it.
+        if (this._forceInOpen && !data.users) this.liveOpsPanelToggled(document.getElementById('liveOpsForceIn'));
     },
 
     /** The 1 s tick (numerals only) and the slow poll (one request). */
@@ -1002,6 +1101,31 @@ const UI_MODULES = {
     async pollLiveOps() {
         if (typeof document.visibilityState === 'string' && document.visibilityState === 'hidden') return;
         if (!this._liveOps || State.adminTab !== 'Live Ops') { this.stopLiveOps(); return; }
+        let count = null;
+        try {
+            count = await API.request('/admin/live_ops/count');
+        } catch (err) {
+            count = null;   // falls back to the rows below, which is what this poll used to do
+        }
+        if (!this._liveOps || State.adminTab !== 'Live Ops') return;
+        if (this.liveOpsCountedRead(count)) {
+            const fresh = { ...this._liveOps, count, at: Date.now() };
+            // Nothing the board draws moved: the figures it is showing are the ones it has,
+            // and the rows that go with them are already on the page.
+            if (!this.liveOpsMoved(count, this._liveOps.count)) { this._liveOps = fresh; return; }
+            let sessions;
+            try {
+                sessions = await API.request('/admin/active_sessions');
+            } catch (err) {
+                return;   // a blip keeps the board up, with its last known-good rows
+            }
+            if (!this._liveOps || State.adminTab !== 'Live Ops') return;
+            this._liveOps = { ...fresh, sessions: Array.isArray(sessions) ? sessions : [] };
+            this.paintLiveOps(this._liveOps);
+            return;
+        }
+        // No counted read: compare the rows themselves, exactly as this poll did before the
+        // counted read existed.
         let sessions;
         try {
             sessions = await API.request('/admin/active_sessions');
@@ -1013,6 +1137,35 @@ const UI_MODULES = {
         if (this.liveOpsSignature(fresh) === this.liveOpsSignature(this._liveOps)) return;
         this._liveOps = fresh;
         this.paintLiveOps(fresh);
+    },
+
+    /**
+     * Whether a counted read says anything the board is drawing has moved.
+     *
+     * The five facts the row signature covered, answered by the server instead of by a
+     * downloaded list: who is on shift (the ids, in no order, hence the sort), where they are
+     * (the sites and how many of them), how many arrived late, and which shift is the oldest.
+     * It is deliberately not a comparison of the whole payload - ``as_of`` moves on every
+     * read, and a board that repainted because the clock advanced is the board that twitches.
+     *
+     * A **name** is the one thing this cannot see: renaming somebody who is on shift leaves
+     * every fact here unchanged, so the new name arrives with the next row read, or with the
+     * operator's own Refresh (which is exact, and always was). That is the trade - a board
+     * that re-reads the rows every 45 s to catch a rename is a board paying the row payload to
+     * be told that nothing happened.
+     */
+    liveOpsMoved(count, previous) {
+        if (!count || !previous) return true;
+        const facts = (value) => JSON.stringify({
+            on_site: Number(value.on_site) || 0,
+            late: Number(value.late) || 0,
+            sites: (value.sites || []).map((site) => [String(site.site_name || ''), Number(site.workers) || 0]),
+            ids: (value.worker_ids || []).map(String).sort(),
+            longest: value.longest
+                ? [String(value.longest.worker_id), String(value.longest.clock_in_time)]
+                : null
+        });
+        return facts(count) !== facts(previous);
     },
 
     liveOpsSignature(data) {
@@ -1035,15 +1188,23 @@ const UI_MODULES = {
         if (note) note.textContent = this.liveOpsFilterNoteHtml(data);
     },
 
+    /** Repaint the force-in panel's body in place, if the panel is on the page at all. */
+    paintForceInBody(data) {
+        const body = document.getElementById('liveOpsForceInBody');
+        if (body) body.innerHTML = this.liveOpsForceInBodyHtml(data);
+    },
+
     /** The Refresh button: a full re-read, but the toolbar stays put. */
     async refreshLiveOps() {
         try {
             const fresh = await this.fetchLiveOps();
-            this._liveOps = fresh;
-            this.paintLiveOps(fresh);
-            const panel = document.getElementById('liveOpsForceIn');
+            // A roster the panel already loaded is not in ``fetchLiveOps`` any more, so a
+            // Refresh must carry it across rather than empty the panel somebody is looking at.
+            const users = this._liveOps && this._liveOps.users;
+            this._liveOps = users ? { ...fresh, users } : fresh;
+            this.paintLiveOps(this._liveOps);
             // Never redraw a panel somebody is part-way through filling in.
-            if (panel && !this._forceInOpen) panel.innerHTML = UI.forceInPanelHtml(fresh.sessions, fresh.users, fresh.sites);
+            if (!this._forceInOpen) this.paintForceInBody(this._liveOps);
         } catch (err) {
             Toast.error((err && err.message) || I18n.__('liveOpsError'));
         }
@@ -1130,8 +1291,33 @@ const UI_MODULES = {
         if (note) note.textContent = this.liveOpsFilterNoteHtml(this._liveOps);
     },
 
-    liveOpsPanelToggled(details) {
+    /**
+     * The force-in panel, opened: remember that, and load the roster if it is not here yet.
+     *
+     * The fetch paints the *panel*, never the board: the disclosure is open, and whatever
+     * somebody has already typed into its fields lives in that subtree - a repaint of the
+     * board would fold the panel shut and blank the form, which is the same mistake
+     * ``paintLiveOps`` exists to avoid on the board itself. A failure says so in the panel and
+     * leaves the rest of the screen alone; the operator can close and reopen it to retry.
+     */
+    async liveOpsPanelToggled(details) {
         this._forceInOpen = !!(details && details.open);
+        if (!this._forceInOpen || !this._liveOps || this._liveOps.users) return;
+        const body = document.getElementById('liveOpsForceInBody');
+        if (!body) return;
+        const wanted = ++this._forceInRun;
+        body.innerHTML = UI.loadingHtml();
+        try {
+            const users = await API.request('/admin/users');
+            if (wanted !== this._forceInRun || !this._liveOps) return;   // the tab has moved on
+            this._liveOps = { ...this._liveOps, users: Array.isArray(users) ? users : [] };
+            body.innerHTML = UI.forceInPanelHtml(
+                this._liveOps.sessions || [], this._liveOps.users, this._liveOps.sites || []
+            );
+        } catch (err) {
+            if (wanted !== this._forceInRun) return;
+            body.innerHTML = `<p class="ui-note is-body is-danger">${I18n.__('error')}: ${this.escapeHtml((err && err.message) || '')}</p>`;
+        }
     },
 
     /** The empty board's one action: open the panel and put the caret in it. */
@@ -1139,6 +1325,9 @@ const UI_MODULES = {
         this._forceInOpen = true;
         const panel = document.getElementById('liveOpsForceIn');
         if (panel) panel.open = true;
+        // Setting ``open`` does not fire ``toggle`` everywhere (and never in the test DOM), so
+        // the roster is asked for here rather than waited for.
+        this.liveOpsPanelToggled(panel);
         const worker = document.getElementById('forceInWorker');
         if (worker) worker.focus();
     },
@@ -2699,14 +2888,18 @@ const UI_MODULES = {
     //  * **The order is the queue's, not this screen's.** Oldest first, straight from the
     //    server: a queue nobody reads in order is a queue that starves whoever applied
     //    first, and the first applicant is the one being phoned about.
-    //  * **The id an approval minted is the one number that matters.** It is what the new
-    //    worker signs in with and what the gate knows them by, so it is said out loud on
-    //    the card that replaces the row, not left in a toast that scrolls away.
+    //  * **The account a decision was about is the thing to remember.** The id is its own - the
+    //    worker was given it when they registered, and has been signing in with it while they
+    //    waited - so the receipt says which account was just approved and what to hand over,
+    //    rather than leaving it in a toast that scrolls away.
     // -----------------------------------------------------------------
 
     /** The last read of the queue, and the last decision this console made. */
     _registrations: null,
     _registrationsLast: null,
+
+    /** The intake switch as the last read answered it, or null before that read. */
+    _registrationsIntake: null,
 
     //: How many applications one read carries. The server's own ceiling is higher, and the
     //: count it reports is counted separately from the page it returns - so a truncated page
@@ -2732,6 +2925,13 @@ const UI_MODULES = {
      * what they do next: the account exists and cannot clock in until somebody enrolls it,
      * and the console that made it is the console that can. It is not an error to retry -
      * the account is real - so it is a warning on a receipt rather than a red failure.
+     *
+     * The sign-in line under it is the other half of a decision the applicant cannot look up.
+     * The id is minted by the approval, the contact is whatever they typed on a form weeks ago,
+     * and the password is one they chose and then never used - so the administrator who made
+     * the account is the only person who can hand all three over at once. They are the same
+     * three values the worker's own notice names (``notifications.KIND_WORKER_ACCOUNT_APPROVED``),
+     * said in the console's voice to the person doing the handing over.
      */
     registrationsNoticeHtml() {
         const last = this._registrationsLast;
@@ -2742,22 +2942,79 @@ const UI_MODULES = {
             // could not: a refusal is not the moment to claim a face is gone when it is still
             // on disk for somebody to find.
             const sentence = I18n.__(last.photo_destroyed === false ? 'registrationsPhotoKept' : 'registrationsRejected')
-                .replace('{request}', String(last.request_id));
+                .replace('{request}', String(last.user_id));
             return `
-                <div class="ui-card is-warn" data-registration-refused="${this.escapeHtml(last.request_id)}">
+                <div class="ui-card is-warn" data-registration-refused="${this.escapeHtml(last.user_id)}">
                     ${heading}
                     <p class="ui-note">${this.escapeHtml(sentence)}</p>
                 </div>`;
         }
+        // What to hand over, now that the row that held it has left the queue: the id is
+        // above, and this is the rest of what a first sign-in is typed with. The contact
+        // comes back in the approval's own answer (see ``handleRegistration``).
+        const contact = [last.phone, last.email].filter(Boolean).join(' \u00b7 ');
+        const signIn = contact
+            ? I18n.__('registrationsSignIn').replace('{id}', last.user_id).replace('{contact}', contact)
+            : I18n.__('registrationsSignInNoContact').replace('{id}', last.user_id);
         const warning = last.template_written
             ? ''
-            : `<p class="ui-note is-warn" data-registration-template-warning="true">${this.OPS_ICONS.alert}${this.escapeHtml(I18n.__('registrationsTemplateWarning').replace('{id}', last.worker_id))}</p>`;
+            : `<p class="ui-note is-warn" data-registration-template-warning="true">${this.OPS_ICONS.alert}${this.escapeHtml(I18n.__('registrationsTemplateWarning').replace('{id}', last.user_id))}</p>`;
         return `
-            <div class="ui-card is-ok" data-registration-minted="${this.escapeHtml(last.worker_id)}">
+            <div class="ui-card is-ok" data-registration-minted="${this.escapeHtml(last.user_id)}">
                 ${heading}
-                <p class="ui-fact-value" data-registration-minted-id>${this.escapeHtml(last.worker_id)}</p>
-                <p class="ui-note">${this.escapeHtml(I18n.__('registrationsApproved').replace('{id}', last.worker_id).replace('{name}', last.name))}</p>
+                <p class="ui-fact-value" data-registration-minted-id>${this.escapeHtml(last.user_id)}</p>
+                <p class="ui-note">${this.escapeHtml(I18n.__('registrationsApproved').replace('{id}', last.user_id).replace('{name}', last.name))}</p>
+                <p class="ui-note" data-registration-signin="${this.escapeHtml(last.user_id)}">${this.escapeHtml(signIn)}</p>
                 ${warning}
+            </div>`;
+    },
+
+    /**
+     * The one control on this screen: whether the permanent link is accepting applications.
+     *
+     *
+     * The public form is a URL the company prints once, so opening and closing it is an
+     * operator's decision on the day rather than a deploy - and it is drawn on the queue
+     * because that is where its consequence shows: a queue that stops growing is otherwise a
+     * queue somebody believes is broken.
+     *
+     * TWO SWITCHES, AND BOTH ARE SAID OUT LOUD. The deployment's own
+     * (``REGISTRATION_ENABLED``) is a ceiling over this one and cannot be moved from here, so
+     * when *it* is what holds the link shut the button is left off the screen entirely and the
+     * sentence names the reason - the rule the rail already follows for a tab the reader
+     * cannot act on, because a control that looks pressable and answers nothing teaches an
+     * operator that this screen is broken.
+     *
+     * The reason codes are mapped to keys rather than interpolated into one: the table is the
+     * vocabulary, and a key built by concatenation is a string no parity check can see.
+     */
+    registrationsIntakeHtml() {
+        const intake = this._registrationsIntake;
+        if (!intake) return '';
+        const WHY = {
+            open: 'registrationsIntakeWhyOpen',
+            closed_by_console: 'registrationsIntakeWhyClosedByConsole',
+            closed_by_deployment: 'registrationsIntakeWhyClosedByDeployment'
+        };
+        const why = WHY[intake.reason] || 'registrationsIntakeWhyClosedByConsole';
+        // Not ``!intake.accepting``: a deployment that does not run walk-up registration at
+        // all is a different answer from an operator having closed it, and only the second is
+        // this console's to change.
+        const movable = why !== 'registrationsIntakeWhyClosedByDeployment';
+        const accepting = intake.accepting === true;
+        const button = movable
+            ? `<button type="button" class="ui-btn ${accepting ? 'ui-btn-danger' : 'ui-btn-primary'}" data-registration-intake="${accepting ? 'close' : 'open'}">${this.escapeHtml(I18n.__(accepting ? 'registrationsIntakeClose' : 'registrationsIntakeOpen'))}</button>`
+            : '';
+        return `
+            <div class="ui-card" data-registrations-intake="${this.escapeHtml(intake.reason)}">
+                <div class="ui-spread">
+                    <div class="ops-row-main">
+                        <span class="ops-stat-label">${this.escapeHtml(I18n.__('registrationsIntakeTitle'))}</span>
+                        <span class="ui-fact-value" data-registrations-intake-state="${this.escapeHtml(intake.reason)}">${this.escapeHtml(I18n.__(accepting ? 'registrationsIntakeAccepting' : 'registrationsIntakeRefusing'))}</span>
+                    </div>
+                    ${button}
+                </div>
+                <p class="ui-note">${this.escapeHtml(I18n.__(why))}</p>
             </div>`;
     },
 
@@ -2851,7 +3108,13 @@ const UI_MODULES = {
     },
 
     /**
-     * The tab: one read of the pending queue, then the rows a reviewer works through.
+     * The tab: the intake switch, the last decision's receipt, then the rows a reviewer works
+     * through.
+     *
+     * Two reads, and they answer different questions: the queue read reports whether the link
+     * is accepting at all (which is what the closed note below it is drawn from), and the
+     * intake read reports *which* of the two switches decided that - the difference between a
+     * control an operator can move and a wall.
      *
      * The read is also what the tab's badge is counted from, and the count is written back
      * into ``State`` here - the badge and the screen are then one number rather than two
@@ -2866,14 +3129,24 @@ const UI_MODULES = {
         content.innerHTML = UI.consoleSkeletonHtml(I18n.__('registrationsTitle'));
         let data;
         try {
-            // The status is the server's own constant (``registrations.STATUS_PENDING``), not
-            // the word the console would have chosen: the endpoint validates it against the
-            // three it knows and answers 400 for anything else, and a queue screen that could
-            // not read its own queue would be a screen of "status must be one of ...".
-            data = await API.request(`/admin/registrations?status=PENDING_REVIEW&limit=${this.REGISTRATIONS_LIMIT}`);
+            // The status is the server's own constant
+            // (``registrations.STATUS_PENDING_APPROVAL``), not the word the console would have
+            // chosen: the endpoint validates it against the three it knows and answers 400 for
+            // anything else, and a queue screen that could not read its own queue would be a
+            // screen of "status must be one of ...".
+            data = await API.request(`/admin/registrations?status=pending_approval&limit=${this.REGISTRATIONS_LIMIT}`);
         } catch (err) {
             content.innerHTML = this.uiErrorHtml(err, "UI.renderAdminTab('Registrations')");
             return;
+        }
+        try {
+            this._registrationsIntake = await API.request('/admin/registrations/intake');
+        } catch (err) {
+            // A switch whose state could not be read is left off the screen rather than drawn
+            // in a position that may not be the server's. The queue's own closed note still
+            // says whether the link is accepting, so nothing on the screen is wrong - there is
+            // just no lever on it.
+            this._registrationsIntake = null;
         }
         this._registrations = data;
         const requests = Array.isArray(data && data.requests) ? data.requests : [];
@@ -2886,7 +3159,7 @@ const UI_MODULES = {
         const closed = data && data.enabled === false
             ? `<p class="ui-note is-warn" data-registrations-closed="true">${this.OPS_ICONS.alert}${this.escapeHtml(I18n.__('registrationsClosed'))}</p>`
             : '';
-        content.innerHTML = `<div class="ui-page" data-registrations="true">${this.registrationsNoticeHtml()}${closed}${this.registrationsHtml(requests, pending)}</div>`;
+        content.innerHTML = `<div class="ui-page" data-registrations="true">${this.registrationsIntakeHtml()}${this.registrationsNoticeHtml()}${closed}${this.registrationsHtml(requests, pending)}</div>`;
         if (typeof content.querySelectorAll === 'function') {
             const bindEach = (selector, handler) => {
                 let nodes = [];
@@ -2899,6 +3172,11 @@ const UI_MODULES = {
                     if (node && typeof node.addEventListener === 'function') handler(node);
                 });
             };
+            bindEach('[data-registration-intake]', (button) => {
+                button.addEventListener('click', () => {
+                    this.toggleRegistrationsIntake(button.getAttribute('data-registration-intake'));
+                });
+            });
             bindEach('[data-registration-photo]', (button) => {
                 button.addEventListener('click', () => {
                     this.showRegistrationPhoto(button.getAttribute('data-registration-photo'));
@@ -2920,14 +3198,15 @@ const UI_MODULES = {
     /**
      * The submitted photograph, fetched with this session's credential.
      *
-     * The endpoint is the per-request one rather than a field on the list, which is why this
-     * is a button: forty faces in one response was the thing the server was built to avoid,
-     * and the bytes are needed exactly once - by the reviewer looking at the application in
-     * front of them.
+     * The endpoint is the per-account one rather than a field on the list, which is why this is
+     * a button: forty faces in one response was the thing the server was built to avoid, and the
+     * bytes are needed exactly once - by the reviewer looking at the application in front of
+     * them.
      *
-     * A 404 is not a failure and does not read like one: the server destroys the photograph
-     * when an application is decided and when the retention sweep finds an orphan, so "there
-     * is no photograph any more" is a fact about the record. It is said in its own words.
+     * A 404 is not a failure and does not read like one: the route only serves an account that is
+     * *still waiting* - an approved worker's face is not this screen's business, and a refused
+     * one has been wiped - so "there is no photograph any more" is a fact about the record. It is
+     * said in its own words.
      */
     async showRegistrationPhoto(requestId) {
         const image = document.getElementById(`registrationPhoto${requestId}`);
@@ -2955,12 +3234,11 @@ const UI_MODULES = {
     /**
      * The two answers to one application, and what each of them does.
      *
-     * **Approve** allocates the id, creates the account and files the face, and the answer
-     * carries the id it was given - which is kept on the screen (see
-     * ``registrationsNoticeHtml``) rather than only announced. **Refuse** keeps the row with
-     * the reason on it and destroys the photograph, and here the console asks for a reason
-     * before it sends: the server accepts a refusal without one, and the record that answers
-     * "why was I turned down" is the only place the answer can come from.
+     * **Approve** lets the account record attendance, and the answer carries the id and what to
+     * hand over - kept on the screen (see ``registrationsNoticeHtml``) rather than only
+     * announced. **Refuse** deletes the account and wipes its face, and here the console asks for
+     * a reason before it sends: the server accepts a refusal without one, and ``audit_log`` is
+     * where the answer to "why was I turned down" survives the deletion.
      *
      * Both buttons go down while the request is in flight: this is a round trip on a phone
      * tether, and a card that took a second answer would be a second account or a second
@@ -2993,18 +3271,25 @@ const UI_MODULES = {
             if (err.status === 409) await UI.renderAdminTab('Registrations');
             return;
         }
-        const minted = String((answer && answer.worker_id) || '');
+        const account = String((answer && answer.user_id) || '');
         const named = String((answer && answer.name) || '');
+        // The two values the sign-in screen matches on. They come back with the answer because
+        // the queue row that held them is gone the moment it is approved.
+        const emailed = String((answer && answer.email) || '');
+        const phoned = String((answer && answer.phone) || '');
         const wroteTemplate = !(answer && answer.template_written === false);
         const photoDestroyed = !(answer && answer.photo_destroyed === false);
         this._registrationsLast = approve
-            ? { action: 'approve', request_id: requestId, worker_id: minted, name: named, template_written: wroteTemplate }
-            : { action: 'reject', request_id: requestId, photo_destroyed: photoDestroyed };
+            ? {
+                  action: 'approve', user_id: account, name: named,
+                  template_written: wroteTemplate, email: emailed, phone: phoned
+              }
+            : { action: 'reject', user_id: account || requestId, photo_destroyed: photoDestroyed };
         if (approve) {
             Toast.success(
                 wroteTemplate
-                    ? I18n.__('registrationsApproved').replace('{id}', minted).replace('{name}', named)
-                    : I18n.__('registrationsTemplateWarning').replace('{id}', minted)
+                    ? I18n.__('registrationsApproved').replace('{id}', account).replace('{name}', named)
+                    : I18n.__('registrationsTemplateWarning').replace('{id}', account)
             );
         } else {
             const refused = I18n.__(photoDestroyed ? 'registrationsRejected' : 'registrationsPhotoKept');
@@ -3019,6 +3304,39 @@ const UI_MODULES = {
         // moment for whoever awaited this: the id stays in ``_registrationsLast`` either way,
         // but a caller that reads the queue the instant this resolves would otherwise read the
         // skeleton.
+        await UI.renderAdminTab('Registrations');
+    },
+
+    /**
+     * Open or close the permanent link, from the console, with no restart.
+     *
+     * The two switches are read back from the server rather than assumed from what was asked
+     * for: a write the deployment flag refuses stores the operator's intent and still leaves
+     * the link shut, and a console that reported success there would be telling an operator
+     * the form is open while the form refuses every applicant. So the answer *is* the state,
+     * and the repaint draws whatever it says - including no lever, when the deployment is what
+     * is holding it.
+     */
+    async toggleRegistrationsIntake(action) {
+        const wanted = action === 'open';
+        const button = typeof document.querySelector === 'function'
+            ? document.querySelector(`[data-registration-intake="${wanted ? 'open' : 'close'}"]`)
+            : null;
+        if (button) button.disabled = true;
+        try {
+            const answer = await API.request('/admin/registrations/intake', {
+                method: 'POST',
+                body: { open: wanted }
+            });
+            this._registrationsIntake = answer || null;
+            Toast.success(I18n.__(wanted ? 'registrationsIntakeOpened' : 'registrationsIntakeShut'));
+        } catch (err) {
+            if (button) button.disabled = false;
+            Toast.error(err.message);
+            return;
+        }
+        // Awaited, so that "the switch was moved" and "the screen shows it" are the same
+        // moment for whoever awaited this - the same contract the two decisions above keep.
         await UI.renderAdminTab('Registrations');
     },
 
@@ -5220,15 +5538,32 @@ const UI_MODULES = {
         if (!content) return;
         content.innerHTML = UI.consoleSkeletonHtml(I18n.__('developerConsole'));
         this._devConsole = null;
-        let runtime, alerts, pool, slow, audit;
+        let runtime, alerts, pool, slow, audit, backups, sessions;
+        let ml, shadow, db, engine, offline, tamper;
         try {
-            [runtime, alerts, pool, slow, audit, sessions] = await Promise.all([
+            [runtime, alerts, pool, slow, audit, backups, sessions,
+             ml, shadow, db, engine, offline, tamper] = await Promise.all([
                 API.request('/developer/runtime'),
                 API.request('/developer/alerts?limit=50'),
                 API.request('/developer/diagnostics/pool'),
                 API.request('/developer/diagnostics/slow-queries?limit=20'),
                 API.request('/developer/audit?limit=100'),
-                API.request('/developer/sessions')
+                // One read of the backup directory. The list carries the verdict each snapshot
+                // recorded when it was written; re-hashing every file is a separate, deliberate
+                // act (the Verify button), because it costs the disk and this is a tab paint.
+                API.request('/developer/db/backups?limit=50'),
+                API.request('/developer/sessions'),
+                // The diagnostic domains: the models and their bands, the shadow migration's
+                // paired log, the database and its journal, the child that owns the models, and
+                // the offline protocol's two ledgers. All six are reads an operator waits on -
+                // the two *acts* beside them (a full integrity check, a checkpoint) are buttons,
+                // because neither belongs in a tab paint.
+                API.request('/developer/ml/diagnostics'),
+                API.request('/developer/ml/shadow-summary'),
+                API.request('/developer/db/stats'),
+                API.request('/developer/engine/process-stats'),
+                API.request('/developer/offline/devices'),
+                API.request('/developer/offline/tamper-alerts')
             ]);
         } catch (err) {
             content.innerHTML = this.uiErrorHtml(err, "UI.renderAdminTab('Developer')");
@@ -5236,7 +5571,9 @@ const UI_MODULES = {
         }
         this._devConsole = {
             runtime: runtime || {}, alerts: alerts || {}, pool: pool || {},
-            slow: slow || {}, audit: audit || {}, sessions: sessions || []
+            slow: slow || {}, audit: audit || {}, backups: backups || {},
+            sessions: sessions || [], ml: ml || {}, shadow: shadow || {}, db: db || {},
+            engine: engine || {}, offline: offline || {}, tamper: tamper || {}
         };
         content.innerHTML = `<div class="ui-page" data-developer-console="true">${this.devConsoleHtml()}</div>`;
         this.bindDeveloperControls(content);
@@ -5251,6 +5588,11 @@ const UI_MODULES = {
             ${this.devRuntimeHtml()}
             ${this.devAlertsHtml()}
             ${this.devDiagnosticsHtml()}
+            ${this.devMlHtml()}
+            ${this.devDatabaseHtml()}
+            ${this.devEngineHtml()}
+            ${this.devOfflineHtml()}
+            ${this.devBackupsHtml()}
             ${this.devSessionsHtml()}
             ${this.devAuditHtml()}`;
     },
@@ -5443,6 +5785,185 @@ const UI_MODULES = {
             </section>`;
     },
 
+    /** Bytes as a person reads them, the way the photo picker already does it. */
+    devBytes(bytes) {
+        const size = Math.max(0, Number(bytes) || 0);
+        if (size < 1024) return `${size} B`;
+        if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+        if (size < 1024 * 1024 * 1024) return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+        return `${(size / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+    },
+
+    /**
+     * The backup directory: what is in it, and the one button that adds to it.
+     *
+     * WHY A BUTTON, AND NOT ONLY A LIST
+     * --------------------------------
+     * ``tools/backup.py`` has been this project's snapshot tool all along, run by hand from a
+     * shell before a migration. The person who decides at 03:00 that a change can wait no longer
+     * is the person looking at this tab, and "open a terminal on the server" is where a backup
+     * does not get taken. The button runs that tool: the database through ``VACUUM INTO`` (atomic,
+     * and correct while the server is running), the source tree, the templates, the interpreter's
+     * own freeze, and a manifest of every file written beside them.
+     *
+     * WRITTEN AND INTACT ARE TWO QUESTIONS
+     * -----------------------------------
+     * A row and a directory is one of them; the verdict is the other, and the Verify button is
+     * what re-asks it. The list reports the verdict each snapshot recorded when it was *written* -
+     * re-hashing every file on every paint is not something a tab is allowed to do - so Verify is
+     * the deliberate act that re-reads the bytes, and its answer is printed where it cannot be
+     * mistaken for the stored one. A snapshot whose verdict is FAIL is shown rather than hidden:
+     * the bytes may still be recoverable by somebody who knows SQLite, and it is exactly the row
+     * the operator must not have to go looking for.
+     */
+    devBackupsHtml() {
+        const data = this._devConsole.backups || {};
+        const items = data.items || [];
+        const directory = String(data.directory || '');
+        const newest = data.newest || null;
+        const age = newest && typeof newest.age_hours === 'number' ? newest.age_hours : null;
+        const rows = items.map((item) => {
+            const kind = String(item.kind || '');
+            const status = String(item.status || '');
+            const tone = status === 'PASS' ? ' is-ok'
+                : (status === 'FAIL' ? ' is-danger' : (kind === 'unverified' ? ' is-warn' : ''));
+            const label = kind === 'snapshot' ? I18n.__('devBackupsKindSnapshot')
+                : (kind === 'database' ? I18n.__('devBackupsKindDatabase') : I18n.__('devBackupsKindUnverified'));
+            const notes = (item.notes || []).filter(Boolean).join(' ');
+            const files = item.files === null || item.files === undefined ? '\u2014' : String(item.files);
+            return `
+                <tr data-dev-backup="${this.escapeHtml(String(item.name || ''))}" data-dev-backup-kind="${this.escapeHtml(kind)}">
+                    <td>
+                        <span class="ops-name">${this.escapeHtml(String(item.name || ''))}</span>
+                        ${notes ? `<span class="ops-sub">${this.escapeHtml(notes)}</span>` : ''}
+                    </td>
+                    <td><span class="ui-badge${tone}">${this.escapeHtml(label)}</span></td>
+                    <td>${this.escapeHtml(String(item.created_at || '\u2014'))}</td>
+                    <td>${this.escapeHtml(this.devBytes(item.size_bytes))}</td>
+                    <td>${status ? `<span class="ui-badge${tone}">${this.escapeHtml(status)}</span>` : this.escapeHtml('\u2014')}</td>
+                    <td>${this.escapeHtml(files)}</td>
+                    <td>${item.verifiable
+                        ? `<button type="button" class="ui-btn ui-btn-sm" data-dev-backup-verify="${this.escapeHtml(String(item.name || ''))}">${this.escapeHtml(I18n.__('devBackupsVerify'))}</button>`
+                        : `<span class="ops-sub">${this.escapeHtml(I18n.__('devBackupsNoManifest'))}</span>`}</td>
+                </tr>`;
+        }).join('');
+        // A backup surface that never says "the newest one is a fortnight old" is a surface that
+        // reports a habit, not a state: the failure an operator actually has is not a corrupt
+        // snapshot, it is not taking one.
+        const stale = age !== null && age >= 24
+            ? `<p class="ui-note is-warn" data-dev-backup-stale="true">${this.OPS_ICONS.alert}${this.escapeHtml(I18n.__('devBackupsStale').replace('{hours}', String(Math.round(age))))}</p>`
+            : '';
+        const empty = data.exists === false
+            ? `<p class="ui-empty" data-dev-backups-empty="true">${this.escapeHtml(I18n.__('devBackupsNoDirectory'))}</p>`
+            : `<p class="ui-empty" data-dev-backups-empty="true">${this.escapeHtml(I18n.__('devBackupsEmpty'))}</p>`;
+        return `
+            <section class="ui-stack" data-dev-section="backups">
+                <h2 class="ui-section-title">${this.escapeHtml(I18n.__('devBackups'))}</h2>
+                <p class="ui-note">${this.escapeHtml(I18n.__('devBackupsHint'))}</p>
+                <p class="ops-sub" data-dev-backups-dir="${this.escapeHtml(directory)}">${this.escapeHtml(I18n.__('devBackupsDirectory').replace('{dir}', directory))}</p>
+                <p class="ops-sub">${this.escapeHtml(I18n.__('devBackupsCounts')
+                    .replace('{snapshots}', String(data.snapshots || 0))
+                    .replace('{databases}', String(data.databases || 0))
+                    .replace('{unverified}', String(data.unverified || 0))
+                    .replace('{bytes}', this.devBytes(data.total_bytes))) }</p>
+                ${stale}
+                <div class="ui-row">
+                    <button type="button" class="ui-btn ui-btn-primary" data-dev-backup-now="true">${this.OPS_ICONS.refresh}${this.escapeHtml(I18n.__('devBackupsNow'))}</button>
+                    <label class="ui-label" for="devBackupAssets"><input type="checkbox" id="devBackupAssets" data-dev-backup-assets="true" checked> ${this.escapeHtml(I18n.__('devBackupsAssets'))}</label>
+                </div>
+                <p class="ui-note">${this.escapeHtml(I18n.__('devBackupsNowHint'))}</p>
+                <table class="ui-table">
+                    <thead><tr>
+                        <th>${this.escapeHtml(I18n.__('devBackupsColName'))}</th>
+                        <th>${this.escapeHtml(I18n.__('devBackupsColKind'))}</th>
+                        <th>${this.escapeHtml(I18n.__('devColWhen'))}</th>
+                        <th>${this.escapeHtml(I18n.__('devBackupsColSize'))}</th>
+                        <th>${this.escapeHtml(I18n.__('devBackupsColStatus'))}</th>
+                        <th>${this.escapeHtml(I18n.__('devBackupsColFiles'))}</th>
+                        <th>${this.escapeHtml(I18n.__('devSessionsColAction'))}</th>
+                    </tr></thead>
+                    <tbody>${rows || `<tr><td colspan="7">${empty}</td></tr>`}</tbody>
+                </table>
+                <p class="ui-note">${this.escapeHtml(I18n.__('devBackupsVerifyHint'))}</p>
+                <pre class="ui-note" data-dev-backup-report="true"></pre>
+            </section>`;
+    },
+
+    /**
+     * Take a snapshot, from this tab.
+     *
+     * The button says so while it waits, because this is the one control here that takes seconds
+     * to minutes: a full snapshot copies the source tree and every enrolled face and hashes all
+     * of it, and on the one vCPU this deployment is sized for that is the heaviest thing the
+     * process can be asked to do. A button that looked idle through that would be clicked again,
+     * which is exactly what the server's own lock refuses.
+     *
+     * The verdict picks the message. "Written" is not "intact": a snapshot that failed its own
+     * check raises a critical alert on the server and reads as an error here, because an operator
+     * who is told "done" about a copy they cannot restore from is worse off than one who is told
+     * nothing.
+     */
+    async takeDevSnapshot() {
+        const box = typeof document.querySelector === 'function'
+            ? document.querySelector('[data-dev-backup-assets]') : null;
+        const includeAssets = box ? !!box.checked : true;
+        const button = typeof document.querySelector === 'function'
+            ? document.querySelector('[data-dev-backup-now]') : null;
+        if (button) {
+            button.disabled = true;
+            button.textContent = I18n.__('devBackupsWorking');
+        }
+        try {
+            const data = await API.request('/developer/db/snapshot', {
+                method: 'POST',
+                body: { include_assets: includeAssets }
+            });
+            const name = String((data && data.name) || '');
+            const files = String((data && data.files) || 0);
+            if (String((data && data.verified) || '') === 'PASS') {
+                Toast.success(I18n.__('devBackupsCreated').replace('{name}', name).replace('{files}', files));
+            } else {
+                Toast.error(I18n.__('devBackupsUnverified').replace('{name}', name));
+            }
+            return UI.renderAdminTab('Developer');
+        } catch (err) {
+            Toast.error((err && err.message) || I18n.__('error'));
+            if (button) {
+                button.disabled = false;
+                button.textContent = I18n.__('devBackupsNow');
+            }
+        }
+    },
+
+    /**
+     * Re-hash one snapshot and print what the check found.
+     *
+     * No repaint on purpose. A repaint re-reads the list, and the list reports the verdict
+     * recorded when the snapshot was written - which is still the old one after a verification
+     * disproves it (the server does not rewrite ``VERIFY.json``; a verification is a *read*).
+     * Redrawing the row from the stored verdict would quietly undo the answer the operator just
+     * asked for, so the answer goes into the report line and stays there until they reload.
+     */
+    async verifyDevBackup(name) {
+        const target = typeof document.querySelector === 'function'
+            ? document.querySelector('[data-dev-backup-report]') : null;
+        try {
+            const report = await API.request(`/developer/db/backups/${encodeURIComponent(name)}/verify`, { method: 'POST' });
+            const status = String((report && report.status) || '');
+            const errors = (report && report.errors) || [];
+            const line = I18n.__('devBackupsVerifyResult')
+                .replace('{name}', name)
+                .replace('{status}', status)
+                .replace('{checked}', String((report && report.files_checked) || 0))
+                .replace('{listed}', String((report && report.files_listed) || 0));
+            if (target) target.textContent = [line].concat(errors).join('\n');
+            if (status === 'PASS') Toast.success(line);
+            else Toast.error(line);
+        } catch (err) {
+            Toast.error((err && err.message) || I18n.__('error'));
+        }
+    },
+
     /**
      * Bind every control the panel drew, by its ``data-`` hook.
      *
@@ -5465,7 +5986,15 @@ const UI_MODULES = {
         on('[data-dev-alert-read]', 'data-dev-alert-read', (id) => this.markDevAlertRead(id));
         on('[data-dev-explain]', 'data-dev-explain', (name) => this.explainDevQuery(name));
         on('[data-dev-flush]', 'data-dev-flush', () => this.flushDevCaches());
+        on('[data-dev-backup-now]', 'data-dev-backup-now', () => this.takeDevSnapshot());
+        on('[data-dev-backup-verify]', 'data-dev-backup-verify', (name) => this.verifyDevBackup(name));
         on('[data-dev-audit-reload]', 'data-dev-audit-reload', () => UI.renderAdminTab('Developer'));
+        on('[data-dev-liveness-apply]', 'data-dev-liveness-apply', () => this.moveDevLivenessMode());
+        on('[data-dev-shadow-evaluate]', 'data-dev-shadow-evaluate', () => this.evaluateDevShadowGate());
+        on('[data-dev-checkpoint]', 'data-dev-checkpoint', () => this.checkpointDevWal());
+        on('[data-dev-integrity]', 'data-dev-integrity', () => this.runDevIntegrityCheck());
+        on('[data-dev-engine-restart]', 'data-dev-engine-restart', () => this.restartDevEngine());
+        on('[data-dev-tamper-filter]', 'data-dev-tamper-filter', () => this.filterDevTamperAlerts());
     },
 
     /** Change one runtime value. The note is optional; the audit row is not. */
@@ -5547,6 +6076,598 @@ const UI_MODULES = {
             const count = Array.isArray(data && data.flushed) ? data.flushed.length : 0;
             Toast.success(I18n.__('devFlushed').replace('{count}', String(count)));
             return UI.renderAdminTab('Developer');
+        } catch (err) {
+            Toast.error((err && err.message) || I18n.__('error'));
+        }
+    },
+
+    // -----------------------------------------------------------------
+    //  The diagnostic domains: the models, the database, the engine child
+    //  and the offline protocol's own forensics
+    // -----------------------------------------------------------------
+    //
+    // Four domains that until now were reachable only with curl. They follow the three rules
+    // the panels above do, and one of them needs stating because these panels differ:
+    //
+    // 1. **A field name is the server's own word for the fact.** The facts grids and the
+    //    forensic rows print ``Stats.as_dict()``'s keys, the pragmas' and the payload's own
+    //    field names rather than a label invented here - a panel that renamed
+    //    ``frames_checkpointed`` would be a second vocabulary for one number, and the first
+    //    thing to drift from the payload it describes. Only the chrome an operator reads as a
+    //    sentence is translated; the write-path panel above already prints its counters this
+    //    way.
+    // 2. **No inline handler** - ``bindDeveloperControls`` binds these controls too, by their
+    //    ``data-`` hooks.
+    // 3. **A failed read is a sentence, not a blank panel** - ``uiErrorHtml``, once for the
+    //    whole console, which is why one dead route takes the tab rather than one panel.
+    //
+    // What is genuinely different is that two of these reads are *acts* rather than
+    // observations: ``PRAGMA integrity_check`` walks every page of the database, seconds on a
+    // large one, and a checkpoint blocks writers while it copies the live frames. Neither
+    // belongs in a tab paint, so both are buttons - the judgement the backups panel's Verify
+    // lever already makes.
+
+    /** Scalars only, in the server's own order: a nested object is not a fact you can print. */
+    devFactPairs(value) {
+        return Object.entries(value || {}).filter(
+            ([, item]) => item !== undefined && (item === null || typeof item !== 'object')
+        );
+    },
+
+    /**
+     * One facts grid, under the server's own field names.
+     *
+     * ``keys`` picks and orders them where a payload's own order is not the order an operator
+     * reads in; ``value`` may also be an array of pairs, where a fact has to be shaped first (a
+     * byte count as a person reads it, a salt that arrives masked).
+     */
+    devFactsHtml(value, columns, keys) {
+        const source = value || {};
+        const pairs = Array.isArray(source)
+            ? source.filter((pair) => pair[1] !== undefined)
+            : (keys
+                ? keys.filter((key) => source[key] !== undefined).map((key) => [key, source[key]])
+                : this.devFactPairs(source));
+        const cells = pairs.map(([key, item]) =>
+            `<span class="ui-fact"><span class="ui-fact-sub">${this.escapeHtml(String(key))}</span>` +
+            `<span class="ui-fact-value">${this.escapeHtml(this.devFactValue(item))}</span></span>`
+        ).join('');
+        if (!cells) return '';
+        return `<div class="ui-grid ${columns || 'three'}">${cells}</div>`;
+    },
+
+    /** A value as a reader takes it: a dash for nothing, a word for a flag, else the string. */
+    devFactValue(value) {
+        if (value === null || value === undefined) return '\u2014';
+        if (typeof value === 'boolean') return value ? 'true' : 'false';
+        return String(value);
+    },
+
+    /**
+     * The models: what this build scores with, and the policy it scores under.
+     *
+     * Five answers an operator needs in one place during an incident, each from the module
+     * that owns it: the queue (is the engine saturated), the decision lines (what a punch is
+     * decided by, and whether a line was derived or typed), the detector and its crop (is the
+     * pipeline the intended one), the liveness policy (enforce, and overridden to what), and
+     * the shadow migration's paired log.
+     *
+     * The mode control is a select built from ``liveness_modes``, which the server computes
+     * from ``liveness.MODES``: the vocabulary has one owner and this draws it rather than
+     * restating three words in a fourth place. The reason is required by the endpoint, so the
+     * box says so *before* the refusal rather than leaving an operator to find it in a 400.
+     */
+    devMlHtml() {
+        const data = this._devConsole.ml || {};
+        const engine = data.engine || {};
+        const detector = data.detector || {};
+        const liveness = data.liveness || {};
+        const active = data.active_band || null;
+        const activeModel = active ? String(active.model || '') : '';
+        const modes = data.liveness_modes || [];
+        const current = String(liveness.mode || '');
+        const options = modes.map((mode) =>
+            `<option value="${this.escapeHtml(mode)}"${mode === current ? ' selected' : ''}>${this.escapeHtml(mode)}</option>`
+        ).join('');
+        // Every band in the table, with the one the live pipeline decides by marked: a band
+        // nobody is scoring with is still worth reading (it is what a flip would move to), but
+        // the live one has to be findable without comparing model ids by eye.
+        const bands = Object.keys(data.bands || {}).sort().map((name) => {
+            const band = data.bands[name] || {};
+            const isActive = !!activeModel && String(band.model || '') === activeModel;
+            return `
+                <div class="ui-card" data-dev-band="${this.escapeHtml(name)}" data-dev-band-active="${isActive ? '1' : '0'}">
+                    <div class="ops-row-main">
+                        <span class="ops-name">${this.escapeHtml(name)}</span>
+                        <span class="ops-sub">${this.escapeHtml(String(band.model || ''))}</span>
+                    </div>
+                    ${this.devFactsHtml(band, 'three', ['approve', 'review', 'derived_approve', 'derived_review'])}
+                    ${band.one_line ? '' : `<p class="ui-note is-warn">${this.escapeHtml(I18n.__('devMlTwoLines'))}</p>`}
+                    ${band.basis ? `<p class="ui-note">${this.escapeHtml(String(band.basis))}</p>` : ''}
+                </div>`;
+        }).join('');
+        return `
+            <section class="ui-stack" data-dev-section="ml">
+                <h2 class="ui-section-title">${this.escapeHtml(I18n.__('devMl'))}</h2>
+                <p class="ui-note">${this.escapeHtml(I18n.__('devMlHint'))}</p>
+                <h3 class="ui-section-title">${this.escapeHtml(I18n.__('devMlQueue'))}</h3>
+                ${this.devFactsHtml(engine)}
+                <p class="ops-sub" data-dev-active-band="${this.escapeHtml(activeModel)}">${this.escapeHtml(
+                    active
+                        ? I18n.__('devMlActiveBand').replace('{model}', activeModel)
+                        : I18n.__('devMlNoBand')
+                )}</p>
+                ${active ? '' : `<p class="ui-note is-warn" data-dev-band-error="true">${this.escapeHtml(String(data.active_band_error || ''))}</p>`}
+                <h3 class="ui-section-title">${this.escapeHtml(I18n.__('devMlBands'))}</h3>
+                <p class="ui-note">${this.escapeHtml(I18n.__('devMlBandsHint'))}</p>
+                ${bands}
+                <h3 class="ui-section-title">${this.escapeHtml(I18n.__('devMlDetector'))}</h3>
+                ${this.devFactsHtml(detector, 'three', ['available', 'detector', 'pipeline', 'model_present', 'model_fingerprint'])}
+                ${this.devFactsHtml(detector.crop)}
+                <h3 class="ui-section-title">${this.escapeHtml(I18n.__('devMlLiveness'))}</h3>
+                <p class="ui-note">${this.escapeHtml(I18n.__('devMlLivenessHint'))}</p>
+                ${this.devFactsHtml([
+                    ['mode', liveness.mode],
+                    ['configured_mode', liveness.configured_mode],
+                    ['override', liveness.override],
+                    ['liveness_override', data.liveness_override],
+                    ['available', liveness.available],
+                    ['input_size', liveness.input_size],
+                    ['accept_threshold', liveness.accept_threshold],
+                    ['reject_threshold', liveness.reject_threshold]
+                ])}
+                <div class="ui-row">
+                    <select class="ui-field" data-dev-liveness-mode="true">${options}</select>
+                    <input class="ui-field" data-dev-liveness-reason="true" placeholder="${this.escapeHtml(I18n.__('devMlLivenessReason'))}">
+                    <button type="button" class="ui-btn" data-dev-liveness-apply="true">${this.escapeHtml(I18n.__('devMlLivenessApply'))}</button>
+                </div>
+                ${this.devShadowHtml()}
+            </section>`;
+    },
+
+    /**
+     * The paired log and the cutover gate's verdict on it.
+     *
+     * ``flip_ready`` is three-valued and the panel must not flatten it: ``true`` is ready,
+     * ``false`` is *not* ready, and ``null`` is **not evaluated** - no gallery was named, so the
+     * coverage the gate is measured against is unknowable from here. The last two call for
+     * opposite next steps ("wait for the backfill" against "name the cache and ask again"), and
+     * a panel that showed both as "not ready" would leave an operator waiting on a measurement
+     * nobody had run. The reason the server sent is printed either way, because it is the only
+     * thing that says which of the two it is.
+     */
+    devShadowHtml() {
+        const data = this._devConsole.shadow || {};
+        const summary = data.summary || {};
+        const paired = data.paired || {};
+        const gate = data.gate || {};
+        const configured = data.configured || {};
+        const ready = data.flip_ready;
+        const tone = ready === true ? ' is-ok' : (ready === false ? ' is-danger' : ' is-warn');
+        const word = ready === true ? I18n.__('devMlShadowReady')
+            : (ready === false ? I18n.__('devMlShadowNotReady') : I18n.__('devMlShadowUnevaluated'));
+        return `
+            <h3 class="ui-section-title">${this.escapeHtml(I18n.__('devMlShadow'))}</h3>
+            <p class="ui-note">${this.escapeHtml(I18n.__('devMlShadowHint'))}</p>
+            ${this.devFactsHtml([
+                ['started', data.started],
+                ['log', configured.log],
+                ['log_present', configured.log_present],
+                ['shadow_model_present', configured.shadow_model_present],
+                ['contract', configured.contract]
+            ])}
+            ${data.started ? this.devFactsHtml([
+                ['events', summary.events],
+                ['paired_samples', summary.paired_samples],
+                ['error_rate', summary.error_rate],
+                ['verdict_agreement', summary.verdict_agreement],
+                ['agreements', paired.agreements],
+                ['disagreements', paired.disagreements],
+                ['coverage', data.coverage],
+                ['min_coverage', gate.min_coverage],
+                ['min_paired_samples', gate.min_paired_samples],
+                ['max_error_rate', gate.max_error_rate]
+            ]) : `<p class="ui-note is-warn" data-dev-shadow-idle="true">${this.escapeHtml(I18n.__('devMlShadowNoLog'))}</p>`}
+            <p class="ui-note"><span class="ui-badge${tone}" data-dev-shadow-gate="${String(ready)}">${this.escapeHtml(word)}</span></p>
+            ${data.reason ? `<p class="ui-note" data-dev-shadow-reason="true">${this.escapeHtml(String(data.reason))}</p>` : ''}
+            <div class="ui-row">
+                <input class="ui-field" data-dev-shadow-gallery="true" placeholder="${this.escapeHtml(I18n.__('devMlShadowGallery'))}">
+                <button type="button" class="ui-btn" data-dev-shadow-evaluate="true">${this.escapeHtml(I18n.__('devMlShadowEvaluate'))}</button>
+            </div>
+            <pre class="ui-note" data-dev-shadow-report="true"></pre>`;
+    },
+
+    /**
+     * The database: contention, the journal, the schema, and the one check that reads it all.
+     *
+     * The checkpoint select is drawn from ``checkpoint_modes`` - the same tuple
+     * ``db_wal_checkpoint`` validates against - so the control cannot offer a mode the endpoint
+     * would answer 400 to. The integrity check is a *button* because it is a full page-level
+     * read of the database, and this is a tab paint; its answer goes into the report line and is
+     * never folded back into the panel, because "found nothing" and "was never run" must not
+     * look the same.
+     */
+    devDatabaseHtml() {
+        const data = this._devConsole.db || {};
+        const wal = data.wal || {};
+        const modes = data.checkpoint_modes || [];
+        const options = modes.map((mode) =>
+            `<option value="${this.escapeHtml(mode)}"${mode === 'TRUNCATE' ? ' selected' : ''}>${this.escapeHtml(mode)}</option>`
+        ).join('');
+        return `
+            <section class="ui-stack" data-dev-section="database">
+                <h2 class="ui-section-title">${this.escapeHtml(I18n.__('devDb'))}</h2>
+                <p class="ui-note">${this.escapeHtml(I18n.__('devDbHint'))}</p>
+                <h3 class="ui-section-title">${this.escapeHtml(I18n.__('devDbCounters'))}</h3>
+                ${this.devFactsHtml(data.counters)}
+                ${data.scope ? `<p class="ops-sub" data-dev-db-scope="true">${this.escapeHtml(String(data.scope))}</p>` : ''}
+                <h3 class="ui-section-title">${this.escapeHtml(I18n.__('devDbWal'))}</h3>
+                ${this.devFactsHtml(wal, 'three', ['pages_in_log', 'bytes_in_log', 'frames_checkpointed', 'busy', 'report_is_a_passive_checkpoint'])}
+                <p class="ui-note">${this.escapeHtml(I18n.__('devDbWalNote'))}</p>
+                <div class="ui-row">
+                    <select class="ui-field" data-dev-checkpoint-mode="true">${options}</select>
+                    <button type="button" class="ui-btn" data-dev-checkpoint="true">${this.escapeHtml(I18n.__('devDbCheckpoint'))}</button>
+                </div>
+                <p class="ui-note">${this.escapeHtml(I18n.__('devDbCheckpointHint'))}</p>
+                <h3 class="ui-section-title">${this.escapeHtml(I18n.__('devDbPragmas'))}</h3>
+                ${this.devFactsHtml(data.pragmas)}
+                <h3 class="ui-section-title">${this.escapeHtml(I18n.__('devDbIntegrity'))}</h3>
+                <p class="ui-note">${this.escapeHtml(I18n.__('devDbIntegrityHint'))}</p>
+                <button type="button" class="ui-btn" data-dev-integrity="true">${this.OPS_ICONS.refresh}${this.escapeHtml(I18n.__('devDbIntegrityRun'))}</button>
+                <pre class="ui-note" data-dev-integrity-report="true"></pre>
+            </section>`;
+    },
+
+    /**
+     * The model child: whether one exists, what it holds, and the lever that replaces it.
+     *
+     * The restart button is drawn only when the deployment actually runs a separate process:
+     * with ``FACE_ENGINE_PROCESS`` off the endpoint answers 409, and a button whose only answer
+     * is a refusal is a trap - the same rule the force-in roster and the snapshot's Verify
+     * lever follow. When no child has been needed yet there is nothing to report *and* the
+     * lever still stands: the operator's intent ("have a healthy model process") is the same
+     * either way, and the server starts one rather than refusing.
+     *
+     * The state word is three-valued for the same reason the shadow gate's is: "no child has
+     * been needed" and "the child is not running" are different states, and the second is the
+     * one a gate is failing under.
+     */
+    devEngineHtml() {
+        const data = this._devConsole.engine || {};
+        const enabled = data.enabled !== false;
+        const started = data.started === true;
+        const alive = data.alive === true;
+        const state = enabled ? (started ? (alive ? 'alive' : 'dead') : 'not_started') : 'in_process';
+        const line = I18n.__({
+            in_process: 'devEngineInProcess',
+            not_started: 'devEngineNotStarted',
+            alive: 'devEngineAlive',
+            dead: 'devEngineDead'
+        }[state]);
+        return `
+            <section class="ui-stack" data-dev-section="engine">
+                <h2 class="ui-section-title">${this.escapeHtml(I18n.__('devEngine'))}</h2>
+                <p class="ui-note">${this.escapeHtml(I18n.__('devEngineHint'))}</p>
+                <p class="ops-sub" data-dev-engine-state="${state}">${this.escapeHtml(line)}</p>
+                ${data.message ? `<p class="ui-note" data-dev-engine-message="true">${this.escapeHtml(String(data.message))}</p>` : ''}
+                ${this.devFactsHtml([
+                    ['enabled', data.enabled],
+                    ['started', data.started],
+                    ['alive', data.alive],
+                    ['name', data.name],
+                    ['handler', data.handler],
+                    ['pid', data.pid],
+                    ['worker_pid', data.worker_pid],
+                    ['interpreter_pid', data.interpreter_pid],
+                    ['starts', data.starts],
+                    ['calls', data.calls],
+                    ['failures', data.failures],
+                    ['timeouts', data.timeouts],
+                    ['in_flight', data.in_flight],
+                    ['last_call_ms', data.last_call_ms],
+                    ['deadline_seconds', data.deadline_seconds],
+                    ['last_error', data.last_error],
+                    ['ping_ms', data.ping_ms],
+                    ['ping_error', data.ping_error],
+                    ['rss_bytes', data.rss_bytes === null || data.rss_bytes === undefined
+                        ? null : this.devBytes(data.rss_bytes)]
+                ])}
+                ${data.ping_note ? `<p class="ui-note is-warn" data-dev-engine-ping-note="true">${this.escapeHtml(String(data.ping_note))}</p>` : ''}
+                ${enabled ? '' : this.devFactsHtml(data.engine)}
+                ${enabled ? `<button type="button" class="ui-btn" data-dev-engine-restart="true">${this.OPS_ICONS.refresh}${this.escapeHtml(I18n.__('devEngineRestart'))}</button>
+                <p class="ui-note">${this.escapeHtml(I18n.__('devEngineRestartHint'))}</p>` : ''}
+            </section>`;
+    },
+
+    /**
+     * Offline forensics: the devices that sign, and the refusals that were about a clock.
+     *
+     * Two ledgers answering different questions. The device ledger is the *trust* half - which
+     * device, whose, signed with which key epoch, and whether it was revoked - and the tamper
+     * list is the *time* half: a monotonic offset that disagrees with the anchor the device was
+     * issued, a signature that does not verify, a nonce replayed twice. Neither is a queue to
+     * approve: a rejected offline punch was never materialised as attendance.
+     *
+     * The filter is the one action, because the question an operator arrives with is almost
+     * always about one worker ("what is that phone doing"), and the endpoint already takes the
+     * id. It narrows the list *in place* rather than repainting the tab: a repaint would re-read
+     * every other route on the tab for one question, and, worse, would redraw the box empty -
+     * losing the very thing the operator just typed. The salt arrives masked and is printed
+     * exactly as the server sent it: a second copy of key material, kept here for convenience,
+     * would only be as safe as this panel.
+     */
+    devOfflineHtml() {
+        const data = this._devConsole.offline || {};
+        const anchors = data.anchors || {};
+        const rows = (data.devices || []).map((device) => {
+            const revoked = !!device.revoked_at;
+            const salt = device.key_salt || {};
+            return `
+                <div class="ui-card${revoked ? ' is-warn' : ''}" data-dev-device="${this.escapeHtml(String(device.device_id || ''))}" data-dev-device-revoked="${revoked ? '1' : '0'}">
+                    <div class="ui-spread">
+                        <div class="ops-row-main">
+                            <span class="ops-name">${this.escapeHtml(String(device.device_id || ''))}</span>
+                            <span class="ops-sub">${this.escapeHtml([String(device.worker_id || ''), device.worker_name || '', device.worker_role || ''].filter(Boolean).join(' \u00b7 '))}</span>
+                        </div>
+                        ${revoked ? `<span class="ui-badge is-warn">${this.escapeHtml(I18n.__('devOfflineRevoked'))}</span>` : ''}
+                    </div>
+                    ${this.devFactsHtml([
+                        ['key_epoch', device.key_epoch],
+                        ['key_salt', salt.prefix ? `${salt.prefix}\u2026 (${salt.length})` : null],
+                        ['created_at', device.created_at],
+                        ['last_seen_at', device.last_seen_at],
+                        ['last_anchor_at', device.last_anchor_at],
+                        ['revoked_at', device.revoked_at]
+                    ])}
+                </div>`;
+        }).join('');
+        return `
+            <section class="ui-stack" data-dev-section="offline">
+                <h2 class="ui-section-title">${this.escapeHtml(I18n.__('devOffline'))}</h2>
+                <p class="ui-note">${this.escapeHtml(I18n.__('devOfflineHint'))}</p>
+                <h3 class="ui-section-title">${this.escapeHtml(I18n.__('devOfflineDevices'))}</h3>
+                <p class="ui-note">${this.escapeHtml(I18n.__('devOfflineDevicesHint'))}</p>
+                <p class="ops-sub" data-dev-offline-anchors="true">${this.escapeHtml(I18n.__('devOfflineAnchors')
+                    .replace('{issued}', String(anchors.issued ?? 0))
+                    .replace('{consumed}', String(anchors.consumed ?? 0))
+                    .replace('{unconsumed}', String(anchors.unconsumed ?? 0)))}
+                 ${this.escapeHtml(I18n.__('devOfflineWindow').replace('{hours}', String(data.window_hours ?? '')))}</p>
+                ${rows || `<p class="ui-empty">${this.escapeHtml(I18n.__('devOfflineEmpty'))}</p>`}
+                <h3 class="ui-section-title">${this.escapeHtml(I18n.__('devOfflineTamper'))}</h3>
+                <p class="ui-note">${this.escapeHtml(I18n.__('devOfflineTamperHint'))}</p>
+                <div data-dev-tamper-block="true">${this.devTamperHtml()}</div>
+                <div class="ui-row">
+                    <input class="ui-field" data-dev-tamper-worker="true" placeholder="${this.escapeHtml(I18n.__('devOfflineFilter'))}">
+                    <button type="button" class="ui-btn" data-dev-tamper-filter="true">${this.escapeHtml(I18n.__('devOfflineFilterApply'))}</button>
+                </div>
+            </section>`;
+    },
+
+    /**
+     * The refusal ledger, in a block of its own so the filter can replace just this.
+     *
+     * The wrapper is what ``filterDevTamperAlerts`` rewrites: the counts, the rows and the empty
+     * state are one answer to one question, and the filter control sits outside it - a
+     * re-rendered button would be an unbound button, since the delegated binding ran once, at
+     * paint time.
+     */
+    devTamperHtml() {
+        const tamper = this._devConsole.tamper || {};
+        const counts = tamper.counts || {};
+        const rows = (tamper.alerts || []).map((alert) => {
+            const flag = alert.tamper === true;
+            const skew = typeof alert.skew_seconds === 'number' ? Math.abs(alert.skew_seconds) : null;
+            const tone = flag ? ' is-danger' : '';
+            return `
+                <div class="ui-card${tone}" data-dev-tamper="${this.escapeHtml(String(alert.client_punch_id || ''))}" data-dev-tamper-flag="${flag ? '1' : '0'}">
+                    <div class="ui-spread">
+                        <div class="ops-row-main">
+                            <span class="ui-badge${tone}">${this.escapeHtml(String(alert.rejection_code || alert.status || ''))}</span>
+                            <div class="ops-who">
+                                <span class="ops-name">${this.escapeHtml(String(alert.client_punch_id || ''))}</span>
+                                <span class="ops-sub">${this.escapeHtml([String(alert.worker_id || ''), alert.worker_name || '', alert.action || ''].filter(Boolean).join(' \u00b7 '))}</span>
+                            </div>
+                        </div>
+                        ${skew === null ? '' : `<span class="ui-badge${skew >= 3600 ? ' is-danger' : ''}" data-dev-tamper-skew="${this.escapeHtml(String(skew))}">${this.escapeHtml(`skew ${skew}s`)}</span>`}
+                    </div>
+                    ${this.devFactsHtml([
+                        ['device_id', alert.device_id],
+                        ['client_timestamp', alert.client_timestamp],
+                        ['anchor_server_time', alert.anchor_server_time],
+                        ['effective_time', alert.effective_time],
+                        ['skew_seconds', alert.skew_seconds],
+                        ['monotonic_offset_s', alert.monotonic_offset_s],
+                        ['signature_version', alert.signature_version],
+                        ['received_at', alert.received_at]
+                    ])}
+                    ${alert.flag_reason ? `<p class="ui-note">${this.escapeHtml(String(alert.flag_reason))}</p>` : ''}
+                </div>`;
+        }).join('');
+        return `
+                <p class="ops-sub" data-dev-tamper-counts="true">${this.escapeHtml(I18n.__('devOfflineTamperCounts')
+                    .replace('{inWindow}', String(counts.in_window ?? 0))
+                    .replace('{tamper}', String(counts.tamper ?? 0))
+                    .replace('{anchored}', String(counts.with_an_anchor ?? 0)))}
+                 ${this.escapeHtml(String((tamper.tamper_codes || []).join(', ')))}</p>
+                ${rows || `<p class="ui-empty">${this.escapeHtml(I18n.__('devOfflineEmpty'))}</p>`}`;
+    },
+
+
+    /**
+     * Move the liveness policy, with the reason the audit row is read for.
+     *
+     * The reason is not optional and is not defaulted here: ``set_liveness_mode`` refuses an
+     * empty one, and inventing a sentence on the operator's behalf would put words in the audit
+     * trail that nobody wrote. A refusal is a toast, not a silent no-op.
+     */
+    async moveDevLivenessMode() {
+        const box = typeof document.querySelector === 'function'
+            ? document.querySelector('[data-dev-liveness-mode]') : null;
+        const field = typeof document.querySelector === 'function'
+            ? document.querySelector('[data-dev-liveness-reason]') : null;
+        if (!box) return;
+        const mode = String(box.value || '');
+        const reason = field ? String(field.value || '').trim() : '';
+        try {
+            const data = await API.request('/developer/ml/liveness-mode', {
+                method: 'POST',
+                body: { mode: mode, reason: reason }
+            });
+            Toast.success(I18n.__('devMlLivenessMoved')
+                .replace('{previous}', String((data && data.previous) || '\u2014'))
+                .replace('{mode}', String((data && data.mode) || mode)));
+            return UI.renderAdminTab('Developer');
+        } catch (err) {
+            Toast.error((err && err.message) || I18n.__('error'));
+        }
+    },
+
+    /**
+     * Ask the server to re-run the cutover gate against a named gallery.
+     *
+     * No repaint, for the reason ``verifyDevBackup`` gives: a repaint would replace the answer
+     * the operator just asked for with the one from the first paint - the "not evaluated" they
+     * stopped relying on. The line goes into its own report, where it cannot be mistaken for
+     * what the paint said.
+     */
+    async evaluateDevShadowGate() {
+        const field = typeof document.querySelector === 'function'
+            ? document.querySelector('[data-dev-shadow-gallery]') : null;
+        const target = typeof document.querySelector === 'function'
+            ? document.querySelector('[data-dev-shadow-report]') : null;
+        const gallery = field ? String(field.value || '').trim() : '';
+        const query = gallery ? `?gallery=${encodeURIComponent(gallery)}` : '';
+        try {
+            const data = await API.request(`/developer/ml/shadow-summary${query}`);
+            const ready = data && data.flip_ready;
+            const word = ready === true ? I18n.__('devMlShadowReady')
+                : (ready === false ? I18n.__('devMlShadowNotReady') : I18n.__('devMlShadowUnevaluated'));
+            const paired = (data && data.paired) || {};
+            const summary = (data && data.summary) || {};
+            const line = [
+                word,
+                `coverage=${String((data && data.coverage) ?? '\u2014')}`,
+                `paired_samples=${String(paired.paired_samples ?? summary.paired_samples ?? '\u2014')}`,
+                `verdict_agreement=${String(summary.verdict_agreement ?? '\u2014')}`,
+                `error_rate=${String(summary.error_rate ?? '\u2014')}`,
+                String((data && data.reason) || '')
+            ].join(' \u00b7 ');
+            if (target) target.textContent = line;
+            if (ready === true) Toast.success(word);
+            else Toast.error(line);
+        } catch (err) {
+            Toast.error((err && err.message) || I18n.__('error'));
+        }
+    },
+
+    /** Checkpoint the journal by hand, in the mode the select names. */
+    async checkpointDevWal() {
+        const box = typeof document.querySelector === 'function'
+            ? document.querySelector('[data-dev-checkpoint-mode]') : null;
+        const mode = box ? String(box.value || '') : '';
+        try {
+            const data = await API.request(
+                `/developer/db/wal-checkpoint?mode=${encodeURIComponent(mode)}`, { method: 'POST' }
+            );
+            Toast.success(I18n.__('devDbCheckpointed')
+                .replace('{mode}', String((data && data.mode) || mode))
+                .replace('{before}', String((data && data.before_frames) ?? 0))
+                .replace('{after}', String((data && data.log_frames) ?? 0)));
+            return UI.renderAdminTab('Developer');
+        } catch (err) {
+            Toast.error((err && err.message) || I18n.__('error'));
+        }
+    },
+
+    /**
+     * Run the full integrity check, and print what it found.
+     *
+     * The button says what it is doing while it waits, because this is the one read here that
+     * takes seconds to minutes: ``PRAGMA integrity_check`` walks every page. No repaint for the
+     * reason the shadow gate gives - and because a repaint would spend the read twice.
+     */
+    async runDevIntegrityCheck() {
+        const target = typeof document.querySelector === 'function'
+            ? document.querySelector('[data-dev-integrity-report]') : null;
+        const button = typeof document.querySelector === 'function'
+            ? document.querySelector('[data-dev-integrity]') : null;
+        if (button) {
+            button.disabled = true;
+            button.textContent = I18n.__('devDbIntegrityRunning');
+        }
+        try {
+            const data = await API.request('/developer/db/integrity');
+            const schema = (data && data.schema) || {};
+            const version = (data && data.schema_version) || {};
+            const integrity = (data && data.integrity) || {};
+            const output = (integrity.output || []).map(String);
+            const lines = [
+                I18n.__('devDbSchemaVersion')
+                    .replace('{current}', String(version.current ?? '\u2014'))
+                    .replace('{expected}', String(version.expected ?? '\u2014')),
+                I18n.__('devDbSchemaPending').replace('{count}', String((version.pending || []).length)),
+                `schema.ready=${String(schema.ready)} \u00b7 schema.mode=${String(schema.mode)}`,
+                integrity.ok
+                    ? I18n.__('devDbIntegrityOk')
+                    : I18n.__('devDbIntegrityProblems').replace('{count}', String(output.length))
+            ].concat(output);
+            if (target) target.textContent = lines.join('\n');
+            if (integrity.ok) Toast.success(I18n.__('devDbIntegrityOk'));
+            else Toast.error(lines[3]);
+        } catch (err) {
+            Toast.error((err && err.message) || I18n.__('error'));
+        } finally {
+            if (button) {
+                button.disabled = false;
+                button.textContent = I18n.__('devDbIntegrityRun');
+            }
+        }
+    },
+
+    /**
+     * Replace the model process.
+     *
+     * Confirmed, because the replacement is not free for anyone waiting at a gate: an in-flight
+     * verification is lost with the child, and the next punch pays the ~200 MiB load again. The
+     * answer names both pids, which is how an operator sees that a wedged child was really
+     * replaced rather than merely reported on.
+     */
+    async restartDevEngine() {
+        if (!confirm(I18n.__('devEngineConfirm'))) return;
+        try {
+            const data = await API.request('/developer/engine/restart-worker', { method: 'POST' });
+            Toast.success(I18n.__('devEngineRestarted')
+                .replace('{old}', String((data && data.old_pid) ?? '\u2014'))
+                .replace('{new}', String((data && data.new_pid) ?? '\u2014')));
+            return UI.renderAdminTab('Developer');
+        } catch (err) {
+            Toast.error((err && err.message) || I18n.__('error'));
+        }
+    },
+
+    /**
+     * Narrow the tamper ledger to one worker, and write the answer back in place.
+     *
+     * An empty box is "the whole window" rather than a refused request: clearing the filter is
+     * the other thing this control is for, and a worker id that matches nothing answers with an
+     * empty list and a zero count, which is the honest answer to a question about nobody.
+     *
+     * No repaint, for the reason the shadow gate gives and one of its own. A repaint would
+     * re-read the whole console for a question about one list, and it would redraw the box
+     * empty - throwing away the id that says which list this is. The block it rewrites holds no
+     * controls of its own, so the binding that ran at paint time is still the binding it needs.
+     */
+    async filterDevTamperAlerts() {
+        const field = typeof document.querySelector === 'function'
+            ? document.querySelector('[data-dev-tamper-worker]') : null;
+        const target = typeof document.querySelector === 'function'
+            ? document.querySelector('[data-dev-tamper-block]') : null;
+        const worker = field ? String(field.value || '').trim() : '';
+        const query = worker ? `?worker_id=${encodeURIComponent(worker)}` : '';
+        try {
+            const data = await API.request(`/developer/offline/tamper-alerts${query}`);
+            this._devConsole.tamper = data || {};
+            if (target) target.innerHTML = this.devTamperHtml();
         } catch (err) {
             Toast.error((err && err.message) || I18n.__('error'));
         }
@@ -8031,6 +9152,826 @@ const UI_MODULES = {
         }
         this.paintNotes(content, this.noteThreadHtml(this._noteThread));
         return Promise.resolve();
+    },
+
+    // =====================================================================
+    //  Dashboard - the console's front door
+    // =====================================================================
+    //
+    // The screen an administrator lands on, and the reason it is a landing screen
+    // rather than a fifth board: **every number on it is counted by the server.**
+    // ``GET /admin/dashboard`` runs aggregate queries and answers with the totals,
+    // where every other screen in this console *downloads a list and counts it in
+    // the browser* - ``fetchLiveOps`` alone reads four full payloads on a poll loop
+    // so that a board can say "12 on site". This tab reads one, once.
+    //
+    // Three rules it follows, all of them the plan's (``docs/DASHBOARD_PLAN.md``):
+    //
+    // 1. **A snapshot, not a board.** It does not poll, on purpose: a polled aggregate
+    //    is a query every few seconds against the same SQLite writer that serves the
+    //    gate. ``as_of`` is drawn beside the figures and the panel says in words that
+    //    it refreshes when asked, because silently drifting totals are worse than
+    //    totals that admit they are a minute old.
+    // 2. **A count, a state, or a link.** Anything that needs a list or a decision
+    //    lives in the tab that owns it, and each panel links there.
+    // 3. **Unknown is not zero.** A panel the server could not read arrives as ``null``
+    //    and is drawn as "could not be read" - never as a zero standing in for it,
+    //    which is the one output that reads as good news.
+    //
+    // Every control is bound by a ``data-`` hook through ``bindDashboardControls``
+    // rather than an ``onclick``: the CSP's inline-attribute allowance may only fall.
+
+    //: The last read, so each view helper can ask for its own slice of it. ``null``
+    //: is "not read", and it is cleared on every entry to the tab: a reader arriving
+    //: at the front door wants the truth now, not the figure from five minutes ago.
+    _dashboard: null,
+
+    //: The element the last paint was drawn into, so switching a view can redraw in place
+    //: without reaching for the document. Written only by ``renderDashboard``, which is the
+    //: only thing that ever paints this tab - so it is the same age as ``_dashboard`` above.
+    _dashboardHost: null,
+
+    //: The days the period panel asks for when nothing has been chosen. It has to be the
+    //: server's own default (``dashboard.DEFAULT_PERIOD_DAYS``), because the label on the
+    //: button says "last 7 days" and the figures under it come from whatever the request
+    //: asked for - one number, in two places, held together by the frontend suite.
+    DASHBOARD_PERIOD_DAYS: 7,
+
+    /**
+     * The period panel's window as the query parameter takes it: a day count, or ``month``.
+     *
+     * ``7`` rather than ``"7days"``: the server refuses anything but a number or ``month``
+     * (see ``dashboard.PERIOD_PATTERN``), and a window the server would 422 is a panel that
+     * reads as broken rather than as the default it meant.
+     */
+    dashboardPeriodToken() {
+        const token = String(State.dashboardDays || '').trim();
+        return token || String(this.DASHBOARD_PERIOD_DAYS);
+    },
+
+    /** The front door: one read, then the five panels. */
+    async renderDashboard(content) {
+        if (!content) return;
+        this._dashboard = null;
+        this._dashboardHost = content;
+        content.innerHTML = UI.consoleSkeletonHtml(I18n.__('dashboard'));
+        let data = null;
+        try {
+            // The period's window is the one thing this screen asks for: every other panel is
+            // about now, and a second parameter would be a second window to explain.
+            data = await API.request(`/admin/dashboard?days=${encodeURIComponent(this.dashboardPeriodToken())}`);
+        } catch (err) {
+            // The shell is drawn anyway, so the refresh control is on the screen that
+            // says the read failed - which is the one moment somebody wants it.
+            content.innerHTML = this.dashboardShellHtml(null) + this.uiErrorHtml(err, null);
+            this.bindDashboardControls(content);
+            return;
+        }
+        this._dashboard = data;
+        content.innerHTML = this.dashboardShellHtml(data);
+        this.bindDashboardControls(content);
+    },
+
+    /**
+     * The shell: the stamp, the vital strip, the view switcher, and the one view in effect.
+     *
+     * WHY IT IS NOT FIVE STACKED PANELS ANY MORE. Five cards down a page is five screens of
+     * scrolling, and the figure that decides whether anybody is needed at all is the one that
+     * ends up below the fold - a dashboard whose answer is four scrolls down is a dashboard read
+     * by habit rather than by need. So the screen is two things now:
+     *
+     * 1. **A vital strip** - the numbers somebody needs *before* deciding to read anything, each
+     *    one the server's own field and each one a link into the tab that owns that queue. It
+     *    never switches away, so the state of the deployment is always on the screen.
+     * 2. **One view at a time**, chosen by a segmented control built from the console's own
+     *    ``ops-seg`` vocabulary, with the panel it draws wired as a real ``tabpanel``.
+     *
+     * Nothing is counted, summed or averaged in the browser to make any of this work: a strip tile
+     * prints one field, and a tab is a name. Where a figure *is* derived - "waiting on a person"
+     * across four queues - the server already answered it (``waiting``), which is why the strip
+     * carries the queues separately rather than adding them up here.
+     */
+    dashboardShellHtml(data) {
+        return `
+            <div class="ui-page" data-dashboard="true">
+                <header class="ui-section-head">
+                    <h1 class="ui-section-title">${this.escapeHtml(I18n.__('dashboard'))}</h1>
+                    <p class="ui-section-note dashboard-lead">${this.escapeHtml(I18n.__('hintDashboard'))}</p>
+                </header>
+                <div class="ui-spread dashboard-stamp">
+                    <p class="ops-sub" data-dashboard-asof="true">${this.escapeHtml(this.dashboardStampText(data))}</p>
+                    <button type="button" class="ui-btn" data-dashboard-refresh="true">${this.OPS_ICONS.refresh}<span>${this.escapeHtml(I18n.__('dashboardRefresh'))}</span></button>
+                </div>
+                ${this.dashboardVitalsHtml(data)}
+                ${this.dashboardSwitchHtml(data)}
+                ${this.dashboardViewHtml(data)}
+            </div>`;
+    },
+
+    /**
+     * The vital strip: five figures, each one field of the payload and each one a link.
+     *
+     * Chosen to be the five that change what somebody does in the next ten minutes: the two
+     * queues a person has to work, who is on site right now, how the week is going, and the hours
+     * nobody has signed for yet. The order is that order. A queue figure that is not zero is
+     * marked as *waiting* (the warn tone), and "on shift" takes the live tone only when somebody
+     * is actually on site - the same two tones the board next door uses for the same facts.
+     */
+    dashboardVitalsHtml(data) {
+        const waiting = data ? data.waiting : null;
+        const moment = data ? data.now : null;
+        const period = data ? data.period : null;
+        // ``null`` when the panel behind the figure could not be read. It is drawn as an em dash
+        // and never as a zero: on this strip a zero is good news, and inventing good news is the
+        // one output this page must not produce.
+        const field = (source, name) =>
+            (source === null || source === undefined ? null : source[name]);
+        const tiles = [
+            { id: 'reviews', labelKey: 'dashboardReviews', tab: 'Approvals', tone: 'is-warn', value: field(waiting, 'reviews') },
+            { id: 'registrations', labelKey: 'dashboardRegistrations', tab: 'Registrations', tone: 'is-warn', value: field(waiting, 'registrations') },
+            { id: 'on_shift', labelKey: 'dashboardOnShift', tab: 'Live Ops', tone: 'is-live', value: field(moment, 'on_shift') },
+            {
+                id: 'present_days', labelKey: 'dashboardPeriodPresentDays', tab: 'Shifts', value: field(period, 'present_days'),
+                note: period
+                    ? I18n.__('dashboardVitalOfExpected').replace('{expected}', String(Number(period.expected_days || 0)))
+                    : ''
+            },
+            { id: 'awaiting_approval_hours', labelKey: 'dashboardPeriodAwaitingHours', tab: 'Approvals', tone: 'is-warn', value: field(period, 'awaiting_approval_hours') }
+        ];
+        return `<section class="dashboard-vitals" data-dashboard-vitals="true">${tiles
+            .map((tile) => this.dashboardVitalHtml(tile))
+            .join('')}</section>`;
+    },
+
+    /**
+     * One vital: the figure, what it is, and where it is worked.
+     *
+     * The whole tile is the button, so the tap target is the tile and not a word inside it (a
+     * phone in gloves is the reader this console was written for). The tab's own name is printed
+     * under the label - "Approvals", "Registrations" - so a tile says where it goes without
+     * repeating a sentence five times, and the accessible name of the button is all of it.
+     */
+    dashboardVitalHtml(tile) {
+        const unknown = tile.value === null || tile.value === undefined;
+        const figure = unknown ? '—' : String(tile.value);
+        // The tone is a *state*, not decoration: a queue with something in it is the reason this
+        // screen exists, and a stopped queue is not marked at all.
+        const flagged = !unknown && Number(tile.value) > 0;
+        const classes = ['dashboard-vital'];
+        if (unknown) classes.push('is-unknown');
+        else if (flagged && tile.tone) classes.push(tile.tone);
+        const offered = this.dashboardTabOffered(tile.tab);
+        const link = offered ? ` data-dashboard-go="${this.escapeHtml(tile.tab)}"` : '';
+        return `
+            <button type="button" class="${classes.join(' ')}" data-dashboard-vital="${this.escapeHtml(tile.id)}"${link}>
+                <span class="dashboard-vital-value" data-dashboard-vital-fact="${this.escapeHtml(tile.id)}">${this.escapeHtml(figure)}</span>
+                <span class="dashboard-vital-label">${this.escapeHtml(I18n.__(tile.labelKey))}</span>
+                ${tile.note ? `<span class="dashboard-vital-note">${this.escapeHtml(tile.note)}</span>` : ''}
+                ${offered ? `<span class="dashboard-vital-link">${this.escapeHtml(I18n.__(adminTabRecord(tile.tab).key))}</span>` : ''}
+            </button>`;
+    },
+
+    /**
+     * The views this screen can show, in the order they are offered, oldest question first.
+     *
+     * One list, so the tab strip, the drawn panel, the keyboard walk and the tests cannot
+     * disagree about what a view is called or which one is first. The short ``label`` is for the
+     * control and the ``title`` is the panel's own heading, because a segmented control that read
+     * "Waiting on a person / Right now / The period" would not fit a phone - and a label is not a
+     * heading.
+     */
+    dashboardViews() {
+        return [
+            { id: 'waiting', label: 'dashboardMetricWaiting', title: 'dashboardWaitingTitle', hint: 'dashboardWaitingHint' },
+            { id: 'now', label: 'dashboardMetricNow', title: 'dashboardNowTitle', hint: 'dashboardNowHint' },
+            { id: 'people', label: 'dashboardMetricPeople', title: 'dashboardPeopleTitle', hint: 'dashboardPeopleHint' },
+            { id: 'places', label: 'dashboardMetricPlaces', title: 'dashboardPlacesTitle', hint: 'dashboardPlacesHint' },
+            { id: 'period', label: 'dashboardMetricPeriod', title: 'dashboardPeriodTitle', hint: 'dashboardPeriodHint' }
+        ];
+    },
+
+    /** The view in effect, or the first one when the remembered id is not one of them. */
+    dashboardMetric() {
+        const views = this.dashboardViews();
+        const wanted = String(State.dashboardMetric || '');
+        return views.some((view) => view.id === wanted) ? wanted : views[0].id;
+    },
+
+    /**
+     * The switcher: a tablist, wired end to end - ``role``, ``aria-selected``, ``aria-controls``,
+     * and the roving ``tabindex`` a tab walk needs (only the selected tab is in the tab order, and
+     * the arrow keys in ``bindDashboardControls`` are what move between them).
+     *
+     * No counts on the tabs, deliberately: a tab that carried a figure would need the *sum* of a
+     * panel's queues, and adding numbers up in the browser is the one thing this screen refuses -
+     * the strip above it already carries each queue as the server counted it.
+     */
+    dashboardSwitchHtml(data) {
+        const active = this.dashboardMetric();
+        const buttons = this.dashboardViews().map((view) => {
+            const selected = view.id === active;
+            return `
+                <button type="button" role="tab" class="dashboard-switch-btn${selected ? ' is-active' : ''}"
+                        id="dashboard-tab-${view.id}" aria-selected="${selected ? 'true' : 'false'}"
+                        aria-controls="dashboard-view-${view.id}" tabindex="${selected ? '0' : '-1'}"
+                        data-dashboard-metric="${view.id}">${this.escapeHtml(I18n.__(view.label))}</button>`;
+        }).join('');
+        return `<div class="dashboard-switch ops-seg" role="tablist" data-dashboard-switch="true"
+                     aria-label="${this.escapeHtml(I18n.__('dashboard'))}">${buttons}</div>`;
+    },
+
+    /** The one view in effect, wrapped as the tabpanel its tab points at. */
+    dashboardViewHtml(data) {
+        const views = this.dashboardViews();
+        const view = views.find((candidate) => candidate.id === this.dashboardMetric()) || views[0];
+        const panel = data ? data[view.id] : null;
+        const readable = panel !== null && panel !== undefined;
+        return `
+            <section class="ui-card dashboard-panel" data-dashboard-panel="${view.id}" role="tabpanel"
+                     id="dashboard-view-${view.id}" aria-labelledby="dashboard-tab-${view.id}">
+                <div class="ui-section-head">
+                    <h2 class="ui-section-title">${this.escapeHtml(I18n.__(view.title))}</h2>
+                    <p class="ui-section-note dashboard-lead">${this.escapeHtml(I18n.__(view.hint))}</p>
+                </div>
+                ${readable
+                    ? this.dashboardViewBodyHtml(view.id, panel)
+                    : `<p class="ui-note is-warn" data-dashboard-unreadable="${view.id}">${this.OPS_ICONS.alert}<span>${this.escapeHtml(I18n.__('dashboardUnreadable'))}</span></p>`}
+            </section>`;
+    },
+
+    /** The body of one view, by id. The renderers themselves are unchanged - one panel, one read. */
+    dashboardViewBodyHtml(id, panel) {
+        if (id === 'now') return this.dashboardNowBodyHtml(panel);
+        if (id === 'people') return this.dashboardPeopleBodyHtml(panel);
+        if (id === 'places') return this.dashboardPlacesBodyHtml(panel);
+        if (id === 'period') return this.dashboardPeriodBodyHtml(panel);
+        return this.dashboardWaitingBodyHtml(panel);
+    },
+
+    /** "Counted at ..." - and what this screen will *not* do unless it is asked. */
+    dashboardStampText(data) {
+        const stamp = data && data.as_of ? String(data.as_of) : '';
+        return stamp
+            ? I18n.__('dashboardAsOf').replace('{stamp}', stamp)
+            : I18n.__('dashboardUnreadable');
+    },
+
+    /**
+     * Whether this session is offered a tab, before a link to it is drawn.
+     *
+     * ``adminVisibleTabs`` is the nav's own answer to that question, so a panel cannot
+     * offer a link the rail does not have. The alert queue is the case that matters: the
+     * server answers ``null`` for its count to anybody but the root tier, and the tab is
+     * ``rootOnly``, so a link there would be a dead end for the person holding the phone.
+     */
+    dashboardTabOffered(tab) {
+        try {
+            return adminVisibleTabs().some((entry) => entry.id === tab);
+        } catch (err) {
+            return false;
+        }
+    },
+
+    /** A link into the tab that owns a queue. Empty where this session is not offered it. */
+    dashboardLinkHtml(tab, labelKey) {
+        if (!this.dashboardTabOffered(tab)) return '';
+        const label = I18n.__(labelKey).replace('{tab}', I18n.__(adminTabRecord(tab).key));
+        return `<p class="dashboard-link"><button type="button" class="ui-btn ui-btn-sm" data-dashboard-go="${this.escapeHtml(tab)}">${this.escapeHtml(label)}</button></p>`;
+    },
+
+    /**
+     * One facts grid, with the labels translated rather than the payload's field names.
+     *
+     * ``devFactsHtml`` prints the server's own keys, which is right on the Developer tab -
+     * an operator reading a diagnostic wants the name the database uses. This screen is read
+     * by an administrator, so each field is drawn under the words the four tables give it;
+     * the field name survives as the ``data-`` hook, so the markup still says which number
+     * it is for anybody reading the page source or a failing test.
+     */
+    dashboardFactsHtml(fields, source) {
+        const cells = fields
+            .filter(([field]) => source[field] !== undefined && source[field] !== null)
+            .map(([field, labelKey]) =>
+                `<span class="ui-fact"><span class="ui-fact-sub">${this.escapeHtml(I18n.__(labelKey))}</span>` +
+                `<span class="ui-fact-value" data-dashboard-fact="${this.escapeHtml(field)}">${this.escapeHtml(String(source[field]))}</span></span>`)
+            .join('');
+        return `<div class="ui-facts dashboard-facts">${cells}</div>`;
+    },
+
+    /**
+     * "26h 10m" / "3d 4h" - how long the oldest thing in the queues has been waiting.
+     *
+     * Below a day it is the board's own short duration, which exists and already reads well
+     * ("{hours}h {minutes}m", "{minutes}m"); above a day, the same shape in days, because
+     * "73h 12m" is a figure a reader has to divide before it means anything.
+     */
+    dashboardWaitLabel(seconds) {
+        const total = Math.max(0, Number(seconds) || 0);
+        const days = Math.floor(total / 86400);
+        if (days >= 1) {
+            const hours = Math.floor((total % 86400) / 3600);
+            return I18n.__('dashboardDaysShort')
+                .replace('{days}', String(days))
+                .replace('{hours}', String(hours));
+        }
+        return this.liveOpsDuration(total);
+    },
+
+    /**
+     * Bind the tab's controls after it is painted.
+     *
+     * One pass over the ``data-`` hooks the markup carries, so no inline ``onclick`` joins
+     * the ones the document policy already tolerates, and a repaint between paint and tap
+     * cannot orphan a handler. The guard is the one every binder here carries: a stub DOM
+     * without ``querySelectorAll`` must be able to render the tab without throwing.
+     */
+    bindDashboardControls(content) {
+        if (!content || typeof content.querySelectorAll !== 'function') return;
+        content.querySelectorAll('[data-dashboard-go]').forEach((button) => {
+            if (typeof button.addEventListener !== 'function') return;
+            button.addEventListener('click', () => UI.renderAdminTab(String(button.getAttribute('data-dashboard-go') || '')));
+        });
+        content.querySelectorAll('[data-dashboard-refresh]').forEach((button) => {
+            if (typeof button.addEventListener !== 'function') return;
+            // A repaint *is* the refresh: the tab re-reads on entry and drops its cached
+            // copy first, so one tap is one request and one honest stamp.
+            button.addEventListener('click', () => UI.renderAdminTab('Dashboard'));
+        });
+        // The view switcher. A tap redraws from the snapshot already in hand rather than
+        // re-reading: which card is on top changes not one figure, so a request behind this tap
+        // would be a request nobody asked for.
+        content.querySelectorAll('[data-dashboard-metric]').forEach((button) => {
+            if (typeof button.addEventListener !== 'function') return;
+            button.addEventListener('click', () => UI_MODULES.dashboardSetMetric(
+                button.getAttribute('data-dashboard-metric')
+            ));
+            // A ``tablist`` promises the arrow keys, and the roving ``tabindex`` puts only the
+            // selected one in the tab order - so without this the views behind the first would be
+            // unreachable from a keyboard, which is a control that only exists for a mouse.
+            button.addEventListener('keydown', (event) => UI_MODULES.dashboardMetricKey(event));
+        });
+        // The period panel's window. Choosing one re-reads the tab: the figures are the
+        // server's, so a window changed here has to be a window re-counted there.
+        content.querySelectorAll('[data-dashboard-preset]').forEach((button) => {
+            if (typeof button.addEventListener !== 'function') return;
+            button.addEventListener('click', () => UI_MODULES.dashboardSetPeriod(
+                String(button.getAttribute('data-dashboard-preset') || '')
+            ));
+        });
+        // One person's own attendance, over the period the figure beside them came from. The
+        // window travels in the markup rather than being read back off the payload, so the link
+        // cannot describe a different period than the number it sits under.
+        content.querySelectorAll('[data-dashboard-worker]').forEach((button) => {
+            if (typeof button.addEventListener !== 'function') return;
+            button.addEventListener('click', () => UI_MODULES.dashboardOpenWorker(
+                button.getAttribute('data-dashboard-worker'),
+                button.getAttribute('data-dashboard-start'),
+                button.getAttribute('data-dashboard-end')
+            ));
+        });
+    },
+
+    /**
+     * One tap on a view: remember it, then redraw it from the snapshot already in hand.
+     *
+     * A switch is not a refresh. The payload on this screen is one counted read, and which card
+     * is on top changes none of its figures - so re-asking the server here would be a request per
+     * tap for an answer this page already holds. The stamp stays where it was for the same
+     * reason: nothing was re-counted, so nothing may claim it was.
+     */
+    dashboardSetMetric(id) {
+        const views = this.dashboardViews();
+        const wanted = String(id === null || id === undefined ? '' : id);
+        if (!views.some((view) => view.id === wanted)) return undefined;
+        State.dashboardMetric = wanted;
+        // No host means no shell on the screen to redraw - the tab was left behind, or the read
+        // failed before there was one. The remembered choice still stands for the next paint.
+        const host = this._dashboardHost;
+        if (!host || typeof host !== 'object') return undefined;
+        host.innerHTML = this.dashboardShellHtml(this._dashboard);
+        this.bindDashboardControls(host);
+        // Focus follows the selection, which is what a keyboard reader just asked for: the redraw
+        // replaced the element that had focus, so it has to be placed by hand.
+        if (typeof host.querySelector === 'function') {
+            const tab = host.querySelector(`#dashboard-tab-${wanted}`);
+            if (tab && typeof tab.focus === 'function') tab.focus();
+        }
+        return undefined;
+    },
+
+    /**
+     * The arrow keys a ``tablist`` promises: the arrows walk and wrap, Home and End jump.
+     *
+     * Left and right follow the order the tabs are *drawn* in rather than a physical direction,
+     * which is the behaviour that survives the RTL layout: the browser reverses the strip, and the
+     * key that meant "the next one" still means "the next one".
+     */
+    dashboardMetricKey(event) {
+        const key = event ? String(event.key || '') : '';
+        const steps = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -1, ArrowDown: 1 };
+        const views = this.dashboardViews();
+        let index = null;
+        if (steps[key]) {
+            const current = views.findIndex((view) => view.id === this.dashboardMetric());
+            index = (Math.max(0, current) + steps[key] + views.length) % views.length;
+        } else if (key === 'Home') {
+            index = 0;
+        } else if (key === 'End') {
+            index = views.length - 1;
+        }
+        if (index === null) return undefined;
+        // Only once the key is known to be ours: a page that swallowed every keystroke to move a
+        // tab would break the scroll keys on the panel underneath.
+        if (typeof event.preventDefault === 'function') event.preventDefault();
+        return this.dashboardSetMetric(views[index].id);
+    },
+
+    /** One tap on a period window: remember it, then re-count the tab for it. */
+    dashboardSetPeriod(token) {
+        State.dashboardDays = String(token || '').trim();
+        return UI.renderAdminTab('Dashboard');
+    },
+
+    /**
+     * Open one person's own attendance, over the window the figure came from.
+     *
+     * The plan asks for the extremes as a *link into the context* rather than as a leaderboard, and
+     * the context lives in the Shifts tab: its rows for one worker, over one period, which is the
+     * same window this panel counted. So the tap carries the person and the two dates - the same
+     * two fields the tab's own period picker writes - and clears any category filter left over
+     * from an earlier visit, because a stale filter would hide the very rows the link promised.
+     */
+    dashboardOpenWorker(workerId, start, end) {
+        const id = String(workerId === null || workerId === undefined ? '' : workerId).trim();
+        if (!id) return undefined;
+        const from = String(start || '').trim();
+        const to = String(end || '').trim();
+        // A window the tab would refuse is worse than the tab's own: only a usable pair is
+        // adopted, and the dates are compared as ISO text, which is what they are.
+        if (from && to && from <= to) State.shiftsRange = { start: from, end: to };
+        State.shiftsQuery = id;
+        State.shiftsCategory = '';
+        return UI.renderAdminTab('Shifts');
+    },
+
+    /**
+     * Waiting on a person - the first view, because it is the only one that changes behaviour.
+     *
+     * Each count is the predicate its own screen uses, so the dashboard and the queue it
+     * names cannot disagree: the review codes are ``reports.PENDING_CODES``, the
+     * applications are ``registrations.STATUS_PENDING_APPROVAL`` (the quarantine a submission
+     * files and an approval lifts), the notes are ``notes.OPEN_STATUSES``
+     * - all decided server-side, in the query, and this screen draws what it is handed.
+     */
+    dashboardWaitingBodyHtml(waiting) {
+        const queues = [
+            ['reviews', 'dashboardReviews', 'Approvals'],
+            ['registrations', 'dashboardRegistrations', 'Registrations'],
+            ['notes', 'dashboardNotes', 'Notes']
+        ];
+        // The alert queue is drawn only where its count is *readable*: the server answers
+        // ``null`` to every role but the root tier, and ``null`` here means "not yours to
+        // read" rather than zero - so a row of 0 would say "nothing is waiting" about a
+        // surface this reader cannot open at all. The tab check is the other half of the
+        // same question, and both are asked because they are answered by different things.
+        if (waiting.alerts !== null && waiting.alerts !== undefined && this.dashboardTabOffered('Alerts')) {
+            queues.push(['alerts', 'dashboardAlerts', 'Alerts']);
+        }
+        const rows = queues.map(([field, labelKey, tab]) => `
+            <div class="dashboard-queue" data-dashboard-queue="${field}">
+                <span class="dashboard-queue-value" data-dashboard-fact="${field}">${this.escapeHtml(String(waiting[field] ?? 0))}</span>
+                <span class="dashboard-queue-label">${this.escapeHtml(I18n.__(labelKey))}</span>
+                ${this.dashboardTabOffered(tab)
+                    ? `<button type="button" class="ui-btn ui-btn-sm" data-dashboard-go="${tab}">${this.escapeHtml(I18n.__('dashboardOpenTab').replace('{tab}', I18n.__(adminTabRecord(tab).key)))}</button>`
+                    : ''}
+            </div>`).join('');
+        return `
+            <div class="dashboard-queues">${rows}</div>
+            ${this.dashboardOldestHtml(waiting)}`;
+    },
+
+    /**
+     * The one figure that decides whether somebody works the queues now or after lunch.
+     *
+     * It is the *maximum* the server computed rather than a sum or an average: an average
+     * across four queues describes none of them, and the question this answers is "has
+     * anything been sitting here too long".
+     */
+    dashboardOldestHtml(waiting) {
+        const seconds = waiting.oldest_seconds;
+        if (seconds === null || seconds === undefined) {
+            // Not "0": nothing waiting has no oldest item at all, and an age of zero would
+            // say something was filed a second ago.
+            return `<p class="ui-note" data-dashboard-oldest="none">${this.escapeHtml(I18n.__('dashboardNothingWaiting'))}</p>`;
+        }
+        const label = I18n.__('dashboardOldest').replace('{waiting}', this.dashboardWaitLabel(seconds));
+        return `<p class="ui-note" data-dashboard-oldest="${this.escapeHtml(String(seconds))}">${this.OPS_ICONS.clock}<span>${this.escapeHtml(label)}</span></p>`;
+    },
+
+    /**
+     * Right now - the numbers that say whether the board next door is normal.
+     *
+     * Live Ops answers *who* is on site, in a list that polls. This answers *how many, and is
+     * that normal*: the same session figure the board holds, plus the three ways a punch can be
+     * waiting - a phone handed it over and it is not a record yet, the deployment refused it, or
+     * the shift has run past the overtime line with nobody having answered for it.
+     *
+     * The distinction is drawn in the words rather than left to the reader: ``refused_24h`` is a
+     * *rate* to watch, because a refused punch has no triage state anybody can clear
+     * (``refused_punches`` owns that decision), and the note under the rows says so.
+     */
+    dashboardNowBodyHtml(moment) {
+        // The tab each figure belongs to, where one exists. ``on_shift`` is the board's own
+        // reading, so it links to the board; an open crossing is an Approvals decision; the
+        // refusals are the root tier's to read. ``offline_waiting`` deliberately has no tab: the
+        // punch queue is triaged at ``/admin/punch_queue``, which no screen in this console
+        // lists, and a button into a tab that does not show the rows is worse than no button.
+        const rows = [
+            ['on_shift', 'dashboardOnShift', 'Live Ops'],
+            ['overtime_open', 'dashboardOvertimeOpen', 'Approvals'],
+            ['offline_waiting', 'dashboardOfflineWaiting', null],
+            ['refused_24h', 'dashboardRefused24h', 'Developer']
+        ].map(([field, labelKey, tab]) => `
+            <div class="dashboard-queue" data-dashboard-now="${field}">
+                <span class="dashboard-queue-value" data-dashboard-fact="${field}">${this.escapeHtml(String(moment[field] ?? 0))}</span>
+                <span class="dashboard-queue-label">${this.escapeHtml(I18n.__(labelKey))}</span>
+                ${tab && this.dashboardTabOffered(tab)
+                    ? `<button type="button" class="ui-btn ui-btn-sm" data-dashboard-go="${tab}">${this.escapeHtml(I18n.__('dashboardOpenTab').replace('{tab}', I18n.__(adminTabRecord(tab).key)))}</button>`
+                    : ''}
+            </div>`).join('');
+        // Who, by site: the same rows the total counts, grouped by the server rather than here,
+        // so the split and the total cannot disagree. A site name is text somebody typed, so it
+        // is escaped like every other value off the wire.
+        const sites = (Array.isArray(moment.by_site) ? moment.by_site : []).map((entry) => `
+            <span class="ui-fact"><span class="ui-fact-sub">${this.escapeHtml(entry.site_name)}</span><span class="ui-fact-value" data-dashboard-now-site="${this.escapeHtml(entry.site_name)}">${this.escapeHtml(String(entry.workers))}</span></span>`).join('');
+        return `
+            <div class="dashboard-queues">${rows}</div>
+            <p class="ui-section-note dashboard-sub">${this.escapeHtml(I18n.__('dashboardNowBySite'))}</p>
+            ${sites
+                ? `<div class="ui-facts dashboard-facts" data-dashboard-onsite="true">${sites}</div>`
+                : `<p class="ui-note" data-dashboard-nobody="true">${this.escapeHtml(I18n.__('dashboardNowNobody'))}</p>`}
+            <p class="ui-note" data-dashboard-refused-note="true">${this.OPS_ICONS.alert}<span>${this.escapeHtml(I18n.__('dashboardNowRefusedNote'))}</span></p>`;
+    },
+
+    /**
+     * People - the roster as this sign-in can see it.
+     *
+     * The root account is not checked for here, and must not be: ``visibility_clause``
+     * excludes it *inside* the query the server ran, because a filter applied on this side
+     * still leaves the count of what it removed on the wire - and a count is an enumeration.
+     */
+    dashboardPeopleBodyHtml(people) {
+        // A fixed order rather than the payload's own: worker first, then the two lead
+        // roles, then the administrative ones - the order an administrator reads a roster
+        // in, and the one the Credentials form offers roles in. A role with no accounts is
+        // left out, because a row of zeroes is not what anybody came to this panel for.
+        const order = ['worker', 'moallem', 'off_office', 'admin', 'head_admin'];
+        const counts = people.by_role || {};
+        const roles = order
+            .filter((role) => counts[role] !== undefined && counts[role] !== null)
+            .map((role) =>
+                `<span class="ui-fact"><span class="ui-fact-sub">${this.escapeHtml(this.roleLabel(role))}</span>` +
+                `<span class="ui-fact-value" data-dashboard-role="${this.escapeHtml(role)}">${this.escapeHtml(String(counts[role]))}</span></span>`)
+            .join('');
+        return `
+            ${this.dashboardFactsHtml([
+                ['accounts', 'dashboardAccounts'],
+                ['active', 'dashboardActive'],
+                // The quarantine, named: an account the public form created and nobody has
+                // decided. Drawn beside "deactivated" and never inside it - they are opposite
+                // facts, and the roster of a deployment with a queue is not a roster that has
+                // been switched off.
+                ['pending_approval', 'dashboardPendingApproval'],
+                ['deactivated', 'dashboardDeactivated'],
+                ['enrolled', 'dashboardEnrolled'],
+                ['no_face', 'dashboardNoFace'],
+                ['no_password', 'dashboardNoPassword'],
+                ['new_this_week', 'dashboardNewThisWeek'],
+                ['never_clocked_in', 'dashboardNeverClockedIn']
+            ], people)}
+            ${roles ? `<p class="ui-section-note dashboard-sub">${this.escapeHtml(I18n.__('dashboardByRole'))}</p>
+            <div class="ui-facts dashboard-facts" data-dashboard-roles="true">${roles}</div>` : ''}
+            ${this.dashboardLinkHtml('Credentials', 'dashboardPeopleLink')}`;
+    },
+
+    /** Places - where a clock-in is allowed from, and who has reached none of them today. */
+    dashboardPlacesBodyHtml(places) {
+        // A category name and a site name are both text somebody typed, and the site list
+        // below is the one *list* of server values this page draws - so both are escaped
+        // like every other value off the wire. (The server refuses markup at the boundary
+        // now; these rows predate that, and a read path does not get to assume.)
+        const categories = (places.by_category || []).map((entry) =>
+            `<span class="ui-fact"><span class="ui-fact-sub">${this.escapeHtml(entry.category)}</span>` +
+            `<span class="ui-fact-value" data-dashboard-category="${this.escapeHtml(entry.category)}">${this.escapeHtml(String(entry.sites))}</span></span>`)
+            .join('');
+        const unmanned = places.unmanned_today || [];
+        return `
+            ${this.dashboardFactsHtml([
+                ['sites', 'dashboardSites'],
+                ['categories', 'dashboardCategories'],
+                ['no_category', 'dashboardNoCategory'],
+                ['overriding_window', 'dashboardOverridingWindow']
+            ], places)}
+            ${categories ? `<p class="ui-section-note dashboard-sub">${this.escapeHtml(I18n.__('dashboardByCategory'))}</p>
+            <div class="ui-facts dashboard-facts" data-dashboard-categories="true">${categories}</div>` : ''}
+            <p class="ui-section-note dashboard-sub" data-dashboard-unmanned-count="${unmanned.length}">${this.escapeHtml(I18n.__('dashboardUnmanned'))}</p>
+            ${unmanned.length === 0
+                ? `<p class="ui-note" data-dashboard-all-manned="true">${this.escapeHtml(I18n.__('dashboardUnmannedNone'))}</p>`
+                : `<div class="dashboard-sites" data-dashboard-unmanned-list="true">${unmanned.map((site) =>
+                    `<span class="ui-badge is-warn" data-dashboard-unmanned-site="${this.escapeHtml(site)}">${this.OPS_ICONS.alert}<span>${this.escapeHtml(site)}</span></span>`).join('')}</div>`}
+            ${this.dashboardLinkHtml('Sites', 'dashboardPlacesLink')}`;
+    },
+
+    /**
+     * The period - the one view that is about a window rather than a moment.
+     *
+     * Everything in it is the server's (``reports.attendance_period``, the counted twin of the
+     * attendance report): the days people were present, the days the site was open, the arrivals
+     * that landed late, the hours an administrator has approved and the hours still waiting on
+     * one. Nothing is added up here - a total computed in the browser would be a fourth copy of
+     * arithmetic that already exists on the server twice.
+     *
+     * The window itself is drawn with the figures (``start``, ``end``, ``preset``) for the reason
+     * the stamp is drawn: a summary has to say what it is a summary *of*. It is also what makes
+     * the two extremes links to a period rather than to a person's whole history.
+     */
+    dashboardPeriodBodyHtml(period) {
+        return `
+            ${this.dashboardPeriodRangeHtml(period)}
+            ${this.dashboardFactsHtml([
+                ['workers', 'dashboardPeriodWorkers'],
+                ['present_days', 'dashboardPeriodPresentDays'],
+                ['expected_days', 'dashboardPeriodExpectedDays'],
+                ['late_arrivals', 'dashboardPeriodLate'],
+                ['average_attendance_rate', 'dashboardPeriodRate'],
+                ['approved_hours', 'dashboardPeriodApprovedHours'],
+                // Beside the approved figure and named for what it is: the part of those hours
+                // that needed somebody's decision, never hours worked twice.
+                ['overtime_hours', 'dashboardPeriodOvertimeHours'],
+                ['awaiting_approval_hours', 'dashboardPeriodAwaitingHours']
+            ], period)}
+            ${this.dashboardDaysHtml(period)}
+            ${this.dashboardExtremesHtml(period)}`;
+    },
+
+    /**
+     * The window control: two presets, the one in effect marked, and the dates it resolved to.
+     *
+     * Buttons rather than the two date inputs the Shifts tab carries, because this panel offers
+     * *two questions* - "how is this week going" and "how did this month go" - and a date picker
+     * would answer neither in one tap. The server counts the window either way.
+     */
+    dashboardPeriodRangeHtml(period) {
+        const active = String(period.preset || '');
+        const presets = [
+            {
+                key: 'days',
+                // The label names the *window the button asks for*, never the one on screen:
+                // under the month preset, a button reading "last 30 days" would be describing
+                // the figures rather than what tapping it does.
+                label: I18n.__('dashboardPeriodPresetDays')
+                    .replace('{days}', String(this.DASHBOARD_PERIOD_DAYS))
+            },
+            { key: 'month', label: I18n.__('dashboardPeriodPresetMonth') }
+        ];
+        const window = I18n.__('dashboardPeriodWindow')
+            .replace('{start}', String(period.start || ''))
+            .replace('{end}', String(period.end || ''));
+        return `
+            <div class="ui-row dashboard-period-range" data-dashboard-period-range="true">
+                ${presets.map((preset) => `
+                    <button type="button" class="ui-chip" data-dashboard-preset="${this.escapeHtml(preset.key)}"
+                            ${preset.key === active ? 'aria-pressed="true"' : ''}>${this.escapeHtml(preset.label)}</button>`).join('')}
+                <span class="ui-note" data-dashboard-period-window="true">${this.escapeHtml(window)}</span>
+            </div>`;
+    },
+
+    /**
+     * The shape of the window: one column per day, the bar its present days, the numeral its late
+     * arrivals.
+     *
+     * This is the one question on this screen that a single number cannot answer. "132 present
+     * days" and "4 late arrivals" say how the window went; they do not say *which* days it came
+     * apart on, and "the whole week was short-staffed" and "Tuesday was short-staffed" are
+     * different problems with different fixes. The counted twin answers it in the same read
+     * (``by_day``), so drawing it costs no request at all.
+     *
+     * The bars are scaled against the busiest day *in the window* rather than against the roster:
+     * an absolute scale would make a quiet deployment look like a dead one, and the question here
+     * is the shape of this window. The busiest day is named in words above the strip, because a
+     * chart whose scale is only implied is a chart nobody can read - and colour never carries the
+     * meaning alone: a late arrival is printed as a numeral on the day it happened, and every
+     * column states its own date and both figures, so the strip is readable without the picture.
+     */
+    dashboardDaysHtml(period) {
+        const days = Array.isArray(period.by_day) ? period.by_day : [];
+        const caption = I18n.__('dashboardPeriodDays')
+            .replace('{days}', String(days.length))
+            .replace('{busiest}', String(days.reduce((most, entry) => Math.max(most, Number(entry.present) || 0), 0)));
+        if (days.length === 0) {
+            return `<p class="ui-note" data-dashboard-days-none="true">${this.escapeHtml(I18n.__('dashboardPeriodNoDays'))}</p>`;
+        }
+        // The floor is the divisor, never the answer: a window nobody worked draws its columns
+        // empty rather than dividing by zero.
+        const scale = Math.max(1, days.reduce((most, entry) => Math.max(most, Number(entry.present) || 0), 0));
+        const columns = days.map((entry) => {
+            const present = Number(entry.present) || 0;
+            const late = Number(entry.late) || 0;
+            const day = String(entry.day || '');
+            // A day with nobody on site draws no bar at all rather than a two-pixel stub: "nobody
+            // came in" and "one person came in" have to be different pictures.
+            const bar = present > 0
+                ? `<span class="dashboard-day-bar" style="height: ${this.dashboardDayHeight(present, scale)}%"></span>`
+                : '<span class="dashboard-day-bar is-empty"></span>';
+            return `
+                <li class="dashboard-day${late > 0 ? ' is-late' : ''}" data-dashboard-day="${this.escapeHtml(day)}"
+                    data-dashboard-day-present="${this.escapeHtml(String(present))}"
+                    aria-label="${this.escapeHtml(this.dashboardDayLabel(entry, present, late))}">${late > 0
+                        ? `<span class="dashboard-day-late" data-dashboard-day-late="${this.escapeHtml(day)}">${this.escapeHtml(String(late))}</span>`
+                        : ''}<span class="dashboard-day-track">${bar}</span><span class="dashboard-day-tick">${this.escapeHtml(this.dashboardDayTick(day))}</span></li>`;
+        }).join('');
+        // ``role="list"`` is not decoration: a markerless list loses its list semantics in Safari
+        // and VoiceOver, which would leave the columns as unlabelled spans.
+        return `
+            <p class="ui-section-note dashboard-sub" data-dashboard-days-caption="true">${this.escapeHtml(caption)}</p>
+            <ol class="dashboard-days" role="list" data-dashboard-days="true" aria-label="${this.escapeHtml(caption)}">${columns}</ol>`;
+    },
+
+    /** One day's height, as a share of the busiest day in the window. */
+    dashboardDayHeight(present, scale) {
+        const share = Math.round((Number(present) || 0) / scale * 100);
+        // A day with somebody in it always draws something: a bar rounded down to 0% would read as
+        // a day nobody came in, which is the one thing this strip must not say by accident.
+        return Math.min(100, Math.max(8, share));
+    },
+
+    /** What one column *is*, in words - the strip for a reader who cannot see a bar. */
+    dashboardDayLabel(entry, present, late) {
+        return I18n.__('dashboardPeriodDayAria')
+            .replace('{day}', String(entry.day || ''))
+            .replace('{present}', String(present))
+            .replace('{late}', String(late));
+    },
+
+    /** The last two digits of the date, under the column - enough to find a bar on a 31-day strip. */
+    dashboardDayTick(day) {
+        return String(day || '').slice(-2);
+    },
+
+    /**
+     * The two people worth opening: the least present, and the most often late.
+     *
+     * Each one is one tap from the context it came from - the person's own rows in the Shifts
+     * tab, over this same window - which is the whole difference between this and a leaderboard:
+     * a ranking tells a reader that somebody is at the bottom, and a link lets them find out why.
+     * Two groups rather than one merged list because "never here" and "always late" are different
+     * facts about a person, and the second is the one worth answering first.
+     */
+    dashboardExtremesHtml(period) {
+        const expected = Number(period.expected_days || 0);
+        const groups = [
+            { name: 'quietest', labelKey: 'dashboardPeriodQuietest', figure: (row) => row.rate },
+            { name: 'most_late', labelKey: 'dashboardPeriodMostLate', figure: (row) => row.late }
+        ];
+        return groups.map((group) => {
+            const rows = Array.isArray(period[group.name]) ? period[group.name] : [];
+            const body = rows.length === 0
+                ? `<p class="ui-note" data-dashboard-extreme-none="${group.name}">${this.escapeHtml(I18n.__('dashboardPeriodNone'))}</p>`
+                : `<div class="dashboard-queues" data-dashboard-extreme="${group.name}">${rows
+                    .map((row) => this.dashboardExtremeRowHtml(row, group, period, expected))
+                    .join('')}</div>`;
+            return `
+                <p class="ui-section-note dashboard-sub">${this.escapeHtml(I18n.__(group.labelKey))}</p>
+                ${body}`;
+        }).join('');
+    },
+
+    dashboardExtremeRowHtml(row, group, period, expected) {
+        const id = String(row.worker_id || '');
+        // The name if the account still has one, the id if it does not: the days were worked
+        // either way, and a row that printed a blank over a deleted account would read as a
+        // rendering bug rather than as somebody whose login is gone.
+        const who = row.worker_name ? String(row.worker_name) : id;
+        const sub = I18n.__('dashboardPeriodExtremeSub')
+            .replace('{days}', String(Number(row.present_days || 0)))
+            .replace('{expected}', String(expected))
+            .replace('{late}', String(Number(row.late || 0)));
+        // The link exists only where the tab that owns those rows is offered - the same guard
+        // every other link on this screen carries, so a control can never lead to a tab the
+        // rail does not have.
+        const link = this.dashboardTabOffered('Shifts')
+            ? `<button type="button" class="ui-btn ui-btn-sm" data-dashboard-worker="${this.escapeHtml(id)}"`
+                + ` data-dashboard-start="${this.escapeHtml(String(period.start || ''))}"`
+                + ` data-dashboard-end="${this.escapeHtml(String(period.end || ''))}">`
+                + `${this.escapeHtml(I18n.__('dashboardPeriodOpenWorker').replace('{tab}', I18n.__(adminTabRecord('Shifts').key)))}</button>`
+            : '';
+        return `
+            <div class="dashboard-queue" data-dashboard-extreme-row="${this.escapeHtml(id)}">
+                <span class="dashboard-queue-value" data-dashboard-extreme-figure="${this.escapeHtml(id)}">${this.escapeHtml(String(group.figure(row) ?? 0))}</span>
+                <span class="dashboard-queue-label">${this.escapeHtml(who)}</span>
+                <span class="ui-note" data-dashboard-extreme-sub="${this.escapeHtml(id)}">${this.escapeHtml(sub)}</span>
+                ${link}
+            </div>`;
     },
 
     escapeHtml(value) {

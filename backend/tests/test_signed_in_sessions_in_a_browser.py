@@ -1338,6 +1338,168 @@ def test_a_worker_reads_the_notice_the_backend_wrote(browser, site, client, tmp_
     assert [row["read"] for row in inbox["notifications"]] == [True], inbox["notifications"]
 
 
+#: The welcome, driven the way a thumb drives it: what leads the clock panel, the id on it,
+#: the one control, and what is left afterwards.
+#:
+#: Order is asserted with ``compareDocumentPosition`` rather than with an index into the
+#: markup, because this is the part of the feature a stub DOM cannot check at all: "the card
+#: is above the button" is a fact about the page, not about a string.
+THE_WELCOME_JOURNEY = r"""
+(async () => {
+    const out = {};
+    const wait = async (test, ms = 6000) => {
+        const started = Date.now();
+        while (Date.now() - started < ms) {
+            if (test()) return true;
+            await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        return false;
+    };
+    const text = (el) => (el ? el.innerText : null);
+    const before = (a, b) => !!a && !!b && !!(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    const badge = () => document.querySelector('.hand-tabs [data-alert-count]');
+
+    // 1. Nothing has been tapped: the card is the first thing on the clock panel, and the id
+    //    is on it as a fact of its own - not only inside the sentence.
+    out.card_arrived = await wait(() => document.querySelector('[data-worker-welcome]') !== null);
+    const card = document.querySelector('[data-worker-welcome]');
+    out.card = text(card);
+    out.id = text(document.querySelector('.hand-welcome-id-value'));
+    out.above_button = before(card, document.querySelector('.hand-clock'));
+    out.above_shift = before(card, document.querySelector('.hand-hero'));
+    out.button = text(document.querySelector('.hand-clock'));
+    // The badge counts the same notice the card is made of, so dismissing it leaves nothing
+    // pointing at what was just read.
+    out.badge = badge() ? badge().innerText.trim() : null;
+
+    // 2. The one control, tapped.
+    const dismiss = document.querySelector('[data-worker-welcome-dismiss]');
+    out.has_button = dismiss !== null;
+    if (dismiss) dismiss.click();
+    // The card goes at once - it *is* the acknowledgement - while the badge follows the request
+    // that reads the notice, so the two are waited for separately rather than assumed to be one
+    // painting.
+    out.cleared = await wait(() => document.querySelector('[data-worker-welcome]') === null);
+    out.badge_cleared = await wait(() => badge() === null);
+    out.badge_after = badge() ? badge().innerText.trim() : null;
+    // Read off the session the app persisted: the card must not be waiting there for the next
+    // reload, which is the whole difference between a welcome and a nag.
+    out.session_welcome = (((JSON.parse(localStorage.getItem('session') || '{}') || {}).user) || {}).welcome;
+    out.shift_still_there = document.querySelector('.hand-clock') !== null;
+    return out;
+})()
+"""
+
+
+@pytest.fixture
+def a_welcome_the_backend_wrote(app_module):
+    """The notice an approval writes, written the way the approval writes it.
+
+    ``notifications.notify_worker`` with ``KIND_WORKER_ACCOUNT_APPROVED`` is the call
+    ``registrations.approve_registration`` makes inside the transaction that creates the
+    account - so what the phone is asked to show is what the backend really produces, for an
+    account that really exists, rather than a row invented by the test. (The approval's own end
+    of it - the id it mints, the contact it names - is pinned in
+    ``test_walk_up_registration.py``.)
+    """
+    body = (
+        f"Your application to work here was approved as worker, and your worker id is "
+        f"{harness.WORKER}. To sign in for the first time, use id {harness.WORKER}, the email "
+        f"you gave us ({harness.EMAILS[harness.WORKER]}), and the password you chose when you "
+        "applied."
+    )
+    with app_module.db(write=True) as conn:
+        written = notifications.notify_worker(
+            conn,
+            worker_id=harness.WORKER,
+            kind=notifications.KIND_WORKER_ACCOUNT_APPROVED,
+            title=f"Your worker id is {harness.WORKER}",
+            body=body,
+            payload={"worker_id": harness.WORKER, "email": harness.EMAILS[harness.WORKER]},
+            dedupe_key="browser-welcome",
+        )
+    assert written, "the notice was not written, so the phone has nothing to welcome anybody with"
+    return body
+
+
+def test_a_new_workers_first_screen_is_their_own_welcome(browser, site, client, tmp_path, a_welcome_the_backend_wrote):
+    """The one number a hired worker cannot look up, on the first screen their account sees.
+
+    Everything about this feature is a claim about *placement*: the notice exists either way, and
+    an inbox row behind a tab is exactly what the worker it is for does not know to open. So the
+    journey is walked in a browser - the card leads the clock panel, the id is on it, one tap
+    takes it away - and then the server is asked whether the tap reached the notice, because a
+    stub DOM can prove the request left and only this can prove the row came back read.
+    """
+    journey = {}
+
+    def walk(tab):
+        journey.update(tab.evaluate(f"({THE_WELCOME_JOURNEY})"))
+
+    seen = _sign_in(
+        browser,
+        site,
+        "worker",
+        browser_support.PHONE,
+        tmp_path,
+        until="document.querySelector('.hand-tabs') !== null",
+        after=walk,
+    )
+
+    assert journey.get("card_arrived"), (
+        f"a worker signed in with a welcome waiting and nothing drew it: the answer to the "
+        f"sign-in is where the id is handed over, and the handset ignored it.\n{seen.describe()}"
+    )
+    assert journey["id"] == harness.WORKER, (
+        f"the card does not print the worker's own id: {journey['card']!r}"
+    )
+    assert f"worker id is {harness.WORKER}" in journey["card"], journey["card"]
+    assert harness.EMAILS[harness.WORKER] in journey["card"], (
+        f"the card is missing the contact the sign-in screen will match on:\n{journey['card']}"
+    )
+    assert "Got it" in journey["card"], (
+        f"nothing on the card says what the one control does:\n{journey['card']}"
+    )
+    assert journey["above_shift"], (
+        f"the welcome is below the shift card - the thing a worker opened the app to do comes "
+        f"first and the number they were hired under comes after it.\n{seen.describe()}"
+    )
+    assert journey["above_button"], (
+        f"the welcome is below the clock button.\n{seen.describe()}"
+    )
+    assert journey["badge"] == "1", (
+        f"the badge and the card disagree about the same notice: {journey['badge']!r}\n"
+        f"{seen.describe()}"
+    )
+
+    assert journey["has_button"], (
+        f"the card has no way to acknowledge it, so it would sit there for ever.\n{seen.describe()}"
+    )
+    assert journey["cleared"], (
+        f"the card is still on screen after the one control was tapped.\n{seen.describe()}"
+    )
+    assert journey["badge_cleared"], (
+        f"the badge still points at the notice that was just read: {journey['badge_after']!r}"
+    )
+    assert journey["badge_after"] is None, journey
+    assert journey["session_welcome"] is None, (
+        f"the stored session still carries the welcome, so it comes back on the next reload "
+        f"and is never actually finished: {journey['session_welcome']!r}"
+    )
+    assert journey["shift_still_there"], (
+        f"dismissing the welcome took the punch card with it.\n{seen.describe()}"
+    )
+
+    # And the tap reached the database. Without this the card would clear whether or not the
+    # notice was read, and the worker would meet it again on every sign-in.
+    inbox = client.get("/api/v1/worker/me/notifications", headers=bearer(harness.WORKER)).json()
+    assert inbox["unread"] == 0, (
+        f"the browser acknowledged the welcome and the server still counts the notice unread: "
+        f"{inbox['notifications']}"
+    )
+    assert [row["read"] for row in inbox["notifications"]] == [True], inbox["notifications"]
+
+
 def test_the_console_module_is_fetched_on_demand_and_only_by_the_console(browser, site, tmp_path):
     """The console's module is deferred, fetched after sign-in, and never a worker's cost.
 

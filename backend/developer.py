@@ -1457,6 +1457,11 @@ def ml_diagnostics() -> dict[str, Any]:
         "detector": _detector_view(),
         "liveness": liveness.status(),
         "liveness_override": liveness_override(),
+        # The vocabulary the console's mode select is drawn from, rather than a fourth copy of
+        # three words spelled out in the frontend: this endpoint is the *other* door onto the
+        # same policy, so the two doors naming the same modes is the only arrangement in which
+        # a button drawn here cannot ask for something ``set_liveness_mode`` refuses.
+        "liveness_modes": list(liveness.MODES),
         "bands": {name: _band_view(band) for name, band in face_detector.BANDS.items()},
     }
     try:
@@ -1753,6 +1758,10 @@ def db_stats() -> dict[str, Any]:
     facts: dict[str, Any] = {
         "counters": dict(connection_stats()),
         "scope": "statement counters are per process; the pragmas below are the shared database's",
+        # The modes ``db_wal_checkpoint`` accepts, so the console's select offers exactly the
+        # four the lever takes. A mode spelled in the frontend instead would be a fifth mode the
+        # day somebody edits one of the two lists, and the server answers that with a 400.
+        "checkpoint_modes": list(WAL_CHECKPOINT_MODES),
     }
     connection = connect(isolation_level=None)
     try:
@@ -2645,7 +2654,7 @@ def list_backups(*, limit: int = 50) -> dict[str, Any]:
 
 def _write_snapshot(
     name: str, directory: Path, *, include_assets: bool
-) -> tuple[Path, dict[str, Any]]:
+) -> tuple[Path, dict[str, Any], str]:
     """Write one snapshot with the project's own tool, and return it with its verdict.
 
     ``tools/backup.py`` is *the* snapshot tool - the database through ``VACUUM INTO`` (atomic and
@@ -2663,11 +2672,13 @@ def _write_snapshot(
 
     database = resolve_path(Path(settings.database_path))
     destination: Path | None = None
+    written_prefix = name
     for attempt in range(1, 11):
         # The tool names the directory ``<prefix>_<stamp>``, and the stamp is whole seconds: two
         # clicks inside one second would otherwise be one snapshot and one ``FileExistsError`` -
         # which is exactly what an operator clicking twice has *not* asked for.
         candidate = name if attempt == 1 else f"{name}_{attempt}"
+        written_prefix = candidate
         try:
             destination = project_backup.create_snapshot(
                 candidate,
@@ -2685,7 +2696,7 @@ def _write_snapshot(
             detail="Ten snapshots already exist for this second. Wait a moment and try again.",
         )
     report = project_backup.verify_snapshot(destination)
-    return destination, report
+    return destination, report, written_prefix
 
 
 def create_project_snapshot(
@@ -2720,8 +2731,6 @@ def create_project_snapshot(
                 ),
             },
         )
-    directory = Path(settings.backup_dir)
-    directory.mkdir(parents=True, exist_ok=True)
     if not _SNAPSHOT_LOCK.acquire(blocking=False):
         raise HTTPException(
             status_code=409,
@@ -2733,10 +2742,16 @@ def create_project_snapshot(
                 ),
             },
         )
+    # Created only once the request is going to happen: a refused click must not leave an empty
+    # directory in a listing an operator reads to decide what exists.
+    directory = Path(settings.backup_dir)
+    directory.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
     try:
         try:
-            destination, report = _write_snapshot(name, directory, include_assets=include_assets)
+            destination, report, written_prefix = _write_snapshot(
+                name, directory, include_assets=include_assets
+            )
         except Exception as exc:  # noqa: BLE001 - whatever the tool refused to do
             with db(write=True) as conn:
                 _audit_developer(
@@ -2778,7 +2793,9 @@ def create_project_snapshot(
         "status": "success",
         "directory": str(destination),
         "name": destination.name,
-        "prefix": name,
+        # What was actually written, not what was asked for: a second snapshot inside the same
+        # second is written under ``<name>_2``, and the list reads the directory's own prefix.
+        "prefix": written_prefix,
         "database": str(resolve_path(Path(settings.database_path))),
         "include_assets": bool(include_assets),
         "files": int(report.get("files_listed") or 0),

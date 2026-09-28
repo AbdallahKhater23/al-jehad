@@ -801,6 +801,13 @@ ACTIVITY_TABLES: Final = (
                                 # each. A pending request is a face in a directory *and* a claim
                                 # on the next free account id, so a suite about the queue must
                                 # start from an empty one rather than inherit yesterday's
+    "registration_settings",    # the public link's intake switch, flipped at runtime from the
+                                # console. Like ``developer_config``: a test that closes the link
+                                # has to have it opened again by being cleared, not by
+                                # remembering to, or the next suite runs against a deployment
+                                # whose form refuses every submission it makes. A missing row is
+                                # the undecided state, so an emptied table is exactly the state
+                                # every deployment that never opened the console is in
 )
 
 #: Tables left exactly as the live database have them: the two ledgers this application

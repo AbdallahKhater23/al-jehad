@@ -21,8 +21,6 @@ This suite pins each state the check can report:
 
 from __future__ import annotations
 
-import secrets
-
 import pytest
 
 import readiness
@@ -43,19 +41,17 @@ def _open(monkeypatch):
 
 
 def _seed_pending(count: int) -> None:
-    """Write ``count`` pending requests straight into the review queue."""
+    """Write ``count`` accounts held for approval straight into the review queue."""
     import database
 
     with database.db() as conn:
         for index in range(count):
             conn.execute(
                 """
-                INSERT INTO registration_requests
-                    (status, full_name, requested_role, photo_path, photo_sha256,
-                     created_at, updated_at)
-                VALUES ('PENDING_REVIEW', ?, 'worker', ?, ?, datetime('now'), datetime('now'))
+                INSERT INTO users (id, name, password_hash, role, status, enrolled_at)
+                VALUES (?, ?, 'x', 'worker', 'pending_approval', datetime('now'))
                 """,
-                (f"Applicant {index}", f"/tmp/{index}.jpg", secrets.token_hex(16)),
+                (str(9000 + index), f"Applicant {index}"),
             )
         conn.commit()
 

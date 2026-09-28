@@ -213,6 +213,10 @@ def test_the_ml_panel_reports_the_models_the_detector_and_the_bands(client, app_
     # liveness reports through its own status, override included.
     assert body["liveness"]["mode"] == liveness.mode()
     assert body["liveness_override"] == developer.liveness_override()
+    # And the vocabulary, because this is the second door onto the same policy: the console's
+    # mode select is drawn from what the endpoint publishes rather than from three words spelled
+    # out in the frontend, which would be a fourth copy of ``liveness.MODES``.
+    assert body["liveness_modes"] == list(liveness.MODES)
 
 
 def test_a_band_view_carries_the_derivation_and_not_only_the_lines(client, app_module):
@@ -550,6 +554,11 @@ def test_the_database_stats_reach_the_pragmas_and_the_journal(client, app_module
     # The counters are one worker's, and the payload says so rather than letting an operator
     # read a single process's statement count as the deployment's.
     assert "per process" in body["scope"]
+    # The checkpoint modes travel with the panel that offers them, for the reason the liveness
+    # modes do: the console's select asks for exactly what ``db_wal_checkpoint`` accepts, so a
+    # vocabulary edit lands in one place instead of two that can disagree with a 400.
+    assert body["checkpoint_modes"] == list(developer.WAL_CHECKPOINT_MODES)
+    assert body["checkpoint_modes"] == ["PASSIVE", "FULL", "RESTART", "TRUNCATE"]
 
 
 def test_the_integrity_report_compares_the_schema_and_never_repairs_it(client, app_module):

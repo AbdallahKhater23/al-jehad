@@ -23,12 +23,13 @@ WHAT IS PINNED
    second ``BEGIN IMMEDIATE`` is refused outright.
 3. **A full band is reported, not guessed at**: ``409 id_space_exhausted``, naming the band that
    is full and what an operator can do about it.
-4. **The number counts upward, and the band ends below the administrative tiers.** A number given
-   back by a deleted account is *not* handed out again - recycling a retired number is a decision
-   an administrator makes in the console, with the roster in front of them - and an id at
-   ``ADMIN_TIER_ID_FLOOR`` is neither counted when the next number is chosen nor ever minted by an
-   approval. The per-role bands that used to split this id space are gone, so the two edges that
-   matter now are the bottom of the workforce band and the administrative floor above it.
+4. **The number is the lowest free one in the band, and the band ends below the administrative
+   tiers.** Reuse is deliberate: a refusal deletes the account *and* wipes the face reference
+   under its id (``registrations.reject_registration``), which is what makes handing that number
+   to the next applicant safe rather than a new face inheriting an old one's template. An id at
+   ``ADMIN_TIER_ID_FLOOR`` is neither counted when the next number is chosen nor ever minted by a
+   submission. The per-role bands that used to split this id space are gone, so the two edges
+   that matter now are the bottom of the workforce band and the administrative floor above it.
 """
 
 from __future__ import annotations
@@ -72,13 +73,23 @@ def _ensure(conn: sqlite3.Connection, user_id: str, role: str) -> bool:
     return True
 
 
-def _highest_in_band() -> int:
+def _free_band_numbers() -> list[int]:
+    """Every number in the band nobody holds, so a test can fill it exactly.
+
+    Read as *the numbers in use*, not as the highest one: the allocator hands out the lowest free
+    number, so filling the band means occupying every gap - a fixture that only extended past the
+    top would leave the allocator somewhere to go.
+    """
     with database.db() as conn:
-        row = conn.execute(
-            "SELECT MAX(CAST(id AS INTEGER)) FROM users WHERE CAST(id AS INTEGER) BETWEEN 1 AND ?",
-            (BAND_CEILING,),
-        ).fetchone()
-    return int(row[0]) if row is not None and row[0] is not None else 0
+        taken = {
+            int(row[0])
+            for row in conn.execute(
+                "SELECT CAST(id AS INTEGER) FROM users WHERE CAST(id AS INTEGER) BETWEEN 1 AND ?",
+                (BAND_CEILING,),
+            )
+            if row[0] is not None
+        }
+    return [value for value in range(1, BAND_CEILING + 1) if value not in taken]
 
 
 def test_concurrent_allocations_never_hand_out_one_number_twice():
@@ -181,7 +192,7 @@ def test_the_write_lock_is_taken_at_begin_and_not_at_the_first_write():
 
 def test_a_full_band_is_named_rather_than_guessed_at():
     """Every number below the administrative floor is spoken for: refuse, and say what to do."""
-    filled = list(range(_highest_in_band() + 1, BAND_CEILING + 1))
+    filled = _free_band_numbers()
     with database.immediate() as conn:
         for value in filled:
             _insert(conn, str(value))
@@ -202,20 +213,21 @@ def test_a_full_band_is_named_rather_than_guessed_at():
             "the refusal has to name what an operator can do, or it is a dead end"
         )
     finally:
-        # Given back in the same test that spent them: the allocator counts upward and does not
-        # recycle, so a band left full would refuse every later test in this process.
+        # Given back in the same test that spent them: a band left full would refuse every later
+        # test in this process.
         with database.immediate() as conn:
             for value in filled:
                 conn.execute("DELETE FROM users WHERE id = ?", (str(value),))
 
 
-def test_the_next_number_counts_upward_and_a_freed_one_is_not_reused():
-    """Numbers are handed out in order, and a deleted account's number is not reissued here.
+def test_the_lowest_free_number_is_handed_out_and_a_freed_one_comes_back():
+    """Numbers fill the gaps, and a gap left by a deleted account is filled first.
 
-    Reuse is the one thing an approval must not do on its own: a recycled id is an id whose
-    previous holder's attendance history is still in the database under it, which is why
-    ``biometrics.new_account_id`` has to move a leftover face file aside before a number is
-    reissued at all. That decision belongs to an administrator in the console.
+    Counting upward from the highest id in use was the old rule, and it left every number a
+    refused application gave back permanently unusable. What makes reuse safe is not this
+    arithmetic: a refusal deletes the account and wipes the face reference under its id before
+    the number is free, so the next holder of that number cannot be scored against the person
+    before them (``registrations.reject_registration``).
     """
     with database.immediate() as conn:
         first = _allocate(conn)
@@ -223,15 +235,15 @@ def test_the_next_number_counts_upward_and_a_freed_one_is_not_reused():
         _insert(conn, first)
         second = _allocate(conn)
         assert int(second) == int(first) + 1, (
-            f"the next number after {first} was {second}; the allocator is not counting upward"
+            f"the next number after {first} was {second}; a contiguous band is not being walked"
         )
         _insert(conn, second)
-        # The number *below* the highest is given back, and that is the one a scan for the lowest
-        # free number would have filled in again.
+        # Give the *lower* one back: a scan for the lowest free number fills it in again, which
+        # is exactly what the old allocator refused to do.
         conn.execute("DELETE FROM users WHERE id = ?", (first,))
         third = _allocate(conn)
-    assert third == str(int(second) + 1), (
-        f"the gap at {first} left by a deleted account was filled in again as {third}"
+    assert third == first, (
+        f"the gap at {first} left by a deleted account was skipped and {third} was handed out"
     )
 
 

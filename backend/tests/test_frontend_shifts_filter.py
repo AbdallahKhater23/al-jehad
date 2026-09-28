@@ -41,6 +41,10 @@ behaviour the screen depends on:
 The search box has its own contract (name / worker id / site / day): a day is an
 ordinary filter here, because a timesheet row *has* a date; see the ``3g`` block.
 
+6. the tab an administrator taps while the console's own opening screen is still
+   fetching is the tab they are left looking at (see the ``9`` block): screens are
+   painted by their requests, and the one that answered last used to decide.
+
 The tab is named **Shifts** and shows hours and approval state only. The report it
 reads carries no ``hourly_rate`` and no ``gross_estimate`` any more, and one test
 here asserts that no money reaches the screen either way: a tab that calls itself
@@ -928,6 +932,78 @@ const results = {};
         };
     }
 
+    // 9. the tab tapped while the screen in front of it is still fetching is the tab the admin
+    //    is left looking at
+    //
+    // The console opens on a tab of its own, and that first read is the slow one - a session
+    // starting on site, over a phone. An admin who wants the timesheet taps Shifts *inside*
+    // it. Which of the two screens was left on the page used to follow from which answer came
+    // back last: the board landed after the tab that was asked for and painted over it, so the
+    // tap looked like it had done nothing, and the figures underneath the date boxes were the
+    // front door's. So the board's read is held open here and answered only after the tap - the
+    // arrival order that used to lose - and what is on the page at the end is the assertion.
+    {
+        const env = adminEnv();
+        // The hold is installed inside the page's own scope: ``API`` and ``window`` belong to
+        // the files under test, not to this harness, and the answer is kept on ``window`` so
+        // the release is a second call into the same scope rather than a value crossing out of
+        // it. ``API.request`` is bound on the way out because it is a method that reads the
+        // base URL off its own object - called off the object it throws instead of asking, and
+        // this scenario would paint two error screens rather than the two screens it is about.
+        env.evaluate([
+            'window.__heldReads = [];',
+            'window.__realRequest = API.request.bind(API);',
+            'API.request = (path, options) => {',
+            "    if (String(path).indexOf('/admin/dashboard') >= 0) {",
+            '        return new Promise((resolve, reject) => {',
+            '            window.__heldReads.push(() => window.__realRequest(path, options).then(resolve, reject));',
+            '        });',
+            '    }',
+            '    return window.__realRequest(path, options);',
+            '};'
+        ].join(''));
+
+        // The console's own frame, opening on its own tab: not awaited, because its read is
+        // being held.
+        const opening = env.evaluate('UI.paintAdminConsole()');
+        // A real turn of the event loop before the tap: the opening screen paints from a
+        // promise callback, so until the loaded page has had a turn of its own its read has
+        // not gone out and the tap below would arrive *before* the screen it interrupts. The
+        // scenario would then be a test of nothing.
+        await env.evaluate('new Promise((resolve) => setTimeout(resolve, 0))');
+        const tapped = env.evaluate("UI.renderAdminTab('Shifts')");
+        const wasOut = env.evaluate('window.__heldReads.length');
+        // Another turn of the event loop, so the tab that was tapped has had every chance to
+        // serve its own read and paint while the board is still out. Whichever screen is up
+        // after this is the one that would be standing if the board never answered at all.
+        await env.evaluate('new Promise((resolve) => setTimeout(resolve, 0))');
+        const tappedWhileOut = env.evaluate("document.getElementById('adminContent').innerHTML")
+            .indexOf('id="shiftsFilter"') >= 0;
+        // Only now does the board answer - the arrival order that used to leave the front door
+        // on the page.
+        env.evaluate('window.__heldReads.forEach((release) => release())');
+        await tapped;
+        await opening;
+        env.evaluate('API.request = window.__realRequest');
+
+        const html = env.evaluate("document.getElementById('adminContent').innerHTML");
+        results.order = {
+            // The premise, reported rather than assumed: a scenario that never had the board's
+            // read in flight would pass without testing anything.
+            was_out: wasOut,
+            // The screen the tap had put up on its own, before the board answered. Reported and
+            // not asserted: how long a tab waits is the console's to choose, but which screen
+            // is still there at the end is not.
+            tapped_while_out: tappedWhileOut,
+            tab: env.evaluate('State.adminTab'),
+            asked: env.requests.map((r) => r.url.replace(/^https?:\/\/[^/]*\/api\/v1/, '')),
+            shifts_after_both: html.indexOf('id="shiftsFilter"') >= 0,
+            dashboard_after_both: html.indexOf('data-dashboard="true"') >= 0,
+            rows_after_both: (html.match(/data-shift=/g) || []).length,
+            hours: cardValues(html).hours
+        };
+    }
+
 """
 
 
@@ -1188,18 +1264,24 @@ def test_a_link_shared_before_the_rename_still_opens(results):
     assert legacy["hours"] == "40"
 
 
+#: The console's landing tab, named once here so a link that does *not* apply can be asserted to
+#: leave the reader where they were without this file carrying the screen's name twice. It is the
+#: Dashboard since it became the console's front door (see ``test_frontend_dashboard.py``).
+LANDING_TAB = "Dashboard"
+
+
 def test_a_fragment_that_is_not_a_period_is_ignored(results):
     junk = results["junk_link"]
     assert junk["junk_state"] == "unset", "junk in the fragment must not become the period"
-    assert junk["junk_tab"] == "Live Ops"
+    assert junk["junk_tab"] == LANDING_TAB
     assert junk["junk_report_requests"] == 0
     assert junk["backwards_state"] == "unset", "a backwards range is not a period"
-    assert junk["backwards_tab"] == "Live Ops"
+    assert junk["backwards_tab"] == LANDING_TAB
 
 
 def test_a_link_pasted_into_the_open_tab_applies_without_a_reload(results):
     change = results["hash_change"]
-    assert change["before_tab"] == "Live Ops"
+    assert change["before_tab"] == LANDING_TAB
     assert change["adopted"] == "2026-08-01..2026-08-31"
     assert change["tab"] == "Shifts"
     assert change["query"] == {"start": "2026-08-01", "end": "2026-08-31"}
@@ -1569,6 +1651,41 @@ def test_a_site_name_cannot_inject_markup(results):
     escaped = results["escaped"]
     assert escaped["raw_site_tag"] is False
     assert escaped["escaped_site_tag"] is True
+
+
+def test_the_tab_tapped_last_is_the_tab_left_on_screen(results):
+    """One screen, one request, one tap - and the tap is the one that survives.
+
+    A tab is not painted by the click, it is painted by whatever its own requests come back
+    with, and the console opens on a tab of its own. On a slow connection an admin taps Shifts
+    inside that first read, so the two answers can arrive in either order - and the answer that
+    arrived last used to be the one on screen. The failure is not cosmetic: the rows an admin
+    is about to approve belong to a screen they have already left, under the dates of the one
+    they asked for.
+
+    The scenario holds the board's own read open until after the tap, which is the arrival
+    order that used to lose, and then asks what is on the page. It also reports how many reads
+    were really held, so a run where nothing was in flight fails as a scenario that proved
+    nothing rather than passing quietly.
+    """
+    order = results["order"]
+    assert order["was_out"] == 1, (
+        "the opening screen's read was not still in flight when the tab was tapped, so this "
+        f"scenario never put the two answers in the order it exists to put them in\n{order}"
+    )
+    assert order["shifts_after_both"] is True, (
+        "the board landed after the tab that was tapped and painted over it: the admin is "
+        "looking at a screen they left"
+    )
+    assert order["dashboard_after_both"] is False, (
+        "the front door is still in the page the admin asked to leave"
+    )
+    assert order["tab"] == "Shifts", (
+        f"the tab the session thinks it is on and the screen do not agree: {order['tab']!r}"
+    )
+    # And it is the real tab, not an empty one that merely kept its period picker.
+    assert order["rows_after_both"] == 3
+    assert order["hours"] == "15"
 
 
 def test_a_worker_name_cannot_inject_markup_into_the_totals(results):

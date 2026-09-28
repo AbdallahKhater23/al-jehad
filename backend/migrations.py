@@ -35,7 +35,7 @@ from security import hash_password
 #: ``MIGRATIONS``. ``readiness`` refuses to start a deployment whose database is older, so a
 #: migration added without bumping this is a server that will not boot; the invariant is
 #: asserted in ``tests/test_site_shift_windows.py`` rather than left to memory.
-SCHEMA_VERSION = 27
+SCHEMA_VERSION = 30
 
 #: Magic number stamped into the SQLite header so we can recognise "this is our
 #: database" - cheap protection against pointing DATABASE_PATH at some other file.
@@ -1717,6 +1717,100 @@ def migration_28_attendance_timestamps_to_utc(conn: sqlite3.Connection) -> None:
             )
 
 
+def migration_29_registration_intake_switch(conn: sqlite3.Connection) -> None:
+    """The intake switch an administrator owns, beside the one the deployment owns.
+
+    WHY A ROW AND NOT THE ENV VAR IT ALREADY HAD
+    --------------------------------------------
+    ``settings.registration_enabled`` (``REGISTRATION_ENABLED``) answers a *deployment*
+    question - may this installation collect walk-up applications at all - and it answers it in
+    the one place an operator cannot reach during a shift: the environment the process was
+    started with. The question actually asked on a Tuesday is narrower and changes hourly:
+    "is the permanent link accepting applications right now". That is a settings row, exactly
+    like ``shift_rules`` and ``company_settings`` next door: one row, edited where the company
+    is administered, with the audit entry an administrator's decision deserves.
+
+    ``NULL`` MEANS NOBODY HAS DECIDED
+    ---------------------------------
+    It is deliberately *not* a synonym for closed. A NULL row makes the reader answer with the
+    deployment's own flag, so a database that never opens this screen - every database on the
+    day this migration lands - keeps behaving exactly as it did before the table existed, in
+    both states ``REGISTRATION_ENABLED`` can be in. ``0`` is a decision: an operator closed the
+    intake, and only an operator can open it again.
+
+    WHAT THIS COLUMN CAN NEVER DO
+    -----------------------------
+    Override the deployment switch. ``registrations.intake_state`` reads the two as a ceiling
+    and a day-to-day position, and the ceiling wins: a public endpoint that accepts a face from
+    a stranger must not be switchable on by whoever holds an administrator session on a site
+    that deliberately does not run one. The console says which of the two is holding it shut,
+    rather than offering a button that appears to do nothing.
+
+    (``registration_settings`` rather than a column on an existing row: ``shift_rules`` is
+    about hours and ``company_settings`` about the lockup, and a settings table whose columns
+    belong to three unrelated features is how a migration comes to need a rewrite to change a
+    switch. Numbered 29 because 28 is written and deliberately unregistered - see the note in
+    the registry below.)
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS registration_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            intake_open INTEGER,
+            updated_at DATETIME,
+            updated_by TEXT
+        )
+        """
+    )
+
+
+def migration_30_self_service_registration(conn: sqlite3.Connection) -> None:
+    """The account *is* the application: a walk-up submission now writes a real user row.
+
+    WHY THIS MIGRATION EXISTS AT ALL
+    --------------------------------
+    It adds one column and one index, and the reason it is a migration rather than neither is
+    that it is the schema's half of a contract change: ``users.status`` gains a third value it
+    has never held (``pending_approval``), and the review queue is now read from ``users``
+    instead of from ``registration_requests``. A database has to be able to *say* which build
+    is running against it, because a worker's clock-in is refused on the basis of that third
+    status - and a deployment whose schema stops one version short must refuse to serve rather
+    than refuse a worker's punch with a message about approval that nothing can clear.
+
+    WHAT ``registration_note`` HOLDS, AND WHY IT IS NOT ON A SEPARATE ROW
+    --------------------------------------------------------------------
+    The applicant's own line about the work they expect to do. It is the one thing the public
+    form collects that a ``users`` row had nowhere to keep, and dropping it would take a fact
+    out of the reviewer's hands that they were reading yesterday: the queue's card shows it,
+    and an administrator deciding whether to hire somebody from one photograph is entitled to
+    read what they said about themselves. Every other field the application carried is already
+    on the account (the name, the contact, the role, the id) or in a place built for it (the
+    consent version and the submitting address are in ``audit_log``, against the account, which
+    is the surface this application already keeps provenance on).
+
+    WHY THE PHOTOGRAPH IS NOT HERE
+    ------------------------------
+    There is no column for it. A submission now writes the face reference straight away (see
+    ``registrations.submit_registration``): the biometric store is where a face lives, under
+    the account's immutable id, and ``retention`` already knows how to find and wipe it there.
+    Keeping a second copy in an intake directory *and* a private table to point at it is the
+    shape a rejected applicant's face escapes through.
+
+    WHAT HAPPENS TO ``registration_requests``
+    -----------------------------------------
+    Nothing. The table stays exactly where migration 24 put it, with its rows, and no code in
+    this build reads or writes it. That is deliberate rather than untidy: those rows are the
+    record of who applied and what an administrator decided, which is a question asked *after*
+    the account exists or does not, and a migration that dropped them would destroy the only
+    copy. A deployment that wants the space back can archive it; nothing here needs it gone.
+    """
+    add_column(conn, "users", "registration_note", "TEXT")
+    # The review queue is "the pending accounts, oldest first", and that is the only read
+    # ``users`` gets on a busy morning that filters on a column which is not its key - so the
+    # index carries the status it is always filtered by.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_users_status ON users(status)")
+
+
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "audit_notifications_shift_rules", migration_1_audit_notifications_shift_rules),
     (2, "provenance_columns_status_code", migration_2_provenance_columns),
@@ -1745,6 +1839,8 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (25, "site_categories", migration_25_site_categories),
     (26, "off_office_workers", migration_26_off_office_workers),
     (27, "transit_to_site_shifts", migration_27_transit_to_site_shifts),
+    (29, "registration_intake_switch", migration_29_registration_intake_switch),
+    (30, "self_service_registration", migration_30_self_service_registration),
     # (28, "attendance_timestamps_to_utc", migration_28_attendance_timestamps_to_utc),
     #
     # NOT REGISTERED YET, ON PURPOSE. Migration 28 and its column contract
