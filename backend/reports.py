@@ -29,6 +29,11 @@ Report shapes
 * ``/admin/reports/export``    - the same data as a streamed CSV, or XLSX when the
   optional ``openpyxl`` extra is installed (a documented 501 otherwise, rather than a
   crash or a silently empty file).
+
+Two of those have a **counted twin**, for the readers that must not download a list to
+summarize one: ``attendance_period`` answers the attendance report's questions in aggregate SQL
+(the console's dashboard reads it), and the arithmetic behind it is ``_shift_hours``'s rather
+than a second opinion about what a shift is worth.
 """
 
 from __future__ import annotations
@@ -192,6 +197,25 @@ def _working_days(conn: sqlite3.Connection) -> set[int]:
 #: by ``SHIFT_TIMESHEET_SQL``), because that is what separates a pending overtime shift
 #: into the standard day it has earned and the extra hours waiting on a manager - and it
 #: describes the shift that was worked even if the policy has moved since.
+
+
+def _expected_days(first: date, last: date, working_days: set[int]) -> int:
+    """The weekdays in a closed range that the site operates on, floored at one.
+
+    The floor is the reason this is a function rather than an expression: a range with no
+    working day in it (a Friday, or a holiday week somebody configured away) would divide
+    by zero in the attendance rate, and a rate of ``0 / 0`` is not a rate. One expected day
+    is the smallest denominator that still answers "of the days there were, how many?",
+    and it is the definition ``attendance_rows`` has always used.
+    """
+    return max(
+        1,
+        sum(
+            1
+            for offset in range((last - first).days + 1)
+            if (first + timedelta(days=offset)).weekday() in working_days
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -598,6 +622,352 @@ ATTENDANCE_SQL = """
 """
 
 
+#: What an arrival's ``flag_reason`` says when it landed outside the window its site applies.
+#:
+#: Two markers rather than one because the flag is written by more than one path and has been
+#: reworded across releases ("outside the clock-in window", "late clock-in"). They are named
+#: here, once, because **two readers need the same answer**: the per-worker rows are classified
+#: in Python (``attendance_rows``) and the period's own totals are counted in SQL
+#: (``ATTENDANCE_PERIOD_SQL``), and a copy of the marker list at either site is how the summary
+#: starts disagreeing with the table under it.
+LATE_FLAG_MARKERS = ("clock-in window", "late")
+
+
+def _late_arrival(reason: Any) -> bool:
+    """Whether one ``flag_reason`` means the arrival was late."""
+    text = str(reason or "").lower()
+    return any(marker in text for marker in LATE_FLAG_MARKERS)
+
+
+def _late_flag_sql(column: str = "flag_reason") -> str:
+    """The same predicate as SQL, built from the same markers, for the counted totals.
+
+    ``LIKE`` in SQLite is already case-insensitive for ASCII, but the reason is lowered here
+    anyway so the two halves of this predicate are visibly the same test.
+    """
+    return "(" + " OR ".join(
+        f"LOWER(COALESCE({column}, '')) LIKE '%{marker}%'" for marker in LATE_FLAG_MARKERS
+    ) + ")"
+
+
+#: Sum over the Clock *Out* rows of the period of the hours the timesheet counts.
+#:
+#: ONE DEFINITION; THE ARITHMETIC IS ``_shift_hours``'S, WRITTEN FOR SQL. The timesheet decides
+#: what a shift is worth row by row (``_shift_hours``, in Python) and this decides what a period
+#: is worth in one aggregate, and the two must not be allowed to drift: a timesheet whose rows
+#: say 8 h and whose header says 7.5 is a report nobody can reconcile. They are held equal by
+#: ``test_admin_dashboard.py`` on a fixture that plants every status code there is, so a change
+#: to one that is not made to the other fails there rather than in somebody's pay run. The
+#: cases, in the same order as ``_shift_hours``:
+#:
+#: * a payable row counts the *approved* figure, falling back to the recorded one;
+#: * a ``pending_overtime`` row credits the standard day it has already earned and holds the
+#:   rest - and fails closed (the whole shift waits) when the row carries no figure for the hold,
+#:   which is the one case where the two halves of the split cannot both be answered;
+#: * every other undecided row waits in full;
+#: * anything else (a refusal) counts for nothing.
+#:
+#: ``overtime_hours`` is its own figure on the row rather than part of ``hours``, summed here
+#: exactly as ``/worker/me/report`` sums it and never added into the other two: it is the hours
+#: that needed a decision, not hours worked twice.
+_APPROVED_HOURS_SQL = """
+    CASE
+      WHEN l.status_code IN ({payable}) THEN COALESCE(l.approved_hours, COALESCE(l.hours, 0))
+      WHEN l.status_code = ? AND COALESCE(l.overtime_hours, 0) > 0
+        THEN COALESCE(l.hours, 0)
+             - MIN(MAX(0.0, COALESCE(l.overtime_hours, 0)), COALESCE(l.hours, 0))
+      ELSE 0.0
+    END
+"""
+
+_AWAITING_HOURS_SQL = """
+    CASE
+      WHEN l.status_code = ? AND COALESCE(l.overtime_hours, 0) > 0
+        THEN MIN(MAX(0.0, COALESCE(l.overtime_hours, 0)), COALESCE(l.hours, 0))
+      WHEN l.status_code IN ({awaiting}) THEN COALESCE(l.hours, 0)
+      ELSE 0.0
+    END
+"""
+
+
+def _shift_period_hours_sql() -> tuple[str, list]:
+    """The hours aggregate, with every code list filled in from the tuple that owns it.
+
+    Returns the statement *and* its parameters, in the order the statement mentions them, so a
+    status added to one of the tuples cannot reach the timesheet's rows without reaching this
+    total as well - and so nobody has to reconstruct the binding order by reading the SQL. Every
+    code list is a placeholder list built here, which is what makes that order checkable: the
+    statement's own text is the only description of it.
+    """
+    payable = ", ".join("?" for _ in PAYABLE_CODES)
+    awaiting = ", ".join("?" for _ in AWAITING_APPROVAL_CODES)
+    sql = (
+        "SELECT COALESCE(SUM("
+        + _APPROVED_HOURS_SQL.format(payable=payable)
+        + "), 0.0) AS approved_hours, "
+        "COALESCE(SUM("
+        + _AWAITING_HOURS_SQL.format(awaiting=awaiting)
+        + "), 0.0) AS awaiting_approval_hours, "
+        "COALESCE(SUM(COALESCE(l.overtime_hours, 0)), 0.0) AS overtime_hours "
+        "FROM attendance_logs l "
+        "WHERE l.action = 'Clock Out' AND l.timestamp >= ? AND l.timestamp < ?"
+    )
+    # The approved case first (its code list, then the pending-overtime comparison), then the
+    # awaiting case (the same comparison, then its code list), then the range.
+    params = [
+        *PAYABLE_CODES,
+        PENDING_OVERTIME_CODE,
+        PENDING_OVERTIME_CODE,
+        *AWAITING_APPROVAL_CODES,
+    ]
+    return sql, params
+
+
+#: Every figure the period's presence has, counted in one statement and no rows returned.
+#:
+#: ``COUNT(DISTINCT worker || unit-separator || day)`` rather than a second pass in Python: this
+#: is the number a dashboard may not download the roster to work out. The unit separator is the
+#: delimiter because a worker id is text somebody typed (an imported roster can hold anything),
+#: and ``'1' || '2' || '3'`` would make two different worker-days look like one.
+#:
+#: The average is over the *rows the report would show* - one per worker present - so it is the
+#: same mean ``attendance_rows`` takes of its own rates, and the two are held equal by test.
+ATTENDANCE_PERIOD_SQL = """
+    SELECT COUNT(*) AS workers,
+           COALESCE(SUM(present_days), 0) AS present_days,
+           COALESCE(SUM(late_arrivals), 0) AS late_arrivals,
+           -- Rounded per worker before the mean, which is what ``attendance_rows`` does to its own
+           -- rows: two figures that are the same number computed twice have to be the same number.
+           COALESCE(AVG(ROUND(MIN(1.0, present_days * 1.0 / ?), 4)), 0.0) AS average_attendance_rate
+    FROM (
+        SELECT l.worker_id AS worker_id,
+               COUNT(DISTINCT l.worker_id || CHAR(31)
+                     || SUBSTR(l.timestamp, 1, 10)) AS present_days,
+               SUM(CASE WHEN {late} THEN 1 ELSE 0 END) AS late_arrivals
+        FROM attendance_logs l
+        WHERE l.action = 'Clock In' AND l.timestamp >= ? AND l.timestamp < ?
+          {extra}
+        GROUP BY l.worker_id
+    )
+"""
+
+#: The period's extremes, bounded by the limit rather than by the roster.
+#:
+#: One row per worker who was present, sorted by the two fields the attendance report already
+#: sorts by (lowest ``attendance_rate`` - which, over one period, is lowest ``present_days`` -
+#: and then most ``late_arrivals``) and cut to ``LIMIT``. A worker with no Clock In row at all is
+#: not in it: the report's own rows are workers who were present, and "nobody has seen this
+#: person in three weeks" is a different question (the dormant-account panel, see the plan).
+ATTENDANCE_EXTREMES_SQL = """
+    SELECT l.worker_id AS worker_id,
+           MAX(u.name) AS worker_name,
+           COUNT(DISTINCT SUBSTR(l.timestamp, 1, 10)) AS present_days,
+           SUM(CASE WHEN {late} THEN 1 ELSE 0 END) AS late_arrivals
+    FROM attendance_logs l
+    LEFT JOIN users u ON u.id = l.worker_id
+    WHERE l.action = 'Clock In' AND l.timestamp >= ? AND l.timestamp < ?
+    GROUP BY l.worker_id
+    ORDER BY {order}
+    LIMIT ?
+"""
+
+#: How many of each extreme the summary carries. Small on purpose: these are two named people
+#: to open, not a leaderboard, and a list long enough to rank would be the leaderboard the plan
+#: refuses.
+EXTREMES_LIMIT = 3
+
+#: The longest window a period summary will build, in days - three years of reporting is the
+#: export's own cap, and a summary nobody reads is not worth counting.
+#:
+#: It is also the ``LIMIT`` on ``ATTENDANCE_PERIOD_DAYS_SQL``, which is what keeps the per-day
+#: breakdown a *counted* read: it returns one row per day in the window rather than per worker,
+#: and no window this application can be asked for is longer than this. ``dashboard`` clamps its
+#: own ``?days=`` to the same number, so the route and the query cannot disagree about it.
+MAX_WINDOW_DAYS = 366
+
+#: The window's days, counted one row each: how many people were here, and how many arrivals
+#: were late.
+#:
+#: A day with nobody in it is a *real* answer (the site was open and nobody came), so the caller
+#: fills the gaps - see ``_period_by_day`` - rather than leaving a bar chart with a hole in it
+#: that a reader would have to interpret as either zero or missing data.
+ATTENDANCE_PERIOD_DAYS_SQL = """
+    SELECT SUBSTR(l.timestamp, 1, 10) AS day,
+           COUNT(DISTINCT l.worker_id) AS present,
+           SUM(CASE WHEN {late} THEN 1 ELSE 0 END) AS late_arrivals
+    FROM attendance_logs l
+    WHERE l.action = 'Clock In' AND l.timestamp >= ? AND l.timestamp < ?
+    GROUP BY day
+    ORDER BY day ASC
+    LIMIT ?
+"""
+
+
+def _period_presence(
+    conn: sqlite3.Connection, *, start: str, end: str, worker_id: str | None = None
+) -> dict:
+    """``(workers, present_days, late_arrivals, average_attendance_rate)``, counted.
+
+    ``worker_id`` is the report's own filter, and the period's expected days come from the same
+    ``_expected_days`` either way - the denominator is a property of the range and the rules,
+    not of who is in the rows.
+    """
+    extra = ""
+    params: list = [start, end]
+    if worker_id:
+        extra += " AND l.worker_id = ?"
+        params.append(worker_id)
+
+    first = datetime.strptime(start, _TS).date()
+    last = datetime.strptime(end, _TS).date() - timedelta(days=1)
+    expected = _expected_days(first, last, _working_days(conn))
+    row = conn.execute(
+        ATTENDANCE_PERIOD_SQL.format(extra=extra, late=_late_flag_sql("l.flag_reason")),
+        (expected, *params),
+    ).fetchone()
+    return {
+        "workers": int(row["workers"] or 0),
+        "expected_days": expected,
+        "present_days": int(row["present_days"] or 0),
+        "late_arrivals": int(row["late_arrivals"] or 0),
+        "average_attendance_rate": round(float(row["average_attendance_rate"] or 0.0), 4),
+    }
+
+
+def _period_hours(
+    conn: sqlite3.Connection, *, start: str, end: str, worker_id: str | None = None
+) -> dict:
+    """``(approved_hours, awaiting_approval_hours, overtime_hours)`` over the same range."""
+    sql, params = _shift_period_hours_sql()
+    if worker_id:
+        sql += " AND l.worker_id = ?"
+        params = [*params, worker_id]
+    row = conn.execute(sql, (*params, start, end)).fetchone()
+    return {
+        "approved_hours": round(float(row["approved_hours"] or 0.0), 4),
+        "awaiting_approval_hours": round(float(row["awaiting_approval_hours"] or 0.0), 4),
+        "overtime_hours": round(float(row["overtime_hours"] or 0.0), 4),
+    }
+
+
+def _period_extremes(
+    conn: sqlite3.Connection, *, start: str, end: str, expected: int, limit: int
+) -> tuple[list[dict], list[dict]]:
+    """``(quietest, most_late)`` - two bounded lists, one query each.
+
+    The order is the report's own (lowest attendance rate first, ``late_arrivals`` breaking the
+    tie) with the id last so the answer is stable when two workers are equally quiet - a list
+    that reorders between two reads of the same period is a list somebody has to explain.
+    """
+    orders = {
+        "quietest": "present_days ASC, late_arrivals DESC, l.worker_id ASC",
+        "most_late": "late_arrivals DESC, present_days ASC, l.worker_id ASC",
+    }
+    lists: dict[str, list[dict]] = {}
+    for name, order in orders.items():
+        rows = conn.execute(
+            ATTENDANCE_EXTREMES_SQL.format(order=order, late=_late_flag_sql("l.flag_reason")),
+            (start, end, int(limit)),
+        ).fetchall()
+        lists[name] = [
+            {
+                "worker_id": str(row["worker_id"]),
+                # ``None`` when the account is gone, exactly as a report row says it: the days
+                # were worked, and a name that no longer exists is not an invented one.
+                "worker_name": row["worker_name"],
+                "present_days": int(row["present_days"] or 0),
+                "rate": round(min(1.0, int(row["present_days"] or 0) / expected), 4),
+                "late": int(row["late_arrivals"] or 0),
+            }
+            for row in rows
+        ]
+    return lists["quietest"], lists["most_late"]
+
+
+def _period_by_day(
+    conn: sqlite3.Connection, *, first: date, last: date, start: str, end: str
+) -> list[dict]:
+    """One row per day of the window, in order, with the days nobody worked filled in as zero.
+
+    The gap-filling is the point: ``GROUP BY day`` answers only for the days that have a row, and
+    a breakdown that silently omits them turns "nobody came on Friday" into "the chart is a bar
+    short" - two different stories to a reader looking at a strip of bars. So the window is
+    enumerated here (it is at most ``MAX_WINDOW_DAYS`` long) and the counted rows are merged into
+    it, which also makes the list's length a property of the *window* rather than of the data.
+    """
+    counted = {
+        str(row["day"]): (int(row["present"] or 0), int(row["late_arrivals"] or 0))
+        for row in conn.execute(
+            ATTENDANCE_PERIOD_DAYS_SQL.format(late=_late_flag_sql("l.flag_reason")),
+            (start, end, MAX_WINDOW_DAYS),
+        ).fetchall()
+    }
+    days: list[dict] = []
+    for offset in range((last - first).days + 1):
+        day = (first + timedelta(days=offset)).isoformat()
+        present, late = counted.get(day, (0, 0))
+        days.append({"day": day, "present": present, "late": late})
+    return days
+
+
+def attendance_period(
+    conn: sqlite3.Connection | None = None,
+    *,
+    start: str,
+    end: str,
+    extremes: int = EXTREMES_LIMIT,
+) -> dict:
+    """The period's own figures for a summary: presence counted, hours counted, extremes bounded.
+
+    THE COUNTED TWIN OF ``attendance_rows``. The attendance *report* is a list - one row per
+    worker present, for a reader who is going to read them - and it is the right shape for the
+    screen that shows it. A dashboard that summarized the period by downloading that list would
+    pay the cost it exists to remove, and its price would grow with the roster where this one's
+    grows with the number of panels. So this answers the same questions in SQL, over the same
+    range, with the same definitions: ``_expected_days`` is the denominator, the same late
+    predicate classifies an arrival, and the hours are the timesheet's own arithmetic (see
+    ``_shift_period_hours_sql``).
+
+    ``conn`` is the caller's connection where one is already open. The dashboard counts every
+    panel through a single connection, and holding that lets its cost test *trace* this read
+    rather than trust it; the default opens one for a caller that has none.
+
+    NOT SCOPED BY ``developer.visibility_clause``, and the reason is the same one phase 2 gave
+    for the open-session figure: this summarizes the attendance report, which is not concealed -
+    and the root account cannot appear in it in the first place, because the gate refuses the
+    developer role a punch (``main.verify_worker``). If that ever changes, the report the panel
+    summarizes names the account too, and both move together.
+    """
+
+    first = datetime.strptime(start, _TS).date()
+    last = datetime.strptime(end, _TS).date() - timedelta(days=1)
+
+    def compute(connection: sqlite3.Connection) -> dict:
+        presence = _period_presence(connection, start=start, end=end)
+        figures = {
+            "workers": presence["workers"],
+            "expected_days": presence["expected_days"],
+            "present_days": presence["present_days"],
+            "late_arrivals": presence["late_arrivals"],
+            "average_attendance_rate": presence["average_attendance_rate"],
+            **_period_hours(connection, start=start, end=end),
+        }
+        quietest, most_late = _period_extremes(
+            connection,
+            start=start,
+            end=end,
+            expected=presence["expected_days"],
+            limit=max(1, int(extremes)),
+        )
+        by_day = _period_by_day(connection, first=first, last=last, start=start, end=end)
+        return {**figures, "by_day": by_day, "quietest": quietest, "most_late": most_late}
+
+    if conn is not None:
+        return compute(conn)
+    with db() as opened:
+        return compute(opened)
+
+
 def attendance_rows(*, start: str, end: str, worker_id: str | None = None) -> dict:
     extra = ""
     params: list = [start, end]
@@ -619,9 +989,12 @@ def attendance_rows(*, start: str, end: str, worker_id: str | None = None) -> di
             str(row["id"]): {"name": row["name"], "role": row["role"]}
             for row in conn.execute("SELECT id, name, role FROM users").fetchall()
         }
+        # The hours half of the same period, counted rather than summed from a second list: the
+        # timesheet's own arithmetic, over the same range, so the totals block below can carry
+        # an approved figure that agrees with the Shifts tab's header for the same days.
+        hours = _period_hours(conn, start=start, end=end, worker_id=worker_id)
 
-    expected_days = sum(1 for offset in range((last - first).days + 1) if (first + timedelta(days=offset)).weekday() in working_days)
-    expected_days = max(1, expected_days)
+    expected_days = _expected_days(first, last, working_days)
 
     buckets: dict[str, dict] = {}
     for record in records:
@@ -645,9 +1018,9 @@ def attendance_rows(*, start: str, end: str, worker_id: str | None = None) -> di
         )
         stamp = str(record["timestamp"])[:10]
         bucket["days_present"].add(stamp)
-        reason = str(record["flag_reason"] or "")
         code = str(record["status_code"] or "")
-        if "clock-in window" in reason or "late" in reason.lower():
+        # One definition, shared with the counted totals above - see ``LATE_FLAG_MARKERS``.
+        if _late_arrival(record["flag_reason"]):
             bucket["late_arrivals"] += 1
         if code in UNDECIDED_AUTO_CLOSE_CODES:
             bucket["auto_closed"] += 1
@@ -679,7 +1052,15 @@ def attendance_rows(*, start: str, end: str, worker_id: str | None = None) -> di
         "totals": {
             "workers": len(rows),
             "expected_days": expected_days,
+            # The days, counted per worker-day rather than per punch: a worker who punched twice
+            # in one day is one present day, and this figure has to mean the same thing in the
+            # header as the ``days_present`` column does on the row beside it.
+            "present_days": sum(row["days_present"] for row in rows),
+            "late_arrivals": sum(row["late_arrivals"] for row in rows),
             "average_attendance_rate": round(sum(row["attendance_rate"] for row in rows) / len(rows), 4) if rows else 0.0,
+            # The timesheet's own three figures, over the same range: what has been approved,
+            # what is still waiting on somebody, and how much of it was overtime.
+            **hours,
         },
     }
 

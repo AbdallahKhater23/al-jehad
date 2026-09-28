@@ -535,8 +535,10 @@ def test_the_queue_is_offered_to_the_root_tier_and_no_one_else(results):
         "the tab left the console's inventory: this is a change of audience, not a removal"
     )
     # Asked for by id anyway - and the console opens the first tab this reader *is* offered
-    # rather than drawing a screen it cannot fill.
-    assert admin["landed"] == "Live Ops", admin["landed"]
+    # rather than drawing a screen it cannot fill. That is the Dashboard since it became the
+    # console's front door; what this asserts is the *fallback*, so the id it names is only
+    # the name of whichever tab happens to be first.
+    assert admin["landed"] == "Dashboard", admin["landed"]
     assert admin["alerts_rendered"] is False, "an administrator was drawn the root tier's queue"
     assert admin["queue_requests"] == 0, (
         "the console asked for an alert queue this session cannot read"

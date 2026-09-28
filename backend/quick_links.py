@@ -717,6 +717,19 @@ async def submit_quick_punch(
         # matched site's own shift window, and that window is the category's when the site has
         # not set one (see ``shift_windows.SITE_ROW_SQL``).
         sites = conn.execute(shift_windows.SITE_ROW_SQL).fetchall()
+        # The site this worker is clocked into may have been deleted while the shift was open,
+        # and then no configured geofence can ever match them again: the boundary the site had
+        # when it was removed is the only thing left that can say they are at a site. Read here,
+        # beside the session, because the decision immediately below is the one that needs it -
+        # and only when a shift is open, because a *deleted* site must never open one.
+        open_session = conn.execute(
+            "SELECT site_name FROM active_sessions WHERE worker_id = ?", (worker["id"],)
+        ).fetchone()
+        deleted_site = (
+            main.deleted_site_at(conn, lat, lon, prefer=open_session["site_name"])
+            if open_session is not None
+            else None
+        )
 
     detected_site = None
     detected_site_row = None
@@ -725,6 +738,13 @@ async def submit_quick_punch(
             detected_site = site["site_name"]
             detected_site_row = site
             break
+    if not detected_site and deleted_site is not None:
+        # The same exception ``/attendance/verify`` makes, on the same evidence and for the same
+        # reason: a shift that is already open can be closed from where it was opened, and the
+        # deleted fence is that place. There is no window row to go with it, so the shift is
+        # judged by the company rules - which is what ``effective_window`` documents for a site
+        # an administrator has deleted.
+        detected_site = deleted_site
     if not detected_site:
         raise HTTPException(
             status_code=403,
@@ -888,6 +908,13 @@ async def submit_quick_punch(
         flag_reason = f"quick link #{row['id']} ({action.lower()}) - selfie recorded, not matched"
         if liveness_flag:
             flag_reason = " | ".join(part for part in (liveness_flag, flag_reason) if part)
+        if detected_site_row is None:
+            # This punch matched no configured fence: it was admitted by the boundary the site
+            # had when it was deleted, and the row has to say so rather than leave an operator
+            # wondering how a punch outside every site was approved.
+            flag_reason = " | ".join(
+                part for part in (flag_reason, main.DELETED_SITE_REASON) if part
+            )
 
         if action == main.ACTION_CLOCK_OUT:
             # The same rule the password path applies: a worker with a row awaiting review does
@@ -983,6 +1010,21 @@ async def submit_quick_punch(
                     moment=now,
                 )
         else:
+            if detected_site_row is None:
+                # The shift this tap was closing ended between the gate and this lock, which
+                # makes the tap a clock-*in* - and a deleted site is not a place that opens a
+                # shift. The admission above is for closing one, so it must not be spent here.
+                _discard_photo(photo_name)
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "error_code": "outside_geofence",
+                        "message": (
+                            "Location rejected. This phone is outside every designated construction "
+                            "site, so the link cannot record a punch from here."
+                        ),
+                    },
+                )
             # A quick link can be used at any site, so the window is the one where the phone
             # actually is - not the global rule, and not the site the worker usually works at.
             site_window = shift_windows.effective_window(detected_site_row, rules)

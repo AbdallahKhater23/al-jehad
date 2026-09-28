@@ -170,8 +170,12 @@ def test_the_fixture_is_the_divergence_only_the_version_check_can_see(future_dat
         "the running code still has migrations to apply, so this fixture is the *other* "
         "divergence and every assertion below would be about a state no rollback produces"
     )
-    assert set(range(1, migrations.SCHEMA_VERSION + 1)) <= applied, (
-        f"the ledger is missing migrations this code does know about: {sorted(applied)}"
+    # The registered set, not ``range(1, SCHEMA_VERSION + 1)``: 28 is written and deliberately
+    # unregistered, so the number is free and no build stamps it (the gap is explained above
+    # ``MIGRATIONS``). Every version this code does register must still be in the ledger.
+    known = {version for version, _, _ in migrations.MIGRATIONS}
+    assert known <= applied, (
+        f"the ledger is missing migrations this code does know about: {sorted(known - applied)}"
     )
     assert _table_exists(future_database, NEWER_TABLE), (
         "the newer migration's own object is missing, so this fixture is a ledger edit rather "

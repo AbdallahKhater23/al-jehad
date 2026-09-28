@@ -148,8 +148,13 @@ def test_the_fixture_is_the_divergence_the_drift_guard_cannot_see(future_databas
         "divergence (a database behind the code) and every assertion below would be about a "
         "state no rollback produces"
     )
-    assert set(range(1, migrations.SCHEMA_VERSION + 1)) <= applied, (
-        f"the ledger is missing migrations this code does know about: {sorted(applied)}"
+    # Every migration *this code registers* is in the ledger - asked of the registry rather
+    # than of ``range(1, SCHEMA_VERSION + 1)``, because the registry has a deliberate gap: 28
+    # stays written-but-unregistered (see the note above ``MIGRATIONS``), so its number is
+    # free and no build ever stamps it.
+    known = {version for version, _, _ in migrations.MIGRATIONS}
+    assert known <= applied, (
+        f"the ledger is missing migrations this code does know about: {sorted(known - applied)}"
     )
     assert _table_exists(future_database, NEWER_TABLE), (
         "the newer migration's own object is missing, so this fixture is a ledger edit rather "

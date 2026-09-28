@@ -1941,6 +1941,199 @@ html.dark .ui-btn-warn:hover:not(:disabled) { color: #0f172a; }
 }
 .ui-fact-sub { font-size: 12px; color: var(--ops-muted); }
 
+/* ---------- The dashboard: the console's front door ---------------------
+   Five counted panels, read rather than worked. The queue row is the one
+   shape here that is not a fact grid: a figure large enough to read from a
+   step back, the words for it, and the button into the tab that owns that
+   queue - because "4 shifts to review" is only useful if the next tap opens
+   them. Every number on this screen is the server's; nothing is derived here,
+   which is why there is no arithmetic in this block either. */
+
+.dashboard-lead { max-width: 64ch; }
+.dashboard-stamp { margin: var(--ui-4) 0; }
+.dashboard-panel { margin-bottom: var(--ui-4); }
+
+/* --- the vital strip -----------------------------------------------------
+   The figures somebody needs *before* deciding to read anything, on one row that never
+   switches away: the state of the deployment stays on the screen whatever view is under it.
+   ``auto-fit`` with a 150px floor rather than fixed columns, because the five figures are
+   five different widths in four different scripts - a fixed grid would clip one of them in
+   Arabic. The whole tile is the button, so the tap target is the card and not a word in it. */
+.dashboard-vitals {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: var(--ui-3);
+    margin-bottom: var(--ui-4);
+}
+.dashboard-vital {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    /* 44px minimum, the console's own touch floor: this is the screen a phone opens on. */
+    min-height: 96px;
+    padding: var(--ui-3);
+    border: 1px solid var(--ops-border);
+    border-inline-start: 3px solid transparent;
+    border-radius: var(--ui-radius);
+    background: var(--ops-surface-2);
+    color: var(--ops-text);
+    font: inherit;
+    text-align: start;
+    cursor: pointer;
+    transition: border-color var(--ui-press), background var(--ui-press);
+}
+.dashboard-vital:hover { background: var(--ops-surface); }
+.dashboard-vital:focus-visible { outline: 2px solid var(--ops-primary); outline-offset: 2px; }
+/* The tone is a state, not decoration: a queue with something in it is the reason this screen
+   exists, and a queue that is empty is not marked at all. Same two hues the board next door
+   uses for the same two facts. */
+.dashboard-vital.is-warn { border-inline-start-color: var(--ops-warn); }
+.dashboard-vital.is-live { border-inline-start-color: var(--ops-live); }
+/* Unknown: the panel behind the figure could not be read. Dimmed rather than tinted - there
+   is no tone that means "we do not know", and inventing one would be the false good news
+   this screen exists to avoid. */
+.dashboard-vital.is-unknown { opacity: 0.7; }
+.dashboard-vital-value {
+    font-family: var(--ops-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 30px;
+    font-weight: 700;
+    line-height: 1.05;
+}
+.dashboard-vital-label {
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 1.35;
+    /* Two lines then an ellipsis: "Hours awaiting approval" is the longest of them, and a
+       label that wrapped to four lines would make the row of cards four different heights. */
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+.dashboard-vital-note { font-size: 12px; color: var(--ops-muted); }
+.dashboard-vital-link { margin-top: auto; font-size: 12px; color: var(--ops-primary-ink); }
+
+/* --- the view switcher ---------------------------------------------------
+   One card at a time, chosen from five. The container borrows the ``ops-seg`` capsule the
+   Live Ops board already uses for its site/category switch, but the *button* is its own rule:
+   this is a ``tablist``, so its selected state is ``aria-selected`` rather than ``aria-pressed``
+   - the same treatment, told to assistive technology in the vocabulary a tablist owns. */
+.dashboard-switch {
+    display: flex;
+    flex-wrap: wrap;
+    max-width: 100%;
+    margin-bottom: var(--ui-4);
+    border-radius: var(--ui-radius);
+}
+.dashboard-switch-btn {
+    min-height: 40px;
+    padding: 0 14px;
+    border: 0;
+    background: transparent;
+    color: var(--ops-text);
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background var(--ui-press), color var(--ui-press);
+}
+.dashboard-switch-btn + .dashboard-switch-btn { border-inline-start: 1px solid var(--ops-border); }
+.dashboard-switch-btn[aria-selected='true'] { background: var(--ops-primary); color: #fff; }
+.dashboard-switch-btn:focus-visible { outline: 2px solid var(--ops-primary); outline-offset: -2px; }
+.dashboard-sub { margin: var(--ui-4) 0 var(--ui-2); }
+.dashboard-link { margin-top: var(--ui-4); }
+/* The period panel's window control: two preset chips and the dates they resolved to. The
+   chip that is in effect needs no rule of its own - ``aria-pressed`` is already the console's
+   "this one is selected" treatment (see ``.ui-chip[aria-pressed='true']``) - so this block
+   only has to hold the row off the dates below it. */
+.dashboard-period-range { margin-bottom: var(--ui-3); }
+
+/* --- the day strip -------------------------------------------------------
+   One column per day of the window: the bar its present days, against the busiest day in the
+   window rather than against the roster (a quiet deployment must not look like a dead one).
+   Scrolls sideways rather than compressing: a month is 31 columns and a clamped window is 366,
+   and squeezing either into a phone's width would leave bars too thin to compare. The columns
+   are ``<li>`` in an ``<ol role="list">``, so the whole strip is readable as text. */
+.dashboard-days {
+    display: flex;
+    align-items: flex-end;
+    gap: 3px;
+    margin: var(--ui-2) 0 0;
+    padding: 0 0 var(--ui-1);
+    list-style: none;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+}
+.dashboard-day {
+    display: flex;
+    flex: 1 0 14px;
+    flex-direction: column;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 2px;
+    min-width: 14px;
+}
+/* The track is the full height of the strip and the bar sits at the bottom of it, so the bars
+   share a baseline: a chart whose bars hang from the middle reads as a waveform instead of as
+   a week. */
+.dashboard-day-track {
+    display: flex;
+    align-items: flex-end;
+    width: 100%;
+    height: 56px;
+    border-bottom: 1px solid var(--ops-border);
+}
+.dashboard-day-bar {
+    display: block;
+    width: 100%;
+    min-height: 4px;
+    border-radius: 3px 3px 0 0;
+    background: var(--ops-primary);
+}
+/* Nobody came in: no bar, and the column still exists - an absent column would read as a day
+   that is not part of the window at all. */
+.dashboard-day-bar.is-empty { height: 0; }
+/* A late arrival is a numeral, not only a colour: the count is the fact, the tint is the
+   shortcut to it. */
+.dashboard-day.is-late .dashboard-day-bar { background: var(--ops-warn); }
+.dashboard-day-late { font-size: 11px; font-weight: 700; color: var(--ops-warn); }
+.dashboard-day-tick {
+    font-family: var(--ops-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 10px;
+    color: var(--ops-muted);
+}
+.dashboard-sites { display: flex; flex-wrap: wrap; gap: var(--ui-2); margin-top: var(--ui-2); }
+.dashboard-queues {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: var(--ui-3);
+}
+.dashboard-queue {
+    display: flex;
+    flex-direction: column;
+    gap: var(--ui-1);
+    padding: var(--ui-3);
+    border: 1px solid var(--ops-border);
+    border-radius: var(--ui-radius);
+    background: var(--ops-surface-2);
+}
+/* The one figure on the page a reader is meant to take in without reading: the same size
+   the credentials screen gives an id, for the same reason - it is the number the rest of
+   the screen is about. */
+.dashboard-queue-value {
+    font-family: var(--ops-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 26px;
+    font-weight: 700;
+    line-height: 1.1;
+    color: var(--ops-text);
+}
+.dashboard-queue-label { font-size: 13px; color: var(--ops-muted); }
+.dashboard-queue .ui-btn { align-self: flex-start; margin-top: var(--ui-1); }
+
 /* ---------- Company mark: the console's preview -------------------------
    The mark as the company set it, on the same ground the paper it prints on
    uses. A fixed box with ``contain``, because a configured logo is whatever
@@ -2674,6 +2867,47 @@ html.dark .ui-btn-warn:hover:not(:disabled) { color: #0f172a; }
 .hand-note-title { display: flex; align-items: flex-start; gap: 8px; margin: 0; font-weight: 700; }
 .hand-note-title svg { width: 16px; height: 16px; flex: none; margin-top: 1px; }
 .hand-note-sub { margin: 3px 0 0; font-size: 12px; font-weight: 500; }
+
+/* ---------- The welcome a new worker meets ------------------------------- */
+
+/* The first card a hired worker's own account ever draws, and the only card in this app that
+   leads with a fact rather than a state: the id they sign in with. It is a card and not a badge
+   for that reason - a badge on a tab is a count somebody has to already care about, and this
+   reader has no way of knowing there is anything to care about yet. The edge is the live green
+   rather than the warning orange: nothing here is wrong, and the one impression a brand-new
+   worker must not take from their own welcome is that something is. */
+.hand-welcome {
+    padding: var(--ui-3);
+    border: 0;
+    border-inline-start: 3px solid var(--ops-live);
+    border-radius: var(--ui-radius);
+    background: var(--ops-live-wash);
+    box-shadow: var(--ops-shadow);
+    text-align: start;
+}
+.hand-welcome-title { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 15px; font-weight: 700; color: var(--ops-live-ink); }
+.hand-welcome-title svg { width: 18px; height: 18px; flex: none; }
+.hand-welcome-lead { margin: 4px 0 0; font-size: 13px; font-weight: 600; color: var(--ops-text); }
+/* The number is the whole point of the card, so it gets a row of its own and the largest type
+   on the screen. Tabular digits for the reason every other figure here has them: this is a
+   number somebody reads out over the phone, or checks against the slip an administrator handed
+   them at the gate. */
+.hand-welcome-id {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--ui-3);
+    margin: var(--ui-3) 0 0;
+    padding: 8px var(--ui-3);
+    border: 1px solid var(--ops-border);
+    border-radius: var(--ui-radius-sm);
+    background: var(--ops-surface);
+}
+.hand-welcome-id-label { font-size: 12px; font-weight: 600; color: var(--ops-muted); }
+.hand-welcome-id-value { font-family: var(--ops-mono); font-size: 26px; font-weight: 700; line-height: 1.1; color: var(--ops-text); }
+.hand-welcome-body { margin: var(--ui-3) 0 0; font-size: 13px; line-height: 1.5; color: var(--ops-text); }
+.hand-welcome-ok { margin-top: var(--ui-3); width: 100%; }
+.hand-welcome-kept { margin: 8px 0 0; font-size: 12px; color: var(--ops-muted); }
 
 /* ---------- Stacks and bubbles ----------------------------------------- */
 

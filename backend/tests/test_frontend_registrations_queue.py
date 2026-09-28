@@ -3,27 +3,28 @@
 WHY THIS EXISTS
 ---------------
 ``test_walk_up_registration`` covers the intake end to end on the server: the switch, the
-validation order, the pending row, the queue cap, the photograph that is destroyed rather
-than kept, and the approval that is the only thing which creates an account. What it cannot
-see is the reviewer: whether anybody can *reach* the queue, read a face before deciding,
-hire somebody, and be told the number they were hired under. That is this file.
+validation order, the held account, the queue cap, the face filed at submission, and the one
+status change an administrator makes. What it cannot see is the reviewer: whether anybody can
+*reach* the queue, read a face before deciding, approve somebody, and be told what to hand over
+now that the account is theirs. That is this file.
 
 Five properties, and each one is a decision rather than a rendering detail:
 
 1. **the tab is a console screen, for the console's audience.** It is offered to an
    administrator (the route behind it is ``admin_only``), it sits with the other people
    screens, and it draws a glyph of its own.
-2. **the queue is the server's, oldest first.** The read asks for ``PENDING_REVIEW`` and renders
-   the rows in the order they arrived, because the applicant at the front is the one being
-   phoned about.
+2. **the queue is the server's, oldest first.** The read asks for ``pending_approval`` and
+   renders the rows in the order they arrived, because the applicant at the front is the one
+   being phoned about.
 3. **the photograph is fetched, never embedded.** An ``<img src>`` cannot carry a token, so
    a URL that worked in a ``src`` would be a URL that worked for anybody - and forty
    applications in one response would be forty faces. One request, this session's
    credential, on the reviewer's own tap.
-4. **the id an approval minted survives the row that produced it.** An approved application
-   leaves the queue by definition, so the number the new worker signs in with is kept on
-   the screen (and in the answer the server sent) rather than in a toast that scrolls away.
-   A refusal needs a reason here, and it destroys the photograph.
+4. **the account a decision was about survives the row that produced it.** A decided account
+   leaves the queue by definition, so what the administrator has to hand over - the id and the
+   contact the sign-in route matches on - is kept on the screen (and in the answer the server
+   sent) rather than in a toast that scrolls away. A refusal needs a reason here, and the server
+   answers whether the face came with it.
 5. **every sentence exists in all four language tables.** A string that reaches three of
    them is a blank line for the reader of the fourth.
 
@@ -53,28 +54,49 @@ HARNESS = r"""
 //  applicant typed into a public form, and it is rendered inside a card.
 const PENDING = [
     {
-        id: 7, status: 'PENDING_REVIEW', full_name: 'Nadia Saleh', phone: '+965 555 0101',
+        id: '7', status: 'pending_approval', full_name: 'Nadia Saleh', phone: '+965 555 0101',
         email: 'nadia@example.com', requested_role: 'worker',
-        work_details: 'Formwork, six years on tower sites.', assigned_id: null,
-        submitted_ip: '10.0.0.9', consent_version: '1', created_at: '2026-09-25 06:40:00',
-        reviewed_by: null, reviewed_at: null, decision_note: null
+        work_details: 'Formwork, six years on tower sites.',
+        created_at: '2026-09-25 06:40:00', has_photo: true, photo_bytes: 4096
     },
     {
-        id: 8, status: 'PENDING_REVIEW', full_name: '<img src=x onerror=alert(1)>Omar',
+        id: '8', status: 'pending_approval', full_name: '<img src=x onerror=alert(1)>Omar',
         phone: '', email: 'omar@example.com', requested_role: 'moallem',
-        work_details: '', assigned_id: null, submitted_ip: '10.0.0.10',
-        consent_version: '1', created_at: '2026-09-26 05:10:00',
-        reviewed_by: null, reviewed_at: null, decision_note: null
+        work_details: '', created_at: '2026-09-26 05:10:00', has_photo: true, photo_bytes: 4096
     }
 ];
 
-//: The id the fake approval mints. Deliberately not one of the fixture's accounts: this is
-//: a number that only exists in the answer, which is what makes it worth asserting.
+//: The account the fake approval is about. Deliberately not one of the fixture's accounts: this
+//: is a number that only exists in the answer, which is what makes it worth asserting.
 const MINTED = '1042';
 
 let queueFails = null;          // a status to answer the queue read with, or null
 let photoMissing = false;       // answer the photograph with 404
 let approveWritesTemplate = true;
+//: The contact the fake approval answers with. It comes back in the *answer* because the queue
+//: row that held it has left the queue the moment it is approved - and it is the second of the
+//: three credentials a first sign-in is typed with.
+let approveContact = { email: 'nadia@example.com', phone: '+965 555 0101' };
+
+//: Which switch is deciding the link's state, as the fake server reports it. ``open`` is the
+//: ordinary case; the other two are the two ways it can be shut, and the console is required to
+//: tell them apart - one of them is a lever it can move and the other is not.
+let intakeReason = 'open';
+let intakeFails = null;         // a status to answer the intake read with, or null
+const intakePosts = [];         // every intake write, in order
+
+function intakeBody() {
+    return {
+        status: 'success',
+        accepting: intakeReason === 'open',
+        reason: intakeReason,
+        deployment_enabled: intakeReason !== 'closed_by_deployment',
+        console_open: intakeReason !== 'closed_by_console',
+        decided: intakeReason === 'closed_by_console',
+        updated_at: null,
+        updated_by: intakeReason === 'closed_by_console' ? '1000' : null
+    };
+}
 let rejectDestroysPhoto = true;
 let decisionFails = null;       // a status to answer a decision with, or null
 const decisions = [];           // every decision posted, in order
@@ -107,19 +129,35 @@ function responders(url, init) {
             return {
                 status: 200,
                 body: {
-                    status: 'success', request_id: requestId, worker_id: MINTED,
+                    status: 'success', user_id: MINTED,
                     name: 'Nadia Saleh', role: 'worker', template_written: approveWritesTemplate,
-                    message: 'Account ' + MINTED + ' created for Nadia Saleh.'
+                    email: approveContact.email, phone: approveContact.phone,
+                    message: MINTED + ' is approved: Nadia Saleh can clock in from now on.'
                 }
             };
         }
         return {
             status: 200,
             body: {
-                status: 'success', request_id: requestId, photo_destroyed: rejectDestroysPhoto,
-                message: 'The request was refused and the photograph has been destroyed.'
+                status: 'success', user_id: String(requestId),
+                photo_destroyed: rejectDestroysPhoto,
+                message: 'The account was refused and its face has been destroyed.'
             }
         };
+    }
+    if (/\/admin\/registrations\/intake$/.test(path)) {
+        if (intakeFails) return { status: intakeFails, body: { detail: 'Database is locked.' } };
+        if (init && String(init.method || 'GET').toUpperCase() === 'POST') {
+            const wanted = JSON.parse(init.body);
+            intakePosts.push({ path: path, body: wanted });
+            // The *answer* is the state, not the request: a deployment that does not run walk-up
+            // registration stores the operator's intent and still answers "closed by
+            // deployment", and the console is required to draw that rather than what it asked.
+            if (intakeReason !== 'closed_by_deployment') {
+                intakeReason = wanted.open ? 'open' : 'closed_by_console';
+            }
+        }
+        return { status: 200, body: intakeBody() };
     }
     if (path.indexOf('/admin/registrations') >= 0) {
         reads.push(path);
@@ -166,6 +204,10 @@ function consoleEnv() {
     queueFails = null;
     photoMissing = false;
     approveWritesTemplate = true;
+    approveContact = { email: 'nadia@example.com', phone: '+965 555 0101' };
+    intakeReason = 'open';
+    intakeFails = null;
+    intakePosts.length = 0;
     rejectDestroysPhoto = true;
     decisionFails = null;
     decisions.length = 0;
@@ -294,8 +336,29 @@ const results = {};
         minted_id: textOf((/<p class="ui-fact-value" data-registration-minted-id>([\s\S]*?)<\/p>/.exec(markup) || [])[0] || ''),
         warning: markup.indexOf('data-registration-template-warning') >= 0,
         receipt: textOf((/<div class="ui-card is-ok"[\s\S]*?<\/div>/.exec(markup) || [])[0] || ''),
+        // What the console has to hand over, and the decision it kept to draw it from.
+        signin: (/data-registration-signin="([^"]*)"/.exec(markup) || [])[1],
+        signin_text: textOf((/<p class="ui-note" data-registration-signin="[^"]*">([\s\S]*?)<\/p>/.exec(markup) || [])[0] || ''),
+        signin_expected: env.evaluate("I18n.__('registrationsSignIn').replace('{id}', '1042').replace('{contact}', '+965 555 0101 \u00b7 nadia@example.com')"),
+        approved_sentence: env.evaluate("I18n.__('registrationsApproved').replace('{id}', '1042').replace('{name}', 'Nadia Saleh')"),
+        page_text: textOf(markup),
+        last: env.evaluate("UI_MODULES._registrationsLast"),
         toast: toasts(env).join(' | '),
         queue_reads: reads.slice()
+    };
+}
+
+// 6b. ...and an application that gave no contact at all is told to leave that box empty
+{
+    const env = consoleEnv();
+    approveContact = { email: '', phone: '' };
+    await env.evaluate("UI.renderAdminTab('Registrations')");
+    await env.evaluate("UI_MODULES.handleRegistration('7', 'approve')");
+    const markup = render(env);
+    results.no_contact = {
+        signin_text: textOf((/<p class="ui-note" data-registration-signin="[^"]*">([\s\S]*?)<\/p>/.exec(markup) || [])[0] || ''),
+        signin_expected: env.evaluate("I18n.__('registrationsSignInNoContact').replace('{id}', '1042')"),
+        generic_sentence: env.evaluate("I18n.__('registrationsSignIn')")
     };
 }
 
@@ -418,6 +481,64 @@ const results = {};
         label: env.evaluate("I18n.__('registrations')")
     };
 }
+
+// 13. the link's own switch: the state it is drawn in, and the one action it offers
+{
+    const env = consoleEnv();
+    await env.evaluate("UI.renderAdminTab('Registrations')");
+    const openMarkup = render(env);
+    // Closing the link is a real decision, so the console is then asked to draw what the server
+    // answered rather than what it asked for.
+    await env.evaluate("UI_MODULES.toggleRegistrationsIntake('close')");
+    const closedMarkup = render(env);
+    // The card, cut at the sentence that closes it rather than at the first closing tag: the
+    // card is nested (a spread, a row of two facts), so a ``</div>``-terminated match stops
+    // before the reason line - which is the half this is about.
+    const cardText = (markup) => textOf((/<div class="ui-card" data-registrations-intake="[^"]*"[\s\S]*?<\/p>/.exec(markup) || [])[0] || '');
+    results.intake = {
+        open_state: (/data-registrations-intake-state="([^"]*)"/.exec(openMarkup) || [])[1],
+        open_card: (/data-registrations-intake="([^"]*)"/.exec(openMarkup) || [])[1],
+        open_action: (/data-registration-intake="([^"]*)"/.exec(openMarkup) || [])[1],
+        open_text: cardText(openMarkup),
+        open_sentence: env.evaluate("I18n.__('registrationsIntakeWhyOpen')"),
+        closed_state: (/data-registrations-intake-state="([^"]*)"/.exec(closedMarkup) || [])[1],
+        closed_action: (/data-registration-intake="([^"]*)"/.exec(closedMarkup) || [])[1],
+        closed_text: cardText(closedMarkup),
+        closed_sentence: env.evaluate("I18n.__('registrationsIntakeWhyClosedByConsole')"),
+        posts: intakePosts.slice(),
+        toast: toasts(env).join(' | ')
+    };
+}
+
+// 14. a deployment that does not run walk-up registration is drawn with no lever at all
+{
+    const env = consoleEnv();
+    intakeReason = 'closed_by_deployment';
+    await env.evaluate("UI.renderAdminTab('Registrations')");
+    const markup = render(env);
+    results.intake_deployment_off = {
+        state: (/data-registrations-intake-state="([^"]*)"/.exec(markup) || [])[1],
+        // ``data-registration-intake`` is the button; ``data-registrations-intake`` is the card.
+        lever: markup.indexOf('data-registration-intake=') >= 0,
+        text: textOf((/<div class="ui-card" data-registrations-intake="[^"]*"[\s\S]*?<\/p>/.exec(markup) || [])[0] || ''),
+        sentence: env.evaluate("I18n.__('registrationsIntakeWhyClosedByDeployment')")
+    };
+}
+
+// 15. a switch whose state could not be read is left off the screen rather than guessed at
+{
+    const env = consoleEnv();
+    intakeFails = 503;
+    await env.evaluate("UI.renderAdminTab('Registrations')");
+    const markup = render(env);
+    results.intake_unreadable = {
+        card: markup.indexOf('data-registrations-intake=') >= 0,
+        lever: markup.indexOf('data-registration-intake=') >= 0,
+        // The queue's own closed note is drawn from the queue read, so the screen still says
+        // whether the link is accepting - there is just no control on it.
+        queue_drawn: cardsOf(markup).length
+    };
+}
 """
 
 
@@ -451,7 +572,7 @@ def test_the_queue_is_read_pending_and_drawn_in_the_order_it_arrived(results):
     # different limit (see ``test_the_waiting_count_reaches_the_tab_badge``).
     panel = [read for read in queue["reads"] if "limit=200" in read]
     assert len(panel) == 1, queue["reads"]
-    assert "status=PENDING_REVIEW" in panel[0], (
+    assert "status=pending_approval" in panel[0], (
         "the work to do is the pending queue, not the archive, and the status is the server's "
         "own constant - the endpoint answers 400 for anything it does not know"
     )
@@ -514,15 +635,61 @@ def test_approving_posts_the_note_and_shows_the_id_it_minted(results):
     posted = approve["posted"][0]
     assert posted["path"] == "/admin/registrations/7/approve"
     assert posted["body"] == {"note": "Hired for the B site"}, posted["body"]
-    # The row is gone from the queue by definition, so the number it was hired under has to
-    # outlive it - this is the id the worker signs in with.
+    # The account leaves the queue by definition, so the id it is known by has to outlive the
+    # row - this is the number the worker signs in with.
     assert approve["minted"] == "1042"
     assert approve["minted_id"] == "1042"
-    assert "Account 1042 was created for Nadia Saleh." in html_module.unescape(approve["receipt"])
-    assert approve["warning"] is False, "the face reference was written in this answer"
+    assert approve["approved_sentence"] in approve["page_text"], (
+        f"the receipt does not say the account was approved: {approve['page_text']!r}"
+    )
+    assert approve["warning"] is False, "the face reference is on file in this answer"
     assert "1042" in approve["toast"]
     # And the queue was re-read afterwards, so the decided row is not left on screen.
     assert len(approve["queue_reads"]) >= 2, approve["queue_reads"]
+
+
+def test_the_receipt_hands_over_the_id_the_contact_and_what_to_do_with_them(results):
+    """Three credentials open a first sign-in, and the applicant has none of them written down.
+
+    The id is minted by the approval, the contact is whatever they typed on a public form, and
+    the password is one they chose and then never used - so the administrator who made the
+    account is the only person who can hand all three over at once, and this receipt is where
+    they read them. The queue row that held the contact has left the queue by definition, so the
+    approval's answer has to carry it back; that is the ``email``/``phone`` pair above.
+    """
+    approve = results["approve"]
+    assert approve["signin"] == "1042", "the line is tied to the id it is about"
+    text = html_module.unescape(approve["signin_text"])
+    assert text == approve["signin_expected"], (
+        f"the receipt is not the sentence the table defines: {text!r}"
+    )
+    assert "1042" in text
+    assert "+965 555 0101" in text and "nadia@example.com" in text, (
+        f"the contact is the value the sign-in route matches, so it has to be on the card: {text!r}"
+    )
+    assert "password" in text
+    # ...and it is drawn from the decision the console kept, not from the row it no longer has.
+    assert approve["last"]["phone"] == "+965 555 0101", approve["last"]
+    assert approve["last"]["email"] == "nadia@example.com", approve["last"]
+
+
+def test_an_application_with_no_contact_is_told_to_leave_that_box_empty(results):
+    """Both contact columns are optional, and the sign-in route matches whatever is stored.
+
+    So the value that opens *this* account is an empty box - the same reason the login form's own
+    email-or-phone input is deliberately not ``required``. An instruction that named a contact
+    the applicant never gave would send them looking for one that does not exist.
+    """
+    no_contact = results["no_contact"]
+    text = html_module.unescape(no_contact["signin_text"])
+    assert text == no_contact["signin_expected"], (
+        f"the receipt is not the sentence the table defines: {text!r}"
+    )
+    assert "1042" in text
+    assert "empty" in text.lower(), f"nothing says what to do with the box: {text!r}"
+    assert text != no_contact["generic_sentence"], (
+        "an application with no contact was given the sentence that names one"
+    )
 
 
 def test_an_account_whose_face_could_not_be_stored_is_reported_as_one(results):
@@ -573,7 +740,7 @@ def test_the_waiting_count_reaches_the_tab_badge(results):
     # The same constant the queue panel asks for. A badge read with the other spelling of
     # pending is a 400 in a ``catch`` that keeps the last count, so the numeral would simply
     # never appear on a console nobody had opened that tab on.
-    assert all("status=PENDING_REVIEW" in path for path in badge["badge_read"]), badge["badge_read"]
+    assert all("status=pending_approval" in path for path in badge["badge_read"]), badge["badge_read"]
     assert painted["count"] == 2
     assert painted["text"] == "2"
     assert "2" in painted["label"]
@@ -627,17 +794,17 @@ def test_the_status_the_console_asks_for_is_one_the_server_answers():
     """The queue read is the server's own status value, not the word this screen would choose.
 
     A frontend suite stubs the server, so a query string the console invented passes here and
-    fails in the console - as a screenful of "status must be one of PENDING_REVIEW, APPROVED,
-    REJECTED or 'all'." for the administrator who opened the tab. The backend is the only
+    fails in the console - as a screenful of "status must be one of pending_approval, active,
+    inactive or 'all'." for the administrator who opened the tab. The backend is the only
     authority on that vocabulary, so it is read here rather than assumed: the values the
     console puts in a ``status=`` parameter are checked against the constants the endpoint
     validates against.
     """
     console = (FRONTEND / "admin_modules.js").read_text(encoding="utf-8")
     server = (BACKEND / "registrations.py").read_text(encoding="utf-8")
-    asked = set(re.findall(r"/admin/registrations\?status=([A-Z_]+)", console))
+    asked = set(re.findall(r"/admin/registrations\?status=([a-z_]+)", console))
     assert asked, "the console does not name a status, so the read depends on the server's default"
-    known = set(re.findall(r'^STATUS_[A-Z_]+ = "([A-Z_]+)"', server, re.MULTILINE))
+    known = set(re.findall(r'^STATUS_[A-Z0-9_]+ = "([a-z_]+)"', server, re.MULTILINE))
     assert known, "the server's status vocabulary moved and this check found nothing to hold to"
     for value in sorted(asked):
         assert value in known, (
@@ -645,3 +812,71 @@ def test_the_status_the_console_asks_for_is_one_the_server_answers():
             f"values ({', '.join(sorted(known))}): the queue screen would render "
             "'status must be one of ...' instead of the queue"
         )
+
+
+def test_the_intake_switch_is_drawn_with_its_state_and_one_action(results):
+    """The one control on this screen, and the reason it is a control rather than a label.
+
+    The public form is a URL the company prints once, so opening and closing it is an operator's
+    decision on the day. What the card has to carry is both the *state* - the reader has to be
+    able to tell open from closed without pressing anything - and which switch decided it, since
+    only one of the two is movable from here.
+    """
+    intake = results["intake"]
+    assert intake["open_state"] == "open", "the card is not drawn in the server's own state"
+    assert intake["open_card"] == "open"
+    assert intake["open_action"] == "close", (
+        "an open link offers to close, and the attribute names the direction rather than the "
+        "current position - a handler that read a position would send the opposite of the tap"
+    )
+    assert intake["open_sentence"] in intake["open_text"], (
+        f"a state with no reason beside it is one an operator cannot act on: {intake['open_text']!r}"
+    )
+
+
+def test_closing_the_link_posts_the_switch_and_draws_what_came_back(results):
+    """The answer is the state, and the screen is redrawn from it rather than from the request.
+
+    A write the deployment flag refuses stores the operator's intent and still leaves the link
+    shut - so a console that repeated what it asked for would report an open form while the form
+    refuses every applicant.
+    """
+    intake = results["intake"]
+    assert intake["posts"], "the control posted nothing at all"
+    posted = intake["posts"][0]
+    assert posted["path"] == "/admin/registrations/intake", posted["path"]
+    assert posted["body"] == {"open": False}, posted["body"]
+    assert intake["closed_state"] == "closed_by_console", (
+        "the link shut but the screen still says otherwise"
+    )
+    assert intake["closed_action"] == "open", "a closed link offers no way back"
+    assert intake["closed_sentence"] in intake["closed_text"], intake["closed_text"]
+
+
+def test_a_deployment_that_does_not_run_registration_is_drawn_without_a_lever(results):
+    """One of the two switches cannot be moved from here, and the card says which.
+
+    A lever that cannot move the thing beside it is worse than no lever: the operator presses it,
+    nothing changes, and what they conclude is that this screen is broken - rather than that the
+    deployment does not run walk-up registration at all. Same rule the rail follows for a tab the
+    reader cannot act on.
+    """
+    blocked = results["intake_deployment_off"]
+    assert blocked["state"] == "closed_by_deployment"
+    assert blocked["lever"] is False, (
+        "a control was drawn for a switch this console cannot move"
+    )
+    assert blocked["sentence"] in blocked["text"], blocked["text"]
+
+
+def test_a_switch_that_could_not_be_read_leaves_no_control_behind(results):
+    """A state that could not be read is not a state to draw a lever in.
+
+    The queue's own closed note is drawn from the *queue* read, so the screen still answers
+    whether the link is accepting - there is simply no switch on it, which is the honest thing to
+    show when the switch's position is unknown.
+    """
+    unreadable = results["intake_unreadable"]
+    assert unreadable["card"] is False, "a card was drawn for a state the server never sent"
+    assert unreadable["lever"] is False
+    assert unreadable["queue_drawn"] == 2, "the queue itself was lost with the switch read"

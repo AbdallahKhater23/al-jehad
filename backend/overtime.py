@@ -1134,6 +1134,12 @@ def scan_auto_close(*, now: datetime | None = None) -> dict:
         #: nothing to do - and the summary is how an operator tells those apart.
         "holding": 0,
         "authorised": [],
+        #: Open travel shifts this pass refused to end, with the shift each one is. They are not
+        #: "skipped" in the ordinary sense - nothing about them was unqualified, the rule simply
+        #: is not allowed to close them (see the branch in the loop) - and a shift left open on
+        #: purpose has to be distinguishable from a watcher that missed it.
+        "transit_held": 0,
+        "awaiting_arrival": [],
     }
     #: The worker notices this pass wrote, so ``deliver_worker_notices`` can push them once
     #: the transaction below has committed.
@@ -1158,7 +1164,8 @@ def scan_auto_close(*, now: datetime | None = None) -> dict:
 
             regular = shift_hours.regular_hours(values)
             sessions = conn.execute(
-                "SELECT worker_id, site_name, clock_in_time FROM active_sessions"
+                "SELECT worker_id, site_name, clock_in_time, is_transit, transit_start_time "
+                "FROM active_sessions"
             ).fetchall()
             # Resolve each shift's standing answer once. An approval arms the close even when
             # the general close is off or standing down, so the early exit below is only taken
@@ -1176,6 +1183,31 @@ def scan_auto_close(*, now: datetime | None = None) -> dict:
                 summary["scanned"] += 1
                 clock_in = _parse_ts(session["clock_in_time"])
                 if clock_in is None:
+                    continue
+                if int(session["is_transit"] or 0):
+                    # An unconfirmed travel shift is not this rule's to end, and that is a
+                    # correction rather than a policy choice: the close below writes an
+                    # *approved* row, so closing a shift that never reached a site would pay it
+                    # - the automatic approval the transit feature exists to withhold ("a shift
+                    # that never reaches a site is never auto-approved"). Nothing this rule can
+                    # see bounds such a shift: no site, no window, no arrival, and a ceiling
+                    # somebody authorised is a permission to work on, not evidence the trip
+                    # ended. It ends when it reaches a fence (the worker's own arrival) or when
+                    # an administrator ends it (`/admin/force_clock_out`, which the worker can
+                    # ask for with `/worker/me/request_checkout`). Counted and named rather than
+                    # silently passed over, because "left open on purpose" and "the watcher
+                    # missed it" look identical in a summary that says nothing.
+                    summary["transit_held"] += 1
+                    summary["awaiting_arrival"].append(
+                        {
+                            "worker_id": session["worker_id"],
+                            "clock_in_time": session["clock_in_time"],
+                            "transit_start_time": session["transit_start_time"],
+                            "elapsed_hours": round(
+                                max(0.0, (moment - clock_in).total_seconds() / 3600.0), 4
+                            ),
+                        }
+                    )
                     continue
                 authorised = _is_authorised(decision)
                 if not general_close and not authorised:

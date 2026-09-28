@@ -6,54 +6,103 @@ WHY THIS IS NOT A PER-PERSON INVITE
 creates the account, and the link registers its owner's face. That is the right shape for one
 named hire and the wrong one for a walk-up, where nobody has applied yet and so there is no
 account to hold a face. Here there is one link for the whole site, anybody can submit to it, and
-nothing about the applicant is decided until an administrator reads the request.
+the account it creates waits for an administrator: it can be signed into immediately, and it
+cannot record a single punch until somebody approves it.
 
 WHAT THE THREE PARTS ARE FOR
 ----------------------------
-* **The intake switch** (``settings.registration_enabled``) is off by default. A static link
-  gets forwarded, and this is the kill switch that closes it without a deploy - on the same
-  reasoning as the calibration switch, a public endpoint that collects a face is not something a
-  deployment should *discover* it is running.
-* **The queue** is the review surface. Submission writes a request and nothing else: no account,
-  no roster entry, no shift, no payroll. Approval is the only thing that creates an account, and
-  it does so atomically (see ``approve_registration``).
+* **The intake switch** is two switches, because they answer two different questions.
+  ``settings.registration_enabled`` (``REGISTRATION_ENABLED``) is the *deployment's*: may this
+  installation collect walk-up applications at all. It ships off, and it is the kill switch - on
+  the same reasoning as the calibration switch, a public endpoint that collects a face is not
+  something a deployment should *discover* it is running. The ``registration_settings`` row is
+  the *operator's*: is the permanent link accepting applications today, a shift-to-shift decision
+  made in the console with no restart. The deployment switch is a ceiling over the operator's
+  (``intake_state``), so an administrator session can never switch on an intake a deployment
+  deliberately does not run - and the console says which of the two is holding the link shut.
+* **The quarantine** is ``users.status``. A submission writes a real account - the id, the name,
+  the contact, the password and the face - as ``pending_approval``, and answers the applicant with
+  the id: they sign in with it at once and cannot clock in or out (``main.verify_worker`` refuses
+  the status before it looks at the fence or the camera). Approval flips that one value to
+  ``active``; a refusal deletes the row and wipes the face, which frees the number.
 * **The decision** is a human's. A photograph of a face is judged by an administrator looking at
-  it, not by a model - which is why no model runs on the public route at all (see below).
+  it, not by a model - the reviewer's eyes are the decision, and the model work below is what a
+  reviewer is *given*, never a verdict of its own.
 
-WHY THE PUBLIC ROUTE RUNS NO MODELS
------------------------------------
-Two reasons, and both are about the deployment rather than about elegance. A public endpoint that
-runs an ONNX inference is a way to keep the one vCPU that also serves the gate busy for free; and
-this application's position on uploads is that liveness can only ever be *advisory* here, because
-a file on disk cannot be proven live. So the public route streams the body to disk through the
-shared upload policy, checks the text, and inserts a row. The face is decoded and embedded exactly
-once, at review, inside the face-engine pool - where the reviewer's decision is what the model
-work is *for*.
+THE ACCOUNT EXISTS BEFORE THE DECISION, AND THAT IS THE POINT
+-------------------------------------------------------------
+This replaced a holding table (``registration_requests``, migration 24) in which an approval was
+the only thing that created an account. The reason it changed is the one thing the old shape
+could not do: tell the applicant what their id was. There the number was minted by the decision,
+so the person waiting was anonymous to a system that would not let them in - they could not check
+whether they had been approved, could not see a notice waiting for them, and if the administrator
+who approved them went home the number existed only on that console's receipt. An account that
+exists and is quarantined answers all three, and the quarantine is the same gate as before: no
+punch without a decision.
 
-WHY THE ACCOUNT ID IS NOT PROMISED UNTIL THE DECISION
------------------------------------------------------
-The id is allocated at approval, inside the same write transaction that inserts the account, by
-``_next_workforce_id``. A number told to the applicant at submission would be a promise this
-application cannot keep: another approval, or an administrator working in the console, may take it
-in the meantime, and an applicant who was told "you are 43" and then hired as 51 is a worse
-experience than one who was told nothing. The answer they get is "we have your request", and the
-number arrives with the account.
+WHAT THE OLD SHAPE COULD NOT ENFORCE, AND THIS ONE CAN
+------------------------------------------------------
+"Cannot clock in yet" is now a fact the *server* holds about the account, checked on every punch
+(``status = 'pending_approval'``) rather than an absence of rows that a second code path had to
+remember to preserve. That is why the refusal lives in the punch endpoint beside the geofence and
+the face match instead of in whichever routes happened to need an account: an approval that is
+reversed, a session that outlives a refusal, a token minted before the decision - all of them
+meet the same line.
 
-Nothing reserves a number any more, and this is the only allocator left. The range-scoped
-allocator in ``security`` and the account id a ``kind=register`` invite used to hold both went
-with the per-role id bands, because an invite now registers a face for an account that already
-exists. What an approval hands out is the next number below the administrative tiers, and a
-number above that floor cannot be minted here at all.
+WHY THE PUBLIC ROUTE NOW RUNS A MODEL
+-------------------------------------
+It did not before, and the reason it does is the shape above: the face has to be *on the account*
+before the account is worth anything, and the account now exists before anybody has decided
+anything - so the embedding happens exactly once, at submission, where the photograph is. The
+alternative - embed at approval - means holding the applicant's face on disk in a private
+directory until an administrator gets round to it, which is the copy this application spends
+every other paragraph refusing to keep.
 
-ONE PHOTOGRAPH IS ONE REQUEST, ONE DECISION DESTROYS THE PHOTO
---------------------------------------------------------------
-The same upload cannot become two pending requests - a script with one JPEG gets one row instead
-of filling the review queue with copies of it (the partial unique index in migration 24). And a
-rejected photo is wiped rather than filed: an intake funnel that keeps the faces it turned down
-would contradict the retention story this system tells about every other face it stores. An
-*approved* photo is destroyed too, once the reference template has been written - the face then
-lives in the biometric store, under an immutable id, where ``retention`` already knows how to
-find it. Keeping a second copy in an intake directory would be a face nothing sweeps.
+The deployment cost is bounded rather than waved away: the work runs in the shared face-engine
+pool (``face_engine.ENGINE``), the same bounded queue a punch waits in, so a burst of walk-ups
+cannot run more inferences at once than a burst of punches - it makes both slower, which is the
+trade, and the intake switch plus the rate limit are what stop a stranger spending that capacity
+at will. Liveness stays advisory for the reason it always was: a file on disk cannot be proven
+live, so on this route the liveness verdict is a note for the reviewer and never a refusal of its
+own.
+
+WHY THE LOWEST FREE NUMBER, AND NOT THE NEXT ONE
+------------------------------------------------
+The id is allocated at submission, inside the same write transaction that inserts the account, by
+``_next_workforce_id``, and it is the lowest number in the workforce band that nobody holds. That
+is a *change*: the previous allocator counted upward, and its docstring argued that a number given
+back by a deleted account should not be handed out again because the queue would have spent it
+twice. That argument does not survive the account existing - there is no queue, and the number is
+not a promise being made to somebody waiting, it is the identity of an account about to be created
+or not created at all.
+
+What makes reuse safe here is the *refusal* rather than the allocator: a rejected applicant's row
+is deleted and their reference wiped from the biometric store by ``biometrics.remove_files`` before
+the number is free, so the next holder of that id cannot be scored against the face of the person
+before them. A number a worker *might* meet again is one a retired (deactivated) account still
+holds, and that one is not free - the band is scanned for ids in use, not for ids ever used.
+
+Both edges still matter and both are enforced here: the band starts at 1, and it ends below the
+administrative tiers (``ADMIN_TIER_ID_FLOOR``), so a public form can never mint a number that looks
+like an administrator's - and a band with no room answers 409 by name rather than wrapping around
+onto an account that is still in use.
+
+ONE PHOTOGRAPH IS ONE FACE, AND IT LIVES IN THE BIOMETRIC STORE
+---------------------------------------------------------------
+The upload is staged on disk under the shared policy, read once for the embedding, and removed by
+the request that wrote it as soon as the reference has a home. What survives is the reference
+under the account's immutable biometric id, where ``retention`` already knows how to find and wipe
+it - nothing keeps a second copy in an intake directory for a reviewer to browse, because that
+copy is exactly the face that would outlive the account it belongs to. A refusal wipes the
+reference rather than filing it: an intake funnel that kept the faces it turned down would
+contradict the retention story this system tells about every other face it stores.
+
+WHAT HAPPENED TO ``registration_requests``
+------------------------------------------
+Migration 24 created it and nothing here reads or writes it any more. The rows stay: they are the
+record of who applied and what an administrator decided, which is a question asked *after* the
+account exists or does not, and a migration that dropped them would destroy the only copy. See
+``migrations.migration_30_self_service_registration``.
 """
 
 from __future__ import annotations
@@ -74,6 +123,7 @@ import biometrics
 import enrollment
 import face_engine
 import notifications
+import overtime
 import retention
 import textguard
 import uploads
@@ -99,10 +149,20 @@ public_router = APIRouter(prefix="/register", tags=["registration"])
 #: The review surface. The same audience as every other administrative read of a person.
 admin_router = APIRouter(prefix="/admin/registrations", tags=["registration"])
 
-STATUS_PENDING = "PENDING_REVIEW"
-STATUS_APPROVED = "APPROVED"
-STATUS_REJECTED = "REJECTED"
-STATUSES = (STATUS_PENDING, STATUS_APPROVED, STATUS_REJECTED)
+#: The status a self-registered account carries until an administrator decides. A third value
+#: for ``users.status`` rather than a flag of its own, so the two states it already had -
+#: ``active`` and ``inactive`` - go on meaning exactly what every reader of them thinks they
+#: mean, and so the quarantine is a fact about the *account*, checked on the punch itself.
+STATUS_PENDING_APPROVAL = "pending_approval"
+
+#: What ``GET /admin/registrations`` will filter on. ``all`` is handled beside these rather than
+#: in the tuple: it is not a status, it is the absence of the filter.
+QUEUE_STATUSES = (STATUS_PENDING_APPROVAL, "active", "inactive")
+
+#: Prefix of the dedupe key the administrators' "somebody is waiting" notice is filed under. One
+#: notice per waiting account, so a submission a phone retried does not bury the queue in copies -
+#: and so ``reject_registration`` can take the notice back with the account it was about.
+PENDING_NOTICE_PREFIX = "registration_pending:"
 
 #: What a walk-up may ask to be, spelled out here rather than borrowed from the invite flow.
 #: These three roles are this form's own contract with a stranger: nobody self-registers as an
@@ -153,46 +213,50 @@ def photos_dir() -> str:
 # the account id an approval mints
 # ---------------------------------------------------------------------------
 def _next_workforce_id(conn: sqlite3.Connection) -> str:
-    """The next account id below the administrative tiers. Refuses with ``409`` when the band is
-    full.
+    """The lowest free account id below the administrative tiers. Refuses with ``409`` when the
+    band is full.
 
     WHY THE CEILING IS THE POINT
     ----------------------------
-    An approval is the one thing on this surface that creates an account, and it is driven by a
+    A submission is the one thing on this surface that creates an account, and it is driven by a
     form a stranger can reach. So it may only ever mint a number inside the band that belongs to
     business accounts: the administrative tiers begin at ``ADMIN_TIER_ID_FLOOR`` and this refuses
     to reach them, rather than trusting that the ids it happens to hand out stay low.
 
     A full band is reported instead of wrapped around: an id reused above an account that is
-    still in use would be a duplicate key, and one reused *for* a deleted account would hand a
-    recycled number to a new face without an operator ever deciding to. Answering 409 names the
-    band and leaves the choice - retire an account, or create this one in the console.
+    still in use would be a duplicate key, and answering 409 names the band and leaves the choice
+    - retire an account, or create this one in the console.
 
-    WHY THE NEXT NUMBER AND NOT THE LOWEST FREE ONE
-    -----------------------------------------------
-    The allocator that scanned for the lowest free number went with the per-role id bands. What
-    makes counting upward the right answer here is the queue itself: an applicant whose photograph
-    is waiting is *going to* need a number, so a number given back by a deleted account is not
-    free in any useful sense - it is a number this queue would have spent twice. Recycling a
-    retired number is a decision an administrator makes in the console, where the roster is in
-    front of them.
+    WHY THE LOWEST FREE NUMBER
+    --------------------------
+    Counting upward from the highest id in use was the old rule and it is deliberately gone: it
+    left every number given back by a refused application permanently unusable, which in a
+    deployment that turns applicants down is a band that fills with nothing. What is reused here
+    was freed *on purpose* - ``reject_registration`` deletes the row and wipes the reference
+    under it - so a new face can never inherit an old one's template. A *deactivated* account
+    still holds its number, which is the difference between freed and retired.
 
     WHY THIS IS ONLY SAFE INSIDE THE CALLER'S WRITE TRANSACTION
     ----------------------------------------------------------
-    This is a **read**. Two approvals that both read "highest is 7" both insert 8, and one of them
-    dies on the primary key. What makes the read-then-insert safe is the caller's
+    This is a **read**. Two submissions that both read "1 to 7 are taken" both insert 8, and one
+    of them dies on the primary key. What makes the read-then-insert safe is the caller's
     ``BEGIN IMMEDIATE`` (``database.immediate``): SQLite takes the single write lock *before* the
     read, so the second caller cannot read until the first has committed and therefore sees the
     row the first one wrote. The primary key stays the last line of defence.
     """
-    row = conn.execute(
-        "SELECT MAX(CAST(id AS INTEGER)) FROM users WHERE CAST(id AS INTEGER) BETWEEN 1 AND ?",
-        (WORKFORCE_ID_CEILING,),
-    ).fetchone()
-    # ``CAST`` is 64-bit in SQLite and a non-numeric id casts to 0, which the ``BETWEEN`` above
+    # ``CAST`` is 64-bit in SQLite and a non-numeric id casts to 0, which the ``BETWEEN`` below
     # excludes - an account id that is not a number occupies no number in this band.
-    highest = int(row[0]) if row is not None and row[0] is not None else 0
-    candidate = highest + 1
+    used = {
+        int(row[0])
+        for row in conn.execute(
+            "SELECT CAST(id AS INTEGER) FROM users WHERE CAST(id AS INTEGER) BETWEEN 1 AND ?",
+            (WORKFORCE_ID_CEILING,),
+        )
+        if row[0] is not None
+    }
+    candidate = 1
+    while candidate in used:
+        candidate += 1
     if candidate > WORKFORCE_ID_CEILING:
         raise HTTPException(
             status_code=409,
@@ -209,6 +273,91 @@ def _next_workforce_id(conn: sqlite3.Connection) -> str:
 
 
 # ---------------------------------------------------------------------------
+# the intake switch: two answers to "is the permanent link accepting today"
+# ---------------------------------------------------------------------------
+#: The link is accepting submissions. The only reason code that means yes.
+INTAKE_OPEN = "open"
+#: The deployment does not run walk-up registration at all, so nothing here can open it.
+INTAKE_CLOSED_BY_DEPLOYMENT = "closed_by_deployment"
+#: An administrator closed the link from the console. Only an administrator can open it again.
+INTAKE_CLOSED_BY_CONSOLE = "closed_by_console"
+
+
+def intake_row() -> Any:
+    """The console's switch row, or ``None`` when nobody has decided - or the table is newer.
+
+    Never raises, and a database older than migration 29 has no such table: a deployment whose
+    migrations have not run yet is not a reason for the permanent public link to answer 500.
+    Both read as "no decision", which is the state every deployment that has never opened the
+    console is in anyway.
+    """
+    try:
+        with db() as conn:
+            return conn.execute("SELECT * FROM registration_settings WHERE id = 1").fetchone()
+    except sqlite3.Error:
+        return None
+
+
+def intake_state() -> dict[str, Any]:
+    """Whether the link accepts a submission right now, and which switch is deciding it.
+
+    TWO SWITCHES, AND ONLY ONE OF THEM IS A CEILING
+    ----------------------------------------------
+    ``settings.registration_enabled`` says whether this *deployment* runs walk-up registration
+    at all: a capability, set where the process is started, and the one thing that can stop a
+    console click from opening a public endpoint that collects faces. The
+    ``registration_settings`` row says whether that capability is *being used* right now, which
+    is a shift-to-shift decision an administrator makes in the console::
+
+        accepting = REGISTRATION_ENABLED and (stored is not 0)
+
+    An untouched row - ``NULL``, and the whole of every database before migration 29 - follows
+    the deployment flag exactly, so none of this changes what an existing deployment does.
+    ``0`` is a decision: the console closed the link, and the console is what opens it again.
+
+    WHY BOTH ARE REPORTED
+    ---------------------
+    A closed form has two possible owners, and an operator looking at one is entitled to know
+    which switch to move before they conclude the console is broken. ``reason`` is that answer
+    as a code (``open`` / ``closed_by_deployment`` / ``closed_by_console``) rather than as a
+    sentence, because the sentence is the reader's language and belongs in the console's own
+    translation tables - see ``registrationsIntakeWhy*`` in ``frontend/i18n.js``.
+    """
+    row = intake_row()
+    stored: int | None = None
+    if row is not None:
+        try:
+            stored = None if row["intake_open"] is None else int(row["intake_open"])
+        except (IndexError, KeyError, TypeError, ValueError):
+            # A column this build cannot make sense of means "no decision", not "closed": the
+            # failure direction that keeps a walk-up link that used to work working.
+            stored = None
+    deployment = bool(settings.registration_enabled)
+    if not deployment:
+        reason = INTAKE_CLOSED_BY_DEPLOYMENT
+    elif stored == 0:
+        reason = INTAKE_CLOSED_BY_CONSOLE
+    else:
+        reason = INTAKE_OPEN
+    return {
+        "accepting": reason == INTAKE_OPEN,
+        "reason": reason,
+        "deployment_enabled": deployment,
+        # The console's own switch position. ``True`` when nobody has touched it, because an
+        # untouched switch is not a closed one - the deployment flag is what it follows.
+        "console_open": stored != 0,
+        "decided": stored is not None,
+        "updated_at": row["updated_at"] if row is not None else None,
+        "updated_by": row["updated_by"] if row is not None else None,
+    }
+
+
+def intake_accepting() -> bool:
+    """The one call the gates make: may a submission be taken, may the form offer itself."""
+    return bool(intake_state()["accepting"])
+
+
+# ---------------------------------------------------------------------------
 # audit + notification helpers
 # ---------------------------------------------------------------------------
 def _now() -> str:
@@ -222,20 +371,27 @@ def _audit(
     actor: CurrentUser | None,
     entity: str,
     entity_id: str,
+    before: Any = None,
     after: Any = None,
     request: Request | None = None,
 ) -> None:
-    """Append an administrative event. Never raises - see ``enrollment._audit``."""
+    """Append an administrative event. Never raises - see ``enrollment._audit``.
+
+    ``before`` as well as ``after`` since the intake switch needs it: a decision that sets a
+    value is only readable later against the value it replaced (see ``set_intake_switch``), while
+    every other caller here is recording something that did not exist before it happened.
+    """
     try:
         conn.execute(
-            "INSERT INTO audit_log (actor_id, actor_role, action, entity, entity_id, after_json, ip, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO audit_log (actor_id, actor_role, action, entity, entity_id, before_json, after_json, ip, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 actor.id if actor else None,
                 actor.role if actor else "public",
                 action,
                 entity,
                 str(entity_id),
+                json.dumps(before, default=str) if before is not None else None,
                 json.dumps(after, default=str) if after is not None else None,
                 request.client.host if request is not None and request.client else None,
                 _now(),
@@ -245,46 +401,126 @@ def _audit(
         pass
 
 
+#: Prefix of the dedupe key an approval's worker notice is filed under. One account is decided
+#: once, so this is belt and braces rather than a rule - the same shape every other notice uses.
+APPROVED_NOTICE_PREFIX = "registration_approved:"
+
+
+def _approved_notice(
+    row: sqlite3.Row, *, worker_id: str, role: str
+) -> dict[str, Any]:
+    """What a worker is told when the quarantine is lifted.
+
+    WHY THIS EXISTS AT ALL
+    ----------------------
+    The applicant already has their number - the form told them, and they signed in to read this
+    - so this is not where the id is handed over. What it carries is the other half, which nobody
+    can look up: that the decision went their way and the quarantine is over. A worker who signs
+    in and finds the clock still refusing them has no way to tell "not yet" from "never", and
+    this row is the answer that arrives without them having to ask an administrator.
+
+    WHAT A SIGN-IN STILL NEEDS
+    --------------------------
+    ``main.login`` matches ``WHERE id = ? AND (email = ? OR phone = ?)`` and then verifies the
+    password, so signing in needs this id, the email or phone **as stored on the account**, and
+    the password. All three came from the form and none of them changed at approval, so this
+    repeats them rather than inventing a credential - the applicant is the one person who cannot
+    re-read what they typed.
+
+    The contact is the awkward third, and worth being explicit about: both columns are optional
+    on the public form, and the sign-in route matches whatever is stored - so a worker who gave
+    neither signs in with that box left empty (the same reason the form's own email-or-phone
+    input is deliberately not ``required``).
+
+    ``payload`` carries the same facts as data for a reader that would rather render them than
+    read this sentence. Never the password: what the request row holds is a bcrypt hash, and the
+    only copy of the credential is in the applicant's head.
+    """
+    email = str(row["email"] or "").strip()
+    phone = str(row["phone"] or "").strip()
+    opening = (
+        f"Your account was approved: you are registered here as {role}, and you can clock in "
+        "from now on."
+    )
+    if not email and not phone:
+        body = (
+            f"{opening} To sign in, use id {worker_id} and the password you chose when you "
+            "applied, and leave the email-or-phone box empty - you did not give us one."
+        )
+    else:
+        given = []
+        if phone:
+            given.append(f"the phone number you gave us ({phone})")
+        if email:
+            given.append(f"the email you gave us ({email})")
+        body = (
+            f"{opening} To sign in, use id {worker_id}, "
+            f"{' or '.join(given)}, and the password you chose when you applied."
+        )
+    return {
+        "title": f"Your account is approved - worker id {worker_id}",
+        "body": body,
+        "payload": {
+            "worker_id": worker_id,
+            "role": role,
+            "email": email,
+            "phone": phone,
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # reading a request for a reviewer
 # ---------------------------------------------------------------------------
-def _as_review(row: sqlite3.Row) -> dict[str, Any]:
-    """One request as the review surface reads it.
+#: The columns of a ``users`` row this module reads. One list, used by both loaders, so a
+#: column cannot be selected by one and forgotten by the other.
+ACCOUNT_COLUMNS = (
+    "id, name, email, phone, role, status, enrolled_at, biometric_id, registration_note"
+)
+
+
+def _as_pending_user(row: sqlite3.Row) -> dict[str, Any]:
+    """One account waiting for approval, as the review surface reads it.
 
     The credential is not here at all - the column is not selected rather than selected and
-    dropped, so there is no path on which a hash reaches a response body. The photo is not here
-    either: it is served by its own route, so a list of forty requests does not carry forty
-    faces, and so a reader without the row's id cannot fetch the bytes.
+    dropped, so there is no path on which a hash reaches a response body. The face is not here
+    either: it is served by its own route, so a list of forty applications does not carry forty
+    faces, and so a reader without the row's id cannot fetch the bytes. What the photo route needs
+    instead is *whether there is one*, which is answered from the biometric store rather than
+    from a column, because that is where a face lives now.
+
+    The keys are the ones the console's card already reads - ``full_name``, ``requested_role``,
+    ``work_details``, ``created_at`` - kept rather than renamed to the account's own column names,
+    because the review screen was built against them and a rename here is a silently blank field
+    there.
     """
-    item = {
-        "id": int(row["id"]),
+    user_id = str(row["id"])
+    photo = biometrics.resolve_photo(user_id, row["biometric_id"])
+    try:
+        size = os.path.getsize(photo) if photo else 0
+    except OSError:
+        size = 0
+    return {
+        "id": user_id,
         "status": row["status"],
-        "full_name": row["full_name"],
+        "full_name": row["name"],
         "phone": row["phone"],
         "email": row["email"],
-        "requested_role": row["requested_role"],
-        "work_details": row["work_details"],
-        "assigned_id": row["assigned_id"],
-        "submitted_ip": row["submitted_ip"],
-        "consent_version": row["consent_version"],
-        "created_at": row["created_at"],
-        "reviewed_by": row["reviewed_by"],
-        "reviewed_at": row["reviewed_at"],
-        "decision_note": row["decision_note"],
-        # Whether the photo is still on disk, so the console knows whether to ask for it. It is
-        # not "was one submitted": a decided request's photo has been destroyed on purpose.
-        "has_photo": bool(str(row["photo_path"] or "").strip()),
-        "photo_bytes": int(row["photo_bytes"] or 0),
+        "requested_role": row["role"],
+        "work_details": row["registration_note"] or "",
+        "created_at": row["enrolled_at"],
+        "has_photo": bool(photo),
+        "photo_bytes": int(size),
     }
-    return item
 
 
-def _load(conn: sqlite3.Connection, request_id: int) -> sqlite3.Row:
+def _load_account(conn: sqlite3.Connection, user_id: str) -> sqlite3.Row:
+    """One account by id, or ``404``. The subject of every route on this surface."""
     row = conn.execute(
-        "SELECT * FROM registration_requests WHERE id = ?", (int(request_id),)
+        f"SELECT {ACCOUNT_COLUMNS} FROM users WHERE id = ?", (str(user_id),)
     ).fetchone()
     if row is None:
-        raise HTTPException(status_code=404, detail="Registration request not found.")
+        raise HTTPException(status_code=404, detail="No account has that id.")
     return row
 
 
@@ -292,36 +528,29 @@ def _load(conn: sqlite3.Connection, request_id: int) -> sqlite3.Row:
 # the sweep
 # ---------------------------------------------------------------------------
 def sweep_orphan_photos() -> int:
-    """Remove photos no request points at, and say how many.
+    """Remove abandoned intake photographs, and say how many.
 
-    A submission writes its photo *before* it inserts the row that names it - deliberately, so a
-    row never points at a file that does not exist - which means a crash in between leaves a file
-    with nothing behind it. Every other path removes its own photo, so what is left for this is
-    that crash and a file somebody copied into the directory. One pass at startup is enough.
+    The directory is a **staging area now**, not a filing cabinet. A submission stages its upload
+    there, reads it once for the embedding, and removes it in the same request once the reference
+    has a home in the biometric store - so a file left behind means one of exactly two things: a
+    request that died between the write and the reference, or a reference that could not be
+    written and whose photograph was deliberately kept so the account can be enrolled from the
+    console (see ``submit_registration``).
 
-    It is deliberately narrow: a file is removed only when **no row names it**, whatever that
-    row's status, and only when it is older than ``registration_photo_stale_hours``. A pending
-    request's photo is never touched, and neither is a decided one's - that is what the stale
-    window is for, and a photo that is still somebody's evidence must not vanish because a
-    restart happened.
+    Both are residue, and the second has a deadline rather than an exemption: the file is kept
+    only for ``registration_photo_stale_hours``, after which this removes it. The account is
+    unaffected - it is real, its id works, and it can be enrolled again from a photograph taken
+    in the console - whereas a face on disk that nothing is going to look at is the thing this
+    module is arranged not to keep. One pass at startup is enough.
     """
     directory = PHOTOS_DIR
     try:
         names = os.listdir(directory)
     except OSError:
         return 0
-    with db() as conn:
-        rows = conn.execute("SELECT photo_path FROM registration_requests").fetchall()
-    referenced = {
-        os.path.basename(str(row["photo_path"]))
-        for row in rows
-        if str(row["photo_path"] or "").strip()
-    }
     cutoff = datetime.now().timestamp() - float(settings.registration_photo_stale_hours) * 3600.0
     removed = 0
     for name in names:
-        if name in referenced:
-            continue
         path = os.path.join(directory, name)
         try:
             if not os.path.isfile(path) or os.path.getmtime(path) > cutoff:
@@ -331,7 +560,7 @@ def sweep_orphan_photos() -> int:
         except OSError:
             continue
     if removed:
-        log.info("removed %s registration photo(s) with no request behind them", removed)
+        log.info("removed %s abandoned intake photograph(s)", removed)
     return removed
 
 
@@ -341,8 +570,8 @@ def _destroy_photo(path: str) -> bool:
     ``retention.wipe_file`` rather than ``os.remove``: a face that has been *decided on* is
     residue, not a temporary file, and it is overwritten before it is unlinked for the same
     reason every biometric file in this application is. A wipe that fails is reported rather
-    than swallowed - the caller keeps the row's reference to it so the sweep can try again, and
-    an operator can see which one it was.
+    than swallowed, and the file it could not remove is left to the startup sweep - which is the
+    only retry there is, now that the photograph is not pointed at by a row.
     """
     name = os.path.basename(str(path or ""))
     if not name:
@@ -381,6 +610,17 @@ class Decision(BaseModel):
         )
 
 
+class IntakeSwitch(BaseModel):
+    """The console's answer to "is the permanent link accepting today".
+
+    A boolean and nothing else. There is deliberately no way to set the *deployment* side of the
+    question through this API: ``REGISTRATION_ENABLED`` is a fact about the process that is
+    running, and an endpoint that could change the ceiling would make the ceiling decorative.
+    """
+
+    open: bool
+
+
 # ---------------------------------------------------------------------------
 # the public link
 # ---------------------------------------------------------------------------
@@ -397,9 +637,18 @@ async def registration_intake(request: Request):  # noqa: ARG001 - the limiter n
     ``enabled: false`` still answers 200 rather than 404. A permanent link that has been
     switched off has to be able to *say* it is switched off, or an applicant sees a broken page
     and tries again tomorrow.
+
+    ``enabled`` is the *effective* state of two switches rather than the deployment flag alone:
+    since the console owns a switch of its own (see ``intake_state``), reading the env flag here
+    would offer the form to somebody the very next line would refuse.
     """
+    state = intake_state()
+    # ``enabled`` alone, and no reason code: an applicant gets one sentence either way, and
+    # *which* switch closed the link is an operator's question - it is answered with the rest of
+    # the state on ``GET /admin/registrations/intake``, where the reader who can move a switch is
+    # looking. This response stays the shape the page has always read.
     return {
-        "enabled": bool(settings.registration_enabled),
+        "enabled": state["accepting"],
         "roles": list(WORKFORCE_ROLES_IN_ORDER),
         "photo_policy": uploads.policy(),
         "min_password_length": settings.min_password_length,
@@ -407,7 +656,7 @@ async def registration_intake(request: Request):  # noqa: ARG001 - the limiter n
         "message": (
             "Submit your details and a photo. An administrator reviews every request before an "
             "account is created."
-            if settings.registration_enabled
+            if state["accepting"]
             else "Registration is closed at the moment. Ask your site administrator to open it."
         ),
     }
@@ -426,18 +675,35 @@ async def submit_registration(
     consent: str = Form(default=""),
     photo: UploadFile = File(...),
 ):
-    """Accept one walk-up registration. Creates no account and promises no id.
+    """Accept one walk-up registration, and create the account it is for.
 
     The order is the argument. Everything that can be refused is refused before a file is
     written: the switch, the text, the role, the consent and the password. Then the photo is
-    streamed to disk through the shared policy - one chunk of memory whatever its size - and the
-    row is inserted. Any failure after the file exists takes the file with it, so a refused
-    submission cannot leave a face in the reviewers' directory for nobody to look at.
+    streamed to disk through the shared policy - one chunk of memory whatever its size - decoded
+    once for its embedding, and the account is inserted. Any failure after the file exists takes
+    the file with it, so a refused submission cannot leave a face in a directory nobody is going
+    to look at.
+
+    WHAT THE APPLICANT GETS BACK
+    ----------------------------
+    Their own id, and the sentence that says what is left: sign in now, clock in later. That is
+    the whole difference between this and the holding table it replaced (see this module's
+    docstring) - the number is the account's from the moment it exists, so the person holding
+    the phone can check on themselves instead of waiting to be told.
+
+    WHY THE QUARANTINE IS A STATUS AND NOT AN ABSENT ROW
+    ----------------------------------------------------
+    ``pending_approval`` is written here and read on every punch. That is what makes the promise
+    above safe: "you can sign in but not clock in" is enforced by the punch endpoint refusing
+    the status (``main.verify_worker``), not by the account happening not to have a shift yet.
 
     The cap is enforced **inside the insert's transaction**, together with the insert: a count
     read before the write is advice, and N concurrent submissions would each read ``cap - 1``.
+    The switch is read the same way: it is the *effective* intake state (``intake_state``), not
+    the deployment flag alone, so closing the link from the console refuses exactly the
+    submissions the form has stopped offering.
     """
-    if not settings.registration_enabled:
+    if not intake_accepting():
         raise HTTPException(
             status_code=403,
             detail={
@@ -492,13 +758,42 @@ async def submit_registration(
     validate_password_strength(password)
 
     stored = await uploads.store_photo(photo, photos_dir(), field="photo", prefix="req-")
+    assigned = ""
+    template_written = True
+    template_error: str | None = None
     try:
+        # The model work, before the account and outside every lock. It reads the staged file
+        # rather than the request body: the upload policy has already streamed the bytes to disk
+        # a chunk at a time, so what is held here is one decoded frame - and any refusal from the
+        # face engine leaves the staged file to the ``except`` below.
+        try:
+            image = uploads.face_frame(stored.path, field="photo")
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error_code": "registration_photo_unreadable",
+                    "message": "That photograph could not be read. Please take another one.",
+                },
+            ) from None
+        try:
+            decision, embedding = await face_engine.ENGINE.run_async(
+                enrollment.embed_reference, image, stage="registration_intake"
+            )
+        except face_engine.FaceEngineBusy as exc:
+            # The pool is the gate's own. Answering "busy" rather than queueing a stranger ahead
+            # of a worker at a gate is the honest order of priorities, and this form can be sent
+            # again.
+            raise face_engine.busy_http_exception(exc) from None
+
         password_hash = hash_password(password)
+        stamp = _now()
         with immediate() as conn:
             waiting = int(
                 conn.execute(
-                    "SELECT COUNT(*) FROM registration_requests WHERE status = ?",
-                    (STATUS_PENDING,),
+                    "SELECT COUNT(*) FROM users WHERE status = ?", (STATUS_PENDING_APPROVAL,)
                 ).fetchone()[0]
             )
             cap = int(settings.registration_pending_cap)
@@ -508,64 +803,61 @@ async def submit_registration(
                     detail={
                         "error_code": "registration_queue_full",
                         "message": (
-                            "There are already as many registration requests waiting for review "
-                            "as this site accepts. Please try again later, or speak to your "
+                            "There are already as many accounts waiting for approval as this "
+                            "site accepts. Please try again later, or speak to your "
                             "administrator."
                         ),
                     },
                 )
-            stamp = _now()
+            assigned = _next_workforce_id(conn)
             try:
-                cursor = conn.execute(
-                    "INSERT INTO registration_requests (status, full_name, phone, email, "
-                    "requested_role, work_details, password_hash, photo_path, photo_sha256, "
-                    "photo_bytes, photo_mime, submitted_ip, consent_at, consent_version, "
-                    "created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                conn.execute(
+                    "INSERT INTO users (id, name, email, phone, password_hash, role, status, "
+                    "enrolled_at, template_version, biometric_id, registration_note) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
                     (
-                        STATUS_PENDING,
+                        assigned,
                         full_name,
-                        phone,
                         email,
-                        role,
-                        work_details,
+                        phone,
                         password_hash,
-                        stored.path,
-                        stored.sha256,
-                        int(stored.size),
-                        stored.mime,
-                        request.client.host if request.client else None,
+                        role,
+                        STATUS_PENDING_APPROVAL,
                         stamp,
-                        CONSENT_VERSION,
-                        stamp,
-                        stamp,
+                        # The face about to be filed can never be confused with whoever held
+                        # this number before: the number is reused, and a previous holder's
+                        # leftover file is moved aside here (see ``biometrics.new_account_id``).
+                        biometrics.new_account_id(assigned),
+                        work_details or None,
                     ),
                 )
             except sqlite3.IntegrityError:
-                # The partial unique index, and the only constraint it can be: the same upload
-                # cannot be pending twice. Answering 409 says the truth (we already have this
-                # photograph) instead of pretending a second row was created.
+                # The allocator and its ``INSERT`` are one transaction, so this can only be a
+                # race with a writer that does not use this lock - the primary key is the last
+                # line of defence, and answering 409 says what actually happened.
                 raise HTTPException(
                     status_code=409,
                     detail={
-                        "error_code": "registration_duplicate",
+                        "error_code": "registration_conflict",
                         "message": (
-                            "This photograph has already been submitted and is waiting for "
-                            "review. You do not need to send it again."
+                            "That account number was taken while this was being sent. Please "
+                            "send the form again."
                         ),
                     },
                 ) from None
-            request_id = int(cursor.lastrowid or 0)
             _audit(
                 conn,
-                action="registration_submitted",
+                action="user_self_registered",
                 actor=None,
-                entity="registration_requests",
-                entity_id=str(request_id),
+                entity="users",
+                entity_id=assigned,
                 after={
-                    "requested_role": role,
-                    "photo_sha256": stored.sha256,
-                    "photo_bytes": int(stored.size),
+                    "name": full_name,
+                    "role": role,
+                    "status": STATUS_PENDING_APPROVAL,
+                    # The consent evidence travels here rather than as a column on the account:
+                    # this is the surface that already records who asked for what, from where
+                    # and when, and ``request`` is what puts the submitting address in the row.
                     "consent_version": CONSENT_VERSION,
                 },
                 request=request,
@@ -574,26 +866,66 @@ async def submit_registration(
                 conn,
                 kind=notifications.KIND_REGISTRATION_SUBMITTED,
                 severity=notifications.SEVERITY_INFO,
-                title="Registration waiting for review",
+                title="New account awaiting approval",
                 body=(
-                    f"{full_name} asked to register as a {role}. Review the request in the "
-                    "Registrations queue; no account exists until you approve it."
+                    f"{full_name} registered as a {role} and is waiting for approval. The "
+                    "account can sign in but cannot clock in until you approve it."
                 ),
-                payload={"request_id": request_id, "requested_role": role},
-                dedupe_key=f"registration_submitted:{request_id}",
+                worker_id=assigned,
+                payload={
+                    "user_id": assigned,
+                    "role": role,
+                    "liveness": decision.as_payload(),
+                },
+                dedupe_key=f"{PENDING_NOTICE_PREFIX}{assigned}",
             )
     except BaseException:
         # Every refusal after the file was written, and every cancellation, takes the file with
-        # it - including the two the database refused above.
+        # it - including a full band, a full queue and a face engine that had no room.
         stored.discard()
         raise
 
+    # The account exists. The template goes in *after* the commit, for the reason it always has:
+    # ``write_reference`` reads the account's biometric id through its own connection, so inside
+    # this request's write lock it would be waiting on the lock it is standing behind.
+    try:
+        await run_in_threadpool(biometrics.write_reference, assigned, image, embedding)
+    except Exception as exc:  # noqa: BLE001 - reported, not fatal: the account is already real
+        template_written = False
+        template_error = f"{type(exc).__name__}: {exc}"
+        log.exception("account %s was created but its face reference could not be written", assigned)
+        with db(write=True) as conn:
+            notifications.notify(
+                conn,
+                kind=notifications.KIND_ENROLLMENT_COMPLETED,
+                severity=notifications.SEVERITY_WARNING,
+                title="A self-registered worker has no face reference",
+                body=(
+                    f"Account {assigned} ({full_name}) was created, but storing the face "
+                    f"reference failed ({template_error}). The photograph is kept at "
+                    f"{os.path.basename(stored.path)} in the registration directory until the "
+                    "retention sweep collects it, so this account can be enrolled from the "
+                    "console before that. Until it is, the account cannot clock in."
+                ),
+                worker_id=assigned,
+                payload={"error": template_error, "photo": os.path.basename(stored.path)},
+                dedupe_key=f"registration_template_failed:{assigned}",
+            )
+    else:
+        # The face has a home under an immutable id, so the staged copy is destroyed rather than
+        # left behind as a second face nothing sweeps.
+        _destroy_photo(stored.path)
+
     return {
         "status": "success",
-        "request_id": request_id,
+        "user_id": assigned,
+        "name": full_name,
+        "role": role,
+        "approval_status": STATUS_PENDING_APPROVAL,
+        "template_written": template_written,
         "message": (
-            "Your registration request has been received. An administrator will review it and "
-            "you will be told how to sign in once it is approved."
+            f"Account created. Your user id is {assigned}. You can sign in now, but an "
+            "administrator has to approve your account before you can clock in or out."
         ),
     }
 
@@ -603,399 +935,391 @@ async def submit_registration(
 # ---------------------------------------------------------------------------
 @admin_router.get("")
 async def list_registrations(
-    status: str = STATUS_PENDING,
+    status: str = STATUS_PENDING_APPROVAL,
     limit: int = 200,
     current: CurrentUser = Depends(admin_only),
 ):
-    """The review queue: oldest first, because a queue nobody reads in order is a queue that
-    silently starves whoever applied first.
+    """The review queue: the accounts waiting for approval, oldest first.
 
-    ``status=all`` is the audit view; the default is the work to do. The count of everything
-    still pending comes back with the page, so a console can show a badge without asking twice -
-    and it is counted separately from ``limit``, because a badge that said "3" because the page
-    was truncated would be a badge that lies.
+    A queue nobody reads in order is a queue that silently starves whoever applied first - and
+    now the person waiting can sign in and watch the clock refuse them, so the order matters to
+    somebody who can see it.
+
+    ``status=all`` is the audit view and the other two values are the states a decided account
+    can be in; the default is the work to do. The count of everything still waiting comes back
+    with the page, so a console can show a badge without asking twice - and it is counted
+    separately from ``limit``, because a badge that said "3" because the page was truncated would
+    be a badge that lies.
+
+    Ordered by ``CAST(id AS INTEGER)`` rather than by ``id`` as text: these ids are TEXT and the
+    allocator hands out the lowest free number, so a lexical order would put 10 before 2 and read
+    as a queue that had lost its place.
     """
-    wanted = str(status or "").strip()
+    wanted = str(status or "").strip().lower()
     limit = max(1, min(int(limit), 1000))
     with db() as conn:
-        if wanted and wanted.lower() != "all":
-            normalised = wanted.upper()
-            if normalised not in STATUSES:
+        if wanted and wanted != "all":
+            if wanted not in QUEUE_STATUSES:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"status must be one of {', '.join(STATUSES)} or 'all'.",
+                    detail=f"status must be one of {', '.join(QUEUE_STATUSES)} or 'all'.",
                 )
             rows = conn.execute(
-                "SELECT * FROM registration_requests WHERE status = ? ORDER BY id ASC LIMIT ?",
-                (normalised, limit),
+                f"SELECT {ACCOUNT_COLUMNS} FROM users WHERE status = ? "
+                "ORDER BY CAST(id AS INTEGER) ASC, id ASC LIMIT ?",
+                (wanted, limit),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM registration_requests ORDER BY id DESC LIMIT ?", (limit,)
+                f"SELECT {ACCOUNT_COLUMNS} FROM users "
+                "ORDER BY CAST(id AS INTEGER) DESC, id DESC LIMIT ?",
+                (limit,),
             ).fetchall()
         pending = int(
             conn.execute(
-                "SELECT COUNT(*) FROM registration_requests WHERE status = ?", (STATUS_PENDING,)
+                "SELECT COUNT(*) FROM users WHERE status = ?", (STATUS_PENDING_APPROVAL,)
             ).fetchone()[0]
         )
     return {
         "status": "success",
-        "enabled": bool(settings.registration_enabled),
+        # What the console's own note about a closed intake is drawn from: a queue that silently
+        # stops growing is a queue somebody believes is broken.
+        "enabled": intake_accepting(),
         "pending": pending,
-        "requests": [_as_review(row) for row in rows],
+        "requests": [_as_pending_user(row) for row in rows],
         "count": len(rows),
     }
 
 
-@admin_router.get("/{request_id}/photo")
+@admin_router.get("/intake")
+async def read_intake_switch(current: CurrentUser = Depends(admin_only)):  # noqa: ARG001
+    """Is the permanent link accepting applications, and which switch decided that.
+
+    Its own route rather than a field on the queue read, because the two questions are asked at
+    different moments: the queue is read when a reviewer wants to work, and this is read (and
+    written) when an operator wants to change whether the public form is open - which is an
+    action on the *link*, not on the applications already waiting on it.
+
+    A site administrator's to read and to write. ``admin_only``, not the root tier: opening or
+    closing the company's own public form is an operational decision about this site, which is
+    exactly the kind of thing this console exists for - the deployment-level switch underneath it
+    is the part that is not reachable from here at all.
+    """
+    return {"status": "success", **intake_state()}
+
+
+@admin_router.post("/intake")
+async def set_intake_switch(
+    request: Request,
+    payload: IntakeSwitch,
+    current: CurrentUser = Depends(admin_only),
+):
+    """Open or close the permanent link, from the console, with no restart.
+
+    WHAT THIS CANNOT DO
+    -------------------
+    Turn on a deployment that does not run walk-up registration: ``REGISTRATION_ENABLED`` is the
+    ceiling and this writes only the position under it. So the answer says which switch is
+    holding the link shut (``reason``), and the console draws no button at all when the answer is
+    the deployment's - a control that appears pressable and changes nothing is worse than no
+    control, because the operator concludes the screen is broken and stops using it.
+
+    It is written even when the deployment switch is off, and that is deliberate: the decision is
+    stored, reported, and takes effect the moment the deployment allows intake at all. Refusing
+    the write would lose an operator's intent and leave them nothing to look at but a button that
+    answers "not yet" with no record of why.
+
+    Audited with the position it replaced, because "the form was open all weekend" is a question
+    somebody will ask, and this row's own ``updated_at`` can only answer it for the latest change.
+    """
+    open_now = bool(payload.open)
+    with db(write=True) as conn:
+        before = conn.execute("SELECT * FROM registration_settings WHERE id = 1").fetchone()
+        # Ensure-then-update rather than an upsert: the row is created by migration 29, but a
+        # database whose resets have emptied it - or an operator's first click on a volume the
+        # migration never ran against - must not answer 500 to a button.
+        conn.execute(
+            "INSERT OR IGNORE INTO registration_settings (id, updated_at) VALUES (1, ?)", (_now(),)
+        )
+        conn.execute(
+            "UPDATE registration_settings SET intake_open = ?, updated_at = ?, updated_by = ? "
+            "WHERE id = 1",
+            (1 if open_now else 0, _now(), current.id),
+        )
+        _audit(
+            conn,
+            action="registration_intake_update",
+            actor=current,
+            entity="registration_settings",
+            entity_id=1,
+            before={"intake_open": before["intake_open"] if before is not None else None},
+            after={"intake_open": 1 if open_now else 0, "requested_open": open_now},
+            request=request,
+        )
+    return {"status": "success", **intake_state()}
+
+
+@admin_router.get("/{user_id}/photo")
 async def registration_photo(
-    request_id: int, current: CurrentUser = Depends(admin_only)
+    user_id: str, current: CurrentUser = Depends(admin_only)
 ):  # noqa: ARG001 - the guard is the point
-    """The submitted photograph, for the reviewer who has to judge it.
+    """The account's reference selfie, for the reviewer who has to judge it.
 
-    A route of its own rather than a field on the list: forty requests in one response would
-    otherwise carry forty faces, and the bytes are needed exactly once - by the person looking
-    at the one request in front of them.
+    A route of its own rather than a field on the list: forty applications in one response would
+    otherwise carry forty faces, and the bytes are needed exactly once - by the person looking at
+    the one application in front of them.
 
-    ``no-store`` on the response, because a face is not a document a proxy should keep - and an
-    approved request's photo is destroyed rather than served, which this answers honestly (404)
-    rather than with a broken image.
+    Read from the **biometric store**, not from an intake directory: a submission files its face
+    straight away (see ``submit_registration``), so that is the only copy there is - and it is the
+    copy ``retention`` already knows how to sweep.
+
+    Narrow on purpose: only an account **still waiting** is served. An approved worker's face is
+    not a document this screen has any business showing, and a refused one has been wiped - so
+    both answer 404, and the console has one sentence for that (``registrationsPhotoGone``) rather
+    than a vocabulary that would tell a reader whether a given number is waiting.
+
+    ``no-store`` on the response, because a face is not a document a proxy should keep.
     """
     with db() as conn:
-        row = _load(conn, request_id)
-    path = str(row["photo_path"] or "").strip()
+        row = conn.execute(
+            "SELECT id, biometric_id, status FROM users WHERE id = ?", (str(user_id),)
+        ).fetchone()
+    if row is None or str(row["status"] or "") != STATUS_PENDING_APPROVAL:
+        raise HTTPException(status_code=404, detail="This account has no photograph on file.")
+    path = biometrics.resolve_photo(str(row["id"]), row["biometric_id"])
     if not path or not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="This request has no photo on file.")
-    response = FileResponse(path, media_type=str(row["photo_mime"] or "application/octet-stream"))
+        raise HTTPException(status_code=404, detail="This account has no photograph on file.")
+    response = FileResponse(path, media_type="image/jpeg")
     response.headers["Cache-Control"] = "no-store"
     return response
 
 
-@admin_router.post("/{request_id}/approve")
+@admin_router.post("/{user_id}/approve")
 async def approve_registration(
     request: Request,
-    request_id: int,
+    user_id: str,
     payload: Decision | None = None,
     current: CurrentUser = Depends(admin_only),
 ):
-    """Hire the applicant: allocate an id, create the account, file the face, and say so.
+    """Lift the quarantine: the account becomes an ordinary, working account.
+
+    WHAT A DECISION NO LONGER HAS TO DO
+    -----------------------------------
+    The account, the id and the face all exist already - a submission wrote them (see
+    ``submit_registration``) - so this route is one compare-and-set on ``users.status`` and
+    nothing else. That is the whole point of the shape: the expensive, refusable work happened
+    while the applicant was standing there with their phone, and the decision an administrator
+    makes an hour or a day later is cheap.
 
     THE ORDER, AND WHY IT IS THIS ORDER
     -----------------------------------
-    1. **The model work, outside the write lock.** The photo is decoded, the face is detected and
-       the embedding is computed while the application holds *no* lock - an inference takes long
-       enough that holding SQLite's single write lock across it would queue a punch at the gate
-       behind a review. The work is submitted to the face-engine pool, the same one the punch
-       uses, so a burst of reviews cannot run more inferences than a burst of punches.
-    2. **One transaction**: the id is allocated for the applicant's role, the account is inserted
-       with a freshly minted biometric id, and the request is moved to ``APPROVED`` with the id it
-       was given. The compare-and-set (``WHERE status = ? AND status is still pending``) is what
-       makes two administrators clicking approve at the same time produce one account rather than
-       two: the second sees zero rows updated and is answered 409.
-    3. **The template, after the commit.** ``biometrics.write_reference`` reads the account's
-       biometric id from the database through its own connection, so it cannot run inside a
-       transaction this process is holding - it would wait on the lock it is standing behind.
-       Writing it *after* the commit is also the honest order: the account exists first, and a
-       failure here is a warning an operator can act on rather than a half-created account.
+    **One transaction.** ``UPDATE ... WHERE id = ? AND status = 'pending_approval'`` *is* the
+    decision: two administrators clicking approve at the same moment produce one approval and one
+    409, because the second sees zero rows updated. The worker's own notice is written in the same
+    transaction, so a notice can never exist for an account that was not approved (see
+    ``_approved_notice``).
 
-    Nothing is created before the decision: no ``users`` row, no roster entry, no shift, no
-    payroll row.
+    **The push, after the commit.** ``overtime.deliver_worker_notices`` selects rows that are not
+    yet delivered, so inside the write lock that created this one it could not see it - and a
+    phone is never worth holding SQLite's single writer for.
+
+    WHAT THIS REPORTS BACK
+    ----------------------
+    The id and the contact, so the console can write the receipt an administrator reads out - and
+    ``template_written``, which is now a *question asked* rather than a step performed: the face
+    is checked for on disk here, because an approved account nobody can score cannot clock in, and
+    the administrator who just approved it is the person holding the console that can enroll it.
     """
     with db() as conn:
-        row = _load(conn, request_id)
-    if row["status"] != STATUS_PENDING:
+        row = _load_account(conn, user_id)
+    if str(row["status"] or "") != STATUS_PENDING_APPROVAL:
         raise HTTPException(
             status_code=409,
             detail={
                 "error_code": "already_reviewed",
                 "message": (
-                    f"This request was already {row['status'].lower().replace('_', ' ')} "
-                    f"by {row['reviewed_by']} at {row['reviewed_at']}."
+                    f"Account {row['id']} is not waiting for approval any more: its status is "
+                    f"{row['status']}."
                 ),
             },
         )
 
-    role = str(row["requested_role"] or "").strip().lower()
+    role = str(row["role"] or "").strip().lower()
     if role not in WORKFORCE_ROLES:
-        # Only reachable if the row was edited by hand. Refuse rather than mint an account in a
+        # Only reachable if the row was edited by hand. Refuse rather than bless an account in a
         # role this surface was never allowed to hand out.
         raise HTTPException(
             status_code=409,
             detail={
                 "error_code": "role_not_available",
-                "message": "This request asks for a role that cannot be created here.",
-            },
-        )
-
-    photo_path = str(row["photo_path"] or "").strip()
-    if not photo_path or not os.path.exists(photo_path):
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error_code": "registration_photo_missing",
-                "message": (
-                    "The photograph for this request is no longer on file, so there is nothing to "
-                    "build a face reference from. Reject it and ask the applicant to submit again."
-                ),
-            },
-        )
-
-    # 1. The model work, under the same bounded pool the gate uses. ``face_frame`` takes the
-    #    *path*, so the encoded photo is never held as bytes here at all: PIL opens the file it
-    #    is pointed at, and what this holds afterwards is the decoded frame.
-    try:
-        image = uploads.face_frame(photo_path, field="registration photo")
-    except HTTPException:
-        raise
-    except Exception:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error_code": "registration_photo_unreadable",
-                "message": "The submitted photo could not be read. Reject it and ask for another.",
-            },
-        ) from None
-
-    try:
-        decision, embedding = await face_engine.ENGINE.run_async(
-            enrollment.embed_reference, image, stage="registration_review"
-        )
-    except face_engine.FaceEngineBusy as exc:
-        raise face_engine.busy_http_exception(exc) from None
-
-    # 2. The account, the allocated id and the verdict, in one write.
-    note = (payload.note if payload else None) or None
-    stamp = _now()
-    assigned = ""
-    try:
-        with immediate() as conn:
-            # The read and the INSERT below are one transaction (``BEGIN IMMEDIATE``), which is
-            # the whole reason two approvals cannot be handed the same number. The role is not an
-            # argument: the number comes from one band, and what the applicant may be is decided
-            # by ``WORKFORCE_ROLES`` long before this line.
-            assigned = _next_workforce_id(conn)
-
-            claimed = conn.execute(
-                "UPDATE registration_requests SET status = ?, assigned_id = ?, reviewed_by = ?, "
-                "reviewed_at = ?, decision_note = ?, updated_at = ? WHERE id = ? AND status = ?",
-                (
-                    STATUS_APPROVED,
-                    assigned,
-                    current.id,
-                    stamp,
-                    note,
-                    stamp,
-                    int(request_id),
-                    STATUS_PENDING,
-                ),
-            )
-            if claimed.rowcount != 1:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "error_code": "already_reviewed",
-                        "message": "Another administrator reviewed this request first.",
-                    },
-                )
-            conn.execute(
-                "INSERT INTO users (id, name, email, phone, password_hash, role, status, "
-                "enrolled_at, template_version, biometric_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, 'active', ?, 1, ?)",
-                (
-                    assigned,
-                    str(row["full_name"]),
-                    str(row["email"] or ""),
-                    str(row["phone"] or ""),
-                    str(row["password_hash"]),
-                    role,
-                    stamp,
-                    # The face about to be filed can never be confused with whoever held this
-                    # account id before: the number is recycled, and a previous holder's
-                    # leftover file is moved aside here (see ``biometrics.new_account_id``).
-                    biometrics.new_account_id(assigned),
-                ),
-            )
-            _audit(
-                conn,
-                action="registration_approved",
-                actor=current,
-                entity="registration_requests",
-                entity_id=str(request_id),
-                after={
-                    "worker_id": assigned,
-                    "role": role,
-                    "liveness": decision.as_payload(),
-                    "note": note,
-                },
-                request=request,
-            )
-    except sqlite3.IntegrityError:
-        # The allocator and its ``INSERT`` are one transaction, so this can only be a race with a
-        # writer that does not use this lock - the primary key is the last line of defence, and
-        # answering 409 says what actually happened.
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error_code": "id_taken",
-                "message": (
-                    f"Account {assigned} was taken while this request was being approved. Try "
-                    "again."
-                ),
-            },
-        ) from None
-
-    # 3. The template, after the commit. A failure here is not silent: the account exists and can
-    #    be enrolled from the console, and the photograph is deliberately kept so that is possible.
-    template_written = True
-    template_error: str | None = None
-    try:
-        # Through the threadpool: this writes two files and re-encodes a thumbnail, and the
-        # event loop is what serves the gate.
-        await run_in_threadpool(biometrics.write_reference, assigned, image, embedding)
-    except Exception as exc:  # noqa: BLE001 - reported, not fatal: the account is already created
-        template_written = False
-        template_error = f"{type(exc).__name__}: {exc}"
-        log.exception("registration %s was approved but its face reference could not be written", request_id)
-        with db(write=True) as conn:
-            notifications.notify(
-                conn,
-                kind=notifications.KIND_ENROLLMENT_COMPLETED,
-                severity=notifications.SEVERITY_WARNING,
-                title="A registered worker has no face reference",
-                body=(
-                    f"Request {request_id} was approved as account {assigned} ({role}), but "
-                    f"storing the face reference failed ({template_error}). That account cannot "
-                    "clock in until an administrator enrolls them from the console."
-                ),
-                worker_id=assigned,
-                payload={"request_id": int(request_id), "error": template_error},
-                dedupe_key=f"registration_template_failed:{request_id}",
-            )
-
-    # 4. The face now has a home under an immutable id, so the reviewed photograph is destroyed
-    #    rather than left as a second copy nothing sweeps. Only on success, and only after the
-    #    write above: while the reference could still fail, the photo is the way to retry.
-    if template_written and _destroy_photo(photo_path):
-        with db(write=True) as conn:
-            conn.execute(
-                "UPDATE registration_requests SET photo_path = '', updated_at = ? WHERE id = ?",
-                (stamp, int(request_id)),
-            )
-            _audit(
-                conn,
-                action="registration_photo_removed",
-                actor=current,
-                entity="registration_requests",
-                entity_id=str(request_id),
-                after={"reason": "approved", "worker_id": assigned},
-                request=request,
-            )
-
-    return {
-        "status": "success",
-        "request_id": int(request_id),
-        "worker_id": assigned,
-        "name": str(row["full_name"]),
-        "role": role,
-        "template_written": template_written,
-        "message": (
-            f"Account {assigned} created for {row['full_name']}."
-            if template_written
-            else (
-                f"Account {assigned} was created, but the face reference could not be stored. "
-                "Enroll this worker from the console before they can clock in."
-            )
-        ),
-    }
-
-
-@admin_router.post("/{request_id}/reject")
-async def reject_registration(
-    request: Request,
-    request_id: int,
-    payload: Decision | None = None,
-    current: CurrentUser = Depends(admin_only),
-):
-    """Turn the applicant down. Creates nothing, and destroys the photograph.
-
-    A refusal is a *product state*, not an error: the row survives with the reason on it, so the
-    decision is auditable and the applicant can be told why. What does not survive is the face -
-    an intake funnel that keeps the photographs it turned down is the retention violation this
-    whole application is built to avoid. The password the applicant chose goes with it: a refusal
-    is not a reason to keep somebody's credential.
-
-    The row stays, which is what makes "may I apply again?" answerable: the partial unique index
-    that stops one photograph becoming two *pending* requests stops applying here, so the same
-    person may submit the same photograph again after a refusal (see migration 24).
-    """
-    with db() as conn:
-        row = _load(conn, request_id)
-    if row["status"] != STATUS_PENDING:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error_code": "already_reviewed",
-                "message": (
-                    f"This request was already {row['status'].lower().replace('_', ' ')} "
-                    f"by {row['reviewed_by']} at {row['reviewed_at']}."
-                ),
+                "message": "This account was registered in a role that cannot be approved here.",
             },
         )
 
     note = (payload.note if payload else None) or None
-    stamp = _now()
-    photo_path = str(row["photo_path"] or "").strip()
+    notice_written = False
     with immediate() as conn:
         claimed = conn.execute(
-            "UPDATE registration_requests SET status = ?, reviewed_by = ?, reviewed_at = ?, "
-            "decision_note = ?, updated_at = ?, password_hash = '' WHERE id = ? AND status = ?",
-            (STATUS_REJECTED, current.id, stamp, note, stamp, int(request_id), STATUS_PENDING),
+            "UPDATE users SET status = 'active' WHERE id = ? AND status = ?",
+            (str(row["id"]), STATUS_PENDING_APPROVAL),
         )
         if claimed.rowcount != 1:
             raise HTTPException(
                 status_code=409,
                 detail={
                     "error_code": "already_reviewed",
-                    "message": "Another administrator reviewed this request first.",
+                    "message": "Another administrator decided this account first.",
                 },
             )
         _audit(
             conn,
-            action="registration_rejected",
+            action="registration_approved",
             actor=current,
-            entity="registration_requests",
-            entity_id=str(request_id),
-            after={"requested_role": row["requested_role"], "note": note},
+            entity="users",
+            entity_id=str(row["id"]),
+            after={"worker_id": str(row["id"]), "role": role, "note": note},
             request=request,
         )
+        # The worker's half of this decision, in the same transaction as the status it is about.
+        notice = _approved_notice(row, worker_id=str(row["id"]), role=role)
+        notice_written = notifications.notify_worker(
+            conn,
+            worker_id=str(row["id"]),
+            kind=notifications.KIND_WORKER_ACCOUNT_APPROVED,
+            title=notice["title"],
+            body=notice["body"],
+            payload=notice["payload"],
+            dedupe_key=f"{APPROVED_NOTICE_PREFIX}{row['id']}",
+        )
 
-    destroyed = _destroy_photo(photo_path) if photo_path else True
-    if destroyed:
-        with db(write=True) as conn:
-            conn.execute(
-                "UPDATE registration_requests SET photo_path = '', updated_at = ? WHERE id = ?",
-                (stamp, int(request_id)),
-            )
-            _audit(
-                conn,
-                action="registration_photo_removed",
-                actor=current,
-                entity="registration_requests",
-                entity_id=str(request_id),
-                after={"reason": "rejected"},
-                request=request,
-            )
+    # The notice is written and the status is committed; now try to reach the phone. ``push``
+    # selects rows that are not yet delivered, so inside the write lock that created this one it
+    # could not see it - and a phone is never worth holding SQLite's single writer for.
+    overtime.deliver_worker_notices({"worker_notified": notice_written})
+
+    # Asked rather than assumed: the reference was written at submission, and a failure there is a
+    # warning on this account until somebody enrolls it. That is a step the administrator who just
+    # approved it can take from this console, so it is reported rather than corrected here.
+    template_written = biometrics.is_enrolled(str(row["id"]), row["biometric_id"])
 
     return {
         "status": "success",
-        "request_id": int(request_id),
-        "photo_destroyed": destroyed,
+        "user_id": str(row["id"]),
+        "name": str(row["name"]),
+        "role": role,
+        # The two values the sign-in screen matches on, so the console can say what to hand over.
+        "email": str(row["email"] or ""),
+        "phone": str(row["phone"] or ""),
+        "template_written": template_written,
         "message": (
-            "The request was refused and the photograph has been destroyed."
-            if destroyed
+            f"Account {row['id']} is approved: {row['name']} can clock in from now on."
+            if template_written
             else (
-                "The request was refused, but the photograph could not be removed and is still "
-                "on disk. Remove it by hand."
+                f"Account {row['id']} is approved, but it has no face reference on file, so it "
+                "cannot clock in yet. Enroll this worker from the console."
+            )
+        ),
+    }
+
+
+@admin_router.post("/{user_id}/reject")
+async def reject_registration(
+    request: Request,
+    user_id: str,
+    payload: Decision | None = None,
+    current: CurrentUser = Depends(admin_only),
+):
+    """Turn the applicant down: the account is destroyed and the number goes back.
+
+    WHAT A REFUSAL IS NOW
+    ---------------------
+    Not a product state on a row that survives - a **deletion**. Under the holding table a refusal
+    kept the request, which is what made "may I apply again?" answerable; an account cannot be kept
+    that way, because an account that exists can sign in and is a name on the roster. So the
+    refusal takes the whole thing: the ``users`` row, the face reference under its biometric id,
+    and the administrators' notice that somebody was waiting.
+
+    The decision is still auditable without the row: ``audit_log`` keeps the refusal, with the
+    name, the role and the reason, and it is the copy that survives an account being deleted -
+    which a ``users`` row could never be.
+
+    THE ORDER MATTERS, AND IT IS THE OPPOSITE OF THE OBVIOUS ONE
+    -----------------------------------------------------------
+    The row is deleted **first**, inside the compare-and-set (``WHERE status = 'pending_approval'``,
+    so a second administrator clicking reject - or one clicking reject after a colleague approved -
+    is answered 409 rather than deleting a working account). The files are wiped *after*, with the
+    biometric id read before the delete, because ``biometrics.remove_files`` would otherwise have
+    to look that id up in a row that no longer exists. A wipe that fails is reported rather than
+    swallowed: the account is still gone, and an operator is told which file to remove by hand.
+
+    WHY THE NUMBER IS FREE AFTERWARDS, AND WHY THAT IS SAFE
+    -------------------------------------------------------
+    A refusal returns the number to the band, and the allocator will hand it to the next applicant
+    (see ``_next_workforce_id``). What makes that safe is the wipe in this function - not the
+    allocator's arithmetic - so the next holder of this id cannot be scored against the face of
+    the person before them.
+    """
+    with db() as conn:
+        row = _load_account(conn, user_id)
+    if str(row["status"] or "") != STATUS_PENDING_APPROVAL:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error_code": "already_reviewed",
+                "message": (
+                    f"Account {row['id']} is not waiting for approval any more: its status is "
+                    f"{row['status']}."
+                ),
+            },
+        )
+
+    note = (payload.note if payload else None) or None
+    with immediate() as conn:
+        deleted = conn.execute(
+            "DELETE FROM users WHERE id = ? AND status = ?",
+            (str(row["id"]), STATUS_PENDING_APPROVAL),
+        )
+        if deleted.rowcount != 1:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error_code": "already_reviewed",
+                    "message": "Another administrator decided this account first.",
+                },
+            )
+        _audit(
+            conn,
+            action="registration_rejected_purged",
+            actor=current,
+            entity="users",
+            entity_id=str(row["id"]),
+            before={"name": row["name"], "role": row["role"]},
+            after={"note": note},
+            request=request,
+        )
+        # The administrators' "somebody is waiting" notice goes with the account it was about: an
+        # alert nobody can act on any more is how a queue screen comes to look broken.
+        conn.execute(
+            "DELETE FROM admin_notifications WHERE dedupe_key = ?",
+            (f"{PENDING_NOTICE_PREFIX}{row['id']}",),
+        )
+
+    removed, failed = biometrics.remove_files(str(row["id"]), row["biometric_id"])
+    if failed:
+        log.warning(
+            "account %s was refused but these files could not be removed: %s", row["id"], failed
+        )
+
+    return {
+        "status": "success",
+        "user_id": str(row["id"]),
+        "photo_destroyed": not failed,
+        "message": (
+            "The account was refused and its face has been destroyed."
+            if not failed
+            else (
+                "The account was refused, but its face reference could not be removed and is "
+                "still on disk. Remove it by hand."
             )
         ),
     }

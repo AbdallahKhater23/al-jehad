@@ -3,25 +3,25 @@
  *
  * WHY THIS EXISTS
  * ---------------
- * The registration intake has been complete on the server for as long as it has existed:
- * ``GET /register`` publishes the policy, ``POST /register`` takes a submission and writes a
- * *pending request*, and an administrator's decision is the only thing that creates an
- * account. What was missing was the half a person uses - nobody without a session could fill
- * anything in, so the queue could only be filled by hand.
+ * ``GET /register`` publishes the policy and ``POST /register`` takes a submission, creating the
+ * account it is for as ``pending_approval``; an administrator's approval is what lets that
+ * account record attendance. What this file is is the half a person uses - nobody without a
+ * session could fill anything in, so applications could only be filed by hand.
  *
- * WHAT IT DOES NOT DO
- * -------------------
- * It creates nothing. The submission carries a name, a password, a role, contact details, an
- * optional line about the work and a photograph, and the answer is "we have your request" -
- * there is no id yet, because the id is minted inside the transaction that approves it. A
- * number said here would be a promise the next approval could take back.
+ * WHAT IT PRODUCES
+ * ----------------
+ * An account. The submission carries a name, a password, a role, contact details, an optional
+ * line about the work and a photograph; the server creates the user immediately, quarantines it
+ * as ``pending_approval``, and answers with the id - which this page puts on the screen, because
+ * it is what the person signs in with. What the account cannot do until an administrator
+ * approves it is record attendance, and that is refused at the punch itself rather than here.
  *
  * ONE KIND OF DECIDING
  * --------------------
  * The page refuses only what it can decide alone: a missing name, a password under the floor
  * the server published, two passwords that differ, an unticked consent line, and a photo that
- * is not one. Everything else - the switch, the role, a duplicate photograph, a full queue -
- * is the server's answer, and each one is spoken in the reader's language off its
+ * is not one. Everything else - the switch, the role, a full queue, a photograph that could not
+ * be read - is the server's answer, and each one is spoken in the reader's language off its
  * ``error_code`` (``Capture.serverMessage``) rather than off the English prose it arrives in.
  *
  * The camera, the photo policy and the language tables are ``capture.js``, shared with the
@@ -110,6 +110,35 @@
         }
     }
 
+    /**
+     * The receipt: the account exists, the number is on the screen, and the form is gone.
+     *
+     * THE NUMBER IS THE WHOLE POINT
+     * -----------------------------
+     * ``POST /register`` answers with the id the account was created under, and that id is what
+     * this person signs in with for as long as they work here. It is what makes this page
+     * different from the one that used to say "we have your request": the applicant is not
+     * anonymous to the system any more, so they can check on themselves instead of waiting to be
+     * told. It is set in the largest type on the page, because the alternative - a number in a
+     * sentence that scrolls away - is somebody who has to telephone an administrator to find out
+     * who they are.
+     *
+     * The form goes away with it (``disarm``), so a second tap cannot become a second account,
+     * and so the only thing left on the page is the way to the sign-in screen.
+     */
+    function showDone(answer) {
+        $("done-id").textContent = String((answer && answer.user_id) || "");
+        $("step-intro").classList.add("hidden");
+        $("send").classList.add("hidden");
+        $("done").classList.remove("hidden");
+        disarm();
+        // The sentence in the message box, and the card beside it, say different things on
+        // purpose: the box is the server's answer ("your account is created and waiting"), and
+        // the card is what to do with the number - including the part that will refuse them at
+        // the gate until an administrator approves.
+        sayKey("register.done", "ok");
+    }
+
     function loadPolicy() {
         fetch(API + "/register")
             .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
@@ -192,10 +221,9 @@
             .then(function (res) {
                 $("status-line").textContent = "";
                 if (res.ok) {
-                    // The request exists now and nothing else does: the form goes away, so a
-                    // second tap cannot become a second request.
-                    disarm();
-                    sayKey("register.done", "ok");
+                    // The account exists now: the form goes away, so a second tap cannot become
+                    // a second account, and the id it was created under takes its place.
+                    showDone(res.body);
                     return;
                 }
                 sayRefusal(res.body && res.body.detail, "register.failed");

@@ -470,6 +470,10 @@ def test_the_console_has_one_account_tab_and_no_enroll_dashboard(results):
     # photographed by the time that tab sees it, so it creates an account from a submission
     # rather than offering a console form to capture a face with.
     assert ids == [
+        # The console's front door, and first for that reason: ``renderAdminTab`` lands on the
+        # first tab this reader is offered, so this list's *order* is what a landing screen is
+        # (see test_frontend_dashboard.py, which pins the screen itself).
+        "Dashboard",
         "Live Ops",
         "Approvals",
         "Alerts",

@@ -125,7 +125,24 @@ const State = {
     mediaStream: null,
     gpsCoords: null,
     workerTab: localStorage.getItem('workerTab') || 'clock',
-    adminTab: 'Live Ops',
+    //: The tab the console opens on, and therefore the console's front door: this is what
+    //: ``paintAdminConsole`` hands to ``renderAdminTab`` on the first frame of a session.
+    //: It has to name the same tab as ``ADMIN_TABS[0]`` below - that array's first entry is
+    //: where an *unoffered* tab id falls back to, and this is where a fresh session starts -
+    //: and ``test_frontend_dashboard.py`` holds the two together so they cannot drift.
+    adminTab: 'Dashboard',
+    //: The dashboard's period window, as the server's ``?days=`` takes it: a day count, or
+    //: ``month``. Empty means "whatever the server defaults to", which is what a fresh session
+    //: wants; a chosen window is held here so the figures keep meaning the period the reader
+    //: picked while they open another tab and come back. It travels as a string because the
+    //: route's parameter is one (``month`` is a window, not a number of days).
+    dashboardDays: '',
+    //: Which of the dashboard's views is on top: the queues, the moment, the roster, the places or
+    //: the period. Held here rather than in the tab, so opening another tab and coming back
+    //: returns to the view the reader was working in - and so a language change, which repaints
+    //: the whole console, does not silently move them. An id the dashboard does not know falls
+    //: back to the first view (``dashboardMetric``), so a stale value cannot blank the screen.
+    dashboardMetric: '',
     //: An administrator who has stepped out of the console and onto the handset to clock
     //: in. The clock, history and profile screens a worker gets, with a way back - because
     //: a manager who covers a site as well has hours of their own to record.
@@ -838,6 +855,10 @@ const Camera = {
 //  layout it may or may not mirror - a nav that shifts shape between the three
 //  languages this app speaks is a nav nobody can learn.
 const ADMIN_ICONS = {
+    //  The front door: four tiles of different sizes, which is what a dashboard is. Deliberately
+    //  not the Live Ops pulse (that is a *live* board and this one is a snapshot), and not the
+    //  Admin sliders (that is the screen where these figures are configured, not read).
+    dashboard: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7.5" height="7.5" rx="1.5"></rect><rect x="13.5" y="3" width="7.5" height="4.5" rx="1.5"></rect><rect x="3" y="13.5" width="7.5" height="7.5" rx="1.5"></rect><rect x="13.5" y="10.5" width="7.5" height="10.5" rx="1.5"></rect></svg>',
     liveOps: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12h3.5l2-6 4 12 2-6H21"></path></svg>',
     approvals: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="m8.5 12.5 2.5 2.5 4.5-5.5"></path></svg>',
     sites: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 21s7-5.7 7-11a7 7 0 1 0-14 0c0 5.3 7 11 7 11Z"></path><circle cx="12" cy="10" r="2.5"></circle></svg>',
@@ -889,6 +910,11 @@ const HAND_ICONS = {
     camera: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8h2.5L8 6h8l1.5 2H20a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1Z"></path><circle cx="12" cy="13" r="3"></circle></svg>',
     alert: ADMIN_ICONS.alert,
     info: ADMIN_ICONS.info,
+    //  The welcome card's glyph, and the console's Credentials key on purpose: both mean
+    //  "access that has been given to somebody", which is what a brand-new worker's id is.
+    //  Not the check-circle (that is Approvals, and it means a decision was taken) and not
+    //  the bell (that is the inbox, which is where this notice would otherwise be waiting).
+    key: ADMIN_ICONS.credentials,
     back: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m14.5 6-6 6 6 6"></path></svg>',
     cloudOff: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 18h9.5a4.5 4.5 0 0 0 .6-8.96A6 6 0 0 0 6.2 8.3"></path><path d="M4 20 20 4"></path></svg>'
 };
@@ -1063,6 +1089,15 @@ const Brand = {
 //  two are deliberately separate, so re-ordering the rail is a decision about
 //  the rail and not a rename of the tab list.
 const ADMIN_TABS = [
+    //  The console's front door, and therefore first: ``renderAdminTab`` falls back to the first
+    //  tab this reader is offered, so the *order* of this list is what a landing screen is.
+    //
+    //  It sits ahead of Live Ops because the two answer different questions and this is the one
+    //  somebody opens first: the board answers *who is on site*, and this answers *what this
+    //  deployment is* - how many accounts, how many sites, and what is waiting on a person. It
+    //  is a snapshot that does not poll (see ``renderDashboard``), which is the second reason it
+    //  is not simply a fifth board.
+    { id: 'Dashboard', key: 'dashboard', hint: 'hintDashboard', group: 'navGroupOperations', icon: 'dashboard' },
     { id: 'Live Ops', key: 'activeShifts', hint: 'hintLiveOps', group: 'navGroupOperations', icon: 'liveOps' },
     { id: 'Approvals', key: 'pendingReviews', hint: 'hintApprovals', group: 'navGroupOperations', icon: 'approvals' },
     // What the system has written, and - for the ones that record a decision - what nobody
@@ -1424,12 +1459,15 @@ const UI = {
     //  The console, and the handset an administrator may step onto
     // -----------------------------------------------------------------
     //: Roles that run the console *and* may step onto the handset. ``worker`` is absent
-    //: because the handset is already where it lives, and ``head_admin`` is absent on
-    //: purpose: it is the role that owns the deployment rather than a rota. ``developer``
-    //: is here because the tier that can do everything an administrator can - including
-    //: work a shift - is not a role the console should refuse the clock to. Adding one
-    //: here is the whole change - every control below reads this list.
-    handsetRoles: ['admin', 'developer'],
+    //: because the handset is already where it lives, ``head_admin`` because it is the role
+    //: that owns the deployment rather than a rota, and ``developer`` because the server
+    //: refuses its punch outright - ``/attendance/verify`` answers 403 "The developer account
+    //: does not check in or out", and the forced clock-in and clock-out refuse it for the same
+    //: reason. A punch card for it could only ever end in that refusal, so the root tier is not
+    //: offered the clock at all: no way in from the console, and no handset to be left sitting
+    //: on. Adding or removing one here is the whole change - every control below reads this
+    //: list, and ``SELF_ENROLL_ROLES`` on the server is asserted to be the same list.
+    handsetRoles: ['admin'],
 
     /** Does this account reach the console but still clock in? */
     canOpenHandset() {
@@ -1657,7 +1695,17 @@ const UI = {
                 // Keep the server's ``expires_at`` beside the token so the app knows when to
                 // slide it, and so a stored session can be discarded after it has lapsed
                 // without a round trip.
-                State.saveUser({ ...res.user, token }, res.expires_at);
+                //
+                // ``welcome`` rides in the session beside the token because this answer is the
+                // only moment the server can hand it over: the notice an approval wrote for
+                // this account, while it is still unread. It is persisted with the session
+                // deliberately - a worker who reloads the page, or opens the app on the phone
+                // in their other pocket, is still somebody who has not been told their id yet,
+                // and the card follows them until it has been acknowledged.
+                State.saveUser(
+                    { ...res.user, token, welcome: res.welcome || null },
+                    res.expires_at
+                );
                 this.renderApp();
                 // Signed in over a working connection: this is the cheapest moment to
                 // register the device and pick up a time anchor.
@@ -2929,13 +2977,13 @@ const UI = {
     },
 
     /**
-     * Read the pending-registration count and paint it on the Registrations tab.
+     * Read the count of accounts waiting for approval and paint it on the Registrations tab.
      *
-     * Asked with ``limit=1``: the queue's own endpoint already counts what is pending
+     * Asked with ``limit=1``: the queue's own endpoint already counts what is waiting
      * separately from the page it returns (a badge that said "3" because the page was
      * truncated would be a badge that lies), so the count costs one request and no rows -
-     * there is no reason to make the badge fetch forty applications with photographs in
-     * front of them to paint a numeral.
+     * there is no reason to make the badge fetch forty applications with faces in front of them
+     * to paint a numeral.
      *
      * On the console only, and a failure is silence, for the reasons the crossings badge
      * beside it gives: a worker's handset has no such tab and would be refused with 403, and
@@ -2949,7 +2997,7 @@ const UI = {
         if (!force && now - this._registrationsResyncedAt < 1000) return;
         this._registrationsResyncedAt = now;
         try {
-            const data = await API.request('/admin/registrations?status=PENDING_REVIEW&limit=1');
+            const data = await API.request('/admin/registrations?status=pending_approval&limit=1');
             State.registrationsWaiting = Math.max(0, Number(data && data.pending) || 0);
         } catch (err) {
             return; // keep the last painted count; the next return-to-tab retries
@@ -3289,34 +3337,58 @@ const UI = {
         this.stopLiveOps();
         this.paintAdminHeader(tab);
 
-        const content = document.getElementById('adminContent');
-        if (!content) return;        content.innerHTML = this.consoleSkeletonHtml(`${I18n.__(adminTabRecord(tab).key)}...`);
-        try {
-            switch (tab) {
-                // The whole board - the stats, the filters, the live timer and the
-                // force-in panel - lives in ``admin_modules.js`` with the other tab
-                // screens. What stays here is the shell and ``forceInPanelHtml``,
-                // because the panel's buttons call back into ``UI.forceIn()``.
-                case 'Live Ops': await UI_MODULES.renderLiveOps(content); break;
-                case 'Approvals': await UI_MODULES.renderApprovals(content); break;
-                case 'Alerts': await UI_MODULES.renderAlerts(content); break;
-                case 'Sites': await UI_MODULES.renderSites(content); break;
-                case 'Credentials': await UI_MODULES.renderCredentials(content); break;
-                case 'Registrations': await UI_MODULES.renderRegistrations(content); break;
-                case 'Links': await UI_MODULES.renderLinks(content); break;
-                case 'Notes': await UI_MODULES.renderNotes(content); break;
-                case 'Developer': await UI_MODULES.renderDeveloperConsole(content); break;
-                case 'Admin': await UI_MODULES.renderAdminManagement(content); break;
-                case 'Shifts': await UI_MODULES.renderShifts(content); break;
-                default:
-                    content.innerHTML = `<div class="ui-empty">${tab} ${I18n.__('comingSoon')}</div>`;
+        // Screens do not paint together, they paint in whatever order their requests come
+        // back in - and that used to decide which tab the admin was left looking at. The
+        // console opens on `State.adminTab` while the session is still being drawn, so a tap
+        // on another tab lands *inside* that first screen's request; a board that answered
+        // slowly then landed after the tab that was asked for and painted over it, and the
+        // tap looked like it had done nothing at all. So the paints are put in a lane: a
+        // render waits for the one before it, and a render that has been superseded while
+        // waiting drops out rather than flickering over the newer tab. The tab tapped last is
+        // the tab on screen, whatever the server took to answer - the failure this prevents is
+        // not cosmetic, because the rows the admin is about to act on are the ones they think
+        // they are looking at.
+        const epoch = (this._adminPaintEpoch || 0) + 1;
+        this._adminPaintEpoch = epoch;
+        const lane = this._adminPaintLane || Promise.resolve();
+        const painting = lane.catch(() => {}).then(async () => {
+            if (epoch !== this._adminPaintEpoch) return;
+            // Looked up here rather than above: a language switch or a rotation replaces the
+            // console's host, and a tab painted into the element that was there before that
+            // would be drawn into a node nobody is looking at.
+            const content = document.getElementById('adminContent');
+            if (!content) return;
+            content.innerHTML = this.consoleSkeletonHtml(`${I18n.__(adminTabRecord(tab).key)}...`);
+            try {
+                switch (tab) {
+                    // The whole board - the stats, the filters, the live timer and the
+                    // force-in panel - lives in ``admin_modules.js`` with the other tab
+                    // screens. What stays here is the shell and ``forceInPanelHtml``,
+                    // because the panel's buttons call back into ``UI.forceIn()``.
+                    case 'Dashboard': await UI_MODULES.renderDashboard(content); break;
+                    case 'Live Ops': await UI_MODULES.renderLiveOps(content); break;
+                    case 'Approvals': await UI_MODULES.renderApprovals(content); break;
+                    case 'Alerts': await UI_MODULES.renderAlerts(content); break;
+                    case 'Sites': await UI_MODULES.renderSites(content); break;
+                    case 'Credentials': await UI_MODULES.renderCredentials(content); break;
+                    case 'Registrations': await UI_MODULES.renderRegistrations(content); break;
+                    case 'Links': await UI_MODULES.renderLinks(content); break;
+                    case 'Notes': await UI_MODULES.renderNotes(content); break;
+                    case 'Developer': await UI_MODULES.renderDeveloperConsole(content); break;
+                    case 'Admin': await UI_MODULES.renderAdminManagement(content); break;
+                    case 'Shifts': await UI_MODULES.renderShifts(content); break;
+                    default:
+                        content.innerHTML = `<div class="ui-empty">${tab} ${I18n.__('comingSoon')}</div>`;
+                }
+            } catch (err) {
+                // The server's sentence is escaped like any other server text: it is written by
+                // whichever endpoint refused the request, and "it is our own message" stops
+                // being true the moment one of them interpolates something a client sent.
+                content.innerHTML = `<p class="ui-note is-body is-danger">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`;
             }
-        } catch (err) {
-            // The server's sentence is escaped like any other server text: it is written by
-            // whichever endpoint refused the request, and "it is our own message" stops
-            // being true the moment one of them interpolates something a client sent.
-            content.innerHTML = `<p class="ui-note is-body is-danger">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`;
-        }
+        });
+        this._adminPaintLane = painting;
+        return painting;
     },
 
     /**

@@ -44,7 +44,18 @@ from datetime import datetime, timedelta
 from typing import Any, Mapping
 
 import numpy as np
-from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -75,12 +86,14 @@ import biometrics
 import branding
 import corpus
 import coverage_report
+import dashboard
 import database
 import developer
 import enrollment
 import face_detector
 import face_engine
 import liveness
+import live_ops
 import migrations
 import netguard
 import notes
@@ -243,6 +256,12 @@ SOURCE_SITE_ARRIVAL = "site_arrival"
 #: The reason stamped on a shift abandoned while still in transit; a constant because the
 #: administrator's review screen and the tests key on the same sentence.
 TRANSIT_ABANDONED_REASON = "Worker clocked out without confirming arrival at any site geofence"
+#: The reason stamped on a punch that was admitted because the geofence covering it has been
+#: *deleted* - the boundary the site had when it was removed still contains this fix, so the
+#: worker is where the shift was opened and the missing fence is an administrator's edit
+#: rather than a worker in the wrong place. A constant because the review screen and the tests
+#: key on the same sentence.
+DELETED_SITE_REASON = "Site geofence was deleted: punch matched its last known boundary"
 
 STATUS_APPROVED = "Approved"
 STATUS_PENDING_REVIEW = "pending_review"
@@ -333,30 +352,11 @@ def _parse_ts(value: Any) -> datetime | None:
     return None
 
 
-def _seconds_on_site(clock_in_time: Any, now: datetime | None = None) -> int | None:
-    """Whole seconds since a stored clock-in, or ``None`` if it cannot be read.
-
-    Sent with every open shift so a client that draws a *live* counter starts at the
-    server's own figure. The stored clock-in is a zone-less wall-clock string
-    (``%Y-%m-%d %H:%M:%S``, written by ``datetime.now()``, i.e. in *this* host's zone);
-    a phone or a console in another zone reads those digits as its own local time, which
-    puts a constant offset on the counter - three hours, for a server in UTC and staff in
-    Kuwait, on a shift that has just started. Sending the count alongside the stamp means
-    the client never has to know what zone the digits were written in: it starts from this
-    number and adds only the seconds it has watched pass.
-
-    "This host's zone" is the company's zone now: ``clock.py`` pins the process (and the
-    container pins the image) to ``Asia/Kuwait``, so the stored digits, this counter and the
-    wall clock at the gate all agree.
-
-    The same function the clock-out path measures a closed shift with
-    (``shift_hours.elapsed_seconds``), so the counter on the card and the hours that are
-    actually recorded cannot disagree about what "so far" means.
-    """
-    clock_in = _parse_ts(clock_in_time)
-    if clock_in is None:
-        return None
-    return shift_hours.elapsed_seconds(clock_in, now if now is not None else datetime.now())
+#: ``live_ops.seconds_on_site`` under the name this module has always called it: the count
+#: travels with every open shift (worker's own card, the board's rows, the counted board read),
+#: so it lives beside the board's arithmetic rather than here. See its docstring for the zone
+#: the stored stamp is written in and why the count is sent at all.
+_seconds_on_site = live_ops.seconds_on_site
 
 
 def _audit(
@@ -1071,6 +1071,72 @@ def site_at(conn: sqlite3.Connection, lat: float, lon: float) -> sqlite3.Row | N
     return None
 
 
+def _deleted_fence_geometry(before_json: str | None) -> tuple[float, float, float] | None:
+    """``(lat, lon, radius)`` from a ``site_delete`` audit entry, or ``None`` if it has none.
+
+    An entry that does not carry a boundary - a hand-written row, a delete recorded before
+    this shape settled - is not evidence about where the site was, and guessing at it would
+    put a fence somewhere nobody ever surveyed.
+    """
+    try:
+        geometry = json.loads(before_json or "")
+        return float(geometry["lat"]), float(geometry["lon"]), float(geometry["radius"])
+    except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+        return None
+
+
+def deleted_site_at(
+    conn: sqlite3.Connection, lat: float, lon: float, *, prefer: str | None = None
+) -> str | None:
+    """The *deleted* site whose last known geofence contains this fix, or ``None``.
+
+    WHY THIS EXISTS: ``site_at`` answers "no fence here", and that one answer means two very
+    different things - the worker is somewhere they should not be, or the site they are
+    standing on was deleted while their shift was open. The first is a refusal. The second is
+    a *configuration* change stranding a worker who is exactly where they are supposed to be:
+    every tap answers "you are outside any designated construction site geofence", and a shift
+    that can never be closed from the field runs on until somebody notices.
+
+    The evidence is the delete itself. ``/admin/sites/delete`` records the row it removed -
+    ``lat``, ``lon`` and ``radius`` in ``before_json`` - in the append-only ``audit_log``, so
+    the boundary a fence had is still known after the fence is gone. That is what makes this a
+    *question about a place* rather than a hole in the rule: the exception it licenses can only
+    be claimed from inside the boundary the site actually had.
+
+    ``prefer`` is asked about first, and the punch path passes the open shift's own site: "the
+    fence this shift was opened inside has been deleted" is a much stronger statement than
+    "some fence used to be here", and it is the one a clock-out is entitled to.
+
+    A name that exists in ``construction_sites`` is skipped entirely: that fence is live,
+    ``site_at`` has already had its say about it, and the boundary it had before it was deleted
+    is not the one in force now. A site removed by direct SQL (a restore, a hand-edited
+    database) leaves no delete event and is therefore indistinguishable from "you are not at
+    work": this returns ``None`` and the punch is refused as it always was. Deleting through
+    the API is the supported path, and the one the console offers.
+    """
+    live = {row[0] for row in conn.execute("SELECT site_name FROM construction_sites")}
+    #: The most recent delete of each name, newest first. A site deleted, re-added and deleted
+    #: again is governed by the boundary in force when it last went away - the same "one row,
+    #: one answer" rule ``site_at`` follows for a pair of overlapping fences.
+    latest: dict[str, tuple[float, float, float]] = {}
+    for row in conn.execute(
+        "SELECT entity_id, before_json FROM audit_log WHERE action = 'site_delete' ORDER BY id DESC"
+    ):
+        name = row["entity_id"]
+        if name is None or name in latest or name in live:
+            continue
+        geometry = _deleted_fence_geometry(row["before_json"])
+        if geometry is not None:
+            latest[str(name)] = geometry
+
+    order = ([prefer] if prefer else []) + [name for name in latest if name != prefer]
+    for name in order:
+        geometry = latest.get(name)
+        if geometry is not None and get_distance_meters(geometry[0], geometry[1], lat, lon) <= geometry[2]:
+            return name
+    return None
+
+
 #: What a worker is told when the *photo* is the problem, keyed by the reason
 #: ``compare_faces_sync`` reports. Those strings are written for an operator reading a
 #: log - and one of them (``Internal processing error: <exception>``) used to be echoed
@@ -1527,6 +1593,13 @@ async def login(request: Request, req: LoginRequest):
     refusal names a real state (an administrator deactivated this account) and is only
     ever seen by somebody who already knows the password, whereas answering it earlier
     would turn "is this account deactivated?" into a question anyone can ask.
+
+    A sign-in also answers with ``welcome``: the notice an approval wrote for this worker,
+    while it is still unread (``notifications.worker_welcome``). A worker hired through the
+    public form has never seen a screen of this application before, and the id they sign in
+    with was minted by somebody else minutes earlier - so the answer to their first sign-in is
+    where that gets handed over, rather than waiting as a badge on a tab. It is ``None`` for
+    every other account and for a worker who has already read theirs.
     """
     with db() as conn:
         user_row = conn.execute(
@@ -1535,11 +1608,23 @@ async def login(request: Request, req: LoginRequest):
             "FROM users WHERE id = ? AND (email = ? OR phone = ?)",
             (req.user_id, req.email_or_phone, req.email_or_phone),
         ).fetchone()
+        # Read here, inside the same connection, and answered only after the credentials below
+        # check out: a row that is not this account's must not be able to tell whether a
+        # welcome is waiting for somebody. See ``notifications.worker_welcome`` for why the
+        # unread notice - rather than a login counter - is what a first sign-in is read from.
+        welcome = notifications.worker_welcome(conn, user_row["id"]) if user_row else None
 
     if not user_row or not verify_password(req.password, user_row["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials or user ID")
 
-    if str(user_row["status"] or "active").strip().lower() != "active":
+    # ``pending_approval`` is deliberately *not* refused here. An account created by the public
+    # form is real, and its owner holds the one credential nobody can reset for them - so signing
+    # in is how they find out whether they have been approved, and the notice written at the
+    # decision is waiting on the screen this lets them reach. What the quarantine forbids is
+    # *attendance*, and that is refused at the punch itself (``verify_worker``): a refusal here
+    # would mean a worker could not read the answer even after an administrator gave it.
+    status = str(user_row["status"] or "active").strip().lower()
+    if status not in ("active", registrations.STATUS_PENDING_APPROVAL):
         raise HTTPException(
             status_code=403,
             detail="This account has been deactivated. Ask an administrator to reactivate it.",
@@ -1556,7 +1641,18 @@ async def login(request: Request, req: LoginRequest):
             "email": user_row["email"],
             "phone": user_row["phone"],
             "role": user_row["role"],
+            # Travels with the account rather than beside it, because the client's own copy of
+            # the user object is what the clock panel is drawn from - and an account that is
+            # waiting for approval has to be able to say so on the screen where it matters.
+            "approval_status": status,
         },
+        # The same fact at the top level, for a client that reads the answer rather than the
+        # account: ``pending_approval`` means "signed in, not yet able to record attendance".
+        "approval_status": status,
+        # The worker's own welcome, when one is waiting: their id and the way back in, handed
+        # over on the one screen this account has never seen. ``None`` for every account that
+        # was not minted by an approval - which is every account an administrator typed.
+        "welcome": welcome,
         "token": token,
         "access_token": token,
         "token_type": "bearer",
@@ -1662,7 +1758,8 @@ async def get_worker_stats(worker_id: str, current: CurrentUser = Depends(admin_
     # clocked in, so every tap after the first answered "Already clocked in!".
     with db() as conn:
         session = conn.execute(
-            "SELECT site_name, clock_in_time, late_flag FROM active_sessions WHERE worker_id = ?",
+            "SELECT site_name, clock_in_time, late_flag, is_transit FROM active_sessions "
+            "WHERE worker_id = ?",
             (worker_id,),
         ).fetchone()
 
@@ -1702,8 +1799,19 @@ async def get_worker_stats(worker_id: str, current: CurrentUser = Depends(admin_
             "SELECT 1 FROM attendance_logs WHERE worker_id = ? AND status = ? LIMIT 1",
             (worker_id, STATUS_PENDING_REVIEW),
         ).fetchone()
+    # Whether this account is still quarantined. It travels with the worker's own stats because
+    # the *clock panel* is what has to say so: the sign-in answer carried the same fact, but an
+    # approval can happen while the phone is sitting on that screen, and a banner that only ever
+    # appears on a fresh sign-in is a banner a worker learns to ignore - or, worse, one they
+    # still believe after it has stopped being true.
+    with db() as conn:
+        account = conn.execute("SELECT status FROM users WHERE id = ?", (worker_id,)).fetchone()
+    approval_status = str(
+        (account["status"] if account is not None else "") or "active"
+    ).strip().lower()
     return {
         "worker_id": worker_id,
+        "approval_status": approval_status,
         "total_hours": round(total, 2),
         "regular_hours": round(float(row["payable_hours"] or 0.0), 2),
         "pending_hours": round(float(row["pending_hours"] or 0.0), 2),
@@ -1716,6 +1824,14 @@ async def get_worker_stats(worker_id: str, current: CurrentUser = Depends(admin_
                 "site_name": session["site_name"],
                 "clock_in_time": session["clock_in_time"],
                 "late_flag": session["late_flag"],
+                # The shift was opened away from every site and no geofence has confirmed it
+                # yet: the phone tells the worker they are on the road and offers them the one
+                # thing that helps - the request above - rather than let them find out what an
+                # off-site Clock Out does by taking one (it is refused; see the transit
+                # milestone). Sent as a flag rather than inferred from ``site_name``: the
+                # placeholder is a sentence for a human, and matching on English in the client
+                # is how a translated or reworded placeholder becomes a missing button.
+                "in_transit": bool(int(session["is_transit"] or 0)),
                 # The count the panel ticks from, as of this response. See
                 # ``_seconds_on_site`` for why the stamp alone is not enough.
                 "seconds_on_site": _seconds_on_site(session["clock_in_time"]),
@@ -1772,6 +1888,111 @@ async def get_my_site_window(
         # is about another worker, so there is no id to tamper with.
         "worker_id": current.id,
         **arrival.as_dict(),
+    }
+
+
+@router.post("/worker/me/request_checkout")
+async def request_checkout(current: CurrentUser = Depends(any_authenticated)):
+    """Ask an administrator to close the open shift, for a worker who cannot close it himself.
+
+    WHY THIS EXISTS: a Clock Out taken away from every site is *refused* while the shift is
+    still unconfirmed (see the transit milestone in ``/attendance/verify``). That refusal is
+    correct - nothing about the shift has been authorised by a place, so the system will not
+    decide when an unverified shift ended - but it must not be a dead end for the person
+    holding the phone: their shift is still open and still counting, and the only way out is an
+    administrator. This is the one tap that tells one.
+
+    The subject is the token's owner; there is no body to tamper with. One notification per
+    shift, not per tap: ``dedupe_key`` is the shift's own clock-in, so a worker who taps again
+    (or whose phone retries) does not bury the request in duplicates - the response says it was
+    already sent rather than pretending it was new.
+
+    The closing itself is ``/admin/force_clock_out``, which records the end at the moment the
+    administrator chooses and the hours figure they judge - which is exactly the decision this
+    endpoint is asking for, and the reason it does not hand that decision to the worker.
+    """
+    with db(write=True) as conn:
+        session = conn.execute(
+            "SELECT site_name, clock_in_time, is_transit, transit_start_time "
+            "FROM active_sessions WHERE worker_id = ?",
+            (current.id,),
+        ).fetchone()
+        if session is None:
+            raise HTTPException(status_code=400, detail="You have no open shift to close.")
+
+        started = _parse_ts(session["transit_start_time"] or session["clock_in_time"])
+        open_hours = (
+            round(shift_hours.elapsed_seconds(started, datetime.now()) / 3600.0, 2)
+            if started
+            else 0.0
+        )
+        user_row = conn.execute(
+            "SELECT name FROM users WHERE id = ?", (current.id,)
+        ).fetchone()
+        display = user_row["name"] if user_row else current.id
+        site = session["site_name"]
+        off_site = bool(int(session["is_transit"] or 0))
+
+        asked = notifications.notify(
+            conn,
+            kind=notifications.KIND_CHECKOUT_REQUEST,
+            severity=notifications.SEVERITY_CRITICAL,
+            title="A worker is asking to be clocked out",
+            body=(
+                f"{display} (id {current.id}) has an open shift that they are asking to have "
+                "closed from the field: "
+                + (
+                    "they are on a travel shift that has not confirmed arrival at a site, so no "
+                    "geofence has authorised it and the system will not end it for them. "
+                    if off_site
+                    else "no geofence matches the punch, so the shift cannot be closed from "
+                    "where they are. "
+                )
+                + f"The shift began at {session['clock_in_time']} and has been open "
+                f"{open_hours:.2f}h. Close it from Live Ops (Force clock out) and set the hours "
+                "you judge; nothing is paid until you do."
+            ),
+            worker_id=current.id,
+            site_name=site,
+            dedupe_key=f"checkout_request:{current.id}:{session['clock_in_time']}",
+            payload={
+                "worker_id": current.id,
+                "site_name": site,
+                "in_transit": off_site,
+                "clock_in_time": session["clock_in_time"],
+                "transit_start_time": session["transit_start_time"],
+                "open_hours": open_hours,
+                "requested_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            },
+        )
+        if asked:
+            _audit(
+                conn,
+                action="attendance_checkout_requested",
+                actor=current,
+                entity="active_sessions",
+                entity_id=current.id,
+                after={
+                    "site": site,
+                    "in_transit": off_site,
+                    "open_hours": open_hours,
+                    "clock_in_time": session["clock_in_time"],
+                },
+            )
+
+    return {
+        "status": "requested",
+        "already_asked": not asked,
+        "message": (
+            "Already sent - an administrator has your request."
+            if not asked
+            else (
+                "Your request was sent. An administrator will close this shift; it stays open, "
+                "and keeps counting, until they do."
+            )
+        ),
+        "open_hours": open_hours,
+        "site_name": site,
     }
 
 
@@ -2341,6 +2562,9 @@ async def unsubscribe_my_push(
 @limiter.limit(settings.attendance_rate_limit)
 async def verify_worker(
     request: Request,
+    #: Used only by the transit arrival, to push the worker's own notice *after* the transaction
+    #: that wrote it has committed - a push cannot see an uncommitted row (see ``push``).
+    background: BackgroundTasks,
     worker_id: str = Form(...),
     action: str = Form(...),
     location_input: str = Form(...),
@@ -2386,13 +2610,30 @@ async def verify_worker(
     # refusal effective on every ASGI worker at once.
     with db() as conn:
         user_row = conn.execute(
-            "SELECT id, name, biometric_id, COALESCE(transit_enabled, 0) AS transit_enabled "
+            "SELECT id, name, status, biometric_id, COALESCE(transit_enabled, 0) AS transit_enabled "
             "FROM users WHERE id = ?",
             (current.id,),
         ).fetchone()
     if user_row is None:
         # The token names an account that is gone: the session is dead, not the form.
         raise HTTPException(status_code=401, detail="Invalid token")
+    if str(user_row["status"] or "").strip().lower() == registrations.STATUS_PENDING_APPROVAL:
+        # An account created by the public registration form, waiting for an administrator. It is
+        # a real account and it can sign in (see ``login``), but it has not been approved by
+        # anybody yet - so it may not record attendance. Refused *here*, before the geofence and
+        # before the camera, for two reasons: nothing about the fix is a matter of standing in
+        # the right place, and a worker at a gate is owed the real reason rather than "outside
+        # the site". The approval is ``registrations.approve_registration``.
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error_code": "account_pending_approval",
+                "message": (
+                    "Your account is awaiting administrator approval. You cannot clock in or "
+                    "out yet."
+                ),
+            },
+        )
     if current.is_developer:
         # The root tier owns the deployment, not a rota: it has no shifts to open or end,
         # and an attendance row in its name would be a figure somebody has to review.
@@ -2424,10 +2665,30 @@ async def verify_worker(
             "FROM active_sessions WHERE worker_id = ?",
             (current.id,),
         ).fetchone()
+        #: A shift that was opened off-site and has not yet been confirmed by a geofence.
+        in_transit = bool(open_session) and int(open_session["is_transit"] or 0) == 1
+        # The fence that would have admitted this punch may have been deleted under the
+        # worker. ``site_at`` cannot tell that apart from "you are not at work", so the
+        # boundary the site had when it was removed is read here - and only when nothing
+        # matched *and* a shift is already open, because that is the only case where the
+        # difference changes what the punch is allowed to do.
+        #
+        # A shift that is still in transit has no site of its own to prefer (its ``site_name``
+        # is the placeholder), so for an arrival the question is the wide one: is this fix
+        # inside the boundary of a site that has since been deleted? For a clock-out the
+        # shift's own site is asked about first (see ``deleted_site_at``).
+        deleted_site = (
+            deleted_site_at(
+                conn,
+                lat,
+                lon,
+                prefer=None if in_transit else open_session["site_name"],
+            )
+            if detected_site_row is None and open_session is not None
+            else None
+        )
 
     detected_site = detected_site_row["site_name"] if detected_site_row is not None else None
-    #: A shift that was opened off-site and has not yet been confirmed by a geofence.
-    in_transit = bool(open_session) and int(open_session["is_transit"] or 0) == 1
 
     if not detected_site:
         # Outside every fence. For everybody but a transit-enabled account this is the refusal it
@@ -2440,10 +2701,20 @@ async def verify_worker(
         #     attempt that has not reached a fence yet, or a Clock Out that abandons the trip).
         # A transit-enabled account outside a fence for any *other* reason is not covered, and is
         # refused exactly as before.
+        #
+        # ...and then there is the case that is not about position at all. An open shift whose
+        # own site row has been deleted, with the fix inside the boundary that site had when it
+        # was removed, is a worker standing *exactly* where this shift was opened - and there is
+        # no geofence left there to say so. Closing that shift is admitted, and only closing it:
+        # nothing about a deleted site authorises new work, so this exception cannot open a
+        # shift, and a fix that matches no deleted boundary either is refused as before.
         opening_the_trip = (
             action in (ACTION_CLOCK_IN, ACTION_TRANSIT_CHECKPOINT) and open_session is None
         )
-        if not (transit_enabled and (opening_the_trip or in_transit)):
+        closing_at_a_deleted_fence = action == ACTION_CLOCK_OUT and deleted_site is not None
+        if not (
+            (transit_enabled and (opening_the_trip or in_transit)) or closing_at_a_deleted_fence
+        ):
             raise HTTPException(
                 status_code=403,
                 detail="Location Rejected. You are outside any designated construction site geofence.",
@@ -2799,12 +3070,22 @@ async def verify_worker(
                 # telling us they have reached a site. The arrival only counts if the fix is
                 # *actually* inside a geofence - a check-in from the car park is not an arrival -
                 # so an off-fence attempt answers 422 and leaves the shift exactly as it was.
-                if detected_site_row is None:
+                #
+                # The destination may have been deleted while the worker was on the road, and
+                # then no live fence can ever confirm this trip however early they arrive: the
+                # boundary the site had when it was removed is the one they can be standing in,
+                # and `deleted_site_at` names it. A fix that matches neither is not an arrival.
+                arrival_site = detected_site if detected_site_row is not None else deleted_site
+                if arrival_site is None:
                     punch_frames.discard_frame(punch_frame)
                     raise HTTPException(
                         status_code=422,
                         detail="Outside target site geofence. Cannot confirm arrival.",
                     )
+                #: True when this arrival is authorised by a deleted fence rather than a live
+                #: one: the milestone row and the audit entry say so instead of pretending the
+                #: site is still configured.
+                deleted_fence = detected_site_row is None
                 # ``clock_in_time`` is left untouched on purpose: it still holds the departure
                 # moment, so the whole travel-plus-work span is credited when the shift closes.
                 # The window is judged against that *departure* moment, since that is when the
@@ -2819,7 +3100,7 @@ async def verify_worker(
                 conn.execute(
                     "UPDATE active_sessions SET site_name = ?, is_transit = 0, late_flag = ?, "
                     "liveness_class = ? WHERE worker_id = ?",
-                    (detected_site, late_flag, liveness_class, current.id),
+                    (arrival_site, late_flag, liveness_class, current.id),
                 )
                 transit_seconds = (
                     shift_hours.elapsed_seconds(transit_start, now) if transit_start else 0
@@ -2831,7 +3112,7 @@ async def verify_worker(
                 arrival_log_id = _insert_log(
                     conn,
                     worker_id=current.id,
-                    site_name=detected_site,
+                    site_name=arrival_site,
                     action=ACTION_TRANSIT_CONFIRMED,
                     timestamp=now_str,
                     hours=0.0,
@@ -2843,6 +3124,7 @@ async def verify_worker(
                     source=SOURCE_SITE_ARRIVAL,
                     liveness_class=liveness_class,
                     liveness_score=liveness_score,
+                    flag_reason=DELETED_SITE_REASON if deleted_fence else None,
                     punch_frame=punch_frame,
                 )
                 if late_flag:
@@ -2854,11 +3136,11 @@ async def verify_worker(
                         body=(
                             f"{user_row['name']} (id {current.id}) began a transit shift at "
                             f"{(session['transit_start_time'] or now_str)}, outside "
-                            f"{site_window.site_name or detected_site}'s "
+                            f"{site_window.site_name or arrival_site}'s "
                             f"{site_window.label()} clock-in window."
                         ),
                         worker_id=current.id,
-                        site_name=detected_site,
+                        site_name=arrival_site,
                         dedupe_key=f"late:{current.id}:{now_str[:10]}",
                     )
                 _audit(
@@ -2868,21 +3150,56 @@ async def verify_worker(
                     entity="attendance_logs",
                     entity_id=arrival_log_id,
                     after={
-                        "site": detected_site,
+                        "site": arrival_site,
                         "origin": {"lat": lat, "lon": lon},
                         "transit_hours": round(transit_seconds / 3600.0, 2),
                         "score": similarity_score,
+                        # The site is gone from ``construction_sites``: the arrival was
+                        # authorised by the boundary it had when it was deleted, and an
+                        # operator reading this later must not have to guess why a punch
+                        # matched no configured fence.
+                        "site_deleted": deleted_fence,
                     },
                     request=request,
+                )
+                # ... and the worker's own notice, in the same transaction as the milestone. It
+                # is the durable half of "you have arrived": the response below says it once, on
+                # one screen, and this is what survives the toast - the arrival is the moment the
+                # travel time they were watching becomes credited, and the inbox is where that
+                # can be read back afterwards. Pushed after the commit via ``background``, for
+                # the reason ``push`` gives: a notice written in an open transaction does not
+                # exist yet as far as the sender's own connection is concerned.
+                arrival_notice = notifications.notify_worker(
+                    conn,
+                    worker_id=current.id,
+                    kind=notifications.KIND_WORKER_TRANSIT_ARRIVED,
+                    title=f"Arrived at {arrival_site}",
+                    body=(
+                        f"Your travel shift was confirmed at {arrival_site} at {now_str}. The "
+                        f"time since you set off ({round(transit_seconds / 3600.0, 2)}h) is "
+                        f"credited to this shift, and your clock-out from the site will pay it."
+                    ),
+                    payload={
+                        "site_name": arrival_site,
+                        "site_deleted": deleted_fence,
+                        "transit_hours": round(transit_seconds / 3600.0, 2),
+                        "confirmed_at": now_str,
+                        "clock_in_time": session["clock_in_time"],
+                    },
+                    dedupe_key=f"transit_arrived:{current.id}:{session['clock_in_time']}",
+                )
+                background.add_task(
+                    overtime.deliver_worker_notices,
+                    {"worker_notified": arrival_notice},
                 )
                 telemetry.observe_punch(action="transit_confirmed", status="approved")
                 return {
                     "status": "arrived",
                     "message": (
-                        f"Arrival confirmed at {detected_site}. Travel time is credited to this "
+                        f"Arrival confirmed at {arrival_site}. Travel time is credited to this "
                         "shift."
                     ),
-                    "site": detected_site,
+                    "site": arrival_site,
                     "score": similarity_score,
                     "hours": 0.0,
                     "break_hours": 0.0,
@@ -2952,90 +3269,38 @@ async def verify_worker(
                 punch_frames.discard_frame(punch_frame)
                 raise HTTPException(status_code=400, detail=_no_open_shift_message(conn, current.id))
 
-            if session_in_transit and detected_site_row is None:
-                # PHASE C - ABANDONED TRANSIT. A Clock Out while the shift is still unconfirmed and
-                # the worker is outside every fence: the trip never arrived. The shift is closed so
-                # it stops counting and does not hang open forever, but the outcome is *review*,
-                # never automatic approval - nothing about the hours is authorised, and an
-                # administrator decides what, if anything, is payable. The travel time is recorded
-                # for that decision rather than approved by it.
-                abandoned_start = _parse_ts(
-                    session["transit_start_time"] or session["clock_in_time"]
-                )
-                abandoned_seconds = (
-                    shift_hours.elapsed_seconds(abandoned_start, now) if abandoned_start else 0
-                )
-                abandoned_hours = round(abandoned_seconds / 3600.0, 4)
-                conn.execute("DELETE FROM active_sessions WHERE worker_id = ?", (current.id,))
-                # No ``approved_hours``: it is deliberately left NULL, because assigning it would
-                # be the automatic approval this path exists to withhold.
-                log_id = _insert_log(
-                    conn,
-                    worker_id=current.id,
-                    site_name=session["site_name"],
-                    action=action,
-                    timestamp=now_str,
-                    hours=abandoned_hours,
-                    score=similarity_score,
-                    status=STATUS_PENDING_REVIEW,
-                    status_code="pending_review",
-                    lat=lat,
-                    lon=lon,
-                    source="online",
-                    liveness_class=liveness_class,
-                    liveness_score=liveness_score,
-                    flag_reason=TRANSIT_ABANDONED_REASON,
-                    punch_frame=punch_frame,
-                )
-                notifications.notify(
-                    conn,
-                    kind=notifications.KIND_REVIEW_PENDING,
-                    severity=notifications.SEVERITY_WARNING,
-                    title="Transit shift ended before reaching a site",
-                    body=(
-                        f"{user_row['name']} (id {current.id}) clocked out {abandoned_hours:.2f}h "
-                        "after starting a travel shift, without ever confirming arrival at a site "
-                        "geofence. The time is not payable until an administrator reviews it."
-                    ),
-                    worker_id=current.id,
-                    site_name=None,
-                    log_id=log_id,
-                    dedupe_key=f"transit_abandon:{log_id}",
-                    payload={
-                        "transit_start_time": session["transit_start_time"],
-                        "abandoned_hours": abandoned_hours,
-                    },
-                )
-                _audit(
-                    conn,
-                    action="attendance_clock_out",
-                    actor=current,
-                    entity="attendance_logs",
-                    entity_id=log_id,
-                    after={
-                        "site": session["site_name"],
-                        "status": STATUS_PENDING_REVIEW,
-                        "reason": TRANSIT_ABANDONED_REASON,
-                        "hours": abandoned_hours,
-                    },
-                    request=request,
-                )
-                telemetry.observe_punch(action="clock_out", status="pending_review")
-                return {
-                    "status": "pending_review",
-                    "message": (
-                        "You clocked out before reaching a site. This shift is held for "
-                        "administrator review, and its travel time is not payable until it is "
-                        "approved."
-                    ),
-                    "site": session["site_name"],
-                    "score": similarity_score,
-                    "hours": abandoned_hours,
-                    "break_hours": 0.0,
-                    "paid_hours": 0.0,
-                    "overtime_hours": 0.0,
-                    "liveness": liveness_decision.as_payload(),
-                }
+            if session_in_transit and detected_site_row is None and deleted_site is None:
+                # PHASE C - AN UNCONFIRMED TRIP, REFUSED. A Clock Out while the shift is still
+                # unconfirmed and the worker is outside every fence - including any boundary a
+                # deleted site left behind, which is what ``deleted_site`` rules out: a worker
+                # standing inside the destination's last known boundary *has* arrived, and saying
+                # they never reached a site would be a false entry in their record. That case
+                # falls through to the confirm-and-close below.
+                #
+                # This path used to close the shift and route the hours to review. It is refused
+                # instead, because *nothing about this shift has been authorised by a place*: the
+                # worker is off-site, the trip never reached a fence, and ending it here would be
+                # the system deciding when an unverified shift ended - the one decision the
+                # geofence rule exists to keep out of the field. The shift stays open and keeps
+                # counting, an administrator is told what the worker is asking for, and the
+                # closing is theirs to make: ``/admin/force_clock_out`` records the end at the
+                # moment they choose, with the hours figure they choose. The worker's side of it
+                # is ``/worker/me/request_checkout``, which is the button the panel offers beside
+                # this refusal.
+                #
+                # This refusal writes *nothing*: it writes no ledger row (there is no
+                # authorised end to record), it changes neither the session nor the shift, and
+                # the raise below rolls the transaction back - which is why there is no audit
+                # entry here to be rolled back with it, the same as the early clock-out's
+                # refusal. The frame goes with the punch, exactly as every other refusal after
+                # the upload does, and the operator's read on "how often is this happening" is
+                # the punch counter, which is precisely the distinction it exists to draw.
+                punch_frames.discard_frame(punch_frame)
+                telemetry.observe_punch(action="clock_out", status="off_site_unconfirmed")
+                # The shift is the worker's only way *into* the request that ends this, so the
+                # refusal carries it: the panel draws the button off this state, and the worker
+                # who taps nothing has still been told the shift is open and counting.
+                raise HTTPException(status_code=409, detail=_off_site_checkout_refusal(session))
 
             if session_in_transit:
                 # Arrived *and* finished in one tap: the fix is inside a fence, so the trip is
@@ -3043,10 +3308,12 @@ async def verify_worker(
                 # below do its work, and because ``clock_in_time`` still holds the departure
                 # moment the credited span includes the travel. Reaching a site is the condition
                 # that authorises the shift, whether it arrives through the explicit checkpoint or
-                # through this clock-out.
+                # through this clock-out - and a deleted destination's last known boundary counts
+                # as reaching it, for the same reason it does in the arrival above.
+                arrived_at = detected_site if detected_site_row is not None else deleted_site
                 conn.execute(
                     "UPDATE active_sessions SET site_name = ?, is_transit = 0 WHERE worker_id = ?",
-                    (detected_site, current.id),
+                    (arrived_at, current.id),
                 )
                 session = conn.execute(
                     "SELECT worker_id, site_name, clock_in_time, is_transit, transit_start_time "
@@ -3147,10 +3414,19 @@ async def verify_worker(
             else:
                 status_msg += f" (Clocked Out of {session['site_name']}. {hours_note})"
 
+        # The name this punch's rows carry. A live fence wins; otherwise it is the shift's own
+        # site - a close that was admitted because that site's row has been deleted still happened
+        # *there*, and ``attendance_logs.site_name`` is NOT NULL. The flags gain the reason at the
+        # same moment, because an approved row that matched no configured geofence is exactly the
+        # kind of entry an operator has to be able to find afterwards. Only the clock-out can be
+        # here with no live fence: every other path that could be has returned above.
+        if detected_site is None:
+            flag_reason = " | ".join(part for part in (flag_reason, DELETED_SITE_REASON) if part)
+        recorded_site = detected_site or session["site_name"]
         log_id = _insert_log(
             conn,
             worker_id=current.id,
-            site_name=detected_site,
+            site_name=recorded_site,
             action=action,
             timestamp=now_str,
             hours=hours_worked,
@@ -3186,7 +3462,7 @@ async def verify_worker(
                     f"the {action.lower()} was logged and is awaiting review."
                 ),
                 worker_id=current.id,
-                site_name=detected_site,
+                site_name=recorded_site,
                 log_id=log_id,
                 payload={"score": similarity_score},
                 dedupe_key=f"review:{log_id}",
@@ -3206,7 +3482,7 @@ async def verify_worker(
             entity="attendance_logs",
             entity_id=log_id,
             after={
-                "site": detected_site,
+                "site": recorded_site,
                 "score": similarity_score,
                 "hours": hours_worked,
                 "break_hours": break_taken,
@@ -3228,7 +3504,7 @@ async def verify_worker(
         "hours": hours_worked,
         "break_hours": break_taken,
         "paid_hours": hours_worked,
-        "site": detected_site,
+        "site": recorded_site,
         "overtime_hours": overtime_hours,
         "liveness": liveness_decision.as_payload(),
     }
@@ -5159,6 +5435,37 @@ def _early_checkout_refusal(record: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _off_site_checkout_refusal(session: Mapping[str, Any]) -> dict[str, Any]:
+    """The refusal a Clock Out gets while the shift is still unconfirmed, off every site.
+
+    ``message`` is English because the API has one language; the app builds its own sentence
+    from these fields in the reader's own language, exactly as it does for the early clock-out
+    question, and ``error_code`` is what it keys on to offer the request button instead of a
+    dead end.
+
+    The middle of the message is the point of the whole path: this is not a broken punch and not
+    a shift the system has ended - the shift is *still open and still counting*, and the close has
+    to come from an administrator, who can record the end at the moment and the hours they judge.
+    """
+    started = session["transit_start_time"] or session["clock_in_time"]
+    elapsed = shift_hours.elapsed_seconds(_parse_ts(started), datetime.now()) if _parse_ts(started) else 0
+    hours = round(elapsed / 3600.0, 2)
+    return {
+        "error_code": "off_site_checkout_needs_admin",
+        "message": (
+            "This shift has not been confirmed at a site, so it cannot be closed from here. "
+            f"It is still open ({hours:.2f}h) and will keep counting until an administrator "
+            "closes it. Use 'Ask an administrator to close my shift' to send the request."
+        ),
+        "reason": TRANSIT_ABANDONED_REASON,
+        "open_hours": hours,
+        "site_name": session["site_name"],
+        "transit_start_time": started,
+        "clock_in_time": session["clock_in_time"],
+        "can_request": True,
+    }
+
+
 def _no_open_shift_message(conn: sqlite3.Connection, worker_id: str) -> str:
     """Why there is nothing to clock out of - and, usually, exactly when it ended.
 
@@ -5998,6 +6305,16 @@ app.include_router(quick_links.public_router, prefix="/api/v1")
 # the per-person enrollment link keeps its own routes and its own meaning.
 app.include_router(registrations.public_router, prefix="/api/v1")
 app.include_router(registrations.admin_router, prefix="/api/v1")
+# The console's front door: one counted read for people, places and what is waiting, built
+# because the numbers it shows did not exist as reads - every screen that needed one had
+# downloaded a full list and counted it in the browser. Additive, like every router above;
+# ``admin_only``, so a site administrator reads it and the root tier reaches it through the
+# same wildcard it reaches every other administrative surface with.
+app.include_router(dashboard.router, prefix="/api/v1")
+# The Live Ops board's own figures, counted instead of downloaded. Additive, like every router
+# above: the board's rows (``/admin/active_sessions``) are untouched, and this is the read the
+# board's numerals and its poll use so a board does not pay for the roster to say "12 on site".
+app.include_router(live_ops.router, prefix="/api/v1")
 # The root tier's own surface: runtime configuration, the private alert hub, diagnostics and
 # the raw audit stream. Additive, like every router above - nothing already served moved, and
 # every route on it is built from ``require_developer``, so an administrator cannot reach one

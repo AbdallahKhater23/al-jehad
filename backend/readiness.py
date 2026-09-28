@@ -1368,8 +1368,11 @@ def _check_registration_intake(ctx: dict) -> Check:
     Three facts an operator has to be able to see without asking the application, because each
     of them is invisible until somebody complains:
 
-    * a **closed intake** is a supported state rather than a fault - the switch ships off - so
-      this reports it as an ok check that says so, and exists for the other two;
+    * a **closed intake** is a supported state rather than a fault - the deployment switch ships
+      off, and an operator closing the link for the afternoon is a decision rather than a fault -
+      so this reports it as an ok check that says so, and exists for the other two. Which of the
+      two switches closed it is named, because that is the whole difference between "this
+      deployment does not run walk-up registration" and "somebody closed it this morning";
     * a **full queue** stops accepting submissions (the cap is enforced inside the insert's
       transaction), and it is the one way this feature fails *quietly*: the applicant is refused
       and the administrator sees nothing, because a queue only looks long when somebody reads it;
@@ -1381,13 +1384,21 @@ def _check_registration_intake(ctx: dict) -> Check:
     off-by-default intake is misconfigured would be this check prioritising the wrong thing. A
     warning that names the directory is what an operator needs; a boot refusal is not.
     """
-    from config import settings
-
-    if not settings.registration_enabled:
-        return Check("registration_intake", TIER_ADVISORY, True, "walk-up registration is closed")
-
     import registrations
     from database import db as _db
+
+    # The effective state, not the env flag: an intake an administrator closed from the console
+    # is closed, and reporting the counts it cannot act on (a full queue, a photo directory) would
+    # be this check describing a link that is refusing everything anyway.
+    state = registrations.intake_state()
+    if not state["accepting"]:
+        return Check(
+            "registration_intake",
+            TIER_ADVISORY,
+            True,
+            f"walk-up registration is closed ({state['reason']})",
+            {"reason": state["reason"], "deployment_enabled": state["deployment_enabled"]},
+        )
 
     directory = registrations.photos_dir()
     try:
@@ -1402,11 +1413,16 @@ def _check_registration_intake(ctx: dict) -> Check:
             {"directory": directory},
         )
 
+    # The accounts waiting for approval, which is what the cap is now about: a walk-up submission
+    # creates the account immediately and quarantines it (see ``registrations.submit_registration``),
+    # so the number this reports is people who can sign in and cannot clock in until somebody
+    # decides - the thing an operator schedules on, and the thing that fills up.
     try:
         with _db() as conn:
             pending = int(
                 conn.execute(
-                    "SELECT COUNT(*) FROM registration_requests WHERE status = 'PENDING_REVIEW'"
+                    "SELECT COUNT(*) FROM users WHERE status = ?",
+                    (registrations.STATUS_PENDING_APPROVAL,),
                 ).fetchone()[0]
             )
     except Exception as exc:  # noqa: BLE001 - a report must never fail on one check
@@ -1414,7 +1430,7 @@ def _check_registration_intake(ctx: dict) -> Check:
             "registration_intake",
             TIER_ADVISORY,
             True,
-            f"walk-up registration is open; the review queue could not be counted: {exc}",
+            f"walk-up registration is open; the accounts awaiting approval could not be counted: {exc}",
         )
 
     cap = int(settings.registration_pending_cap)
@@ -1424,14 +1440,14 @@ def _check_registration_intake(ctx: dict) -> Check:
             TIER_ADVISORY,
             False,
             f"the registration review queue is full ({pending} of {cap}); new submissions are "
-            "refused until an administrator reviews some",
+            "refused until an administrator decides some",
             {"pending": pending, "cap": cap},
         )
     return Check(
         "registration_intake",
         TIER_ADVISORY,
         True,
-        f"walk-up registration is open; {pending} of {cap} review slots in use",
+        f"walk-up registration is open; {pending} of {cap} approval slots in use",
         {"pending": pending, "cap": cap},
     )
 

@@ -481,8 +481,16 @@ def test_the_schema_version_names_the_newest_migration():
     # split of the old moallem band: any account the shrunk range left in 750-999 is rewritten
     # to the new role so the stored role and the id range still agree, and 27 the transit-to-site
     # columns - ``users.transit_enabled`` (an administrator's per-account grant) plus the four
-    # ``active_sessions`` columns that carry an off-geofence shift until a site confirms it.)
-    assert migrations.SCHEMA_VERSION == 27
+    # ``active_sessions`` columns that carry an off-geofence shift until a site confirms it.
+    # 28 is the attendance-timestamps-to-UTC rewrite, written and *deliberately unregistered* -
+    # it and the readers/writers of those columns have to land together (see the registry note
+    # and ``docs/RUNBOOK_ATTENDANCE_UTC.md``), so the number is left free rather than reused.
+    # 29 adds ``registration_settings``, the console's own intake switch for the public
+    # walk-up registration link, and 30 the schema half of self-service registration:
+    # ``users.registration_note`` plus the ``users(status)`` index the approval queue is read
+    # with, so a walk-up submission is a real account held in a third status until an
+    # administrator approves it.)
+    assert migrations.SCHEMA_VERSION == 30
 
 
 def test_the_migration_is_replayable_and_idempotent():

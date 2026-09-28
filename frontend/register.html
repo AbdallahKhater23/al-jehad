@@ -134,6 +134,22 @@
   .msg.ok { display: block; background: rgba(22, 163, 74, 0.18); color: #86efac; border: 1px solid rgba(134, 239, 172, 0.4); }
   .msg.err { display: block; background: rgba(220, 38, 38, 0.18); color: #fca5a5; border: 1px solid rgba(252, 165, 165, 0.4); }
   .hidden { display: none !important; }
+  /* The receipt's number: the one thing on this page the applicant has to keep, so it is set
+     larger than anything else here and in the same mono face the console sets ids in. */
+  .done-id {
+    margin: 0; font-size: 1.7rem; font-weight: 700; letter-spacing: .06em;
+    color: var(--brand-gold-hi); overflow-wrap: anywhere;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  /* The way off this page, drawn at the weight of the send button because it is the only thing
+     left to do. An ``<a>`` rather than a button with a redirect: the sign-in screen is a
+     different document, and this page has no router to route with. */
+  .btn-link {
+    display: block; text-align: center; text-decoration: none; min-height: 52px;
+    line-height: 52px; border-radius: 12px; font-weight: 600;
+    color: var(--brand-green-ink);
+    background: linear-gradient(180deg, var(--brand-gold-hi), var(--brand-gold) 52%, var(--brand-gold-lo));
+  }
   .credit {
     margin: 0; padding: 0 16px calc(18px + env(safe-area-inset-bottom, 0px));
     text-align: center; font-size: .78rem; color: rgba(237, 231, 214, 0.62);
@@ -248,9 +264,28 @@
     <p class="note warn hidden" id="photo-problem"></p>
   </div>
 
-  <div class="card">
+  <div class="card" id="send">
     <button id="btn-submit" style="width:100%" data-t="register.submit" disabled>Send my request</button>
     <p class="note" id="status-line"></p>
+  </div>
+
+  <!--
+    The receipt, hidden until ``POST /register`` answers. The account exists by the time this is
+    shown, and the number in it is the one thing the applicant has to keep: it is what they sign
+    in with, and nothing on this page will say it again. A card of its own rather than a sentence
+    in the message box above, because the message box is where refusals go, and a number read out
+    of a refusal reads like one.
+
+    Filled and revealed by ``register.js`` (``showDone``); every sentence here is a ``data-t``
+    node, so it is already in the reader's language when it appears - the translation pass runs
+    at boot whether or not the card is visible.
+  -->
+  <div class="card hidden" id="done">
+    <p class="note" data-t="register.doneTitle">Account created</p>
+    <p class="note" data-t="register.doneId">Your user ID</p>
+    <p class="done-id" id="done-id"></p>
+    <p class="note" data-t="register.doneHint">Sign in with this ID and the password you chose. An administrator must approve your account before you can clock in or out.</p>
+    <a class="btn-link" id="btn-login" href="/" data-t="register.doneLogin">Go to sign in</a>
   </div>
 </main>
 

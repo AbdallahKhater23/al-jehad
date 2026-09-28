@@ -63,6 +63,8 @@ DEVELOPER_ROUTES = (
     "/api/v1/developer/ml/shadow-summary",
     "/api/v1/developer/db/stats",
     "/api/v1/developer/db/integrity",
+    # The backup directory: what is in it, and what may be added to it.
+    "/api/v1/developer/db/backups",
     "/api/v1/developer/engine/process-stats",
     "/api/v1/developer/offline/devices",
     "/api/v1/developer/offline/tamper-alerts",
@@ -177,6 +179,11 @@ def test_the_developer_surface_is_closed_to_every_door_the_console_uses(client, 
         # of the payroll database, every face template rewritten by hand, and a *session* for
         # somebody else's account. A lock with those behind it is not a lock.
         "/api/v1/developer/db/backup",
+        # ...and the snapshot tool, which copies every face template and every payroll row into
+        # a directory, plus the lever that re-hashes one of them. A path segment out of a URL by
+        # an administrator is a 403 before the name is even looked at.
+        "/api/v1/developer/db/snapshot",
+        "/api/v1/developer/db/backups/manual_dev_20260101_000000/verify",
         "/api/v1/developer/geo/test-point",
         "/api/v1/developer/biometrics/reindex",
         f"/api/v1/developer/auth/impersonate/{WORKER}",

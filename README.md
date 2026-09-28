@@ -170,6 +170,33 @@ it; `ngrok http 8000` works the same way if that is what you have.
   HTTPS address instead.
 - **Clock-in says location rejected** — the worker is outside the site geofence.
   Site coordinates and radii are managed in Admin → Sites.
+- **A worker is stuck on "location rejected" at a site that was just deleted, or a transit
+  arrival never confirms** — the site row was removed while their shift was open, so there is
+  no geofence left to match them against. The boundary the site *had* is still known, because
+  `/admin/sites/delete` records the row it removed (lat, lon, radius) in the audit log, and
+  the worker is admitted if their fix falls inside it: a clock-out at a site that was deleted
+  from under the shift is approved and flagged `Site geofence was deleted: punch matched its
+  last known boundary`, and an in-transit trip that reaches a deleted destination confirms
+  like any other arrival. Those punches show the flag on the row (Approvals → the log card),
+  so scroll there first. Two limits are deliberate: a deleted site can never **open** a new
+  shift - it is not a workplace any more - and a worker standing anywhere else, including
+  elsewhere on the same site, is still refused. Deleting a site by hand (`sqlite3`) leaves no
+  delete event, so there is nothing to match and the refusal stands; use the console, or
+  force-clock the shift out from Admin → Live Ops.
+- **A transit worker's shift will not close, and the app says an administrator has to** — that
+  is the rule, not a fault. A transit worker (the per-account grant, Credentials → *Allow
+  off-site shift start*) may open a shift away from every site; it opens **pending**, at "In
+  Transit", and it counts: the worker is on the clock, the console lists them, and nothing is
+  payable yet. Arriving at a site confirms the shift - the placeholder becomes the site, the
+  travel time is credited from the departure, and the worker gets an "Arrival confirmed" notice
+  in their own inbox. A Clock Out taken away from every site is **refused** (409,
+  `off_site_checkout_needs_admin`): nothing about the shift has been authorised by a place, so
+  the system will not decide when it ended. The worker taps **Ask an administrator to close my
+  shift** on their panel, which raises one critical alert under Alerts (one per shift, however
+  many times it is tapped), and the administrator ends it from Live Ops → **Force clock out**,
+  choosing the hours. The shift keeps counting until they do - and the automatic close will not
+  step in: an unconfirmed trip is never paid by the watcher, which reports what it left alone
+  under `transit_held`.
 - **Every arrival at one site is flagged late** — that site's clock-in window does not
   contain the hours people actually arrive. Check the site's own window (Admin → Sites,
   or `GET /api/v1/admin/sites`); a window that starts after it ends is overnight, and
@@ -496,11 +523,11 @@ Key settings (all optional except `SECRET_KEY`, full list in `backend/config.py`
 | `WORKER_PHOTOS_DIR` | `worker_photos` | reference selfies, one per enrolled account |
 | `PUNCH_FRAMES_DIR` | `punch_frames` | the downscaled evidence frame stored with a punch |
 | `QUICK_LINK_PHOTOS_DIR` | `quick_link_photos` | the selfie a quick-link punch arrives with |
-| `REGISTRATION_ENABLED` | `0` | the walk-up onboarding link (`GET`/`POST /api/v1/register`). Off by default, so a deployment publishes it deliberately; while off the link answers as closed and every submission is refused |
-| `REGISTRATION_PHOTOS_DIR` | `registration_photos` | the selfie a walk-up applicant sends, held until an administrator approves or rejects it |
-| `REGISTRATION_PENDING_CAP` | `200` | how many applications may wait for review at once; the next is refused rather than letting the queue grow without bound |
+| `REGISTRATION_ENABLED` | `0` | the walk-up onboarding link (`GET`/`POST /api/v1/register`), and the *ceiling* over the console's own intake switch: while off the link answers as closed and every submission is refused, whatever an administrator sets on `POST /api/v1/admin/registrations/intake` |
+| `REGISTRATION_PHOTOS_DIR` | `registration_photos` | the selfie a walk-up applicant sends - a *staging* area, not a store: the file is read once for the face and deleted in the same request, and the two residues (a request that died, a reference that could not be written) are swept by age |
+| `REGISTRATION_PENDING_CAP` | `200` | how many accounts may be waiting for approval at once; the next submission is refused rather than letting the quarantine grow without bound |
 | `REGISTRATION_RATE_LIMIT` | `20/minute` | per-IP ceiling on submissions to the public link |
-| `REGISTRATION_PHOTO_STALE_HOURS` | `168` | how long an application photo no row references is kept before the startup sweep deletes it |
+| `REGISTRATION_PHOTO_STALE_HOURS` | `168` | how long a leftover intake photograph is kept before the startup sweep deletes it; age is the only test there is, because nothing in the database points into that directory |
 | `MIN_PASSWORD_LENGTH` | `8` | shortest password the server will set, in the console and on a registration link |
 | `ENROLLMENT_TOKEN_TTL_HOURS` | `72` | how long an enrollment or registration link stays usable |
 | `OVERTIME_WATCHER_INTERVAL_SECONDS` | `60` | how often that timer runs |
@@ -1089,34 +1116,92 @@ is claimed, and the walk-up allocator below treats it as taken, so the two creat
 never hand the same id to two people. Revoking, expiring or claiming the invite releases it. The Credentials tab has this behind one
 button, with the URL, a copy button, a WhatsApp message and the QR code.
 
-**Walk-up registration (one standing link, no account yet).** An invite is issued per
-person; a *walk-up* link is the opposite - a single public URL a site can print or display,
-where anybody applies and nothing exists until an administrator decides. `GET /api/v1/register`
-reports whether it is open and what the form must satisfy, `POST /api/v1/register` streams the
-photo to disk and writes a `registration_requests` row (`PENDING_REVIEW`) - never an account,
-a face template or an id. An administrator lists the queue at `GET /api/v1/admin/registrations`,
-views the photo at `.../{id}/photo`, and *then* approves or rejects:
+**Walk-up registration (one standing link, and a real account the moment it is sent).** An
+invite is issued per person; a *walk-up* link is the opposite - a single public URL a site can
+print or display, where anybody applies. `GET /api/v1/register` reports whether it is open and
+what the form must satisfy. `POST /api/v1/register` **creates the account there and then**: a
+real row in `users`, with a real id, the applicant's own password, their work details as
+`registration_note`, and `status = 'pending_approval'`. There is no second, half-made kind of
+person for the rest of the system to know about, and the number they were hired under is theirs
+from the first second - so the form can tell them what it is and sign them in with it. What the
+account may *not* do is punch (see the quarantine below). The id is the **lowest free number in
+the workforce band** (1..999; the administrative tiers start at `ADMIN_TIER_ID_FLOOR`, 1000), the
+role is one of `worker`, `moallem`, `off_office` and never an administrator, and the queue the
+administrator reviews is that same table read the other way round. `GET
+/api/v1/admin/registrations` lists the accounts waiting (and takes
+`?status=pending_approval|active|inactive`), the photo is at `.../{id}/photo`, and *then* somebody
+approves or rejects:
 
 ```
 GET  /api/v1/register                      -> whether it is open, the roles, the photo policy
-POST /api/v1/register                      multipart: photo + name, phone, role, password,...
-GET  /api/v1/admin/registrations           the queue, oldest first, no password, no path
-GET  /api/v1/admin/registrations/{id}/photo     the application photo, `Cache-Control: no-store`
-POST /api/v1/admin/registrations/{id}/approve   {"note": "..."} -> creates the account
-POST /api/v1/admin/registrations/{id}/reject    {"note": "..."} -> wipes the photo, keeps the row
+POST /api/v1/register                      multipart: photo + name, phone, role, password,... -> the account
+GET  /api/v1/admin/registrations           the accounts awaiting approval, oldest id first, no password
+GET  /api/v1/admin/registrations/intake    is the link accepting, and which switch decided it
+POST /api/v1/admin/registrations/intake    {"open": true|false} -> opens or closes the link
+GET  /api/v1/admin/registrations/{id}/photo     the applicant's photo, while the account is pending
+POST /api/v1/admin/registrations/{id}/approve   {"note": "..."} -> the status becomes active
+POST /api/v1/admin/registrations/{id}/reject    {"note": "..."} -> the account goes, its face with it
 ```
 
-Approval is the only thing that creates an account, and it is atomic: it allocates the
-**lowest free id in the role's block** - an id a live registration invite is holding counts as
-taken, so an approval can never spend a number another administrator already promised to
-somebody - writes the user row and its face template behind one write lock, and clears the
-pending row in the same movement, so two administrators approving the last slot cannot both
-think they won. The password the applicant chose is never returned,
-logged or selected by the queue - the applicant would otherwise learn the account's credentials
-from a screenshot of the review list. The link is off unless `REGISTRATION_ENABLED=1`, capped by
-`REGISTRATION_PENDING_CAP`, rate-limited per IP (`REGISTRATION_RATE_LIMIT`), and deliberately
-does **no model work** on the public route: the 1 vCPU that serves the punch gate must not be
-spent on a stranger's upload. Liveness, if it applies at all, runs at review.
+There are **two intake switches**, because they answer two different questions.
+`REGISTRATION_ENABLED` is the *deployment's* - may this installation collect walk-up
+applications at all - and it is a ceiling that no API call can move. The row behind
+`/admin/registrations/intake` is the *operator's*: is the standing link accepting today, a
+shift-to-shift decision the Registrations tab turns into one button, with no restart. The
+effective state is `REGISTRATION_ENABLED and (the row is not 0)`, an untouched row follows the
+deployment flag, and both the form and the queue read report the effective state rather than the
+env var. The console names which of the two is holding the link shut, and draws no button at all
+when the deployment switch is the one doing it.
+
+**The quarantine.** A pending account **can sign in**. `POST /api/v1/auth/login` answers its
+token, its id, its name, its role and `"approval_status": "pending_approval"`, so a new worker
+can open the app, read the notice that carries their own number, and see what is waiting on a
+person. It **cannot clock in or out**: `POST /api/v1/attendance/verify` refuses with 403
+`account_pending_approval` *before* any GPS or face work is done, and the handset puts the reason
+on the clock panel as a banner with the clock button disabled, so the rule is something the
+worker reads rather than something they walk into. Sign-in is the one thing the status does not
+take away, and that is the point: the alternative - refusing the sign-in too - leaves somebody
+who has just been told their number with no way to see whether they are being processed or
+forgotten. Deactivation is the other refusal, and the one that has always been absolute: an
+`inactive` account cannot sign in at all (403).
+
+**Approval is a status flip; a refusal deletes the account.** Approval is
+`UPDATE users SET status = 'active'` inside one write lock, and 409 `already_reviewed` if another
+administrator decided first - two administrators cannot both approve or both refuse the same
+applicant, however close together they tap. It is followed by the worker's own notice, which is
+where the quarantine is lifted in words, and which repeats the id, the contact the sign-in screen
+will match and a reminder of the password they chose (the value itself is never returned, logged
+or selected by the queue, so nobody can learn an account's credentials from a screenshot of the
+review list). The console's receipt says the same three things for an administrator to hand over.
+A **refusal deletes the row** and then destroys the face files, and the number returns to the
+band for the next applicant - which is safe only because the wipe happens *first*: the next
+holder of that id can never be scored against the face of the person before them. A refusal also
+takes the administrators' own "somebody is waiting" notice with the account it was about, since
+an alert nobody can act on is how a queue screen comes to look broken. Both decisions land in
+`audit_log` (`registration_approved`, `registration_rejected_purged`, and the submission itself
+as `user_self_registered`).
+
+The link is off unless `REGISTRATION_ENABLED=1` *and* the console's intake switch is open (see
+above), capped by `REGISTRATION_PENDING_CAP` - now a cap on pending *accounts* - and rate-limited
+per IP (`REGISTRATION_RATE_LIMIT`). The cap and the switch are read inside the insert's own
+transaction: a count taken before the write is advice, and N concurrent submissions would each
+read `cap - 1`. The public route *does* do the model work - the submitted frame is embedded at
+intake, so that a face the gate cannot read is refused while the applicant is still standing
+there with the form open, rather than discovered by an administrator an hour later. Two
+consequences are deliberate: a submission can be answered `503` when the face engine is busy,
+because the pool is the gate's own and queueing a stranger ahead of a worker at a gate is the
+wrong order of priorities; and a submission that fails after the account is written but before
+the template lands leaves the account in place rather than rolling it back, because the account
+is real - the warning notice names the photograph, so an administrator can enroll it from the
+console, and until they do the account exists and cannot punch, which is a state somebody can
+find and fix rather than one nothing points at.
+
+That approval notice is also the one thing
+`POST /api/v1/auth/login` answers with while it is still unread (`welcome`), so the worker's
+**first screen** is their own welcome rather than a badge on a tab they have no reason to open:
+the id drawn as a fact, the notice's sentence underneath it, and one button that marks the notice
+read. It is the unread state, not a per-device flag, that decides this - so it survives a reload
+or a new phone, and it does not come back once acknowledged.
 
 **Bulk import.** `POST /api/v1/admin/enrollment/bulk` with `roster` (CSV: `user_id,name`
 plus optional `role,email,phone,photo`) and `photos` (ZIP). Add `?dry_run=true` to
@@ -1187,6 +1272,73 @@ over it (liveness, then the face comparison) and writes the verdict onto the rev
 the liveness verdict and a sentence the reviewer reads. It is evidence, never a decision — a model
 that runs hours later is not a witness, so scoring cannot approve an offline punch and cannot refuse
 one either, and a spoof it finds is recorded and notified without touching what the shift is worth.
+
+## The console's dashboard
+
+```
+GET /api/v1/admin/dashboard?days=7    what this deployment is, counted
+```
+
+One read, five panels. **People**: accounts by role and state, how many have a face on file, how
+many have no password, how many joined this week, how many have never clocked in - and how many are
+*quarantined*, an account the public form created and nobody has approved yet, counted apart from
+the deactivated ones because a queue of applications is not a roster that has been switched off.
+**Places**: sites, categories, which sites override the shared clock-in window, and the ones nobody
+has clocked into today. **Waiting**: shifts awaiting a review, applications awaiting a decision,
+open notes, and - for the root tier - the unacknowledged alert queue, beside how long the oldest
+thing in any of them has been waiting. **Right now**: the Live Ops board's own figure for who is on
+site (total and by site), how many open shifts are past the overtime line with nobody having
+answered for them, how many punches a phone handed over that are not attendance records yet, and
+how many punches were refused in the last day.
+
+Every figure is counted in SQL, against the predicate the screen that owns that queue already
+uses, and every count is scoped by the same concealment rule as the roster it summarizes: the root
+account is excluded *inside* the query, because a filter applied afterwards still hands back the
+count of what it removed. None of it is derived by downloading a list and counting it in the
+browser - which is what the other console screens do, and the reason these numbers did not exist
+as reads until now. `enrolled` is *recorded* enrollment (the row, not a template file on disk),
+and `never_clocked_in` is exact rather than approximate because retention never deletes an
+`attendance_logs` row, so the absence of one really does mean a worker who has never punched.
+
+The `now` panel is the one that *borrows*, and deliberately: `on_shift` and `by_site` are
+`live_ops.summary` borrowed whole - the board's own counted read (see *Live Ops* below) - so the
+dashboard and the board cannot report two different totals for the same afternoon, and
+`overtime_open` is counted from `overtime.open_crossings` rather than from a second version of the
+overtime rule written in SQL. `offline_waiting` is the materialiser's own predicate - a verified
+punch with no `materialized_log_id` yet - not `processed_at IS NULL`, which is stamped on
+rejections too and so would report a signature this deployment already refused as work somebody
+still owes. `refused_24h` is a **rate to watch rather than a queue**: a refused punch has no triage
+state anybody can clear, and the panel says so under the figure.
+
+**The period** is the one panel about a window rather than a moment: `?days=` takes a number of days
+(default seven, today included) or the word `month` for the calendar month so far, and the window
+travels back with the figures (`start`, `end`, `days`, `preset`) so the control can say which one is
+in effect and the two linkages can name the period they open. The whole panel is
+`reports.attendance_period` - the counted twin of `/admin/reports/attendance`, run through the
+dashboard's own connection rather than a second one - so "days present", "days expected", "late
+arrivals", "average attendance rate" and the hours are the report's definitions and not a second
+copy of them. The hours are the *timesheet's* arithmetic: an approved figure falls back to the
+recorded one, a pending overtime shift credits the standard day it has earned and holds the rest,
+and `overtime_hours` is the part that needed a decision, never hours worked twice. Beside the
+figures are the two people worth opening - the least present and the most often late - each an
+ordered, capped list (three, by lowest attendance rate and then most late arrivals) and each a link
+into that person's own rows over exactly that window, because a ranking tells a reader somebody is
+at the bottom and a link lets them find out why.
+
+`alerts` is `null` rather than `0` for anybody but the root tier: that queue is not an
+administrator's to read, and a zero would say "nothing is waiting" about a surface they cannot
+open. The same rule, the other way round, is what a whole panel does - a panel whose own queries
+fail answers `null` and the console draws "could not be read" over it, because a zero standing in
+for unknown reads as good news on the one screen somebody opens to decide whether anything is
+wrong.
+
+The **Dashboard** tab is the console's landing screen for every console role, and it is a
+*snapshot*, not a board: `as_of` is stamped on the panel and it re-reads when the Refresh button is
+pressed, never on a timer. Live Ops next door polls deliberately - it answers *who is on site* and
+has to be current to the second - and it asks `GET /admin/live_ops/count` on that timer, reading the
+shift rows only when the count says something moved. This answers *how many, and is that normal*,
+and a polled aggregate is a query every few seconds against the same SQLite writer that serves the
+gate.
 
 ## Reporting
 
@@ -1419,6 +1571,36 @@ typed in full ("salmiya block 4"), still finds the place. One question, one answ
 tabs. A board where an administrator's own shift reads like anybody else's is a board whose
 reader has to recognise a name before they can tell who is on site, and the role is the one
 fact that decides who reviews the hours afterwards.
+
+**The figures are counted, not downloaded.** Above the rows are three numerals - on site now,
+how many sites (or categories) that is spread across, and how many arrived late - and they used
+to be produced by fetching four payloads and counting what was in them, on every render, every
+Refresh and inside the poll. One of those payloads was `/admin/users`: the whole roster, whose
+rows each carry `password_set` and an audit-log join for the last password change, fetched so
+that a board of *who is on site* could fill a picker of who is not. That is the right shape for
+the Credentials tab and the wrong shape for the gate.
+
+So the figures are counted in SQL by `backend/live_ops.py` and read with
+`GET /api/v1/admin/live_ops/count`: `on_site`, `late`, the sites with how many people are on
+each, the ids on shift, and the longest open shift as a row reference (`seconds_on_site`
+included, because a console in another zone must not parse a zone-less stamp to start its
+counter). Every query is the board's own join - `active_sessions` joined to `users` - so a
+session whose account has been deleted is dropped by the figures and by the rows in the same
+breath. The dashboard's `now` panel borrows the same read rather than repeating that join.
+
+Two things follow from it, and both are deliberate. The **poll** asks the counted read first and
+fetches the rows only when the answer says something moved - who is on shift, where, how many
+arrived late, which shift is oldest - so a board nobody is acting on costs one aggregate query
+every 45 s rather than a row payload. A *renamed* worker is the one change that answer cannot
+see; the new name arrives with the next row read, or with the operator's own Refresh. And the
+**force-in panel's roster is loaded when the panel is opened**, not with the board behind it:
+the panel is a roster and that is exactly where a roster-sized read belongs.
+
+`late` is the flag's own reading, not a re-derivation: `active_sessions.late_flag` holds the
+sentence `shift_windows.describe` wrote when an arrival missed its window (or nothing), and the
+console's rule and the count's SQL are the same one - something was written, and it is not
+`0` or `false`. It used to read `true`/`'1'`, which no deployment ever writes, so the late badge
+and the late figure were both quietly zero.
 
 ## Data retention and erasure
 

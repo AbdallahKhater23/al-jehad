@@ -15,8 +15,9 @@ for the person holding the phone is the same as it not existing.
 What can only be checked here, and not in a backend test:
 
 1. the console offers the way in, and only to the roles that have one - an administrator
-   does, a worker already lives on the handset, and a head administrator is not offered a
-   punch card, because that role owns the deployment rather than a rota;
+   does, a worker already lives on the handset, and neither a head administrator nor the
+   root tier is offered a punch card: both roles own the deployment rather than a rota, and
+   the server refuses the developer's punch outright (``/attendance/verify`` answers 403);
 2. taking it lands on the *real* handset - the same punch card a worker gets, reading the
    worker's own self-scoped endpoints - and not on a second, lighter screen;
 3. there is a way back, and a worker never sees one, because a worker has no console;
@@ -50,6 +51,7 @@ const ADMIN = { id: '1000', name: 'Site Admin', role: 'admin' };
 const WORKER = { id: '1', name: 'Seed Worker', role: 'worker' };
 const HEAD = { id: '5000', name: 'Head Admin', role: 'head_admin' };
 const MOALLEM = { id: '600', name: 'Seed Lead Worker', role: 'moallem' };
+const DEVELOPER = { id: '309010401073', name: 'Developer', role: 'developer' };
 
 // One approved shift and one still waiting on somebody: the split the whole overtime gate
 // exists for, and the split this screen must not blur.
@@ -178,16 +180,23 @@ const results = {};
     const admin = await bootAs(ADMIN);
     const worker = await bootAs(WORKER);
     const head = await bootAs(HEAD);
+    const developer = await bootAs(DEVELOPER);
     results.offered = {
         admin: admin.evaluate('UI.canOpenHandset()'),
         worker: worker.evaluate('UI.canOpenHandset()'),
         head: head.evaluate('UI.canOpenHandset()'),
+        // The root tier: every punch it could send is refused by the server, so the clock is
+        // never offered to it in the first place.
+        developer: developer.evaluate('UI.canOpenHandset()'),
         // A data hook, not an inline handler: the CSP's inline-attribute allowance is
         // pinned per file and may not rise, so the two new controls are bound by
         // delegation. ``test_frontend_xss.py`` is what enforces that.
         admin_button: admin.evaluate('UI.handsetButtonHtml()').indexOf('data-open-handset') >= 0,
         head_button: head.evaluate('UI.handsetButtonHtml()'),
-        worker_button: worker.evaluate('UI.handsetButtonHtml()')
+        worker_button: worker.evaluate('UI.handsetButtonHtml()'),
+        developer_button: developer.evaluate('UI.handsetButtonHtml()'),
+        // A developer's console frame, as drawn: no way onto the clock anywhere in it.
+        developer_frame: developer.evaluate("document.getElementById('app').innerHTML").indexOf('data-open-handset') >= 0
     };
 }
 
@@ -246,6 +255,18 @@ const results = {};
     results.head = {
         screen: screen(env),
         handset_mode: env.evaluate('State.handsetMode')
+    };
+}
+
+// 5b. the root tier is not put on the clock either, and for the same reason it cannot be:
+// the server refuses the punch
+{
+    const env = await bootAs(DEVELOPER);
+    await env.evaluate('UI.openHandset()');
+    results.developer = {
+        screen: screen(env),
+        handset_mode: env.evaluate('State.handsetMode'),
+        close_button: env.evaluate('UI.closeHandsetButtonHtml()')
     };
 }
 
@@ -618,6 +639,32 @@ def test_a_head_administrator_is_not_put_on_the_clock(results):
     head = results["head"]
     assert head["screen"] == "admin"
     assert head["handset_mode"] is False, "openHandset() must refuse a role without one"
+
+
+def test_the_root_tier_is_not_offered_the_clock_the_server_refuses(results):
+    """A punch card for the developer could only ever end in a 403.
+
+    ``/attendance/verify`` answers the developer with 403 "The developer account does not check
+    in or out", and the forced clock-in and clock-out carry the same rule - the root tier owns
+    the deployment rather than a rota, and an attendance row in its name would be a figure
+    somebody has to review. So the button is not drawn: a control whose only outcome is a
+    refusal is a dead end on the operator's own screen, which is the same rule the force-in
+    roster follows for this role.
+    """
+    offered = results["offered"]
+    assert offered["developer"] is False, "the root tier was offered the clock"
+    assert offered["developer_button"] == "", "and its console drew the way in anyway"
+    assert offered["developer_frame"] is False, (
+        "a data-open-handset control reached the developer's console frame"
+    )
+    developer = results["developer"]
+    assert developer["screen"] == "admin", "a developer belongs on the console"
+    assert developer["handset_mode"] is False, (
+        "openHandset() must refuse the role whose every punch is refused"
+    )
+    assert developer["close_button"] == "", (
+        "and there is no handset for it to offer a way back from"
+    )
 
 
 def test_my_hours_leads_with_the_totals_and_where_they_were_worked(results):

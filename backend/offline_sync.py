@@ -142,6 +142,16 @@ STATUS_ACCEPTED = "accepted"
 STATUS_FLAGGED = "flagged"
 STATUS_REJECTED = "rejected"
 
+#: The statuses a *verified* queue row can carry, and therefore the pair the materialiser will
+#: pick up. Published as a constant because a second reader now counts the backlog this module
+#: works through - the console's dashboard, which must not recast "waiting to become a record"
+#: as its own predicate (see ``dashboard._now``). ``rejected`` is deliberately not here: a
+#: refused punch is a decision already made, not work somebody owes.
+PENDING_STATUSES: tuple[str, ...] = (STATUS_ACCEPTED, STATUS_FLAGGED)
+
+#: The same pair as a SQL list, so ``_PENDING_SQL`` cannot drift from the tuple above.
+_PENDING_STATUS_LIST = ", ".join(f"'{status}'" for status in PENDING_STATUSES)
+
 #: ``attendance_logs.site_name`` is NOT NULL and legitimate rows name a real site, so a
 #: punch that geolocates nowhere needs an explicit sentinel rather than a fabricated
 #: site name that payroll could mistake for the truth.
@@ -753,10 +763,11 @@ def _rejected_params(punch: OfflinePunch, *, worker_id: str, device_id: str) -> 
 # ---------------------------------------------------------------------------
 # materialization
 # ---------------------------------------------------------------------------
-_PENDING_SQL = """
-    SELECT *, {effective} AS effective_time
+_PENDING_SQL = f"""
+    SELECT *, {{effective}} AS effective_time
     FROM punch_queue
-    WHERE worker_id = ? AND status IN ('accepted', 'flagged') AND materialized_log_id IS NULL
+    WHERE worker_id = ? AND status IN ({_PENDING_STATUS_LIST})
+      AND materialized_log_id IS NULL
     ORDER BY effective_time ASC, id ASC
 """
 

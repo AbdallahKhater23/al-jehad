@@ -154,9 +154,21 @@ def test_migration_28_is_not_registered_until_the_code_moves_with_it():
 
     When the writer/reader conversion in the runbook lands, register migration 28 there and
     update this test in the same commit - reading the runbook is the point.
+
+    The number is free on purpose, and it stays free while the schema moves *around* it:
+    migrations 29 and 30 have been registered since, which is what
+    ``test_database_from_a_newer_build`` calls the registry's deliberate gap. This test used to
+    pin ``SCHEMA_VERSION == 27`` as well, which was the same claim only while 27 was the newest
+    migration - so every later registration had to come here and edit a number, which is churn
+    rather than a guard. What the version pin was really asking (the schema version is the
+    newest migration this code knows about) is asserted directly below, and it holds whatever
+    the newest migration happens to be.
     """
     assert 28 not in {version for version, _, _ in migrations.MIGRATIONS}, (
         "register migration 28 only together with the clock.utc_now/clock.to_kuwait conversion; "
         "see docs/RUNBOOK_ATTENDANCE_UTC.md"
     )
-    assert migrations.SCHEMA_VERSION == 27
+    assert migrations.SCHEMA_VERSION == max(version for version, _, _ in migrations.MIGRATIONS), (
+        "the schema version and the newest registered migration disagree, so a build would "
+        "report one level and apply another"
+    )

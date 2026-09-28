@@ -21,6 +21,10 @@ What is asserted here:
 4. **The biometric pipeline is not bypassed.** These punches run the same liveness and match the
    gate does - the suite's stub engine returns an approved match, so a punch that succeeds here
    has passed the whole chain.
+
+A shift that never reaches a site is *refused* its off-site ending rather than closed: see
+``test_transit_pending_shift`` for the three states of that shift - pending on the road,
+confirmed on arrival, and closed by an administrator after the worker asks.
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ import sqlite3
 from datetime import datetime, timedelta
 
 import harness
+import main
 from harness import (
     ADMIN,
     DOWNTOWN,
@@ -233,37 +238,42 @@ def test_an_arrival_that_is_not_at_a_site_is_refused_and_leaves_the_shift_in_tra
 
 
 # ---------------------------------------------------------------------------
-# 5. Phase C - an abandoned transit shift goes to review, never auto-approval
+# 5. Phase C - an unconfirmed transit shift cannot be ended from the field
 # ---------------------------------------------------------------------------
-def test_clocking_out_still_in_transit_is_held_for_review(client):
-    """Never reached a site: the shift closes so it stops counting, but nothing is auto-approved."""
+def test_clocking_out_still_in_transit_is_refused_and_left_open(client):
+    """Never reached a site: nothing authorised an end to it, so nothing here may write one.
+
+    This path used to close the shift and hold the hours for review. It refuses instead, and
+    the shift stays open and counting: the end of an unconfirmed shift is the administrator's
+    act (`/admin/force_clock_out`), asked for by the worker (`/worker/me/request_checkout`).
+    The observer that ends a shift nobody remembered - the watcher - is not allowed to pay one
+    either; see `test_transit_pending_shift`.
+    """
     _grant_transit(client)
     _depart(client)
     _backdate_the_departure(hours=2.0)
+    started = db_scalar(
+        "SELECT clock_in_time FROM active_sessions WHERE worker_id = ?", (MOALLEM,)
+    )
 
     response = clock_in(
         client, MOALLEM, action="Clock Out", headers=bearer(MOALLEM), coordinates=OUTSIDE_ALL_SITES
     )
-    assert response.status_code == 200, response.text[:300]
-    body = response.json()
-    assert body["status"] == "pending_review"
-    assert body["paid_hours"] == 0.0, "an abandoned trip is not payable without a decision"
+    assert response.status_code == 409, response.text[:300]
+    detail = response.json()["detail"]
+    assert detail["error_code"] == "off_site_checkout_needs_admin"
+    assert detail["can_request"] is True
+    assert detail["reason"] == main.TRANSIT_ABANDONED_REASON
 
-    assert db_scalar("SELECT COUNT(*) FROM active_sessions WHERE worker_id = ?", (MOALLEM,)) == 0
-
-    logs = _log_rows()
-    assert len(logs) == 1, logs
-    _action, status, status_code, hours, approved_hours, _source, flag = logs[0]
-    assert status_code == "pending_review"
-    assert approved_hours is None, "assigning approved hours would be the automatic approval we withheld"
-    assert hours and hours > 1.5, "the travel time is recorded for the reviewer, not approved"
-    assert flag == "Worker clocked out without confirming arrival at any site geofence"
-
-    alert = db_rows(
-        "SELECT title FROM admin_notifications WHERE kind = 'review_pending' AND worker_id = ?",
+    session = db_rows(
+        "SELECT site_name, is_transit, clock_in_time FROM active_sessions WHERE worker_id = ?",
         (MOALLEM,),
     )
-    assert alert, "an abandoned transit shift must raise an administrator alert"
+    assert len(session) == 1, "a refused punch must not close the shift"
+    assert session[0][0] == TRANSIT_SITE
+    assert session[0][1] == 1, "it is still unconfirmed, exactly as it was"
+    assert session[0][2] == started, "the departure moment does not move either"
+    assert _log_rows() == [], "a refusal writes no ledger row"
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +341,9 @@ def test_the_migration_adds_the_transit_columns_idempotently():
         assert {"is_transit", "transit_start_time", "transit_origin_lat", "transit_origin_lon"} <= sessions
         # Replay: nothing is added (and, crucially, no exception is raised).
         migrations.migration_27_transit_to_site_shifts(conn)
-        assert migrations.SCHEMA_VERSION == 27
+        # Not ``== 27``: this assertion is about the transit schema being in the tree, and a
+        # pinned number turns every later migration into a red test in *this* suite - a fact
+        # about the numbering rather than about transit.
+        assert migrations.SCHEMA_VERSION >= 27
     finally:
         conn.close()

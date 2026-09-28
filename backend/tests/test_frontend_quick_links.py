@@ -362,12 +362,21 @@ const results = {};
     const env = await linksEnv();
     await env.evaluate("UI.renderAdminTab('Live Ops')");
     const markup = render(env);
+    // The panel's roster is the board's one lazy read (see ``test_frontend_live_ops``): the
+    // render carries the disclosure and an empty body, and it is the panel that asks for the
+    // accounts - so the panel is opened here, and read off the element it was painted into.
     results.force_in = {
-        workers: optionsOf(markup, 'forceInWorker'),
-        sites: optionsOf(markup, 'forceInSite'),
-        button: markup.indexOf('data-force-in="true"') >= 0,
+        button_in_the_render: markup.indexOf('data-force-in="true"') >= 0,
         asked_for: env.requests.map((r) => r.url.replace(/^https?:\/\/[^/]*\/api\/v1/, '')).sort()
     };
+    results.force_in.asked_before_opening = results.force_in.asked_for;
+    await env.evaluate("UI_MODULES.openForceIn()");
+    // The roster fetch resolves on a microtask; a turn of the event loop lets it paint.
+    await env.evaluate("new Promise((resolve) => setTimeout(resolve, 0))");
+    const panel = env.evaluate("document.getElementById('liveOpsForceInBody').innerHTML");
+    results.force_in.workers = optionsOf(panel, 'forceInWorker');
+    results.force_in.sites = optionsOf(panel, 'forceInSite');
+    results.force_in.button = panel.indexOf('data-force-in="true"') >= 0;
     env.evaluate("document.getElementById('forceInWorker').value = '1'");
     env.evaluate("document.getElementById('forceInSite').value = 'New Capital Zone B'");
     await env.evaluate("UI.forceIn()");
@@ -528,8 +537,15 @@ def test_live_ops_can_force_a_worker_onto_a_site(results):
     assert force_in["sent"]["site_name"] == "New Capital Zone B"
     assert force_in["authorized"] == "Bearer tok-5000"
     assert "Force Clocked In" in force_in["toast"]
-    for path in ("/admin/active_sessions", "/admin/users", "/admin/sites"):
+    for path in ("/admin/active_sessions", "/admin/sites", "/admin/users"):
         assert path in force_in["asked_for"]
+    # ``/admin/users`` is asked for here because this panel asked for it: the board's own render
+    # carries the disclosure and an empty body, and the roster arrives when the panel is opened
+    # (``test_frontend_live_ops`` holds the board to that, on a screen with no Links tab to
+    # confuse the two readers).
+    assert force_in["button_in_the_render"] is False, (
+        "the render carries the panel's disclosure, never its roster"
+    )
 
 
 def test_the_force_in_panel_says_when_there_is_nobody_to_force(results):

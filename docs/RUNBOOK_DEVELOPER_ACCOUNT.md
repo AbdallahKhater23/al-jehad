@@ -59,8 +59,8 @@ than repeated in fifty route declarations, a developer session satisfies `admin_
 `head_admin_only`, `any_authenticated` and every worker route — including routes written before
 the role existed. It is strictly above `admin`: the admin-targeted guards test
 `role == "admin"` (`security._guard_standard_admin`), which a developer is not, so the
-restrictions that bind a standard admin do not bind it. On the handset side,
-`UI.handsetRoles = ['admin', 'developer']`, so the worker clock-in UI opens for it.
+restrictions that bind a standard admin do not bind it. On the handset side it is the opposite:
+`UI.handsetRoles = ['admin']`, so the console draws it no way onto the clock at all.
 
 **The one thing it must not do is check in or out.** The developer owns the deployment, not a
 rota, so an attendance row in its name would be a figure somebody has to review for a person
@@ -73,8 +73,11 @@ who does not work sites. Three paths to a shift answer the same refusal
 * `POST /api/v1/admin/force_clock_out` with `worker_id` = the developer id — same rule, and it
   holds even against a planted `active_sessions` row.
 
-The Live Ops force-in roster filters the account out on screen to match — a button that always
-answers 403 is a trap, so it is absent rather than present-and-refused.
+The Live Ops force-in roster filters the account out on screen to match, and so does the clock
+itself: a button that always answers 403 is a trap, so it is absent rather than
+present-and-refused. The root tier therefore gets no **Clock In** control on its own console
+frame either — `UI.openHandset()` refuses it exactly as the punch endpoint does, so an
+operator cannot step onto a handset whose every punch would be refused.
 
 The reverse is not true and is the point of the tier: a route built from `require_developer`
 refuses every administrator, because their role is not in the set and they are not the
@@ -104,6 +107,23 @@ Every route below is guarded by `security.require_developer`. All are mounted un
 | `GET` | `/api/v1/developer/refused-punches` |
 | `GET` | `/api/v1/developer/refused-punches/{refusal_id}/frame` |
 | `POST` | `/api/v1/developer/refused-punches/{refusal_id}/clear` |
+| `GET` | `/api/v1/developer/ml/diagnostics` |
+| `GET` | `/api/v1/developer/ml/shadow-summary` |
+| `POST` | `/api/v1/developer/ml/liveness-mode` |
+| `GET` | `/api/v1/developer/db/stats` |
+| `GET` | `/api/v1/developer/db/integrity` |
+| `POST` | `/api/v1/developer/db/wal-checkpoint` |
+| `POST` | `/api/v1/developer/db/backup` |
+| `GET` | `/api/v1/developer/db/backups` |
+| `POST` | `/api/v1/developer/db/snapshot` |
+| `POST` | `/api/v1/developer/db/backups/{name}/verify` |
+| `GET` | `/api/v1/developer/engine/process-stats` |
+| `POST` | `/api/v1/developer/engine/restart-worker` |
+| `GET` | `/api/v1/developer/offline/devices` |
+| `GET` | `/api/v1/developer/offline/tamper-alerts` |
+| `POST` | `/api/v1/developer/geo/test-point` |
+| `POST` | `/api/v1/developer/biometrics/reindex` |
+| `POST` | `/api/v1/developer/auth/impersonate/{worker_id}` |
 
 The deployment's own notification queue moved here from `/admin/notifications` (which is gone,
 not filtered): a forced start, a schema repair, a retention sweep and a coverage verdict are the
@@ -122,6 +142,7 @@ a shared version counter in one transaction, and every worker re-reads on its ne
 | `maintenance_mode` | flag | `false` | Refuse authenticated writes with 503 while the database is worked on; reads, sign-in and the readiness probe stay served. |
 | `log_level` | level | `INFO` | Root logger level, applied to this process now and to every other worker on its next read. One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. |
 | `auth_anomaly_alerts` | flag | `true` | Whether repeated credential failures are raised into the alert hub. Off is legitimate behind a scanner that trips it hourly. |
+| `liveness_mode_override` | choice | unset | Overrides the configured liveness mode at runtime: `off`, `advisory` or `enforce`. Read through `liveness.mode()`, so the punch path, enrollment's `inherit`, `readiness()` and `status()` all see the same answer. Setting `enforce` with no model makes readiness fatal. |
 
 ### The alert hub
 
@@ -143,6 +164,11 @@ nothing. `POST /api/v1/developer/alerts/9/read` acknowledges one.
 | `startup_override` | The deployment was forced up past a failing self-test. |
 | `capacity_refusal` | Face verification refused a request for room — a site arriving at once. |
 | `developer_account_seeded` | The root account was created, or its credential was rotated. |
+| `backup_unverified` | A manual database snapshot did not pass its own check. |
+| `snapshot_unverified` | A project snapshot was written and failed its own verification. |
+| `snapshot_failed` | A project snapshot could not be written at all. |
+| `biometric_reindex` | A face template was rewritten from a stored selfie, by hand. |
+| `impersonation_token_minted` | A read-only session was minted for another account. |
 
 The hub never fails its caller: `developer.raise_alert` swallows every error, and its dedupe key
 collapses repeats (one row per window, so a saturated pool writes one alert an hour, not one per
@@ -183,11 +209,19 @@ drops one by name, and `POST /api/v1/developer/diagnostics/caches/flush` drops a
 `GET /api/v1/developer/audit` is the raw, appended history — an incident is reconstructed from
 it, so it neither summarises nor hides the developer's own actions from the developer. It
 projects a named field set (`SELECT *` is never used) and carries **no hash and no token**. The
-`security_actions` it highlights are `developer.SECURITY_ACTIONS`: `login`, `login_failed`,
-`password_reset`, `password_change_self`, `user_create`, `user_delete`, `user_edit`,
-`user_status`, `role_change`, `sessions_revoked`, `startup_override`, `notification_acknowledge`, `retention_sweep`,
-`biometric_enroll`, `review_approve`, `review_reject`. Trace ids link an audit row to the alert
-raised for the same failure.
+`security_actions` it highlights are `developer.SECURITY_ACTIONS`:
+
+`login`, `login_failed`, `password_reset`, `password_change_self`, `user_create`, `user_delete`,
+`user_edit`, `user_status`, `role_change`, `sessions_revoked`, `startup_override`,
+`notification_acknowledge`, `retention_sweep`, `biometric_enroll`, `review_approve`,
+`review_reject`, `runtime_change`, `db_wal_checkpoint`, `engine_worker_restart`,
+`dev_backup_created`, `dev_snapshot_created`, `dev_snapshot_failed`, `dev_biometric_reindex`,
+`dev_impersonation_token_minted`.
+
+`login` is the best evidence there is of when a credential was last used, and the
+`dev_*` rows are the acts on the records themselves: a snapshot taken, a template rewritten, a
+session minted for somebody else. Trace ids link an audit row to the alert raised for the same
+failure.
 
 ### Live sessions
 
@@ -216,6 +250,45 @@ approve path. `GET /api/v1/developer/refused-punches` defaults to today and caps
 `.../{refusal_id}/clear` drops one row from the list (the evidence stays on disk until retention
 sweeps it, and the clear is audited as `refused_punch_clear`).
 
+### Backups
+
+Two different things, deliberately kept apart by kind and by name, both written into
+`settings.backup_dir` (`<project root>/backups` unless `BACKUP_DIR` says otherwise):
+
+| What | Written by | Contains | Checked |
+|---|---|---|---|
+| **snapshot** | `POST /api/v1/developer/db/snapshot` — the console's *Take a snapshot* button — which runs `backend/tools/backup.py` | `source/` (the application's own files), `data/times.db` (a `VACUUM INTO` copy: atomic, and correct while the server is running), `assets/` (face templates, worker photographs, certificates), `env/` (both interpreters' freeze), `MANIFEST.sha256`, `VERIFY.json` | Yes, by the tool's own verifier, before the operator is told it is done |
+| **database copy** | `POST /api/v1/developer/db/backup` | one `<prefix>_<stamp>.db` file, copied through SQLite's online backup API and `quick_check`ed | No manifest — this is the one-call copy for the middle of an incident, not for a planned change |
+
+`GET /api/v1/developer/db/backups` lists both, newest first, and keeps them apart: an operator
+deciding what to restore from has to be able to see which row has a manifest behind it. A
+directory with no `VERIFY.json` is reported as **unverified** rather than hidden — an interrupted
+snapshot is exactly the row somebody has to see before trusting the one above it. The verdict a
+row shows is the one recorded when the snapshot was *written*; a paint never re-hashes a tree.
+
+`POST /api/v1/developer/db/backups/{name}/verify` re-reads the bytes: every file the manifest
+lists, and the snapshot's own database. That is the only check that can tell *written* from *still
+intact* a month later. It is a **read**, and it does not rewrite `VERIFY.json`: a snapshot that
+has rotted keeps the verdict it was written with, and the verification that disproved it is what
+the console prints in its report line.
+
+Taking one is heavy and serialised. The source tree and every enrolled face are copied and
+hashed, which is the largest thing this process can be asked to do on a one-vCPU box, so
+`developer._SNAPSHOT_LOCK` lets a second click get `409 snapshot_in_progress` instead of a second
+snapshot competing for the same disk and the same single writer. Two clicks inside one second
+produce `manual_dev_<stamp>` and `manual_dev_2_<stamp>` rather than one snapshot and an
+exception. **The assets are included by default**: a snapshot without the templates cannot
+restore an enrolled worker's face. The `prefix` is a *name* — letters, digits, dots, dashes and
+underscores, never a path — and `../escaped` is refused with `400`.
+
+A snapshot is not deleted when its verification fails. The bytes may still be recoverable by
+somebody who knows SQLite, and it raises `snapshot_unverified` so it is not a fact the operator
+has to go looking for.
+
+The console section for this is *Developer → Backups*: the button, the assets choice, the list,
+the staleness line when the newest snapshot is more than a day old, and a Verify button on every
+row that has a manifest.
+
 ### The console
 
 Signed in as the developer, the web console offers two tabs no administrator sees — both marked
@@ -223,10 +296,38 @@ Signed in as the developer, the web console offers two tabs no administrator see
 disabled:
 
 - **Developer** — the runtime flags, the alert hub, diagnostics (pool, slow queries, query
-  plans, cache flush) and the audit stream in one panel.
+  plans, cache flush), the four diagnostic domains (below), the backup directory (take a
+  snapshot, verify one), the live sessions and the audit stream in one panel.
 - **Alerts** — the deployment notification queue (`/api/v1/developer/notifications`) with acknowledge.
 
-The worker clock-in UI is also open (`UI.handsetRoles`).
+#### The diagnostic domains
+
+The `Developer` tab reads the four domains that used to be curl-only, and each panel offers the
+levers that endpoint has:
+
+| Panel | Painted from | Levers |
+|---|---|---|
+| **Models and the decision line** | `/developer/ml/diagnostics`, `/developer/ml/shadow-summary` | Move the liveness policy (mode from `liveness.MODES`, reason required); evaluate the cutover gate against a named gallery |
+| **Database** | `/developer/db/stats` | Checkpoint the journal (mode from `WAL_CHECKPOINT_MODES`); run the full integrity check |
+| **Model process** | `/developer/engine/process-stats` | Restart the model process — drawn only when the models really are in a child |
+| **Offline forensics** | `/developer/offline/devices`, `/developer/offline/tamper-alerts` | Narrow the tamper ledger to one worker |
+
+Two of those reads are deliberately **not** part of the tab paint, because both are acts rather
+than observations: `PRAGMA integrity_check` walks every page of the database, and a checkpoint
+blocks writers while it copies the live frames. They are buttons, and the answer appears beside
+the button rather than in a repainted panel. `test_frontend_developer_console.py` holds that
+line by asserting the endpoints a paint really asks for.
+
+The facts grids print the **server's own field names** (`pages_in_log`, `frames_checkpointed`,
+`ping_ms`) rather than a label invented on the panel: a renamed counter is a second vocabulary
+for one number, and the first thing to drift from the payload. Only the chrome an operator reads
+as a sentence is translated, in all four languages.
+
+The mode and checkpoint selects are drawn from `liveness_modes` and `checkpoint_modes` in those
+payloads, so the control cannot offer a value the endpoint would refuse with a 400.
+
+The worker clock-in UI is **not** open: `UI.handsetRoles` is `['admin']`, so the root tier is
+offered no way onto the clock (see "The one thing it must not do" above).
 
 ## Routine operations
 
@@ -260,7 +361,60 @@ curl -s "$HOST/api/v1/developer/diagnostics/pool" -H "Authorization: Bearer $TOK
 curl -s "$HOST/api/v1/developer/diagnostics/slow-queries?limit=20" -H "Authorization: Bearer $TOKEN"
 curl -s "$HOST/api/v1/developer/diagnostics/query-plan/roster" -H "Authorization: Bearer $TOKEN"
 curl -s -X POST "$HOST/api/v1/developer/diagnostics/caches/flush" -H "Authorization: Bearer $TOKEN"
+
+# The four diagnostic domains, as the console's panels read them. Every one of these is a GET
+# an operator can run by hand; the two *acts* below are separate calls for that reason.
+curl -s "$HOST/api/v1/developer/ml/diagnostics" -H "Authorization: Bearer $TOKEN"
+curl -s "$HOST/api/v1/developer/ml/shadow-summary?gallery=/srv/attendance/assets/shadow_gallery.json" \
+  -H "Authorization: Bearer $TOKEN"
+curl -s "$HOST/api/v1/developer/db/stats" -H "Authorization: Bearer $TOKEN"
+curl -s "$HOST/api/v1/developer/engine/process-stats" -H "Authorization: Bearer $TOKEN"
+curl -s "$HOST/api/v1/developer/offline/devices?hours=72" -H "Authorization: Bearer $TOKEN"
+curl -s "$HOST/api/v1/developer/offline/tamper-alerts?days=7" -H "Authorization: Bearer $TOKEN"
+
+# The two deliberate acts. TRUNCATE is the checkpoint mode that hands the disk space back, and
+# the full integrity check reads every page: neither belongs on a schedule.
+curl -s -X POST "$HOST/api/v1/developer/db/wal-checkpoint?mode=TRUNCATE" -H "Authorization: Bearer $TOKEN"
+curl -s "$HOST/api/v1/developer/db/integrity" -H "Authorization: Bearer $TOKEN"
+
+# Replace the model process (refused with 409 when the models run in-process)
+curl -s -X POST "$HOST/api/v1/developer/engine/restart-worker" -H "Authorization: Bearer $TOKEN"
+
+# A snapshot before a change you would not want to make twice (takes seconds to minutes), then
+# what the directory holds. The console's Developer -> Backups panel is the same two calls.
+curl -s -X POST "$HOST/api/v1/developer/db/snapshot" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"include_assets": true, "note": "pre-migration"}'
+curl -s "$HOST/api/v1/developer/db/backups" -H "Authorization: Bearer $TOKEN"
+
+# Months later: re-read the bytes rather than the verdict recorded when it was written.
+curl -s -X POST "$HOST/api/v1/developer/db/backups/manual_dev_20260927_120000/verify" \
+  -H "Authorization: Bearer $TOKEN"
 ```
+
+### Restoring from a snapshot
+
+Never a route and never a button: a restore replaces the database the running process has open,
+so it is an operator's decision made with the server stopped.
+
+```bash
+# 1. Verify before you trust it. `sha256sum -c` also works: the manifest's paths are relative.
+cd /app/backend && python tools/backup.py --verify /app/backups/manual_dev_20260927_120000
+
+# 2. Keep what you are replacing. A bad restore is recoverable by exactly one thing.
+mv /data/times.db /data/times.db.replaced
+
+# 3. Put the snapshot's database back, and its faces with it.
+cp /app/backups/manual_dev_20260927_120000/data/times.db /data/times.db
+cp -r /app/backups/manual_dev_20260927_120000/assets/local_references/. /app/local_references/
+
+# 4. Start the server and read the readiness gate. A snapshot from an older schema is migrated
+#    forward on boot, and the gate is what tells you it worked.
+```
+
+The snapshot's `source/` directory is there to **read**, not to serve: rolling the code back is a
+git operation, and restoring an old tree over a newer database is how one becomes the other's
+bug. What `data/` and `assets/` are for is the pair that cannot be rebuilt from a repository: the
+payroll history and the enrolled faces.
 
 ## Rotating the credential
 
