@@ -18,7 +18,18 @@ touches:
   it is doing - an absent control and a cleared one are different answers;
 * the categories themselves can be added, renamed, retuned and deleted, and each row says how
   many sites follow it, which is the number that decides whether an edit here is a correction
-  or a retune of a whole class of buildings.
+  or a retune of a whole class of buildings;
+* the tab opens on the *sites*: adding one and maintaining a class are the rare jobs, so both
+  are folds in the header band, shut until somebody asks for them - and the add form is the one
+  fold that opens itself, on a deployment where there is no site to look at yet;
+* a site is one row carrying the figures that decide something - the category, the window in
+  force and where it came from, the radius - rather than a card of four labelled facts, because
+  four facts a card is five sites a screen and forty a scroll nobody makes;
+* a list long enough to need a search gets one, and it narrows the sites already in hand: this
+  tab repaints from a string, so re-asking the server to filter would be a request per keystroke
+  for a list that is already on screen;
+* and deleting a site is answered by the delegated listener rather than by an ``onclick=`` with
+  a site name in it, which was the last attribute of that kind on this tab.
 
 Node is optional; without it these skip rather than fail.
 """
@@ -334,6 +345,116 @@ const results = {};
         body: JSON.parse(calls[calls.length - 1].body)
     };
 }
+
+// 8. the shape of the tab: the band, the two folds, then the sites - and both folds shut
+{
+    const env = adminEnv();
+    await env.evaluate("UI.renderAdminTab('Sites')");
+    const markup = markupOf(env);
+    const at = (needle) => markup.indexOf(needle);
+    results.folds = {
+        // The order *is* the redesign: what an administrator opens this tab for comes first,
+        // and the two forms that used to stand in front of it are behind folds below the band.
+        order: [at('data-sites-bar'), at('id="sitesAddPanel"'), at('id="siteCategoriesPanel"'), at('id="sitesList"')],
+        add_hidden: /id="sitesAddPanel"[^>]*\shidden/.test(markup),
+        categories_hidden: /id="siteCategoriesPanel"[^>]*\shidden/.test(markup),
+        add_collapsed: /data-sites-add[^>]*aria-expanded="false"/.test(markup),
+        categories_collapsed: /data-sites-categories[^>]*aria-expanded="false"/.test(markup),
+        search_hidden: markup.indexOf('id="sitesQuery"') < 0,
+        // A site name is operator data, and this attribute was the last place one was written
+        // into executable text anywhere in the console.
+        delete_has_no_inline_handler: !/data-delete-site="[^"]*"[^>]*onclick=/.test(markup),
+        reads_before: env.requests.filter((r) => r.url.indexOf('/admin/sites') >= 0).length
+    };
+    env.evaluate('UI_MODULES.toggleSitesAdd()');
+    const opened = markupOf(env);
+    results.folds.add_open = !/id="sitesAddPanel"[^>]*\shidden/.test(opened);
+    results.folds.add_open_expanded = /data-sites-add[^>]*aria-expanded="true"/.test(opened);
+    results.folds.form_still_there = opened.indexOf('id="addSiteForm"') >= 0;
+    results.folds.fields_still_there = opened.indexOf('id="siteWindowStart"') >= 0;
+    env.evaluate('UI_MODULES.toggleSitesCategories()');
+    const categories = markupOf(env);
+    results.folds.categories_open = !/id="siteCategoriesPanel"[^>]*\shidden/.test(categories);
+    results.folds.categories_keeps_rows = (categories.match(/data-category-row="/g) || []).length;
+    results.folds.reads_after = env.requests.filter((r) => r.url.indexOf('/admin/sites') >= 0).length;
+}
+
+// 9. a site is a row, and the row carries the figures that decide something
+{
+    const env = adminEnv();
+    await env.evaluate("UI.renderAdminTab('Sites')");
+    const markup = markupOf(env);
+    const row = /<li class="sites-row"[^>]*data-site="Downtown Tower A"[\s\S]*?<\/li>/.exec(markup);
+    results.rows = {
+        row: !!row,
+        categorised: /data-site-category="Downtown Tower A">([^<]*)</.exec(markup) ? RegExp.$1 : null,
+        radius: row ? row[0].indexOf('65 m') >= 0 : false,
+        // "from مخزن" is the answer to "who moved these hours", and it is a word on the row
+        // rather than a fourth labelled fact.
+        origin: row
+            ? row[0].indexOf(env.evaluate("I18n.__('sitesWindowFromCategory').replace('{category}', 'مخزن')")) >= 0
+            : false,
+        // Neither fixture site sets a zone, so neither row may print one: the zone at an
+        // inheriting site is the company's, and the company's is set once, on the Admin tab.
+        zone_pills: (markup.match(/ops-badge is-zone/g) || []).length,
+        editor_closed: markup.indexOf('id="editSiteForm"') < 0
+    };
+}
+
+// 10. a long list gets a search, and narrowing it is a read of the list already in hand
+{
+    const env = adminEnv();
+    await env.evaluate("UI.renderAdminTab('Sites')");
+    // Sixteen sites - four times the fixture, and over SITES_SEARCH_AFTER, which is where a
+    // search stops being a control that can only ever cost a look.
+    env.evaluate("for (let round = 0; round < 3; round += 1) { UI_MODULES._sites = UI_MODULES._sites.concat(UI_MODULES._sites.map(function (site) { return Object.assign({}, site, { site_name: site.site_name + ' north' }); })); }");
+    env.evaluate('UI_MODULES.paintSites()');
+    const long = markupOf(env);
+    const readsBefore = env.requests.filter((r) => r.url.indexOf('/admin/sites') >= 0).length;
+    results.search = {
+        has_box: long.indexOf('id="sitesQuery"') >= 0,
+        rows: (long.match(/data-site="/g) || []).length,
+        has_clear: long.indexOf('data-clear-sites-search') >= 0,
+        reads_before: readsBefore
+    };
+    env.evaluate("document.getElementById('sitesQuery').value = 'مخزن'");
+    await env.evaluate("document.getElementById('sitesFilter').onsubmit({ preventDefault: function () {} })");
+    const narrowed = markupOf(env);
+    results.search.narrowed_rows = (narrowed.match(/data-site="/g) || []).length;
+    results.search.narrowed_count = (/data-sites-count[^>]*>([^<]*)</.exec(narrowed) || [null, null])[1];
+    results.search.narrowed_count_expected = env.evaluate("I18n.__('sitesShowing').replace('{shown}', '8').replace('{total}', '16')");
+    results.search.clear_button_now = narrowed.indexOf('data-clear-sites-search') >= 0;
+    results.search.reads_after = env.requests.filter((r) => r.url.indexOf('/admin/sites') >= 0).length;
+    // A query that matches nothing is a list to be unhidden rather than a dead end.
+    await env.evaluate("UI_MODULES.setSitesQuery('ZZZ')");
+    const none = markupOf(env);
+    results.search.no_match = none.indexOf('data-sites-no-match') >= 0;
+    results.search.no_match_names_query = none.indexOf('ZZZ') >= 0;
+    results.search.list_gone = none.indexOf('id="sitesList"') < 0;
+    // The way out is in the empty state, and it is answered by the *page*: the list it would
+    // have been delegated from is exactly what is not on screen.
+    env.evaluate("document.getElementById('sitesPage').onclick({ target: { closest: function (wanted) { return wanted === '[data-clear-sites-search]' ? {} : null; } } })");
+    results.search.cleared_rows = (markupOf(env).match(/data-site="/g) || []).length;
+}
+
+// 11. a deployment with no sites at all opens the one form it has, by itself
+{
+    const env = adminEnv();
+    await env.evaluate("UI.renderAdminTab('Sites')");
+    env.evaluate('UI_MODULES._sites = []');
+    env.evaluate('UI_MODULES.paintSites()');
+    const empty = markupOf(env);
+    results.empty = {
+        empty_state: empty.indexOf('data-sites-empty') >= 0,
+        add_open: !/id="sitesAddPanel"[^>]*\shidden/.test(empty),
+        add_expanded: /data-sites-add[^>]*aria-expanded="true"/.test(empty),
+        no_search: empty.indexOf('id="sitesQuery"') < 0,
+        no_list: empty.indexOf('id="sitesList"') < 0
+    };
+    // ...and it shuts again like any other fold: the automatic state is a default, not a lock.
+    env.evaluate('UI_MODULES.toggleSitesAdd()');
+    results.empty.add_closed = /id="sitesAddPanel"[^>]*\shidden/.test(markupOf(env));
+}
 """
 
 
@@ -484,3 +605,119 @@ def test_editing_a_category_sends_the_id_and_clears_what_was_emptied(results):
     assert edited["body"]["clock_in_window_start"] is None, (
         "an emptied box is an explicit null - \"inherit again\" - not an omission"
     )
+
+
+# ---------------------------------------------------------------------------
+# the shape of the tab: the sites first, and the two jobs behind folds
+# ---------------------------------------------------------------------------
+def test_the_tab_opens_on_the_sites_with_both_forms_shut(results):
+    """The redesign, in one assertion: the tab opens on the list, not on eleven empty boxes."""
+    folds = results["folds"]
+    band, add, categories, sites = folds["order"]
+    assert -1 not in folds["order"], "the band, both folds and the list all have to be there"
+    assert band < add < categories < sites, (
+        "the band comes first, then the two folds, then the sites: "
+        f"got {folds['order']}"
+    )
+    assert folds["add_hidden"] is True, (
+        "the add form shipped open, which is the thing this tab did wrong"
+    )
+    assert folds["categories_hidden"] is True
+    assert folds["add_collapsed"] is True and folds["categories_collapsed"] is True, (
+        "a shut fold has to say it is shut, not only look it"
+    )
+    assert folds["search_hidden"] is True, (
+        "two sites need no search: the box appears over a list long enough to need one, not"
+        " over every list"
+    )
+
+
+def test_opening_a_fold_is_a_repaint_and_not_a_request(results):
+    folds = results["folds"]
+    assert folds["add_open"] is True
+    assert folds["add_open_expanded"] is True, (
+        "and the button says so, to the eye and to a screen reader"
+    )
+    assert folds["form_still_there"] is True, "the fold shows the same form, field ids and all"
+    assert folds["fields_still_there"] is True, "including the window boxes the save reads"
+    assert folds["categories_open"] is True
+    assert folds["categories_keeps_rows"] == 2, "and the category rows move with it"
+    assert folds["reads_after"] == folds["reads_before"], (
+        "opening a fold re-read the sites: it repaints from the list already in hand"
+    )
+
+
+def test_the_delete_button_is_no_longer_an_inline_handler(results):
+    """It was the last ``onclick=`` on this tab, and the only one carrying a site name."""
+    assert results["folds"]["delete_has_no_inline_handler"] is True, (
+        "deleting a site must go through the delegated listener: handler text built from a"
+        " site name is the sink the document CSP exists to close"
+    )
+
+
+# ---------------------------------------------------------------------------
+# the row, and the search a long list gets
+# ---------------------------------------------------------------------------
+def test_a_site_is_one_row_with_the_figures_that_decide_something(results):
+    rows = results["rows"]
+    assert rows["row"] is True, "a site is a row, not a card"
+    assert rows["categorised"] == "مخزن"
+    assert rows["radius"] is True, "the radius is on the row"
+    assert rows["origin"] is True, (
+        "and the hours say where they came from: 'from مخزن' is the answer to why an arrival"
+        " was judged the way it was"
+    )
+    assert rows["editor_closed"] is True, "the list opens with no editor in it"
+
+
+def test_the_company_zone_is_not_repeated_on_every_row(results):
+    """What is the same for every site belongs to the company window, not to each row."""
+    assert results["rows"]["zone_pills"] == 0, (
+        "neither fixture site sets a zone, so neither row may print one - the zone in force at"
+        " an inheriting site is the company's, and it is set once, on the Admin tab"
+    )
+
+
+def test_a_long_list_gets_a_search_that_narrows_without_asking_the_server_again(results):
+    search = results["search"]
+    assert search["has_box"] is True, (
+        "sixteen sites is past the point where a search pays for itself"
+    )
+    assert search["rows"] == 16, search
+    assert search["narrowed_rows"] == 8, (
+        "the warehouse is half the list, and the search matches a site's category as well as"
+        f" its name: {search}"
+    )
+    assert search["narrowed_count"] == search["narrowed_count_expected"], (
+        f"the count has to describe the view, not the list: {search['narrowed_count']}"
+    )
+    assert "8" in search["narrowed_count"] and "16" in search["narrowed_count"]
+    assert search["has_clear"] is False, "nothing typed yet, so there is nothing to clear"
+    assert search["clear_button_now"] is True, "and once something is, the way out is offered"
+    assert search["reads_after"] == search["reads_before"], (
+        "narrowing the search re-read the sites: it should filter the list already on screen"
+    )
+
+
+def test_a_search_that_finds_nothing_offers_the_way_out(results):
+    search = results["search"]
+    assert search["no_match"] is True
+    assert search["no_match_names_query"] is True, "the sentence names what was typed"
+    assert search["list_gone"] is True
+    assert search["cleared_rows"] == 16, (
+        "the empty state's own button restored the list - and it is answered by the page,"
+        " because the list it could have been delegated from is what is not on screen"
+    )
+
+
+def test_an_empty_deployment_opens_the_add_form_by_itself(results):
+    empty = results["empty"]
+    assert empty["empty_state"] is True
+    assert empty["add_open"] is True, (
+        "with no sites at all the form is the only thing this tab can usefully offer, so it"
+        " opens itself"
+    )
+    assert empty["add_expanded"] is True
+    assert empty["no_search"] is True, "a search over nothing only costs a look"
+    assert empty["no_list"] is True
+    assert empty["add_closed"] is True, "and it shuts again like any other fold"

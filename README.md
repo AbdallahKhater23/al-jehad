@@ -736,15 +736,29 @@ curl -X POST localhost:8000/api/v1/admin/sites/edit \
 ```
 
 **From the console** (the way it is meant to be set): *Sites* → **Edit** on a site, or fill the
-window in on the *Add a site* form. Each card names the window **in force** and whether each half
-of it came from the site or from *Admin → Shift rules*, so "why was this arrival flagged?" is
-answered on the same screen as the site. Blank times mean "follow the company window", and *Use
-the company window* on an existing site empties them - which is what produces the explicit nulls
-that clear an override. The company window itself now sits on *Admin → Shift rules* next to the
-paid hours: it takes the same `HH:MM` and IANA-timezone checks as a site's, and emptying a box
-puts it back to the shipped `04:00`–`06:30`. Before this, neither window could be chosen in the
-console at all - the endpoint existed and nothing called it, which for the person at the gate is
-the same as the feature not existing.
+window in on the *Add a site* form behind the band's own button. Each **row** names the window
+**in force** and whether each half of it came from the site, from its category, or from *Admin →
+Shift rules*, so "why was this arrival flagged?" is answered on the same screen as the site.
+Blank times mean "follow the company window", and *Use the company window* on an existing site
+empties them - which is what produces the explicit nulls that clear an override. The company
+window itself now sits on *Admin → Shift rules* next to the paid hours: it takes the same `HH:MM`
+and IANA-timezone checks as a site's, and emptying a box puts it back to the shipped
+`04:00`–`06:30`. Before this, neither window could be chosen in the console at all - the endpoint
+existed and nothing called it, which for the person at the gate is the same as the feature not
+existing.
+
+The tab itself is **the sites first**. Adding one and maintaining a category are the rare jobs,
+so both are folds in the header band, shut until somebody asks for them - and the add form is the
+one fold that opens itself on a deployment with no sites at all, where it is the only useful
+thing the tab has to say. A site is one **row** rather than a card: the name and its coordinates,
+then the three figures that decide something - the category, the window in force with the word
+saying where it came from, the radius - as pills on the same line, with *Edit* and *Delete* at the
+end of it. The zone is on the row only where the site (or its category) set its own, because the
+zone every inheriting site shares is the company's, and the company's is set once, on *Admin →
+Shift rules*. Past about eight sites the band grows a search that matches a **name or a category**
+and narrows the list already on screen - with no request - and a list it empties says what was
+typed and offers the way back, rather than a dead end. Before this, opening *Sites* met a
+six-field add form and a second list of categories standing in front of the first site.
 
 `21:30`–`05:30` is an overnight window: it runs past midnight, and **both** 23:15 and 04:30 are
 inside it. That is the case the old global rule could not express - a window whose start is
@@ -826,8 +840,10 @@ curl -X POST localhost:8000/api/v1/admin/sites/edit \
   shareable link (`#shifts=…&q=…&c=…`) and narrows the printed and downloaded timesheet exactly as
   it narrows the screen.
 * The **Sites** tab gets a category picker on both forms - with *No category* first, which is what
-  every existing site is - and a *Site categories* panel to add, rename, retune and delete them.
-  A card names the category the site is in, and a window that came from a category says so.
+  every existing site is - and a *Site categories* fold to add, rename, retune and delete them.
+  A row names the category the site is in, and a window that came from a category says so in the
+  words *from مخزن*, rather than in a label that leaves the reader to work out which layer moved
+  the hours.
 * `GET /api/v1/readiness` checks the categories too, not only the sites: a category whose zone no
   runtime can resolve moves every site inside it at once, and it is reported as `category <name>`
   rather than as one of its sites - which is the screen where the fix is made.
@@ -1458,7 +1474,28 @@ rather than the raw clock - 8.25 h of a 9.5 h shift, with `recorded_hours` kept 
 In the admin console, the **Shifts** tab opens on this month and lets the admin pick a
 period - or tap *This month* / *Last month* / *This week*, the week running from Sunday to
 match `working_days`. It shows the totals (hours, approved hours, hours and shifts awaiting
-approval, unpaid break, shifts, workers, late arrivals) and then the shifts themselves.
+approval, late arrivals, shifts, workers, unpaid break) and then the shifts themselves.
+
+The period and everything that leaves the screen are **one band** at the top: the three
+presets, the category list beside them, and the *Copy link* and *Download* controls pushed to
+the far end of the same line. The two dates behind the presets are folded into a *Custom
+period* control, and the fold **opens by itself** whenever the period on screen is not one of
+the presets - a window typed in, or one a strip column selected - with the dates in its
+summary. A period nobody can read off the screen is a period the figures cannot be checked
+against.
+
+Below the totals is a **coverage strip**: one column per day of the period, each bar scaled
+against the busiest day in that window, with the hours still waiting for a decision drawn as a
+hatched top on the solid counted hours. The two parts are told apart by pattern as well as by
+colour, and the late arrivals are a numeral above the column rather than a tint on it, so
+nothing in the strip is carried by colour alone. Every column is a button: tapping it makes
+that day the period (as `applyShiftsDay` does from the search box, clearing the search for the
+same reason). A period too long to read a day at a time is grouped - weeks, then months, then
+quarters - so a year is twelve columns rather than 365, and the unit in use is named in the
+caption. The strip describes the rows **the view is holding**, not the period's whole answer:
+under a search or an attention filter its figures are the same figures as the cards above it,
+and its columns still span the whole period, which is how a reader sees *when* in the month
+the rows they filtered to happened.
 
 The table's columns are the administrator's to arrange. They arrive in this order -
 **Date, Employee, Role, User ID, Site, Arrival, Hours, Awaiting approval, Open notes** - and
@@ -1631,6 +1668,31 @@ a bare number; a number that names nobody is now a search with no matches, which
 honest answer to it. Searching repaints from the
 rows already in hand, so it costs no request - only a new period does.
 Hours still awaiting approval are shown beside the approved ones and never added to them.
+
+The two figures that ask somebody to act are also **filters**: *Awaiting approval* and *Late
+arrivals* sit beside the search box, each carrying the count it would show - the report's own
+figure, so a chip cannot promise rows it will not fill. They narrow *with* the search and the
+category rather than instead of them, they travel into the CSV and the printed sheet like every
+other narrowing, and the note under the cards names them. A chip whose count has fallen to zero
+while it is the one in effect stays on screen, because a filter nobody can see is a filter
+nobody can switch off. A period whose rows are all decided and all on time offers no chip at
+all: a filter that selects nothing is a dead end.
+
+Any column can be **sorted** by pressing its header - once for the direction that column is
+normally asked about (a counted column starts at its biggest), again for the other way, and a
+third time to put the period's own order back. `aria-sort` says which column is in effect and
+which way, and the arrow that shows it is drawn by the stylesheet rather than written into the
+cell, so the header's *text* is still exactly the column's name - which is what the printed
+sheet, the column editor and the product suite read. The sort is not remembered: the column
+*order* is a preference somebody set up once, while a sort is a question being asked right now,
+like the search. The file and the sheet follow the screen, so a sorted table exports in the
+order it is being read in.
+
+A month that fills more than one page is **painted one page at a time**: the first fifty rows,
+a line saying *Showing the first 50 of 1,413 shifts*, and a *Show more* button that paints
+another fifty from the rows already in hand. The cap is on what is *drawn* and nothing else -
+the CSV and the printed sheet are built from every row the view holds, because a download that
+held only what somebody had scrolled to would be the worse lie of the two.
 
 **Who is in the attendance figures.** `/admin/reports/attendance` counts the day somebody
 walked in, so an administrator who covered a shift appears in it like anyone else - the same

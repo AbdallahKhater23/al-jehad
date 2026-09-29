@@ -191,6 +191,71 @@ in all three, and every one keeps the contrast (`فحص لا حذف`, `यह �
 | RT-3 | `retentionLeftBehind` | Drift - the fault reads as neutral | English *Left behind* means "the policy says this should be gone and it is not" - the only figure on the panel that is a fault. Arabic `متبقّي`, Hindi `बाक़ी` and Urdu `باقی` all mean "remaining/left over", which is a measurement, not a fault, and a reader who does not already know the policy reads it as a total. The badge's colour carries the warning visually, and a screen reader gets nothing but the word. Suggested: `لم يُحذف` / `छूटी हुई फ़ाइलें` / `رہ جانے والی فائلیں`. |
 | RT-4 | `retentionTargetAnchors` | Drift - two nouns for the same rows | The Developer console already names these `devOfflineAnchors` (`المرتكزات` / `एंकर` / `اینکر`), and the handset's own message speaks of a signing key (`deviceKeyLost`). This panel says "Device keys" (`مفاتيح الأجهزة` / `फ़ोन की ऑफ़लाइन कुंजियाँ` / `فون کی آفلائن کیز`) - a third noun, and the only place the row is called a *key* rather than an anchor. The English is already split this way, so the fix is a decision rather than a translation: pick one noun, or keep "keys" for whatever the sweep deletes and leave "anchors" to the protocol. |
 
+## Added after this review: the Shifts tab
+
+Sixteen strings, written with that tab's redesign - the per-day coverage strip, the two
+attention filters, the sortable headers and the paged table. Two of the findings below were
+**fixed while reviewing**: they were this author's own errors rather than decisions that want a
+third opinion, and shipping a known grammar fault to be flagged would be a strange use of the
+flag.
+
+**Fixed - Arabic numeral agreement (SM-1).** `shiftsCoverageDays` and its three siblings were
+written as `{count} يوماً`, `{count} أسبوعاً` and so on: the accusative *singular*, which is right
+for eleven and above and wrong for three to ten. The counts these keys actually carry are 4
+(weeks, quarters), 12 (months) and 28-31 (days), so three of the four were being used in the
+range where Arabic wants the plural - "4 أسبوعاً" for what should be "4 أسابيع". No single numeral
+form is correct across 4 and 31, so the phrasing now steps around the choice: `{count} من الأسابيع`
+(*n of the weeks*), which is grammatical for every count. The general fix is a plural rule in
+`I18n`; this phrase works around its absence.
+
+**Fixed - the break hint repeated its own label (SM-2).** The tile is labelled *Unpaid break* and
+its hint opened "unpaid, already out of the hours" (Arabic `غير مدفوعة، ...`). All four now carry
+only the half the label does not already say.
+
+| # | Key | Class | Note |
+|---|---|---|---|
+| SM-1 | `shiftsCoverageDays/Weeks/Months/Quarters` | **Fixed - grammar** | See above: the singular accusative was wrong for the counts these keys carry. |
+| SM-2 | `shiftsBreakHint` | **Fixed - redundancy** | See above: the hint repeated the word its own label is made of. |
+| SM-3 | `shiftsShowMore` | Drift - two words for one control | The credentials roster (reworked in the same session) added `credentialsShowMore`, *Show {count} more*, and this tab added *Show more*: one control, one screen family, two phrasings - Arabic `المزيد ({count})` against `عرض المزيد`, Hindi `{count} और दिखाएँ` against `और दिखाएँ`, Urdu `{count} مزید دکھائیں` against `مزید دکھائیں`. One should win, and the roster's is arguably the better of the two: the count on the button is the only place a reader is told how much is left if the line above it has scrolled away. |
+| SM-4 | `shiftsCoverageTap` | Drift - the only device verb in the tables | *Tap a column to narrow the period to it.* Every other interactive hint in the console is device-neutral (*Show shifts for this day*, *Pick both a start and an end date*), and this console is read on a phone and on a desktop, where the same gesture is not called tapping. Suggested: name the outcome - *Choose a column to narrow the period to it* - or let the button-ness of the column speak for itself. |
+| SM-5 | `shiftsCustomPeriod` | Watch - new vocabulary, three shapes | Nothing else in the tables says "custom", so all four were written here: Arabic `فترة مخصصة` (an adjective), Hindi `कस्टम अवधि` (a transliteration) and Urdu `اپنی مرضی کی مدت` (a phrase, *a period of one's own choosing*). The Urdu is close to twice the length of the other three and sits in the `summary` of the period fold, where the width is not free. Not wrong; worth a native eye at the width it is used in. |
+| SM-6 | `shiftsCoverageDayAria`, `shiftsShowing` | Watch - phrasing that is heard rather than seen | Both are read aloud. `shiftsCoverageDayAria`'s `{from}` is an ISO date (`2026-08-05`), which a screen reader will read digit by digit - the same choice the console makes for dates on screen, worth knowing it is also heard. Hindi's `shiftsShowing` joins its two figures with a slash (*पहले {shown} / {total}*) where the other three use a word. |
+
+Two keys were deliberately **not** written: the two attention chips reuse `shiftsPending` (*Awaiting
+approval*) and `shiftsLateArrivals` (*Late arrivals*) - the same words as the amber card and the
+column header above them - because a filter that names its figure differently from the figure is a
+filter the reader has to translate.
+
+## Added after this review: the Sites tab
+
+Seven strings, written with that tab's redesign - the search that appears over a long list, and
+the sentences its two empty states need. One was **fixed while reviewing**, for the same reason
+SM-1 was: it was this author's own error rather than a decision that wants a third opinion.
+
+The tab's other words were deliberately **not** written. The band's two buttons reuse `sitesAdd`
+(*Add a site*) and `sitesCategories` (*Site categories*); the figures on a row reuse `sitesCategory`,
+`sitesCategoryNone`, `sitesWindowStart`/`sitesWindowEnd`, `sitesWindowTimezone`, `sitesRadius` and
+the three *where this came from* sentences; both folds' hints reuse `sitesLocationHint`,
+`sitesWindowHint` and `sitesCategoriesHint`. Renaming the same facts on the way past a redesign
+would have made the tab read as a different feature rather than a clearer view of the same one -
+and it is exactly the sort of drift the parity suite cannot see, because it counts keys and
+placeholder names and never reads either.
+
+**Fixed - the empty state made a claim that was not true (ST-1).** `sitesNoMatch` was first
+written as *No sites*, which is the same sentence as `sitesEmpty` - the one the tab shows on a
+deployment that has no sites *at all*, where the answer is the add form sitting above it. A search
+that matched nothing and a company with nothing are two states with two different ways out, so the
+sentence now names what was typed: *No site matches "{query}"*, with `sitesNoMatchHint` and
+`sitesClearSearch` beside it.
+
+| # | Key | Class | Note |
+|---|---|---|---|
+| ST-1 | `sitesNoMatch` | **Fixed - a claim that was untrue** | See above: it said the same thing as `sitesEmpty` about a state that is not the same state. |
+| ST-2 | `sitesShowing` | Drift - the second phrasing of `shiftsShowing` | Both are *{shown} of {total} {things}* and both exist because each tab filters its own list; the Arabic, Hindi and Urdu copies were written to match `shiftsShowing` where that was natural. Two tabs, one sentence - worth confirming the three translations really are as alike as their English is. |
+| ST-3 | `sitesSearchLabel` | Watch - a label only a screen reader hears | *Search sites* (Arabic `ابحث في المواقع`). It names the box for a reader who cannot see the placeholder, which makes it the one string here that nobody can proofread by looking at the screen and the one with no width to argue about. |
+| ST-4 | `sitesCategoriesEmpty` | Watch - terse by design | *No categories yet.* The fold it sits in already carries `sitesCategoriesHint`, so this is a full stop rather than a second explanation; the Arabic `لا توجد فئات بعد.` and the Urdu `ابھی کوئی زمرہ نہیں۔` mirror that. Not wrong, but it is the shortest sentence in the group and the one whose *tone* a native reader would settle. |
+| ST-5 | `sitesSearchPlaceholder` | Checked against the code, not by a reader | *Name or category* (Arabic `الاسم أو الفئة`), which is what `sitesMatches` actually filters on - a name or a category, never an id. Recorded because a placeholder that promises more than the filter delivers is the commonest lie a search box tells. |
+
 ## What this review cannot conclude
 
 Register and idiom for a *native* reader: whether `متوقف`, `सुप्त` or `غیر حاضر` is the word a

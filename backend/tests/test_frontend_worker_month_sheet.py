@@ -493,15 +493,19 @@ def test_the_sheet_is_that_worker_s_month_and_nobody_else_s(results):
 def test_the_sheet_says_whose_it_is_once_and_the_identity_is_not_a_column(results):
     """Whose month it is belongs in the header, not repeated down every row.
 
-    The employee, the role and the id are columns of the *tab* - three of its nine - and on a
+    The employee, the role and the id are columns of the *tab* - three of its ten - and on a
     sheet about one person they would carry the same three facts on every line. They are said
     once, above the table, and the columns that remain keep the administrator's own order.
+
+    The seven that remain are the tab's own default order with those three taken out, which is
+    why *Category* is here: it sits between the site and the arrival on the tab, and a sheet
+    that dropped it would answer "which warehouse was this?" with a site name and no class.
     """
     month = results["month"]
     assert month["meta"][0] == "Seed Lead · Moallem · id 600", month["meta"]
     assert month["sheet"].count("Seed Lead") == 1, "the name is on the sheet once"
     assert month["headers"] == [
-        "Date", "Site", "Arrival", "Hours", "Awaiting approval", "Open notes"
+        "Date", "Site", "Category", "Arrival", "Hours", "Awaiting approval", "Open notes"
     ], "the tab's own columns, without the three that say whose rows these are"
     assert "2026-08-01" in month["meta"][1] and "2026-08-31" in month["meta"][1], (
         f"the period line has to name the month that was requested: {month['meta'][1]!r}"
@@ -521,8 +525,10 @@ def test_the_sheet_totals_that_worker_s_month_and_keeps_the_waiting_hours_out(re
     assert "Hours awaiting approval: 7.5 h" in totals, totals
     assert "2 Shifts worked" in totals, totals
     assert "0.5 h Unpaid break" in totals, totals
-    # The fifth column of the sheet's own six: Date, Site, Arrival, Hours, Awaiting, Notes.
-    awaiting = [row for row in results["month"]["rows"] if row[4] == "Awaiting approval"]
+    # The sixth column of the sheet's own seven: Date, Site, Category, Arrival, Hours,
+    # Awaiting, Notes. Read by index on purpose - the point is that the column is in that
+    # position, not that the word appears somewhere on the row.
+    awaiting = [row for row in results["month"]["rows"] if row[5] == "Awaiting approval"]
     assert len(awaiting) == 1, f"the one undecided shift has to say so: {results['month']['rows']}"
 
 

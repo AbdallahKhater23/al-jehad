@@ -243,7 +243,16 @@ def test_a_servers_own_error_message_is_escaped_too(results):
 #: removes that line from ``netguard.CSP_HTML``. The count is allowed to fall and never to
 #: rise: adding an ``onclick=`` to a new button fails here, with this sentence as the reason.
 INLINE_HANDLER_BUDGET = {
-    "admin_modules.js": 67,
+    # 67 until the Shifts tab's own controls were moved onto one delegated listener: its
+    # presets, its column steps, its day columns, its attention chips and its "Show more"
+    # button were nine inline handlers between them, and every one of them carried either a
+    # period or a column name inside an attribute value.
+    #
+    # 57 since the Sites tab's delete button joined the delegated listener it had been sitting
+    # beside: it was the last handler on that tab, and the one attribute in the console with a
+    # *site name* in it - so the count coming down is not tidiness, it is one fewer place a
+    # name from the database is written into executable text.
+    "admin_modules.js": 57,
     "frontendjavascript.js": 19,
     "worker_modules.js": 10,
 }
