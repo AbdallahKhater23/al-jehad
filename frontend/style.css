@@ -3384,3 +3384,314 @@ html.dark .ui-btn-warn:hover:not(:disabled) { color: #0f172a; }
     body.is-printing-report .print-sheet-note { font-size: 8.5pt; margin: 10px 0 0; max-width: 90ch; }
 }
 
+/* ---------- Shifts: the period band, the coverage strip, the timesheet -------
+
+   The tab a month is read from, and why it is laid out this way. What was here
+   was three stacked rows of controls - two dates, a submit button, an export pair,
+   then three presets, a category list and a search box - standing between the reader
+   and the first figure. The window is now one band: the presets that answer most of
+   the questions, the two dates folded behind them, the category filter beside them,
+   and whatever leaves the screen - the link and the download - pushed to the far end
+   of the same line.
+
+   The fold is not a hiding place: it opens by itself whenever the period is not one
+   of the presets, and its summary then names the window rather than saying "custom".
+   A period nobody can read off the screen is a period the figures cannot be trusted
+   against, which is the whole reason this tab shows a period at all. */
+
+.shifts-bar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--ui-3); margin-bottom: var(--ui-3); }
+.shifts-bar-period { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--ui-2); flex: 1 1 380px; min-width: 0; }
+.shifts-presets { display: flex; flex-wrap: wrap; align-items: center; gap: var(--ui-2); }
+.shifts-bar-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--ui-2); margin-inline-start: auto; }
+.shifts-export-format { width: auto; min-width: 118px; }
+.shifts-search { display: flex; flex-wrap: wrap; align-items: center; gap: var(--ui-2); margin-bottom: var(--ui-3); }
+.shifts-columns { margin-bottom: var(--ui-3); }
+
+.shifts-custom { min-width: 0; }
+.shifts-custom > summary {
+    display: inline-flex; align-items: center; gap: 8px;
+    min-height: 42px; padding: 8px 14px;
+    border: 1px solid var(--ops-border); border-radius: 12px;
+    background: var(--ops-surface); color: var(--ops-text);
+    font-family: var(--ops-mono); font-variant-numeric: tabular-nums;
+    font-size: 13px; font-weight: 700; line-height: 1;
+    cursor: pointer; white-space: nowrap;
+}
+.shifts-custom > summary::-webkit-details-marker { display: none; }
+/* Which state the fold is in is a glyph and a border, not only a shade: it is open by itself
+   on every window a preset did not produce, and a reader who cannot tell open from shut would
+   not know whether the dates on screen are the dates behind the figures. */
+.shifts-custom > summary::after { content: '\25be'; font-size: 10px; color: var(--ops-muted); }
+.shifts-custom[open] > summary { border-color: var(--ops-primary); }
+.shifts-custom[open] > summary::after { content: '\25b4'; color: var(--ops-primary); }
+.shifts-custom > summary:focus-visible { outline: 2px solid var(--ops-primary); outline-offset: 2px; }
+.shifts-custom-body {
+    display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--ui-2);
+    margin-top: var(--ui-2); padding: var(--ui-3);
+    background: var(--ops-surface-2); border: 1px solid var(--ops-border); border-radius: 12px;
+}
+
+/* --- the coverage strip --------------------------------------------------
+   One column per day of the period, against the busiest day in the window rather than
+   against the roster: a quiet deployment must not look like a dead one, and this strip is
+   read the same way the dashboard's own day strip is. The counted hours are solid, the hours
+   still waiting for a decision are hatched on top of them - two series told apart by pattern
+   as well as by colour, because the pair (blue, amber) is the pair that the commonest
+   colour-vision deficiency flattens. A column is a button; the whole tab narrows to it. */
+.shifts-coverage {
+    margin-bottom: var(--ui-4); padding: var(--ui-3);
+    background: var(--ops-surface-2); border: 1px solid var(--ops-border); border-radius: 14px;
+}
+.shifts-coverage-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: var(--ui-2); }
+.shifts-coverage-head .ui-section-note { margin: 0; }
+.shifts-coverage-legend { display: flex; flex-wrap: wrap; gap: var(--ui-3); margin: 0; font-size: 12px; color: var(--ops-muted); }
+.shifts-legend { display: inline-flex; align-items: center; gap: 6px; }
+.shifts-legend-key { width: 12px; height: 12px; border-radius: 3px; border: 1px solid var(--ops-border); }
+.shifts-legend-key.is-counted { background: var(--ops-primary); border-color: var(--ops-primary); }
+.shifts-legend-key.is-undecided {
+    border-color: var(--ops-warn);
+    background: repeating-linear-gradient(135deg, var(--ops-warn) 0 2px, transparent 2px 5px);
+}
+.shifts-days {
+    display: flex; align-items: flex-end; gap: 3px;
+    margin: var(--ui-3) 0 0; padding: 0;
+    list-style: none; overflow-x: auto; overscroll-behavior-x: contain;
+}
+.shifts-day { display: flex; flex: 1 0 14px; flex-direction: column; align-items: center; min-width: 14px; }
+.shifts-day-btn {
+    display: flex; flex-direction: column; align-items: center; gap: 2px;
+    width: 100%; min-width: 0; padding: 0;
+    border: 0; background: none; color: inherit; cursor: pointer;
+}
+.shifts-day-btn:focus-visible { outline: 2px solid var(--ops-primary); outline-offset: 2px; border-radius: 6px; }
+/* The track is the full height of the strip and the bar sits at the bottom of it, so every
+   column shares a baseline: bars hanging from the middle read as a waveform, not as a month. */
+.shifts-day-track {
+    display: flex; align-items: flex-end; justify-content: center;
+    width: 100%; height: 56px;
+    border-bottom: 1px solid var(--ops-border);
+}
+.shifts-day-bar {
+    display: flex; flex-direction: column; justify-content: flex-end;
+    width: 100%; min-height: 4px;
+    border-radius: 3px 3px 0 0; background: var(--ops-primary);
+}
+.shifts-day-undecided {
+    display: block; width: 100%;
+    background: repeating-linear-gradient(135deg, var(--ops-warn) 0 2px, transparent 2px 5px);
+}
+/* The column the period is on: a ring around it rather than a tint, so the marker does not
+   read as a third series beside the two the legend explains. */
+.shifts-day.is-selected .shifts-day-btn { box-shadow: inset 0 0 0 2px var(--ops-primary); border-radius: 6px; }
+/* A late arrival is a numeral, not only a colour: the count is the fact, the tint is the
+   shortcut to it. */
+.shifts-day-late { font-family: var(--ops-mono); font-variant-numeric: tabular-nums; font-size: 10px; font-weight: 700; color: var(--ops-warn); }
+.shifts-day-tick { font-family: var(--ops-mono); font-variant-numeric: tabular-nums; font-size: 10px; color: var(--ops-muted); }
+.shifts-day.is-late .shifts-day-tick { color: var(--ops-warn); }
+.shifts-coverage-hint { margin: var(--ui-2) 0 0; }
+
+/* --- the timesheet -------------------------------------------------------
+   A period a payroll month fills is a thousand rows, so the table is its own scroll
+   container with a header that stays on screen: the column a figure belongs to is the one
+   thing a reader cannot hold in their head for a thousand rows. The cap is on width as well
+   - ten columns do not fit a laptop - and the table scrolls sideways rather than wrapping
+   the site names into four lines each. */
+/* A timesheet is read down its columns, so the cells give up their air to the text: eleven
+   columns at a laptop width are tight, and 12px of padding each side is what pushed the site
+   name into three lines and made every row 84px tall. */
+.shifts-table-wrap { display: block; }
+/* The header wraps, the cell does not: ``white-space: nowrap`` on a header makes the *label*
+   the widest thing in the column, so "Awaiting approval" reserved 158px of a 1061px table for
+   a badge that needs 60, and the width it took came out of the site name beside it - which
+   wrapped to three lines and made every row of the month 78px tall. Two lines of header over
+   fifty rows of one line is the trade this table wants to make. */
+.shifts-table-wrap .ui-table th { padding: 8px 9px; white-space: normal; }
+.shifts-table-wrap .ui-table td { padding: 7px 9px; }
+/* The row's two actions are one thought and stay on one line. Without this the cell is as
+   narrow as its (invisible) header, the two buttons stack, and the two of them - not any
+   column of data - set the height of every row in the table. */
+.shifts-table-wrap .ui-table td:last-child { white-space: nowrap; }
+.shifts-table-wrap .ui-table thead th {
+    position: sticky; top: 0; z-index: 2;
+    background: var(--ops-surface);
+    box-shadow: inset 0 -1px 0 var(--ops-border);
+}
+.shifts-table-wrap .ui-table tbody tr[data-awaiting='true'] td { box-shadow: inset 0 0 0 9999px color-mix(in srgb, var(--ops-warn) 5%, transparent); }
+.shifts-table-wrap .ui-table tbody tr[data-awaiting='true'] td:first-child { box-shadow: inset 3px 0 0 var(--ops-warn); }
+
+/* The header cell is a button because the column can be sorted by it, and it has to keep
+   looking like a header: the arrow is drawn from ``aria-sort``, so the cell's *text* stays
+   exactly the column's name - which is what the printed sheet and the file read. */
+.shifts-sort {
+    display: inline-flex; align-items: center; gap: 6px;
+    width: 100%; padding: 0; border: 0; background: none;
+    color: inherit; font: inherit; letter-spacing: inherit; text-transform: inherit;
+    text-align: start; cursor: pointer;
+}
+.shifts-sort:hover { color: var(--ops-text); }
+.shifts-sort:focus-visible { outline: 2px solid var(--ops-primary); outline-offset: 2px; border-radius: 4px; }
+.shifts-sort::after { content: '\2195'; font-size: 10px; opacity: 0.3; }
+th[aria-sort='ascending'] .shifts-sort::after { content: '\2191'; opacity: 1; color: var(--ops-primary); }
+th[aria-sort='descending'] .shifts-sort::after { content: '\2193'; opacity: 1; color: var(--ops-primary); }
+
+/* How much of the view is painted, and the control that paints more. The count sits with the
+   button because they are one thought: what you are seeing is a window onto more. */
+.shifts-more {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+    gap: var(--ui-2); margin-top: var(--ui-3);
+}
+/* The hint lines under two of the figures are a sentence, not a label, so this block lets
+   them wrap rather than cutting them off with an ellipsis: a clipped explanation is worse
+   than none, and the tiles are sized for the figure rather than for the footnote. */
+.shifts-stats { margin-bottom: var(--ui-4); }
+.shifts-stats .ops-stat-hint { white-space: normal; }
+.shifts-more .ui-note { margin: 0; }
+
+/* A phone is where this tab is read, so the controls stop taking the first screen of it.
+   Measured on a 390px viewport: the search box was reserving 220px of basis and pushing its
+   own button onto a second line, the category list was as wide as its longest option and so
+   sat under the period fold instead of beside it, and ten labelled facts in two columns was
+   *taller* than ten of them in one - 133px per pair wrapped "Date / 2026-08-01" onto two
+   lines. One fact per line, tighter, and the controls stop shoving each other around. */
+@media (max-width: 560px) {
+    .shifts-bar { gap: var(--ui-2); }
+    .shifts-bar-period { gap: var(--ui-2); }
+    .shifts-search { gap: var(--ui-2); }
+    .shifts-search input[type='search'] { flex: 1 1 120px; }
+    .shifts-bar-period select { min-width: 0; max-width: 150px; }
+    .shifts-facts { gap: var(--ui-1); }
+}
+/* A shift waiting for a decision is marked on the card as it is on the row: a spine down the
+   inline start, which is the same place the flag sits in every other list in this console. */
+.ui-card.is-stacked[data-awaiting='true'] { border-inline-start: 3px solid var(--ops-warn); }
+
+/* The table takes the window's height and scrolls inside it, which is what lets the header
+   stay put. On a phone the tab is cards and there is no header to keep, so the cap is off. */
+@media (min-width: 721px) {
+    .shifts-table-wrap { max-height: 72vh; overflow: auto; }
+}
+
+/* ---------- Sites --------------------------------------------------------
+   The tab opens on the sites. It used to open on eleven empty boxes - a six-field add
+   form, then a second list of categories - with the sites below the fold, which is the
+   wrong way round for the nine visits in ten that are a look rather than an edit: which
+   window applies here, why was that arrival flagged, is this pin on the right corner.
+   The two forms are folds in one band now, and both are shut until somebody asks.
+
+   A site is a row rather than a card. Four labelled facts were most of a card each, so
+   five sites filled the screen and forty were a scroll nobody made; the three figures
+   that decide something are pills on the line under the name, and the zone is one of
+   them only where a site (or its category) set its own.
+
+   The chevron on a fold button is drawn from ``aria-expanded``, so "this panel is open"
+   is one fact for the eye and for a screen reader rather than two that can drift apart. */
+
+.sites-bar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--ui-3); margin-bottom: var(--ui-4); }
+.sites-bar-lead { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.sites-bar-lead .ui-section-note { margin: 0; }
+.sites-bar-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--ui-2); margin-inline-start: auto; }
+/* The count on the Categories button is a badge, one size down: inside a button it is a figure
+   beside a label, not a status of its own. It takes the button's own text colour rather than a
+   badge's: ``--ops-calm`` on ``--ops-calm-wash`` measures 1.73:1 in the dark theme, and a
+   figure that is a *number to read* cannot be the one thing on the band nobody can read. */
+.sites-bar-actions .ops-badge { padding: 1px 7px; color: var(--ops-text); }
+.sites-toggle::after { content: '\25be'; font-size: 10px; color: var(--ops-muted); }
+.sites-toggle[aria-expanded='true'] { border-color: var(--ops-primary); }
+.sites-toggle[aria-expanded='true']::after { content: '\25b4'; color: var(--ops-primary); }
+.sites-toggle:focus-visible { outline: 2px solid var(--ops-primary); outline-offset: 2px; }
+
+/* The search takes the room it needs and gives the rest back, rather than growing to half the
+   band on a wide screen: a box that is 580px wide for a word or two reads as the most
+   important control on the tab, which it is not. */
+.sites-search { display: flex; flex-wrap: wrap; align-items: center; gap: var(--ui-2); flex: 0 1 420px; min-width: 0; }
+
+/* ``[hidden]`` is the user agent's ``display: none``, and ``.ui-card`` sets a display of its
+   own, which outranks it - so without this line a shut fold is a shut fold that is visible. */
+.sites-fold[hidden] { display: none; }
+.sites-fold > .ui-section-note { margin: 0; }
+
+.sites-list {
+    margin: 0; padding: 0; list-style: none;
+    border: 1px solid var(--ops-border); border-radius: var(--ui-radius);
+    background: var(--ops-surface); overflow: hidden;
+}
+/* A site is one line of a list at a laptop width: the pin and the name, the figures that decide
+   something, then the two buttons. Four labelled facts *under* the name measured 96px a site at
+   1440px, with the right third of every row empty - five sites a screen, forty a scroll nobody
+   makes. The same parts are a small grid on a phone (see the media query below), because 390px
+   holds the pin, a name and two labelled buttons and nothing else. */
+.sites-row { display: flex; flex-direction: column; gap: var(--ui-2); padding: 10px var(--ui-4); min-width: 0; }
+.sites-row-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--ui-2) 10px; min-width: 0; }
+/* Hairlines rather than a card each: forty sites are one surface with forty rows on it, not
+   forty boxes to be counted and re-counted down the screen. */
+.sites-row + .sites-row { border-top: 1px solid var(--ops-border); }
+/* The row being edited is tinted rather than boxed: the editor is a form, and a form is a
+   different kind of thing from the row it stands in for. */
+.sites-row[data-site-editing='true'] { background: var(--ops-surface-2); }
+/* The pin sits in the console's avatar disc, and the disc does not size the glyph in it:
+   without this line the icon takes its own default box and hangs out of the circle. */
+.sites-pin { width: 30px; height: 30px; }
+.sites-pin svg { width: 16px; height: 16px; flex: none; }
+/* The name column takes the slack, which is what keeps the pills and the two buttons together
+   at the end of the row rather than marooned at the far right of it. */
+.sites-who { display: flex; flex: 1 1 140px; flex-direction: column; min-width: 0; }
+.sites-name { font-weight: 700; color: var(--ops-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sites-coords {
+    font-family: var(--ops-mono); font-variant-numeric: tabular-nums; font-size: 12px;
+    color: var(--ops-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sites-row-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--ui-2); }
+
+/* The figures. The pills are the console's badge in the neutral tone: a badge's calm wash is a
+   *status* colour, and "65 m" is not a status. The window keeps the mono face, because a time
+   is read digit by digit, and the origin stays a word beside it - "from مخزن" is the answer to
+   why an arrival was judged the way it was. */
+.sites-facts { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+/* Both places a figure is shown as a pill - a site's line and a category's row - get the same
+   neutral pill, so the same class does not mean two things one screen apart. */
+.sites-facts .ops-badge,
+.sites-categories .ops-badge { background: var(--ops-surface-2); color: var(--ops-text); border: 1px solid var(--ops-border); }
+.sites-facts .ops-badge.is-window,
+.sites-categories .ops-badge.is-window {
+    font-family: var(--ops-mono); font-variant-numeric: tabular-nums; letter-spacing: -0.01em; font-weight: 800;
+}
+.sites-facts .ops-badge.is-zone { background: var(--ops-surface); color: var(--ops-muted); }
+.sites-origin { font-size: 12px; color: var(--ops-muted); }
+
+/* The categories: the same row, one level in, and inside the fold they are already in - so
+   no second box around them. */
+.sites-categories { margin: 0; padding: 0; list-style: none; }
+.sites-category-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--ui-2); padding: 8px 0; border-bottom: 1px solid var(--ops-border); }
+.sites-category-row.is-editing { display: block; padding: var(--ui-2) 0; }
+.sites-category-name { font-weight: 700; color: var(--ops-text); min-width: 0; }
+.sites-category-reach { font-size: 12px; color: var(--ops-muted); }
+.sites-category-row .sites-row-actions { margin-inline-start: auto; }
+
+/* Under a tablet width the row's one line becomes three: the name and its coordinates, then
+   the pills, then the two buttons at the end of a line of their own. Measured at 390px: two
+   labelled buttons take 178px of the 282px a row has, so a name sharing their line is cut to
+   62px - "Down…", which is a row that cannot be read. The name takes a line instead, and the
+   buttons stay words rather than becoming a bin glyph somebody has to guess at. */
+@media (max-width: 720px) {
+    .sites-who { flex: 1 1 auto; }
+    .sites-row-actions { margin-inline-start: auto; }
+    /* A labelled button is a word wide, and this is the width where the words stop fitting:
+       the row's own controls stay thumb-sized even when the row itself is tight. */
+    .sites-row-actions .ui-btn { min-height: 40px; }
+}
+
+/* A phone is where this tab is read, so the band stops taking the first screen of it: the two
+   fold buttons share a line and the search gives up the basis it reserves on a wide screen. */
+@media (max-width: 560px) {
+    .sites-bar { gap: var(--ui-2); }
+    .sites-bar-actions { width: 100%; margin-inline-start: 0; }
+    /* One full-width button per line, and measured rather than guessed: at 390px the two
+       labels are 141px and 205px of content, so they cannot share a 308px line - and a
+       control that has to shrink its own word to fit is worse than a second line of chrome. */
+    .sites-bar-actions .ui-btn { flex: 1 1 auto; }
+    .sites-search { flex-basis: 100%; }
+    .sites-search input[type='search'] { flex: 1 1 120px; }
+    .sites-row { padding: 10px var(--ui-3); }
+}
+
+

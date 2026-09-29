@@ -133,6 +133,20 @@ const TRANSLATIONS = {
         "shiftsNoMatches": "No shift matches this search.",
         "shiftsNothingToExport": "There is nothing on screen to download for this period.",
         "shiftsShowDay": "Show shifts for this day",
+        // The strip: the same figures as the cards, arranged by when they were worked.
+        "shiftsCustomPeriod": "Custom period",
+        "shiftsCoverageCaption": "{units} · {hours} h counted · {awaiting} h awaiting a decision",
+        "shiftsCoverageDays": "{count} days",
+        "shiftsCoverageWeeks": "{count} weeks",
+        "shiftsCoverageMonths": "{count} months",
+        "shiftsCoverageQuarters": "{count} quarters",
+        "shiftsCoverageDayAria": "{from}: {hours} h counted, {awaiting} h awaiting a decision, {late} late arrivals",
+        "shiftsCoverageTap": "Tap a column to narrow the period to it.",
+        "shiftsShowing": "Showing the first {shown} of {total} shifts",
+        "shiftsShowMore": "Show more",
+        "shiftsSortBy": "Sort by {column}",
+        "shiftsHoursHint": "every shift in the period",
+        "shiftsBreakHint": "already out of the hours above",
         "shiftsRangeRequired": "Pick both a start and an end date.",
         "shiftsRangeInvalid": "The end date cannot be before the start date.",
         "credentials": "Credentials",
@@ -1145,6 +1159,18 @@ const TRANSLATIONS = {
         "sitesCategorySaved": "Category saved. Every site that follows it moved with it.",
         "sitesCategoryDeleted": "Category deleted.",
         "sitesCategoryDeleteConfirm": "Delete \u201c{name}\u201d? {sites} site(s) follow it - move those sites to another category, or to none, first.",
+        //  ---- the Sites tab's band (the list-first redesign) --------------------
+        //  Four of these are the search that appears once a list is long enough to need one:
+        //  its label, its two hints, and the sentence an empty result gets - which names what
+        //  was typed, because "no sites" on a deployment with forty of them is a lie the
+        //  reader has to disprove themselves.
+        "sitesShowing": "{shown} of {total} sites",
+        "sitesSearchLabel": "Search sites",
+        "sitesSearchPlaceholder": "Name or category",
+        "sitesNoMatch": "No site matches \u201c{query}\u201d",
+        "sitesNoMatchHint": "Try a site name, or the category it is in.",
+        "sitesClearSearch": "Clear search",
+        "sitesCategoriesEmpty": "No categories yet.",
 
         "adminRulesHint": "These are the numbers the whole console reads: the board's overtime line, the payroll totals and the automatic close all come from here.",
         // Was eight keys for the Admin tab's own create-an-administrator form. The panel is

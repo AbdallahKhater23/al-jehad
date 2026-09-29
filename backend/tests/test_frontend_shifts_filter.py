@@ -198,6 +198,67 @@ function shiftsResponder(url) {
             })])
         };
     }
+    if (start === '2004-01-12' && end === '2004-01-12') {
+        // The day the strip's own column points at: one shift, four hours, arrived an hour late.
+        return {
+            status: 200,
+            body: report(start, end, [shift({
+                log_id: 942, worker_id: '612', worker_name: 'Strip Three', date: '2004-01-12',
+                timestamp: '2004-01-12 16:00:00', hours: 4, recorded_hours: 4.5,
+                arrival_time: '2004-01-12 07:30:00', arrival_verdict: 'late', arrival_minutes: 60
+            })])
+        };
+    }
+    if (start === '2004-01-01') {
+        // A window the strip can be read off: two shifts on one day (one of them waiting for a
+        // decision), one on another day that arrived an hour late, and 28 days nobody worked.
+        return {
+            status: 200,
+            body: report(start, end, [
+                shift({
+                    log_id: 940, worker_id: '610', worker_name: 'Strip One', date: '2004-01-05',
+                    timestamp: '2004-01-05 16:00:00', hours: 8, recorded_hours: 8.5,
+                    arrival_time: '2004-01-05 04:10:00'
+                }),
+                shift({
+                    log_id: 941, worker_id: '611', worker_name: 'Strip Two', date: '2004-01-05',
+                    timestamp: '2004-01-05 17:00:00', hours: 3, recorded_hours: 3.5,
+                    status_code: 'pending_review', status: 'pending_review', awaiting_approval: true,
+                    arrival_time: '2004-01-05 04:10:00'
+                }),
+                shift({
+                    log_id: 942, worker_id: '612', worker_name: 'Strip Three', date: '2004-01-12',
+                    timestamp: '2004-01-12 16:00:00', hours: 4, recorded_hours: 4.5,
+                    arrival_time: '2004-01-12 07:30:00', arrival_verdict: 'late', arrival_minutes: 60
+                })
+            ])
+        };
+    }
+    if (start === '2005-01-01') {
+        // A whole year: 365 days of window, one shift in the middle of it. The strip has to
+        // become twelve columns rather than 365.
+        return {
+            status: 200,
+            body: report(start, end, [shift({
+                log_id: 950, date: '2005-06-10', timestamp: '2005-06-10 16:00:00', hours: 7,
+                recorded_hours: 7.5, arrival_time: '2005-06-10 04:10:00'
+            })])
+        };
+    }
+    if (start === '2006-01-01') {
+        // A month that fills more than one page: 120 shifts, which is what "Show more" and the
+        // "Showing the first n of m" line exist for.
+        const many = [];
+        for (let i = 0; i < 120; i += 1) {
+            many.push(shift({
+                log_id: 1000 + i, worker_id: String(700 + (i % 7)), worker_name: `Row ${i}`,
+                date: `2006-01-${String((i % 28) + 1).padStart(2, '0')}`,
+                timestamp: '2006-01-01 16:00:00', hours: 8, recorded_hours: 8.5,
+                arrival_time: '2006-01-01 04:10:00'
+            }));
+        }
+        return { status: 200, body: report(start, end, many) };
+    }
     if (start === '2003-01-01') {
         // Production-shaped ids. This deployment's roster is ids like `1`, `2` and `4`, and
         // every date on a sheet carries those digits - so a period whose ids are digits of
@@ -317,6 +378,7 @@ function cardValues(html) {
         has_filter_note: html.indexOf('data-filter-note') >= 0,
         has_no_matches: html.indexOf('data-no-matches') >= 0,
         has_day_chip: html.indexOf('data-show-day') >= 0,
+        has_days: html.indexOf('data-shifts-days="true"') >= 0,
         has_columns_panel: html.indexOf('id="shiftsColumns"') >= 0,
         has_timesheet_note: html.indexOf('One row per shift.') >= 0,
         column_order: order ? order[1].split(',') : null,
@@ -339,6 +401,43 @@ function cardValues(html) {
         input_end: inputValue(html, 'shiftsEnd'),
         input_query: inputValue(html, 'shiftsQuery')
     };
+}
+
+// The coverage strip, read as numbers rather than as heights: which unit it settled on, how
+// many columns that is, and what each column's data says. The bars are a share of the busiest
+// day in the window, so a bar is only meaningful beside the others - which is why the counts
+// are read off the buckets as well.
+function coverage(html) {
+    const unit = /data-shifts-coverage="([a-z]+)"/.exec(html);
+    const bars = (html.match(/class="shifts-day-bar" style="height:(\d+)%"/g) || [])
+        .map((found) => Number(/height:(\d+)%/.exec(found)[1]));
+    const undecided = (html.match(/class="shifts-day-undecided" style="height:(\d+)%"/g) || [])
+        .map((found) => Number(/height:(\d+)%/.exec(found)[1]));
+    return {
+        unit: unit ? unit[1] : null,
+        has_strip: html.indexOf('data-shifts-days="true"') >= 0,
+        has_hint: html.indexOf('shifts-coverage-hint') >= 0,
+        has_legend: html.indexOf('shifts-legend-key is-counted') >= 0
+            && html.indexOf('shifts-legend-key is-undecided') >= 0,
+        count: (html.match(/<li class="shifts-day/g) || []).length,
+        buttons: (html.match(/class="shifts-day-btn"/g) || []).length,
+        days: (html.match(/data-shift-day="([0-9-]+)"/g) || []).map((found) => found.slice(16, -1)),
+        bars: bars,
+        undecided: undecided,
+        late: (html.match(/class="shifts-day-late">(\d+)</g) || []).map((found) => Number(/>\d+/.exec(found)[0].slice(1))),
+        selected: (html.match(/class="shifts-day is-selected"/g) || []).length,
+        caption: (/data-shifts-days="true" aria-label="([^"]*)"/.exec(html) || [])[1] || null,
+        // One label per column: what a screen reader is handed instead of a bar. Anchored on
+        // the button so the strip's own caption cannot be counted as one of its columns.
+        labels: (html.match(/class="shifts-day-btn"[\s\S]{0,240}?aria-label="[^"]*h counted, [^"]*h awaiting a decision/g) || []).length
+    };
+}
+
+// One element's text, with its markup taken off - for reading a sentence out of the page.
+function textOf(html, marker) {
+    const at = html.indexOf(marker);
+    if (at < 0) return null;
+    return html.slice(at, html.indexOf('</p>', at)).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
 function lastQuery(env) {
@@ -1001,6 +1100,187 @@ const results = {};
             dashboard_after_both: html.indexOf('data-dashboard="true"') >= 0,
             rows_after_both: (html.match(/data-shift=/g) || []).length,
             hours: cardValues(html).hours
+        };
+    }
+
+    // 10. the coverage strip: the period read day by day, the undecided hours drawn apart
+    {
+        const env = adminEnv();
+        await env.evaluate("UI_MODULES.setShiftsRange('2004-01-01', '2004-01-31')");
+        await env.evaluate("UI.renderAdminTab('Shifts')");
+        const html = env.evaluate("document.getElementById('adminContent').innerHTML");
+        results.coverage = Object.assign(coverage(html), cardValues(html), {
+            // The same rows as buckets: the arithmetic behind the bars, so a strip drawing the
+            // wrong heights fails here rather than in a screenshot.
+            buckets: env.evaluate(`(function () {
+                const covered = UI_MODULES.shiftsCoverageBuckets(UI_MODULES._shiftsReport.report);
+                return covered.buckets.map((b) => [b.key, b.hours, b.awaiting, b.late, b.tick]);
+            })()`)
+        });
+
+        // A year is twelve columns, not 365.
+        const year = adminEnv();
+        await year.evaluate("UI_MODULES.setShiftsRange('2005-01-01', '2005-12-31')");
+        await year.evaluate("UI.renderAdminTab('Shifts')");
+        results.coverage_year = coverage(year.evaluate("document.getElementById('adminContent').innerHTML"));
+
+        // A period with nothing in it draws no strip: the panel below already says so.
+        const quiet = adminEnv();
+        await quiet.evaluate("UI_MODULES.setShiftsRange('2000-01-01', '2000-01-31')");
+        await quiet.evaluate("UI.renderAdminTab('Shifts')");
+        results.coverage_empty = coverage(quiet.evaluate("document.getElementById('adminContent').innerHTML"));
+
+        // One tap on a column narrows the whole tab to that day - and takes the search with it.
+        await env.evaluate(`(async () => {
+            document.getElementById('shiftsQuery').value = 'strip';
+            await UI_MODULES.applyShiftsSearch();
+        })()`);
+        const selectedWhileFiltered = env.evaluate("document.getElementById('adminContent').innerHTML")
+            .indexOf('class=\"shifts-day is-selected\"') >= 0;
+        await env.evaluate("UI_MODULES.applyShiftsBucket('2004-01-12..2004-01-12')");
+        results.coverage_tap = Object.assign(
+            cardValues(env.evaluate("document.getElementById('adminContent').innerHTML")),
+            {
+                state: env.evaluate("State.shiftsRange.start + '..' + State.shiftsRange.end"),
+                query: env.evaluate('State.shiftsQuery'),
+                request: lastQuery(env),
+                selected_while_filtered: selectedWhileFiltered
+            }
+        );
+    }
+
+    // 11. the two attention filters, which the amber figures above the table point at
+    {
+        const env = adminEnv();
+        // A window whose two flagged shifts are *different* shifts: one is waiting for a
+        // decision and arrived on time, the other was decided and arrived an hour late. On a
+        // window where one shift is both, a chip that filtered by the wrong field would pass.
+        await env.evaluate("UI_MODULES.setShiftsRange('2004-01-01', '2004-01-31')");
+        await env.evaluate("UI.renderAdminTab('Shifts')");
+        const html = env.evaluate("document.getElementById('adminContent').innerHTML");
+        const read = () => cardValues(env.evaluate("document.getElementById('adminContent').innerHTML"));
+        const chips = [];
+        const chipRe = /data-attention="([a-z]+)"[^>]*aria-pressed="([a-z]+)"[^>]*>([^<]*)</g;
+        let found = chipRe.exec(html);
+        while (found !== null) {
+            chips.push([found[1], found[2], found[3].trim()]);
+            found = chipRe.exec(html);
+        }
+        await env.evaluate("UI_MODULES.setShiftsAttention('awaiting')");
+        const awaiting = read();
+        const note = textOf(env.evaluate("document.getElementById('adminContent').innerHTML"), 'data-filter-note');
+        env.evaluate('UI_MODULES.downloadShiftsCsv()');
+        const csv = await env.lastBlobText();
+        await env.evaluate("UI_MODULES.setShiftsAttention('late')");
+        const late = read();
+        // The period on screen is not the period the rows are dated in for this fixture, so the
+        // chip that is on stays on screen even once nothing matches it: a filter nobody can see
+        // is a filter nobody can switch off.
+        await env.evaluate("UI_MODULES.setShiftsAttention('late')");
+        const cleared = read();
+        // Read where it is, not at the end of the scenario: the filter moves on from here.
+        const clearedState = env.evaluate('State.shiftsAttention');
+        // Two different filters do not cancel each other: the search, the category and the
+        // attention chip all narrow the same rows.
+        await env.evaluate("UI_MODULES.setShiftsAttention('awaiting')");
+        const both = read();
+        await env.evaluate("UI_MODULES.setShiftsCategory('Warehouse')");
+        const narrowed = read();
+        await env.evaluate("UI_MODULES.setShiftsCategory('')");
+
+        const decided = adminEnv();
+        await decided.evaluate("UI_MODULES.setShiftsRange('2002-01-01', '2002-01-31')");
+        await decided.evaluate("UI.renderAdminTab('Shifts')");
+        const decidedHtml = decided.evaluate("document.getElementById('adminContent').innerHTML");
+
+        results.attention = {
+            chips: chips,
+            awaiting: awaiting,
+            note: note,
+            csv: csv,
+            late: late,
+            cleared: Object.assign(cleared, { state: clearedState }),
+            both: both,
+            narrowed: narrowed,
+            quiet_chips: (decidedHtml.match(/data-attention=/g) || []).length
+        };
+    }
+
+    // 12. sorting a column - and the third press, which puts the period's own order back
+    {
+        const env = adminEnv();
+        await env.evaluate("UI.renderAdminTab('Shifts')");
+        const read = () => {
+            const html = env.evaluate("document.getElementById('adminContent').innerHTML");
+            return Object.assign(cardValues(html), {
+                sort: env.evaluate('JSON.stringify(UI_MODULES.shiftsSort())'),
+                sorted_headers: (html.match(/<th[^>]*aria-sort="[a-z]+"[^>]*>/g) || []),
+                headers: headerLabels(html)
+            });
+        };
+        const initial = read();
+        await env.evaluate("UI_MODULES.sortShiftsBy('hours')");
+        const byHours = read();
+        await env.evaluate("UI_MODULES.sortShiftsBy('hours')");
+        const byHoursAsc = read();
+        await env.evaluate("UI_MODULES.sortShiftsBy('hours')");
+        const restored = read();
+        await env.evaluate("UI_MODULES.sortShiftsBy('employee')");
+        const byName = read();
+        // The file follows the screen: a sorted table exports in the order it is being read in.
+        env.evaluate('UI_MODULES.downloadShiftsCsv()');
+        const csv = await env.lastBlobText();
+        results.sorting = {
+            initial: initial,
+            by_hours: byHours,
+            by_hours_asc: byHoursAsc,
+            restored: restored,
+            by_name: byName,
+            csv: csv,
+            // A sort is how one reader is holding the page, not a setting: nothing is written
+            // to storage for it, unlike the column order.
+            stored: env.evaluate("localStorage.getItem('shiftsSort')")
+        };
+    }
+
+    // 13. a month that fills more than one page is painted one page at a time
+    {
+        const env = adminEnv();
+        await env.evaluate("UI_MODULES.setShiftsRange('2006-01-01', '2006-01-31')");
+        await env.evaluate("UI.renderAdminTab('Shifts')");
+        const read = () => {
+            const html = env.evaluate("document.getElementById('adminContent').innerHTML");
+            return Object.assign(cardValues(html), {
+                count_line: (/data-shifts-count="(\d+)"/.exec(html) || [])[1] || null,
+                more: html.indexOf('data-shifts-more') >= 0,
+                limit: env.evaluate('State.shiftsLimit')
+            });
+        };
+        const first = read();
+        await env.evaluate('UI_MODULES.showMoreShifts()');
+        const second = read();
+        await env.evaluate('UI_MODULES.showMoreShifts()');
+        const third = read();
+        // The file and the sheet are the whole period whatever has been painted: a download of
+        // what somebody happened to have scrolled to would be the worse lie of the two.
+        env.evaluate('UI_MODULES.downloadShiftsCsv()');
+        const csv = await env.lastBlobText();
+        env.evaluate("document.getElementById('shiftsExportFormat').value = 'pdf'");
+        env.evaluate('UI_MODULES.downloadShiftsReport()');
+        const sheet = (env.printed[env.printed.length - 1] || {}).sheet || '';
+        env.fireWindowEvent('afterprint');
+        // A new search is a new list: the painted count goes back to one page of it.
+        await env.evaluate(`(async () => {
+            document.getElementById('shiftsQuery').value = 'Row';
+            await UI_MODULES.applyShiftsSearch();
+        })()`);
+        results.paging = {
+            first: first,
+            second: second,
+            third: third,
+            csv_rows: csv.replace(/\r\n$/, '').split('\r\n').length - 1,
+            sheet_rows: (sheet.match(/<tr>/g) || []).length,
+            searched: read()
         };
     }
 
@@ -1694,3 +1974,204 @@ def test_a_worker_name_cannot_inject_markup_into_the_totals(results):
     assert escaped["raw_tag"] is False
     assert escaped["escaped_tag"] is True
     assert escaped["hours"] == "50"
+
+
+# ---------------------------------------------------------------------------
+# The strip, the attention chips, the sort, and the page
+#
+# Four things the tab grew because it could say what a period added up to and never
+# *when* it was worked, never which rows needed somebody, could not be read in any
+# order but the server's, and painted a payroll month as one string of 15 000 cells.
+# Each is asserted against the report it was built from rather than against numbers
+# typed here twice.
+# ---------------------------------------------------------------------------
+def test_the_strip_reads_the_period_one_column_per_day(results):
+    """The same hours as the cards, arranged by when they were worked.
+
+    The strip is the tab's own figures over a time axis, so it is checked against those
+    figures: 15 h over three shifts, two of them on the 5th with one still waiting for a
+    decision, and one on the 12th that arrived an hour late.
+    """
+    coverage = results["coverage"]
+    assert coverage["has_strip"] is True, "a period with work in it needs a strip"
+    assert coverage["unit"] == "day"
+    assert coverage["count"] == 31, "January has 31 columns, worked or not"
+    assert coverage["buttons"] == 31, "every column is a button: tapping one narrows the period"
+    assert coverage["days"][0] == "2004-01-01" and coverage["days"][-1] == "2004-01-31"
+    assert coverage["has_legend"] is True, "two series need a key, and not a colour-only one"
+    assert coverage["has_hint"] is True, "a control nobody is told about is a control nobody uses"
+
+    buckets = {entry[0]: entry for entry in coverage["buckets"]}
+    assert buckets["2004-01-05"][1] == 11, buckets["2004-01-05"]
+    assert buckets["2004-01-05"][2] == 3, "the pending shift's hours are counted apart"
+    assert buckets["2004-01-05"][3] == 0
+    assert buckets["2004-01-12"][1] == 4 and buckets["2004-01-12"][3] == 1
+    assert buckets["2004-01-07"][1] == 0, "a day nobody worked is a column, not a gap"
+
+    # The bars are a share of the busiest day in the window: the busiest is full height, and
+    # the day beside it is a third of it rather than a second full bar. Only the two worked
+    # days have a bar at all - which is how a reader sees that 29 days hold nothing.
+    assert len(coverage["bars"]) == 2, coverage["bars"]
+    assert coverage["bars"][0] == 100, "the 5th is the busiest day of this window"
+    assert 30 <= coverage["bars"][1] <= 40, coverage["bars"][1]
+    assert coverage["undecided"][0] == 27, "3 h of the 5th's 11 h are still waiting"
+    assert coverage["undecided"][1] == 0, "nothing on the 12th is waiting"
+    assert coverage["late"] == [1], "only the 12th had a late arrival"
+
+    assert "31 days" in coverage["caption"]
+    assert f"{coverage['hours']} h counted" in coverage["caption"]
+    assert f"{coverage['awaiting_approval_hours']} h awaiting a decision" in coverage["caption"]
+    assert coverage["labels"] == 31, "one labelled column each: the strip for a reader who hears it"
+
+
+def test_a_long_period_is_read_in_months_rather_than_in_days(results):
+    """A year is twelve columns, not 365: the strip has to survive the window it is given."""
+    year = results["coverage_year"]
+    assert year["unit"] == "month"
+    assert year["count"] == 12, "twelve months in a year"
+    assert year["days"][0] == "2005-01-01" and year["days"][-1] == "2005-12-01"
+    assert year["bars"] == [100], "one shift in June, and it is the busiest month by default"
+    assert "12 months" in year["caption"]
+
+
+def test_a_period_with_no_shifts_draws_no_strip(results):
+    """The empty panel already says the period is empty; a row of zero columns says it twice."""
+    empty = results["coverage_empty"]
+    assert empty["has_strip"] is False
+    assert empty["count"] == 0
+
+
+def test_a_column_of_the_strip_narrows_the_period_to_that_day(results):
+    """What happened on that Tuesday is asked by pointing at the Tuesday."""
+    tap = results["coverage_tap"]
+    assert tap["selected_while_filtered"] is False, "no column is the period until a day is taken"
+    assert tap["state"] == "2004-01-12..2004-01-12"
+    assert tap["request"] == {"start": "2004-01-12", "end": "2004-01-12"}, (
+        "the strip must ask for the day it was tapped on"
+    )
+    assert tap["query"] == "", "the search was a request for a day, and the day has been taken"
+    assert tap["shift_rows"] == 1 and tap["hours"] == "4"
+
+
+def test_the_amber_figures_become_filters_carrying_the_count_they_will_show(results):
+    """Two questions about a period, asked by tapping the figure that raises them.
+
+    The window is chosen so the two answers are different shifts: the one waiting for a
+    decision arrived on time, and the one that arrived an hour late has already been decided.
+    """
+    attention = results["attention"]
+    assert [chip[0] for chip in attention["chips"]] == ["awaiting", "late"]
+    assert attention["chips"][0][2] == "Awaiting approval (1)", attention["chips"]
+    assert attention["chips"][1][2] == "Late arrivals (1)", attention["chips"]
+    assert [chip[1] for chip in attention["chips"]] == ["false", "false"], (
+        "neither filter is on until it is tapped"
+    )
+
+    # The count on the chip is the card's own figure: the same 3 h the period is waiting on.
+    assert attention["awaiting"]["awaiting_approval"] == "1"
+    assert attention["awaiting"]["shift_rows"] == 1
+    assert attention["awaiting"]["hours"] == "3", "the pending shift's own three hours"
+    assert attention["awaiting"]["approved_hours"] == "0"
+    assert attention["awaiting"]["awaiting_approval_hours"] == "3"
+    assert attention["awaiting"]["has_filter_note"] is True, (
+        "the figures above a narrowed table have to say they cover fewer rows"
+    )
+    assert "Awaiting approval" in attention["note"], attention["note"]
+    assert "1 / 3" in attention["note"], attention["note"]
+
+    # The other chip selects the other shift - 4 h, decided, late.
+    assert attention["late"]["shift_rows"] == 1
+    assert attention["late"]["hours"] == "4"
+
+    # Tapping the chip that is on turns it off again.
+    assert attention["cleared"]["shift_rows"] == 3
+    assert attention["cleared"]["state"] == ""
+    assert attention["cleared"]["hours"] == "15"
+
+    # The attention filter travels into the file, like every other narrowing on this tab.
+    lines = attention["csv"].strip().split("\r\n")
+    assert len(lines) == 2, lines
+    assert lines[1] == "Strip Two,611,Downtown Tower A,3", lines
+
+    # Search, category and attention narrow the same rows rather than cancelling out.
+    assert attention["both"]["shift_rows"] == 1
+    assert attention["narrowed"]["shift_rows"] == 1, (
+        "the pending shift is at a warehouse site, so the category keeps it"
+    )
+
+    # A period whose rows are all decided and all on time offers no chip at all: a filter that
+    # selects nothing is a dead end, and the card that would raise the question is a zero.
+    assert attention["quiet_chips"] == 0
+
+
+def test_a_column_can_be_sorted_and_the_third_press_puts_the_period_back(results):
+    """A thousand rows cannot be read in any order but the one you need.
+
+    Three states, not two: the order the server sent has to stay reachable, or an
+    administrator who sorted the table once has lost the period's own order for the session.
+    """
+    sorting = results["sorting"]
+    assert sorting["initial"]["sort"] == '{"key":"","direction":"asc"}', sorting["initial"]["sort"]
+    assert sorting["initial"]["sorted_headers"] == [], "nothing is sorted until a header is pressed"
+    assert sorting["initial"]["rows"][0][0] == "2026-08-07", "the server's own order, untouched"
+
+    # Hours starts at its biggest: 8, 4, 3 - which here is also the order they arrived in.
+    assert sorting["by_hours"]["sort"] == '{"key":"hours","direction":"desc"}'
+    assert [row[7] for row in sorting["by_hours"]["rows"]] == ["8", "4", "3"]
+    assert len(sorting["by_hours"]["sorted_headers"]) == 1, sorting["by_hours"]["sorted_headers"]
+    assert 'aria-sort="descending"' in sorting["by_hours"]["sorted_headers"][0]
+
+    # Pressed again: the same column, the other way, smallest shift first.
+    assert sorting["by_hours_asc"]["sort"] == '{"key":"hours","direction":"asc"}'
+    assert [row[7] for row in sorting["by_hours_asc"]["rows"]] == ["3", "4", "8"]
+    assert sorting["by_hours_asc"]["rows"][0][1] == "Bilal Khan"
+    assert 'aria-sort="ascending"' in sorting["by_hours_asc"]["sorted_headers"][0]
+
+    # A third press is the way back, and the header stops claiming to sort anything.
+    assert sorting["restored"]["sort"] == '{"key":"","direction":"asc"}'
+    assert sorting["restored"]["sorted_headers"] == []
+    assert sorting["restored"]["rows"] == sorting["initial"]["rows"]
+
+    # A different column, sorted by what the cell shows rather than by the wire value.
+    assert [row[1] for row in sorting["by_name"]["rows"]] == ["Ana Torres", "Bilal Khan", "Seed Lead"]
+
+    # The header's *text* is still exactly the column's name: the arrow is drawn, not written,
+    # because the printed sheet and the file read this same text.
+    assert sorting["by_name"]["headers"] == sorting["initial"]["headers"]
+    assert sorting["by_name"]["headers"][0] == "Date"
+
+    # The file follows the screen: a table being read in a sorted order exports in that order.
+    lines = sorting["csv"].strip().split("\r\n")
+    assert lines[1] == "Ana Torres,601,Harbour Depot,4", lines
+
+    # And none of this is a setting: a sort is how one reader is holding the page.
+    assert sorting["stored"] is None
+
+
+def test_a_month_that_fills_more_than_one_page_is_painted_one_page_at_a_time(results):
+    """120 shifts are painted 50 at a time, and the file is not.
+
+    The cap is on what is *drawn*: the download and the printed sheet are the rows the view
+    holds, or a file would quietly become whatever somebody had scrolled to.
+    """
+    paging = results["paging"]
+    assert paging["first"]["shift_rows"] == 50, "one page of the 120"
+    assert paging["first"]["count_line"] == "120"
+    assert paging["first"]["more"] is True
+    assert paging["first"]["limit"] == 0, "nothing has been grown yet"
+    assert paging["first"]["hours"] == "960", "the figures are the period's, not the page's"
+
+    assert paging["second"]["shift_rows"] == 100
+    assert paging["second"]["more"] is True
+
+    assert paging["third"]["shift_rows"] == 120
+    assert paging["third"]["more"] is False, "the whole period is painted: nothing left to offer"
+
+    # The two files are the period, whatever has been scrolled to.
+    assert paging["csv_rows"] == 120
+    assert paging["sheet_rows"] == 121, "one header row and the 120 shifts"
+
+    # A new search is a new list: the painted count goes back to one page of it.
+    assert paging["searched"]["limit"] == 0
+    assert paging["searched"]["shift_rows"] == 50
+    assert paging["searched"]["count_line"] == "120", "the search matched every row of the period"

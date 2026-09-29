@@ -170,6 +170,23 @@ const State = {
     // selection that lived only in the markup would be lost on the next repaint.
     shiftsQuery: '',
     shiftsCategory: '',
+    // The timesheet's two attention filters, '' meaning neither: the shifts still waiting for
+    // a decision, and the ones whose arrival fell outside the site's window. Kept in State
+    // like the query, so switching tabs - or switching language, which re-renders - does not
+    // quietly widen the table an administrator was reading.
+    shiftsAttention: '',
+    // Which column the timesheet is sorted by, and which way. Held here rather than in the
+    // URL: a sort is how one reader is holding the page, and a link that carried it would
+    // hand a colleague somebody else's idea of what the interesting rows are.
+    shiftsSort: null,
+    // How many rows the table has painted for the view in hand. Grown by "Show more" and
+    // reset by anything that changes which rows the view holds.
+    shiftsLimit: 0,
+    // The Sites tab's search. Held here for the reason every other filter above is: that tab
+    // repaints itself from a string on every fold, editor and save, so a search that lived
+    // only in the markup would be dropped - silently widening the list - by the next one.
+    // The box itself is absent below eight sites (see SITES_SEARCH_AFTER in UI_MODULES).
+    sitesQuery: '',
     //: How many walk-up applications are waiting on a decision. Read when the console paints
     //: and when the tab is returned to, like the crossings count beside it - an applicant is
     //: hired by *somebody else's* console as often as by this one.

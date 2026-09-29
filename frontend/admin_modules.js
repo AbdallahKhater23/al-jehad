@@ -2392,6 +2392,17 @@ const UI_MODULES = {
     //: The last list the API returned, for repaints that must not refetch (opening the editor).
     _sites: null,
     _sitesContent: null,
+    //: Whether the header's two folds are open, or ``null`` for "as the screen needs them".
+    //: Both are shut when the tab opens, so what this tab opens on is the sites rather than
+    //: eleven empty boxes - and the add fold opens by itself on an empty deployment, because
+    //: then there is nothing else on this tab worth doing.
+    _sitesAdd: null,
+    //: The categories fold. Never automatic: a list of classes is context for the sites, not
+    //: the thing anybody came to this tab for.
+    _sitesCategoriesOpen: false,
+    //: Above this many sites the search box appears. Below it the whole list is on screen at
+    //: once, and a search over seven rows is a control that only ever costs a look.
+    SITES_SEARCH_AFTER: 8,
 
     //  A site is a point and a radius, and the tab showed one of them: a row reading
     //  "Radius: 65m" with a red Delete link, and an add form whose entire instruction
@@ -2399,8 +2410,25 @@ const UI_MODULES = {
     //  admin who cannot see the coordinates cannot tell a correct site from a typo,
     //  and "Lat,Lon" is not a format most people can produce on a phone. They can
     //  long-press a spot in a maps app and copy two numbers, which is what the form
-    //  now asks for and what the card now shows back.
-
+    //  now asks for and what the row now shows back.
+    //
+    //  The list comes first. Nearly every visit to this tab is a *look*: which window
+    //  applies here, why was that arrival flagged, is this pin on the right corner. It
+    //  used to be answered by a six-field add form and a second list of categories
+    //  standing in front of the first site, so the tab opened on eleven empty boxes with
+    //  the sites below the fold. Adding a site and retuning a category are real jobs and
+    //  rare ones, so both live behind a fold in the header band - shut until somebody asks
+    //  for them, opened by the code itself when there is nothing else to do.
+    //
+    //  And a site is a row, not a card. Four labelled facts were most of a card each, so
+    //  five sites filled the screen and forty were a scroll nobody made. The name and the
+    //  coordinates open the row; the three figures that decide something - the category,
+    //  the window in force with where it came from, the radius - are pills on the line
+    //  under them. The zone is a pill only when the site (or its category) set its own, so
+    //  the one company zone every inheriting site shares is not repeated forty times.
+    //
+    //  What the row does not show, the editor still does, and the editor is one tap away.
+    //
     /**
      * The category picker: the categories, plus the choice of none.
      *
@@ -2416,54 +2444,206 @@ const UI_MODULES = {
         return `<option value=""${chosen === '' ? ' selected' : ''}>${this.escapeHtml(I18n.__('sitesCategoryNone'))}</option>${options}`;
     },
 
-    sitesCardHtml(site) {
+    /** The search needle, as the administrator left it in the box. */
+    sitesQuery() {
+        const value = State.sitesQuery;
+        return value === null || value === undefined ? '' : String(value).trim();
+    },
+
+    /**
+     * A site matches on its own name or on the category it is in.
+     *
+     * Those are the two words somebody has in mind when they are looking for a site - "the
+     * warehouse" as readily as "Tower B" - and neither of them is the id, which nobody on
+     * this screen has ever needed.
+     */
+    sitesMatches(site, needle) {
+        const name = String((site && site.site_name) || '');
+        const category = String((site && site.category) || '');
+        return `${name}\n${category}`.toLowerCase().indexOf(needle) >= 0;
+    },
+
+    /** The sites the search leaves standing, in the server's order. */
+    sitesFiltered(sites) {
+        const all = Array.isArray(sites) ? sites : [];
+        const needle = this.sitesQuery().toLowerCase();
+        if (!needle) return all;
+        return all.filter((site) => this.sitesMatches(site, needle));
+    },
+
+    /**
+     * Whether the add fold is open: what the administrator last said, or - before they have
+     * said anything - whether this deployment has a site at all. Two sites and no more are
+     * a list to read; no sites at all is a form to fill in, and only the form.
+     */
+    sitesAddOpen(sites) {
+        if (this._sitesAdd === true || this._sitesAdd === false) return this._sitesAdd;
+        const rows = sites || this._sites || [];
+        return rows.length === 0;
+    },
+
+    sitesCategoriesOpen() {
+        return this._sitesCategoriesOpen === true;
+    },
+
+    /**
+     * The header band: what is on the tab, how much of it, and the two jobs that are not
+     * reading it.
+     *
+     * The count says "3 of 9 sites" the moment a search is on rather than "9 sites", for the
+     * same reason the timesheet's does: this tab repaints from a string, and a figure that
+     * describes the list rather than the view is one somebody will read as the view.
+     *
+     * The two buttons are folds, and they say so: ``aria-expanded`` is the state a screen
+     * reader announces, and the chevron beside the label is the same state drawn.
+     */
+    sitesBarHtml(sites) {
+        const all = Array.isArray(sites) ? sites : [];
+        const shown = this.sitesFiltered(all);
+        const query = this.sitesQuery();
+        const categories = (this._siteCategories || []).length;
+        const addOpen = this.sitesAddOpen(all);
+        const categoriesOpen = this.sitesCategoriesOpen();
+        return `
+            <div class="sites-bar" data-sites-bar="true">
+                <div class="sites-bar-lead">
+                    <h3 class="ui-section-title">${this.escapeHtml(I18n.__('sitesTitle'))}</h3>
+                    <p class="ui-section-note" data-sites-count>${this.escapeHtml(
+                        query
+                            ? I18n.__('sitesShowing')
+                                .replace('{shown}', String(shown.length))
+                                .replace('{total}', String(all.length))
+                            : I18n.__('sitesCount').replace('{count}', String(all.length))
+                    )}</p>
+                </div>
+                ${this.sitesSearchHtml(all)}
+                <div class="sites-bar-actions">
+                    <button type="button" class="ui-btn ui-btn-primary sites-toggle" data-sites-add
+                            aria-expanded="${addOpen ? 'true' : 'false'}" aria-controls="sitesAddPanel">
+                        ${this.OPS_ICONS.plus}${this.escapeHtml(I18n.__('sitesAdd'))}
+                    </button>
+                    <button type="button" class="ui-btn sites-toggle" data-sites-categories
+                            aria-expanded="${categoriesOpen ? 'true' : 'false'}" aria-controls="siteCategoriesPanel">
+                        ${this.OPS_ICONS.pin}${this.escapeHtml(I18n.__('sitesCategories'))}${
+                            categories === 0
+                                ? ''
+                                : `<span class="ops-badge">${this.escapeHtml(String(categories))}</span>`
+                        }
+                    </button>
+                </div>
+            </div>`;
+    },
+
+    /**
+     * The search box - over a list long enough to need one.
+     *
+     * Submitted rather than filtered on every keystroke, exactly as the timesheet's box is:
+     * this tab repaints from a string, so filtering as somebody types rebuilds the input under
+     * the caret and drops the caret with it. The box is absent, not disabled, on a short list:
+     * a control that cannot change what is on screen is a control that only ever costs a look.
+     */
+    sitesSearchHtml(sites) {
+        const all = Array.isArray(sites) ? sites : [];
+        if (all.length <= this.SITES_SEARCH_AFTER) return '';
+        const query = this.sitesQuery();
+        return `
+            <form id="sitesFilter" class="sites-search">
+                <label class="sr-only" for="sitesQuery">${this.escapeHtml(I18n.__('sitesSearchLabel'))}</label>
+                <input type="search" id="sitesQuery" class="ui-field is-flex" value="${this.escapeHtml(query)}"
+                       placeholder="${this.escapeHtml(I18n.__('sitesSearchPlaceholder'))}">
+                <button type="submit" class="ui-btn">${this.OPS_ICONS.search}${this.escapeHtml(I18n.__('search'))}</button>
+                ${query ? `<button type="button" class="ui-btn ui-btn-quiet" data-clear-sites-search>${this.OPS_ICONS.close}${this.escapeHtml(I18n.__('clear'))}</button>` : ''}
+            </form>`;
+    },
+
+    /** Apply the search box: the list already in hand, read again - never a second request. */
+    applySitesSearch(event) {
+        if (event && event.preventDefault) event.preventDefault();
+        const field = document.getElementById('sitesQuery');
+        State.sitesQuery = field && field.value !== undefined ? String(field.value) : '';
+        this.paintSites();
+        return undefined;
+    },
+
+    /** Set the search from code: the empty state's own button, and anything that links here. */
+    setSitesQuery(value) {
+        State.sitesQuery = value === null || value === undefined ? '' : String(value);
+        this.paintSites();
+        return undefined;
+    },
+
+    toggleSitesAdd() {
+        this._sitesAdd = !this.sitesAddOpen();
+        this.paintSites();
+        return undefined;
+    },
+
+    toggleSitesCategories() {
+        this._sitesCategoriesOpen = !this.sitesCategoriesOpen();
+        this.paintSites();
+        return undefined;
+    },
+
+    /**
+     * One site, as one row.
+     *
+     * The figures that decide something are pills under the name, and the origin is a word
+     * rather than a fourth label: "from مخزن" is the answer to "who moved these hours", which
+     * is the question this screen is actually asked. What the row leaves out - the configured
+     * window, the zone it inherits - is in the editor, one tap away.
+     */
+    sitesRowHtml(site) {
         const name = String(site.site_name || '');
         const lat = Number(site.lat);
         const lon = Number(site.lon);
         const coords = Number.isFinite(lat) && Number.isFinite(lon)
             ? `${lat.toFixed(5)}, ${lon.toFixed(5)}`
             : '\u2014';
-        const facts = this._siteEdit === name
-            ? this.sitesEditHtml(site)
-            : `
-                <div class="ui-facts" style="margin-top:14px">
-                    <div class="ui-fact">
-                        <span class="ops-stat-label">${this.escapeHtml(I18n.__('sitesCategory'))}</span>
-                        <span class="ui-fact-value" data-site-category="${this.escapeHtml(name)}">${this.escapeHtml(site.category || I18n.__('sitesCategoryNone'))}</span>
-                    </div>
-                    <div class="ui-fact">
-                        <span class="ops-stat-label">${this.escapeHtml(I18n.__('sitesRadius'))}</span>
-                        <span class="ui-fact-value">${this.escapeHtml(`${site.radius} m`)}</span>
-                    </div>
-                    <div class="ui-fact">
-                        <span class="ops-stat-label">${this.escapeHtml(I18n.__('sitesWindow'))}</span>
-                        <span class="ui-fact-value" data-site-window="${this.escapeHtml(name)}">${this.escapeHtml(this.windowLabel(site))}</span>
-                        <span class="ops-sub">${this.escapeHtml(this.windowOriginLabel(site, ['clock_in_window_start', 'clock_in_window_end']))}</span>
-                    </div>
-                    <div class="ui-fact">
-                        <span class="ops-stat-label">${this.escapeHtml(I18n.__('sitesWindowTimezone'))}</span>
-                        <span class="ui-fact-value">${this.escapeHtml(String((site.window || {}).site_timezone || ''))}</span>
-                        <span class="ops-sub">${this.escapeHtml(this.windowOriginLabel(site, ['site_timezone']))}</span>
-                    </div>
+        const editing = this._siteEdit === name;
+        const zone = String((site.window || {}).site_timezone || '');
+        // The zone appears when the site (or its category) set its own, which is the case where
+        // it can differ from the next row's. It is one word on every other row for no reason:
+        // the zone in force at an inheriting site is the company's, and the company's is set
+        // once, on the Admin tab. The editor still names it for the site that inherits it.
+        const zonePill = zone && !this.windowInherited(site, 'site_timezone')
+            ? `<span class="ops-badge is-zone">${this.escapeHtml(zone)}</span>`
+            : '';
+        const facts = `
+                <div class="sites-facts">
+                    <span class="ops-badge" data-site-category="${this.escapeHtml(name)}">${this.escapeHtml(site.category || I18n.__('sitesCategoryNone'))}</span>
+                    <span class="ops-badge is-window" data-site-window="${this.escapeHtml(name)}">${this.escapeHtml(this.windowLabel(site))}</span>
+                    <span class="sites-origin">${this.escapeHtml(this.windowOriginLabel(site, ['clock_in_window_start', 'clock_in_window_end']))}</span>
+                    <span class="ops-badge">${this.escapeHtml(`${site.radius} m`)}</span>
+                    ${zonePill}
                 </div>`;
         return `
-            <li class="ui-card" data-site="${this.escapeHtml(name)}">
-                <div class="ui-spread">
-                    <div class="ops-row-main">
-                        <span class="ops-avatar" aria-hidden="true">${this.OPS_ICONS.pin}</span>
-                        <div class="ops-who">
-                            <span class="ops-name">${this.escapeHtml(name)}</span>
-                            <span class="ops-sub">${this.escapeHtml(coords)}</span>
-                        </div>
-                    </div>
-                    <div class="ui-row">
+            <li class="sites-row" data-site="${this.escapeHtml(name)}"${editing ? ' data-site-editing="true"' : ''}>
+                <div class="sites-row-head">
+                    <span class="ops-avatar sites-pin" aria-hidden="true">${this.OPS_ICONS.pin}</span>
+                    <span class="sites-who">
+                        <span class="sites-name">${this.escapeHtml(name)}</span>
+                        <span class="sites-coords">${this.escapeHtml(coords)}</span>
+                    </span>
+                    ${editing ? '' : facts}
+                    <span class="sites-row-actions">
                         <button type="button" class="ui-btn ui-btn-sm" data-edit-site="${this.escapeHtml(name)}">${this.OPS_ICONS.clock}${this.escapeHtml(I18n.__('sitesEdit'))}</button>
-                        <button type="button" class="ui-btn ui-btn-danger ui-btn-sm" data-delete-site="${this.escapeHtml(name)}"
-                                onclick="UI_MODULES.deleteSite('${this.liveOpsInlineString(name)}')">${this.OPS_ICONS.trash}${this.escapeHtml(I18n.__('sitesDelete'))}</button>
-                    </div>
+                        <button type="button" class="ui-btn ui-btn-danger ui-btn-sm" data-delete-site="${this.escapeHtml(name)}">${this.OPS_ICONS.trash}${this.escapeHtml(I18n.__('sitesDelete'))}</button>
+                    </span>
                 </div>
-                ${facts}
+                ${editing ? this.sitesEditHtml(site) : ''}
             </li>`;
+    },
+
+    /**
+     * Whether half of a site's window came from the company rules rather than from the site
+     * (or from its category).
+     *
+     * Per *field*, like ``windowOriginLabel``: a site may set its hours and keep the company
+     * zone, so one answer for both halves would be a lie about one of them.
+     */
+    windowInherited(site, key) {
+        const source = ((site && site.window) || {}).source || {};
+        return !source[key] || source[key] === 'global';
     },
 
     /**
@@ -2580,15 +2760,22 @@ const UI_MODULES = {
         </datalist>`;
     },
 
-    sitesAddHtml() {
+    /**
+     * The add form, folded away in the header band.
+     *
+     * It opens by itself on a deployment with no sites at all, where it is the only useful
+     * thing this tab has to offer - and stays shut everywhere else, where it is a form the
+     * administrator came here to *avoid* until they need it.
+     */
+    sitesAddHtml(sites) {
+        const open = this.sitesAddOpen(sites);
         // The hint above the fields is the whole difference between a form an admin can
         // fill in from a phone and one they have to guess at - including the window, which is
         // the field that decides whether a worker arriving at 05:30 is on time or a review.
         return `
-            <section class="ui-card is-flat" aria-labelledby="sitesAddTitle">
-                <h3 class="ui-section-title" id="sitesAddTitle">${this.escapeHtml(I18n.__('sitesAdd'))}</h3>
-                <p class="ui-section-note" style="margin-top:4px">${this.escapeHtml(I18n.__('sitesLocationHint'))}</p>
-                <form id="addSiteForm" class="ui-grid three" style="margin-top:14px">
+            <section id="sitesAddPanel" class="ui-card is-flat sites-fold" aria-label="${this.escapeHtml(I18n.__('sitesAdd'))}"${open ? '' : ' hidden'}>
+                <p class="ui-section-note">${this.escapeHtml(I18n.__('sitesLocationHint'))}</p>
+                <form id="addSiteForm" class="ui-grid three" style="margin-top:12px">
                     <div>
                         <label class="ui-label" for="siteName">${this.escapeHtml(I18n.__('sitesName'))}</label>
                         <input type="text" id="siteName" class="ui-field" required
@@ -2637,6 +2824,10 @@ const UI_MODULES = {
      * Every row says how many sites follow it, because that is the figure that decides whether
      * an edit here is a small correction or a retune of a whole class of sites - and it is the
      * same number the server refuses a delete on.
+     *
+     * The whole panel is a fold, because it is the second half of this tab rather than the
+     * first: a class of sites is worth reading *after* the sites, and it used to be the thing
+     * standing between the administrator and them.
      */
     sitesCategoriesHtml() {
         const categories = this._siteCategories || [];
@@ -2645,29 +2836,25 @@ const UI_MODULES = {
         const rows = categories.map((category) => {
             const id = Number(category.category_id);
             if (editing === id) {
-                return `<li class="ui-card" data-category-row="${id}">${this.siteCategoryFormHtml(category)}</li>`;
+                return `<li class="sites-category-row is-editing" data-category-row="${id}">${this.siteCategoryFormHtml(category)}</li>`;
             }
             return `
-                <li class="ui-card" data-category-row="${id}">
-                    <div class="ui-spread">
-                        <div class="ops-who">
-                            <span class="ops-name">${this.escapeHtml(category.name)}</span>
-                            <span class="ops-sub">${this.escapeHtml(this.siteCategoryWindowLabel(category))} · ${this.escapeHtml(I18n.__('sitesCategorySiteCount').replace('{count}', String(category.site_count || 0)))}</span>
-                        </div>
-                        <div class="ui-row">
-                            <button type="button" class="ui-btn ui-btn-sm" data-category-edit="${id}">${this.escapeHtml(I18n.__('sitesEdit'))}</button>
-                            <button type="button" class="ui-btn ui-btn-danger ui-btn-sm" data-category-delete="${id}">${this.escapeHtml(I18n.__('sitesDelete'))}</button>
-                        </div>
-                    </div>
+                <li class="sites-category-row" data-category-row="${id}">
+                    <span class="sites-category-name">${this.escapeHtml(category.name)}</span>
+                    <span class="ops-badge is-window">${this.escapeHtml(this.siteCategoryWindowLabel(category))}</span>
+                    <span class="sites-category-reach">${this.escapeHtml(I18n.__('sitesCategorySiteCount').replace('{count}', String(category.site_count || 0)))}</span>
+                    <span class="sites-row-actions">
+                        <button type="button" class="ui-btn ui-btn-sm" data-category-edit="${id}">${this.escapeHtml(I18n.__('sitesEdit'))}</button>
+                        <button type="button" class="ui-btn ui-btn-danger ui-btn-sm" data-category-delete="${id}">${this.escapeHtml(I18n.__('sitesDelete'))}</button>
+                    </span>
                 </li>`;
         }).join('');
         return `
-            <section class="ui-section" id="siteCategoriesPanel">
-                <div class="ui-section-head">
-                    <h3 class="ui-section-title">${this.escapeHtml(I18n.__('sitesCategories'))}</h3>
-                    <p class="ui-section-note">${this.escapeHtml(I18n.__('sitesCategoriesHint'))}</p>
-                </div>
-                ${categories.length === 0 ? '' : `<ul class="ui-stack" style="list-style:none;margin:0 0 14px;padding:0">${rows}</ul>`}
+            <section id="siteCategoriesPanel" class="ui-card is-flat sites-fold" aria-label="${this.escapeHtml(I18n.__('sitesCategories'))}"${this.sitesCategoriesOpen() ? '' : ' hidden'}>
+                <p class="ui-section-note">${this.escapeHtml(I18n.__('sitesCategoriesHint'))}</p>
+                ${categories.length === 0
+                    ? `<p class="ui-note is-faint">${this.escapeHtml(I18n.__('sitesCategoriesEmpty'))}</p>`
+                    : `<ul class="sites-categories" data-categories-list="true">${rows}</ul>`}
                 ${this.siteCategoryFormHtml(null)}
             </section>`;
     },
@@ -2721,26 +2908,42 @@ const UI_MODULES = {
             </form>`;
     },
 
+    /**
+     * The tab: the band, the two folds, then the sites - in that order.
+     *
+     * The two empty states are why the order is spelled out here. No sites at all is not a
+     * search that found nothing: it is a deployment where nobody can clock in, so the state
+     * sends the reader to the add form (which has opened itself above it). A search that found
+     * nothing is a list to be *unhidden*, so it offers the way out and names what was typed.
+     */
     sitesHtml(sites) {
-        const list = sites.length === 0
-            ? `<div class="ui-empty" data-sites-empty="true">
+        const all = Array.isArray(sites) ? sites : [];
+        const shown = this.sitesFiltered(all);
+        const query = this.sitesQuery();
+        let list;
+        if (all.length === 0) {
+            list = `<div class="ui-empty" data-sites-empty="true">
                     <span class="ui-empty-icon">${this.OPS_ICONS.pin}</span>
                     <p class="ui-empty-title">${this.escapeHtml(I18n.__('sitesEmpty'))}</p>
                     <p class="ui-empty-body">${this.escapeHtml(I18n.__('sitesEmptyHint'))}</p>
-               </div>`
-            : `<ul id="sitesList" class="ui-stack" style="list-style:none;margin:0;padding:0" data-sites-list="true">
-                    ${sites.map((site) => this.sitesCardHtml(site)).join('')}
+               </div>`;
+        } else if (shown.length === 0) {
+            list = `<div class="ui-empty" data-sites-no-match="true">
+                    <span class="ui-empty-icon">${this.OPS_ICONS.search}</span>
+                    <p class="ui-empty-title">${this.escapeHtml(I18n.__('sitesNoMatch').replace('{query}', query))}</p>
+                    <p class="ui-empty-body">${this.escapeHtml(I18n.__('sitesNoMatchHint'))}</p>
+                    <button type="button" class="ui-btn ui-btn-sm" data-clear-sites-search>${this.OPS_ICONS.close}${this.escapeHtml(I18n.__('sitesClearSearch'))}</button>
+               </div>`;
+        } else {
+            list = `<ul id="sitesList" class="sites-list" data-sites-list="true">
+                    ${shown.map((site) => this.sitesRowHtml(site)).join('')}
                </ul>`;
+        }
         return `
-            ${this.sitesAddHtml()}
+            ${this.sitesBarHtml(all)}
+            ${this.sitesAddHtml(all)}
             ${this.sitesCategoriesHtml()}
-            <section class="ui-section">
-                <div class="ui-section-head">
-                    <h3 class="ui-section-title">${this.escapeHtml(I18n.__('sitesTitle'))}</h3>
-                    <p class="ui-section-note" data-sites-count>${this.escapeHtml(I18n.__('sitesCount').replace('{count}', String(sites.length)))}</p>
-                </div>
-                ${list}
-            </section>`;
+            ${list}`;
     },
 
     async renderSites(content) {
@@ -2770,11 +2973,22 @@ const UI_MODULES = {
     paintSites(content) {
         const target = content || this._sitesContent;
         if (!target) return;
-        target.innerHTML = `<div class="ui-page" data-sites="true">${this.sitesHtml(this._sites || [])}</div>`;
+        target.innerHTML = `<div class="ui-page" id="sitesPage" data-sites="true">${this.sitesHtml(this._sites || [])}</div>`;
         const form = document.getElementById('addSiteForm');
         if (form) form.onsubmit = (event) => this.addSite(event);
         const edit = document.getElementById('editSiteForm');
         if (edit) edit.onsubmit = (event) => this.saveSite(event);
+        // The search box: submitted rather than filtered as somebody types, because this tab
+        // repaints from a string and a keystroke-by-keystroke filter would rebuild the input
+        // under the caret. It is only in the markup on a list long enough to need it.
+        const filter = document.getElementById('sitesFilter');
+        if (filter) filter.onsubmit = (event) => this.applySitesSearch(event);
+        // The header's two folds, and the empty state's way out of a search that found nothing.
+        // Bound to the page rather than to the list, because all of those are on screen when
+        // the list is not; each router is kept to its own hooks, so that a click inside the
+        // list cannot be answered twice (see ``onSitesPanelClick``).
+        const page = document.getElementById('sitesPage');
+        if (page) page.onclick = (event) => this.onSitesPanelClick(event);
         // One listener for every card, bound as a property rather than written as an
         // ``onclick=`` attribute in the markup: handler text built from data is the sink the
         // document CSP keeps 'unsafe-inline' for (see docs/FRONTEND_RENDERING.md).
@@ -2792,10 +3006,13 @@ const UI_MODULES = {
     },
 
     /**
-     * The Sites tab's buttons: edit, cancel, and "use the company window".
+     * The row's own buttons: edit, cancel, "use the company window", delete.
      *
      * Delegated from the list container, so no handler text is ever built out of a site name,
      * and guarded on ``closest`` because the event this receives is the browser's to shape.
+     * Delete moved here from the inline ``onclick=`` the button used to carry: a site name is
+     * operator data, and handler text built out of operator data is the sink the document CSP
+     * exists to close. That button was the last one on this tab holding one.
      */
     onSitesClick(event) {
         const target = event && event.target;
@@ -2803,7 +3020,27 @@ const UI_MODULES = {
         const edit = target.closest('[data-edit-site]');
         if (edit) { this.openSiteEdit(edit.dataset.editSite); return; }
         if (target.closest('[data-cancel-site-edit]')) { this.cancelSiteEdit(); return; }
-        if (target.closest('[data-company-window]')) this.useCompanyWindow();
+        if (target.closest('[data-company-window]')) { this.useCompanyWindow(); return; }
+        const remove = target.closest('[data-delete-site]');
+        if (remove) { this.deleteSite(remove.dataset.deleteSite); return; }
+    },
+
+    /**
+     * The header band's own controls: the two folds, and the way out of a search.
+     *
+     * A second router rather than more routes on the first one. These controls sit above the
+     * list - they are on screen when the list is empty, and when a search has emptied it - so
+     * they cannot be delegated from the list; and because the page contains the list, a router
+     * that answered both sets of hooks would answer a click inside the list twice, which for a
+     * fold is a toggle that opens and shuts inside one tap.
+     */
+    onSitesPanelClick(event) {
+        const target = event && event.target;
+        if (!target || typeof target.closest !== 'function') return undefined;
+        if (target.closest('[data-sites-add]')) return this.toggleSitesAdd();
+        if (target.closest('[data-sites-categories]')) return this.toggleSitesCategories();
+        if (target.closest('[data-clear-sites-search]')) return this.setSitesQuery('');
+        return undefined;
     },
 
     openSiteEdit(name) {
@@ -8066,11 +8303,225 @@ ${sessionsFact}${statusFact}
         }));
     },
 
+    /** How many columns the coverage strip draws before it groups them. */
+    shiftsCoverageMaxBuckets() {
+        return 40;
+    },
+
+    /** Every calendar day from one ``YYYY-MM-DD`` to another, inclusive. */
+    shiftsDaysBetween(start, end) {
+        const parse = (value) => {
+            const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ''));
+            return match ? new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3])) : null;
+        };
+        const first = parse(start);
+        const last = parse(end);
+        if (!first || !last || last < first) return [];
+        const days = [];
+        // A clipped walk rather than a loop that trusts its two dates: they arrive from a shared
+        // link and from two date boxes, and a decade typed into them must not draw 3 650 columns
+        // into the page.
+        const cursor = new Date(first.getTime());
+        while (cursor <= last && days.length < 4000) {
+            days.push(this.isoDate(cursor));
+            cursor.setDate(cursor.getDate() + 1);
+        }
+        return days;
+    },
+
+    /**
+     * The unit one column of the strip stands for.
+     *
+     * Days while a period is short enough to read a day at a time, then weeks, months and
+     * quarters - the same window, at a scale that still fits on the screen. A year is twelve
+     * columns, not 365.
+     */
+    shiftsCoverageUnit(days) {
+        if (days.length <= this.shiftsCoverageMaxBuckets()) return 'day';
+        if (Math.ceil(days.length / 7) <= this.shiftsCoverageMaxBuckets()) return 'week';
+        if (days.length / 30.5 <= this.shiftsCoverageMaxBuckets()) return 'month';
+        return 'quarter';
+    },
+
+    /** The bucket a day belongs to under one unit: days grouped, no row counted twice. */
+    shiftsCoverageKey(day, unit) {
+        if (unit === 'week') {
+            const when = new Date(Number(day.slice(0, 4)), Number(day.slice(5, 7)) - 1, Number(day.slice(8, 10)));
+            // Sunday, like the week preset and the site's own working week.
+            when.setDate(when.getDate() - when.getDay());
+            return this.isoDate(when);
+        }
+        if (unit === 'month') return day.slice(0, 7);
+        if (unit === 'quarter') return `${day.slice(0, 4)}-Q${Math.floor((Number(day.slice(5, 7)) - 1) / 3) + 1}`;
+        return day;
+    },
+
+    /**
+     * What the period looks like day by day - or week, month, quarter by, for a long one.
+     *
+     * Built from the rows already in hand rather than from a second request: the tab knows every
+     * shift it is showing, and the strip is those figures arranged by when they were worked
+     * instead of by who worked them. Empty days are *columns*, not gaps - a Sunday nobody worked
+     * is the answer to a question about Sundays.
+     */
+    shiftsCoverageBuckets(report, shown) {
+        const period = (report && report.period) || {};
+        // The rows the *view* holds, not the period's whole answer: a strip of the period while
+        // the cards above it describe a search would be two sets of figures on one screen, and
+        // the note between them says the figures cover the rows shown.
+        const rows = shown || (report && report.rows) || [];
+        const days = this.shiftsDaysBetween(period.start, period.end);
+        if (days.length === 0) return { unit: 'day', buckets: [] };
+        const unit = this.shiftsCoverageUnit(days);
+        const byDay = {};
+        rows.forEach((row) => {
+            const day = String(row.date || '').slice(0, 10);
+            if (!day) return;
+            const entry = byDay[day] || { hours: 0, awaiting: 0, late: 0, shifts: 0 };
+            entry.hours += Number(row.hours) || 0;
+            entry.awaiting += this.shiftAwaitingHours(row);
+            entry.late += row.arrival_verdict === 'late' ? 1 : 0;
+            entry.shifts += 1;
+            byDay[day] = entry;
+        });
+        const buckets = [];
+        const index = {};
+        days.forEach((day) => {
+            const key = this.shiftsCoverageKey(day, unit);
+            if (!Object.prototype.hasOwnProperty.call(index, key)) {
+                index[key] = buckets.length;
+                buckets.push({
+                    key: key, start: day, end: day, hours: 0, awaiting: 0, late: 0, shifts: 0,
+                    tick: this.shiftsCoverageTick(key, unit)
+                });
+            }
+            const bucket = buckets[index[key]];
+            bucket.end = day;
+            const entry = byDay[day];
+            if (!entry) return;
+            bucket.hours += entry.hours;
+            bucket.awaiting += entry.awaiting;
+            bucket.late += entry.late;
+            bucket.shifts += entry.shifts;
+        });
+        return { unit: unit, buckets: buckets };
+    },
+
+    /** The numeral under one column: the day, the week's first day, the month or the quarter. */
+    shiftsCoverageTick(key, unit) {
+        if (unit === 'month') return String(Number(key.slice(5, 7)));
+        if (unit === 'quarter') return String(key.slice(6));
+        return String(key).slice(-2);
+    },
+
+    /**
+     * One column of the strip, as text - the strip for a reader who cannot see a bar.
+     *
+     * Every number the bar is drawn from is in the label, so a screen reader gets the figures
+     * rather than a row of "column". Nothing here is carried by colour alone either: the late
+     * arrivals are a numeral above the column, not a tint on it.
+     */
+    shiftsCoverageLabel(bucket, unit) {
+        const from = unit === 'day' ? bucket.start : `${bucket.start} \u2192 ${bucket.end}`;
+        return I18n.__('shiftsCoverageDayAria')
+            .replace('{from}', from)
+            .replace('{hours}', this.hoursLabel(bucket.hours))
+            .replace('{awaiting}', this.hoursLabel(bucket.awaiting))
+            .replace('{late}', String(bucket.late));
+    },
+
+    /** The unit, in the reader's words, with the number of columns in it. */
+    shiftsCoverageUnits(count, unit) {
+        const keys = {
+            day: 'shiftsCoverageDays', week: 'shiftsCoverageWeeks', month: 'shiftsCoverageMonths'
+        };
+        return I18n.__(keys[unit] || 'shiftsCoverageQuarters').replace('{count}', String(count));
+    },
+
+    /**
+     * The strip: one column per day of the period, the counted hours drawn against the busiest
+     * day, with the hours still waiting for a decision drawn as its own hatched top.
+     *
+     * The two parts are told apart by pattern as well as by colour - the counted part is solid,
+     * the undecided part is hatched - because an operator reading this on a phone in sunlight, or
+     * through one of the colour-vision deficiencies that are commonest against orange and blue, is
+     * still owed the difference. A column is a button: tapping it narrows the whole tab to that
+     * day, which is "what happened on that Tuesday" asked by pointing at it.
+     */
+    shiftsCoverageHtml(report, shown) {
+        const covered = this.shiftsCoverageBuckets(report, shown);
+        const unit = covered.unit;
+        const buckets = covered.buckets;
+        const rows = shown || (report && report.rows) || [];
+        // Nothing happened and nothing is drawn: the panel below already says the period is empty,
+        // and a row of zero-height columns would be a second, quieter way of saying it.
+        if (rows.length === 0 || buckets.length === 0) return '';
+        const scale = Math.max.apply(null, [1].concat(buckets.map((bucket) => bucket.hours)));
+        const total = buckets.reduce((sum, bucket) => sum + bucket.hours, 0);
+        const awaiting = buckets.reduce((sum, bucket) => sum + bucket.awaiting, 0);
+        const range = this.shiftsRange();
+        const caption = I18n.__('shiftsCoverageCaption')
+            .replace('{units}', this.shiftsCoverageUnits(buckets.length, unit))
+            .replace('{hours}', this.hoursLabel(total))
+            .replace('{awaiting}', this.hoursLabel(awaiting));
+        const columns = buckets.map((bucket) => {
+            const selected = range.start === bucket.start && range.end === bucket.end;
+            const share = bucket.hours > 0 ? Math.min(100, Math.max(6, Math.round(bucket.hours / scale * 100))) : 0;
+            const undecided = bucket.hours > 0 ? Math.min(100, Math.round(bucket.awaiting / bucket.hours * 100)) : 0;
+            const bar = share > 0
+                ? `<span class="shifts-day-bar" style="height:${share}%">`
+                    + `<span class="shifts-day-undecided" style="height:${undecided}%"></span></span>`
+                : '';
+            const label = this.shiftsCoverageLabel(bucket, unit);
+            return `
+                <li class="shifts-day${bucket.late > 0 ? ' is-late' : ''}${selected ? ' is-selected' : ''}"
+                    data-shift-day="${this.escapeHtml(bucket.start)}">${bucket.late > 0
+                        ? `<span class="shifts-day-late">${this.escapeHtml(String(bucket.late))}</span>`
+                        : ''}<button type="button" class="shifts-day-btn"
+                        data-shift-bucket="${this.escapeHtml(`${bucket.start}..${bucket.end}`)}"
+                        aria-pressed="${selected ? 'true' : 'false'}"
+                        aria-label="${this.escapeHtml(label)}" title="${this.escapeHtml(label)}">
+                        <span class="shifts-day-track">${bar}</span>
+                        <span class="shifts-day-tick">${this.escapeHtml(bucket.tick)}</span>
+                    </button></li>`;
+        }).join('');
+        return `
+            <div class="shifts-coverage" data-shifts-coverage="${unit}">
+                <div class="shifts-coverage-head">
+                    <p class="ui-section-note">${this.escapeHtml(caption)}</p>
+                    <p class="shifts-coverage-legend">
+                        <span class="shifts-legend"><span class="shifts-legend-key is-counted" aria-hidden="true"></span>${this.escapeHtml(I18n.__('shiftsApproved'))}</span>
+                        <span class="shifts-legend"><span class="shifts-legend-key is-undecided" aria-hidden="true"></span>${this.escapeHtml(I18n.__('shiftsPendingHours'))}</span>
+                    </p>
+                </div>
+                <ol class="shifts-days" role="list" data-shifts-days="true" aria-label="${this.escapeHtml(caption)}">${columns}</ol>
+                <p class="ui-note shifts-coverage-hint">${this.escapeHtml(I18n.__('shiftsCoverageTap'))}</p>
+            </div>`;
+    },
+
+    /**
+     * One tap on a column of the strip: make that day (or week, month, quarter) the period.
+     *
+     * The same move as ``applyShiftsDay``, and it clears the search for the same reason: what was
+     * typed was a request for a day, and leaving it in the box would hide the very rows it just
+     * asked for.
+     */
+    async applyShiftsBucket(value) {
+        const parts = String(value || '').split('..');
+        const start = parts[0] || '';
+        const end = parts[1] || start;
+        if (!this.setShiftsRange(start, end)) return undefined;
+        State.shiftsQuery = '';
+        State.shiftsLimit = 0;
+        return UI.renderAdminTab('Shifts');
+    },
+
     /** One tap on a preset: set the period, then reload the totals for it. */
     applyShiftsPreset(key) {
         const preset = this.shiftsPresets().find((candidate) => candidate.key === key);
         if (!preset) return;
         if (!this.setShiftsRange(preset.range.start, preset.range.end)) return;
+        State.shiftsLimit = 0;
         return UI.renderAdminTab('Shifts');
     },
 
@@ -8230,12 +8681,90 @@ ${sessionsFact}${statusFact}
         // month's warehouse shifts by Ahmed" is a question somebody actually asks. Neither
         // clears the other, and the filter note below the cards names both.
         State.shiftsCategory = String(name === undefined || name === null ? '' : name);
+        State.shiftsLimit = 0;
         return this.repaintShiftsFromCache();
     },
 
-    /** Whether anything is narrowing the rows, the category included. */
+    /** The attention filter in effect: '' | 'awaiting' | 'late'. */
+    shiftsAttention() {
+        const value = String(State.shiftsAttention || '');
+        return ['awaiting', 'late'].indexOf(value) >= 0 ? value : '';
+    },
+
+    /**
+     * The two questions asked of a period with something wrong in it: which shifts are still
+     * waiting for a decision, and whose arrival fell outside the site's window.
+     *
+     * Both are already figures on the cards above, and these are the rows behind each of them.
+     * The count on a chip is the report's own figure, so a chip cannot promise rows it will not
+     * fill - and a chip whose count has fallen to zero *stays* on screen while it is the one in
+     * effect, because a filter nobody can see is a filter nobody can switch off, and the table
+     * under it would simply look empty.
+     */
+    shiftsAttentionChips(report) {
+        const counts = this.shiftsAttentionCounts(report);
+        const active = this.shiftsAttention();
+        return [
+            { key: 'awaiting', label: 'shiftsPending', count: counts.awaiting },
+            { key: 'late', label: 'shiftsLateArrivals', count: counts.late }
+        ].filter((chip) => chip.count > 0 || chip.key === active);
+    },
+
+    /** How many shifts each attention chip would show, in the period on screen. */
+    shiftsAttentionCounts(report) {
+        const rows = (report && report.rows) || [];
+        return {
+            awaiting: rows.filter((row) => row.awaiting_approval).length,
+            late: rows.filter((row) => row.arrival_verdict === 'late').length
+        };
+    },
+
+    /** One tap on an attention chip: on, off again, or over to the other one. */
+    setShiftsAttention(key) {
+        const wanted = ['awaiting', 'late'].indexOf(String(key)) >= 0 ? String(key) : '';
+        State.shiftsAttention = wanted === this.shiftsAttention() ? '' : wanted;
+        // The painted count belongs to the view it was grown for: a filter that changes which
+        // rows are in hand goes back to one page of them.
+        State.shiftsLimit = 0;
+        return this.repaintShiftsFromCache();
+    },
+
+    /** The rows an attention filter selects, or all of them when none is on. */
+    shiftsAttentionRows(rows) {
+        const attention = this.shiftsAttention();
+        if (attention === 'awaiting') return rows.filter((row) => row.awaiting_approval);
+        if (attention === 'late') return rows.filter((row) => row.arrival_verdict === 'late');
+        return rows;
+    },
+
+    /** The attention filter in the reader's words, for the note and the printed sheet. */
+    shiftsAttentionLabel() {
+        const attention = this.shiftsAttention();
+        if (!attention) return '';
+        return I18n.__(attention === 'awaiting' ? 'shiftsPending' : 'shiftsLateArrivals');
+    },
+
+    /**
+     * How much of one shift is still undecided.
+     *
+     * The server sends the figure on every row, so the console sums the server's own arithmetic
+     * rather than assuming an awaiting shift holds all of its hours - which stopped being true
+     * when a pending overtime shift began crediting its standard day and holding only the extra.
+     * The fallback is for a payload from an older server, where holding everything was the rule;
+     * it keeps the two figures summing to ``hours`` either way. One definition, used by the totals
+     * and by the coverage strip alike, so the bar and the card cannot disagree.
+     */
+    shiftAwaitingHours(row) {
+        if (!row.awaiting_approval) return 0;
+        if (row.awaiting_approval_hours === undefined || row.awaiting_approval_hours === null) {
+            return Number(row.hours) || 0;
+        }
+        return Number(row.awaiting_approval_hours) || 0;
+    },
+
+    /** Whether anything is narrowing the rows, the category and the attention chips included. */
     shiftsFiltering() {
-        return this.shiftsQuery() !== '' || this.shiftsCategory() !== '';
+        return this.shiftsQuery() !== '' || this.shiftsCategory() !== '' || this.shiftsAttention() !== '';
     },
 
     /**
@@ -8246,7 +8775,7 @@ ${sessionsFact}${statusFact}
      * search, and the period in the name still says which rows are in the file.
      */
     shiftsExportFilter() {
-        return [this.shiftsQuery(), this.shiftsCategory()].filter(Boolean).join(' ');
+        return [this.shiftsQuery(), this.shiftsCategory(), this.shiftsAttention()].filter(Boolean).join(' ');
     },
 
     /** The filter, in one sentence, for the note under the cards and the printed sheet. */
@@ -8255,7 +8784,8 @@ ${sessionsFact}${statusFact}
             this.shiftsQuery() ? `“${this.shiftsQuery()}”` : '',
             this.shiftsCategory()
                 ? `${I18n.__('shiftsCategoryFilter')}: “${this.shiftsCategory()}”`
-                : ''
+                : '',
+            this.shiftsAttentionLabel()
         ].filter(Boolean).join(' \u00b7 ');
     },
 
@@ -8362,13 +8892,7 @@ ${sessionsFact}${statusFact}
         // overtime shift began crediting its standard day and holding only the extra. The
         // fallback is for a payload from an older server, where holding everything was
         // the rule; it keeps the two figures summing to ``hours`` either way.
-        const awaitingHours = (row) => {
-            if (!row.awaiting_approval) return 0;
-            if (row.awaiting_approval_hours === undefined || row.awaiting_approval_hours === null) {
-                return Number(row.hours) || 0;
-            }
-            return Number(row.awaiting_approval_hours) || 0;
-        };
+        const awaitingHours = (row) => this.shiftAwaitingHours(row);
         return {
             shifts: rows.length,
             workers: new Set(rows.map((row) => String(row.worker_id))).size,
@@ -8391,15 +8915,136 @@ ${sessionsFact}${statusFact}
         };
     },
 
+    /** The column the table is reading by, or '' for the order the server sent. */
+    shiftsSort() {
+        const stored = State.shiftsSort || {};
+        const key = this.shiftsColumnDefs()[stored.key] ? stored.key : '';
+        return { key: key, direction: stored.direction === 'desc' ? 'desc' : 'asc' };
+    },
+
+    /**
+     * One press on a column header: sort by it, then the other way, then back to the period's
+     * own order.
+     *
+     * Three states rather than two, because a sort here is a way of *reading* a timesheet rather
+     * than a property of it: the order the server sent the rows in (newest first) has to stay
+     * reachable, and a third press is a shorter way back to it than a separate reset button.
+     *
+     * Nothing is written to storage - unlike the column order, which is a preference somebody
+     * set up once and expects to find again. A sort is a question being asked right now, like
+     * the search, and the search is not remembered either.
+     */
+    sortShiftsBy(key) {
+        if (!this.shiftsColumnDefs()[key]) return undefined;
+        const current = this.shiftsSort();
+        const first = this.shiftsSortFirst(key);
+        if (current.key !== key) State.shiftsSort = { key: key, direction: first };
+        else if (current.direction === first) State.shiftsSort = { key: key, direction: first === 'asc' ? 'desc' : 'asc' };
+        else State.shiftsSort = null;
+        return this.repaintShiftsFromCache();
+    },
+
+    /**
+     * Which way the first press on a column goes.
+     *
+     * A counted column starts at its biggest: nobody opens "Hours" to find the shortest shift of
+     * the month, and the same is true of the shift still waiting for them.
+     */
+    shiftsSortFirst(key) {
+        return ['id', 'hours', 'awaiting', 'notes'].indexOf(key) >= 0 ? 'desc' : 'asc';
+    },
+
+    /** What one cell is worth as a sort key, in the same words the row shows it in. */
+    shiftsSortValue(row, key) {
+        switch (key) {
+            case 'id':
+                return Number(row.worker_id) || 0;
+            case 'hours':
+                return Number(row.hours) || 0;
+            case 'notes':
+                return Number(row.open_notes) || 0;
+            // A shift waiting for a decision is the top of this column read either way: the only
+            // question the column answers is which of these still needs somebody.
+            case 'awaiting':
+                return row.awaiting_approval ? 1 : 0;
+            case 'employee':
+                return String(row.worker_name || row.worker_id || '');
+            case 'role':
+                return this.roleLabel(row.role) || '';
+            case 'site':
+                return String(row.site_name || '');
+            case 'category':
+                return String(row.site_category || '');
+            case 'arrival':
+                return this.arrivalWords(row);
+            default:
+                return String(row.date || '');
+        }
+    },
+
+    /**
+     * The rows in the order the table is reading them.
+     *
+     * Sorted on a copy: the report in hand is the server's own answer, and the printed sheet and
+     * the file are built from it - a repaint must not reorder what the next export reads. Ties
+     * keep the order they arrived in, so two shifts on one day never swap places between one
+     * repaint and the next.
+     */
+    shiftsSorted(rows) {
+        const sort = this.shiftsSort();
+        if (!sort.key) return rows;
+        const key = sort.key;
+        const factor = sort.direction === 'desc' ? -1 : 1;
+        return rows.slice().sort((one, other) => {
+            const left = this.shiftsSortValue(one, key);
+            const right = this.shiftsSortValue(other, key);
+            if (typeof left === 'number' && typeof right === 'number') return (left - right) * factor;
+            return String(left).localeCompare(String(right), undefined, { numeric: true }) * factor;
+        });
+    },
+
+    /**
+     * One header cell: the column's name, and a button that sorts by it.
+     *
+     * The arrow is drawn by the stylesheet from ``aria-sort``, so the header's *text* stays
+     * exactly the column's name: the printed sheet, the column editor and the product suite all
+     * read that text, and a glyph painted into it would travel into all three.
+     */
+    shiftsSortHeaderHtml(key) {
+        const label = this.shiftsColumnLabel(key);
+        const sort = this.shiftsSort();
+        const sorted = sort.key === key;
+        const title = I18n.__('shiftsSortBy').replace('{column}', label);
+        return `<th${sorted ? ` aria-sort="${sort.direction === 'desc' ? 'descending' : 'ascending'}"` : ''}>`
+            + `<button type="button" class="shifts-sort" data-sort="${key}"`
+            + ` aria-label="${this.escapeHtml(title)}" title="${this.escapeHtml(title)}">`
+            + `${this.escapeHtml(label)}</button></th>`;
+    },
+
+    /**
+     * The class one cell carries, which is about how it is *read* rather than what it says.
+     *
+     * A counted column is set in tabular numerals and aligned to the end, so hours line up as a
+     * column of numbers instead of a column of words: an administrator looking for the longest
+     * shift of the month is comparing digits, and digits that do not line up cannot be compared
+     * by eye. The class carries no text, so none of this reaches the file or the paper.
+     */
+    shiftsCellClass(key) {
+        return ['id', 'hours', 'awaiting', 'notes'].indexOf(key) >= 0 ? ' class="is-numeric is-end"' : '';
+    },
+
     /** Reads the search box and repaints the rows for it. */
     async applyShiftsSearch() {
         const box = document.getElementById('shiftsQuery');
         State.shiftsQuery = box ? String(box.value || '').trim() : '';
+        // A new search is a new list: the painted count goes back to one page of it.
+        State.shiftsLimit = 0;
         return this.repaintShiftsFromCache();
     },
 
     async clearShiftsSearch() {
         State.shiftsQuery = '';
+        State.shiftsLimit = 0;
         return this.repaintShiftsFromCache();
     },
 
@@ -8427,6 +9072,7 @@ ${sessionsFact}${statusFact}
         // The query was a request for a day, not a filter: leaving it in the box would
         // hide every row of the very day it just fetched.
         State.shiftsQuery = '';
+        State.shiftsLimit = 0;
         return UI.renderAdminTab('Shifts');
     },
 
@@ -8477,7 +9123,7 @@ ${sessionsFact}${statusFact}
      * count, which is more honest than a row of zeros.
      */
     shiftsToolbarHtml(range, report) {
-        return `${this.shiftsFilterHtml(range, report)}${this.shiftsColumnsHtml()}${this.shiftsSearchHtml()}`;
+        return `${this.shiftsFilterHtml(range, report)}${this.shiftsSearchHtml(report)}${this.shiftsColumnsHtml()}`;
     },
 
     /**
@@ -8494,7 +9140,7 @@ ${sessionsFact}${statusFact}
         const chip = 'ui-chip';
         const step = 'ui-btn ui-btn-sm ui-btn-quiet';
         return `
-            <details id="shiftsColumns" class="ops-panel" style="margin-bottom:16px">
+            <details id="shiftsColumns" class="ops-panel shifts-columns">
                 <summary>${this.OPS_ICONS.table}<span>${this.escapeHtml(I18n.__('shiftsColumns'))}</span></summary>
                 <div class="ops-panel-body">
                     <div class="ui-row" data-column-editor data-order="${order.join(',')}">
@@ -8502,13 +9148,15 @@ ${sessionsFact}${statusFact}
                             <span class="${chip}" data-column="${key}">
                                 ${this.shiftsColumnLabel(key)}
                                 <button type="button" data-move-earlier title="${this.escapeHtml(I18n.__('shiftsColumnEarlier'))}"
-                                        onclick="UI_MODULES.moveShiftsColumn('${key}', -1)" class="${step}"
+                                        aria-label="${this.escapeHtml(`${I18n.__('shiftsColumnEarlier')}: ${this.shiftsColumnLabel(key)}`)}"
+                                        class="${step}"
                                         ${index === 0 ? 'disabled' : ''}>&#8592;</button>
                                 <button type="button" data-move-later title="${this.escapeHtml(I18n.__('shiftsColumnLater'))}"
-                                        onclick="UI_MODULES.moveShiftsColumn('${key}', 1)" class="${step}"
+                                        aria-label="${this.escapeHtml(`${I18n.__('shiftsColumnLater')}: ${this.shiftsColumnLabel(key)}`)}"
+                                        class="${step}"
                                         ${index === order.length - 1 ? 'disabled' : ''}>&#8594;</button>
                             </span>`).join('')}
-                        <button type="button" data-columns-reset onclick="UI_MODULES.resetShiftsColumns()" class="${chip}">${this.escapeHtml(I18n.__('shiftsColumnsReset'))}</button>
+                        <button type="button" data-columns-reset class="${chip}">${this.escapeHtml(I18n.__('shiftsColumnsReset'))}</button>
                     </div>
                 </div>
             </details>`;
@@ -8552,6 +9200,30 @@ ${sessionsFact}${statusFact}
     onShiftsClick(event) {
         const target = event && event.target;
         if (!target || typeof target.closest !== 'function') return undefined;
+        // Everything in this tab that acts on a click is dispatched here, by a ``data-*``
+        // attribute rather than an inline handler: the CSP's per-file allowance for those may
+        // only fall, and several of the controls being dispatched carry operator text (a period,
+        // a category, a worker's name) that must not be spliced into an attribute value.
+        const routes = [
+            ['[data-preset]', (node) => this.applyShiftsPreset((node.dataset || {}).preset)],
+            ['[data-attention]', (node) => this.setShiftsAttention((node.dataset || {}).attention)],
+            ['[data-shift-bucket]', (node) => this.applyShiftsBucket((node.dataset || {}).shiftBucket)],
+            ['[data-sort]', (node) => this.sortShiftsBy((node.dataset || {}).sort)],
+            ['[data-shifts-more]', () => this.showMoreShifts()],
+            ['[data-show-day]', (node) => this.applyShiftsDay((node.dataset || {}).showDay)],
+            ['[data-clear-search]', () => this.clearShiftsSearch()],
+            ['[data-copy-link]', () => this.copyShiftsLink()],
+            ['[data-export-shifts]', () => this.downloadShiftsReport()],
+            ['[data-columns-reset]', () => this.resetShiftsColumns()],
+            // The two column steps live inside the chip they move, so the column is the button's
+            // own parent rather than a value carried in an inline handler.
+            ['[data-move-earlier]', (node) => this.moveShiftsColumn((node.parentElement.dataset || {}).column, -1)],
+            ['[data-move-later]', (node) => this.moveShiftsColumn((node.parentElement.dataset || {}).column, 1)]
+        ];
+        for (let index = 0; index < routes.length; index += 1) {
+            const found = target.closest(routes[index][0]);
+            if (found) return routes[index][1](found);
+        }
         const edit = target.closest('[data-edit-hours]');
         if (edit) {
             const dataset = edit.dataset || {};
@@ -8563,73 +9235,97 @@ ${sessionsFact}${statusFact}
     },
 
     /**
-     * The search box: name, worker id, site - or a date.
+     * The search box, and the two attention filters beside it.
      *
-     * Submitted rather than filtered on every keystroke, because the tab is repainted
-     * from a string: filtering as you type would rebuild the input under the caret and
-     * drop it mid-word. Enter (or Search) applies, Clear removes it.
+     * Submitted rather than filtered on every keystroke, because the tab is repainted from a
+     * string: filtering as you type would rebuild the input under the caret and drop it mid-word.
+     * Enter (or Search) applies, Clear removes it.
+     *
+     * The chips are the two things the period's figures point at and no column can be read into
+     * agreement with: the shifts still waiting for a decision, and the arrivals that fell outside
+     * their window. They narrow *with* the search rather than instead of it, and each carries the
+     * count it would bring - the same count as the amber card above it.
      */
-    shiftsSearchHtml() {
+    shiftsSearchHtml(report) {
         const query = this.shiftsQuery();
+        const attention = this.shiftsAttention();
+        const chips = this.shiftsAttentionChips(report).map((chip) => `
+                <button type="button" data-attention="${chip.key}" aria-pressed="${chip.key === attention ? 'true' : 'false'}"
+                        class="ui-chip">${this.escapeHtml(I18n.__(chip.label))} (${chip.count})</button>`).join('');
         return `
-            <form id="shiftsSearchForm" class="ui-row" style="margin-bottom:16px">
+            <form id="shiftsSearchForm" class="shifts-search">
                 <label class="sr-only" for="shiftsQuery">${this.escapeHtml(I18n.__('shiftsSearchPlaceholder'))}</label>
                 <input type="search" id="shiftsQuery" class="ui-field is-flex" value="${this.escapeHtml(query)}"
                        placeholder="${this.escapeHtml(I18n.__('shiftsSearchPlaceholder'))}">
                 <button type="submit" class="ui-btn">${this.OPS_ICONS.search}${this.escapeHtml(I18n.__('search'))}</button>
-                ${query ? `<button type="button" data-clear-search onclick="UI_MODULES.clearShiftsSearch()" class="ui-btn ui-btn-quiet">${this.OPS_ICONS.close}${this.escapeHtml(I18n.__('clear'))}</button>` : ''}
+                ${query ? `<button type="button" data-clear-search class="ui-btn ui-btn-quiet">${this.OPS_ICONS.close}${this.escapeHtml(I18n.__('clear'))}</button>` : ''}
+                ${chips}
             </form>`;
     },
 
     /**
-     * The date-range picker.
+     * The period band: which window is on screen, and what leaves this screen.
      *
-     * Deliberately without ``min``/``max`` on the inputs: tightening the end to the
-     * current start (or the reverse) makes a legitimate move - "back to August" -
-     * impossible from the UI, and the range is validated properly on submit anyway.
+     * One band rather than three stacked rows of controls. The period a reader is looking at, the
+     * three presets that answer most of the questions asked of a timesheet, and - folded until
+     * somebody asks for it - the two dates behind them, beside the category filter. The figures
+     * then begin one band down instead of three, which is the difference between a tab somebody
+     * reads and a tab somebody scrolls past.
+     *
+     * The dates stay in the document whether the fold is open or shut: they are what the form
+     * submits and what a shared link fills in, and a control that only existed while it was open
+     * could not be filled in by anything. The fold opens by itself whenever the period on screen
+     * is not one of the presets - a custom window must never be a period with nothing naming it -
+     * and its summary then says which window it is rather than the word "Custom".
      */
     shiftsFilterHtml(range, report) {
+        const custom = !this.shiftsPresets(range).some((preset) => preset.active);
         return `
-            <form id="shiftsFilter" class="ui-row" style="align-items:flex-end;margin-bottom:12px">
-                <div>
-                    <label class="ui-label" for="shiftsStart">${this.escapeHtml(I18n.__('shiftsFrom'))}</label>
-                    <input type="date" id="shiftsStart" value="${this.escapeHtml(range.start)}" class="ui-field">
+            <form id="shiftsFilter" class="shifts-bar">
+                <div class="shifts-bar-period">
+                    <div class="shifts-presets" role="group" aria-label="${this.escapeHtml(I18n.__('shiftsPeriod'))}">
+                        <!-- The data-preset and data-active attributes stay adjacent and in that
+                             order: the product suite reads which preset is in effect from exactly
+                             that pair. -->
+                        ${this.shiftsPresets(range).map(preset => `
+                            <button type="button" data-preset="${preset.key}" data-active="${preset.active}"
+                                    class="ui-chip"${preset.active ? ' aria-pressed="true"' : ''}>${this.escapeHtml(I18n.__(preset.label))}</button>`).join('')}
+                    </div>
+                    <details class="shifts-custom"${custom ? ' open' : ''}>
+                        <summary>${this.escapeHtml(custom ? `${range.start} \u2192 ${range.end}` : I18n.__('shiftsCustomPeriod'))}</summary>
+                        <div class="shifts-custom-body">
+                            <div>
+                                <label class="ui-label" for="shiftsStart">${this.escapeHtml(I18n.__('shiftsFrom'))}</label>
+                                <input type="date" id="shiftsStart" value="${this.escapeHtml(range.start)}" class="ui-field">
+                            </div>
+                            <div>
+                                <label class="ui-label" for="shiftsEnd">${this.escapeHtml(I18n.__('shiftsTo'))}</label>
+                                <input type="date" id="shiftsEnd" value="${this.escapeHtml(range.end)}" class="ui-field">
+                            </div>
+                            <button type="submit" class="ui-btn ui-btn-primary">${this.OPS_ICONS.table}${this.escapeHtml(I18n.__('viewTotals'))}</button>
+                        </div>
+                    </details>
+                    <!-- The category picker sits in this band rather than under the table, where an
+                         operator is already reading rows: "what am I looking at" is answered here,
+                         and a warehouse filter is the same kind of choice as "this month". The count
+                         on each option is the shifts behind it in *this* period. A list rather than a
+                         quick search, so a long category name cannot scroll out of reach and the
+                         chosen one is legible at a glance. -->
+                    ${this.shiftsCategorySelectHtml(report)}
                 </div>
-                <div>
-                    <label class="ui-label" for="shiftsEnd">${this.escapeHtml(I18n.__('shiftsTo'))}</label>
-                    <input type="date" id="shiftsEnd" value="${this.escapeHtml(range.end)}" class="ui-field">
-                </div>
-                <button type="submit" class="ui-btn ui-btn-primary">${this.OPS_ICONS.table}${this.escapeHtml(I18n.__('viewTotals'))}</button>
-                <div>
+                <div class="shifts-bar-actions">
+                    <button type="button" data-copy-link class="ui-chip">${this.OPS_ICONS.copy}${this.escapeHtml(I18n.__('copyLink'))}</button>
                     <!-- Which file the Download button writes. Read when the button is pressed
                          rather than remembered, so asking for the PDF once does not leave the
                          next download as a PDF nobody wanted. -->
-                    <label class="ui-label" for="shiftsExportFormat">${this.escapeHtml(I18n.__('shiftsExportFormat'))}</label>
-                    <select id="shiftsExportFormat" class="ui-field">
+                    <label class="sr-only" for="shiftsExportFormat">${this.escapeHtml(I18n.__('shiftsExportFormat'))}</label>
+                    <select id="shiftsExportFormat" class="ui-field shifts-export-format">
                         <option value="csv">${this.escapeHtml(I18n.__('shiftsExportExcel'))}</option>
                         <option value="pdf">${this.escapeHtml(I18n.__('shiftsExportPdf'))}</option>
                     </select>
+                    <button type="button" data-export-shifts class="ui-btn">${this.OPS_ICONS.download}${this.escapeHtml(I18n.__('shiftsExportDownload'))}</button>
                 </div>
-                <button type="button" onclick="UI_MODULES.downloadShiftsReport()" class="ui-btn">${this.OPS_ICONS.download}${this.escapeHtml(I18n.__('shiftsExportDownload'))}</button>
-            </form>
-            <div class="ui-row" style="margin-bottom:20px">
-                <!-- The data-preset and data-active attributes stay adjacent and in that
-                     order: the product suite reads which preset is in effect from exactly
-                     that pair. -->
-                ${this.shiftsPresets(range).map(preset => `
-                    <button type="button" data-preset="${preset.key}" data-active="${preset.active}"
-                            onclick="UI_MODULES.applyShiftsPreset('${preset.key}')"
-                            class="ui-chip"${preset.active ? ' aria-pressed="true"' : ''}>${this.escapeHtml(I18n.__(preset.label))}</button>`).join('')}
-                <!-- The category picker sits beside the periods rather than under the table,
-                     where an operator is already reading rows: this row is where "what am I
-                     looking at" is answered, and a warehouse filter is the same kind of choice
-                     as "this month". The count on each option is the shifts behind it in *this*
-                     period. A list rather than a quick search, so a long category name cannot
-                     scroll out of reach and the chosen one is legible at a glance. -->
-                ${this.shiftsCategorySelectHtml(report)}
-                <button type="button" data-copy-link onclick="UI_MODULES.copyShiftsLink()"
-                        class="ui-chip ui-push">${this.OPS_ICONS.copy}${this.escapeHtml(I18n.__('copyLink'))}</button>
-            </div>`;
+            </form>`;
     },
 
     async loadShiftsReport(content) {
@@ -8637,6 +9333,9 @@ ${sessionsFact}${statusFact}
         try {
             const report = await API.request(`/admin/reports/shifts?start=${range.start}&end=${range.end}`);
             this._shiftsReport = { range: { start: range.start, end: range.end }, report: report };
+            // A different period is a different list: whatever had been grown by "Show more"
+            // belonged to the rows that just went off screen.
+            State.shiftsLimit = 0;
             this.paintShifts(content, this.shiftsToolbarHtml(range, report) + this.shiftsReportHtml(report));
         } catch (err) {
             // No figures for this period, so nothing may be reused from an earlier one.
@@ -8659,6 +9358,10 @@ ${sessionsFact}${statusFact}
         const day = this.shiftsSearchDay(query);
         const filtering = this.shiftsFiltering();
         const shown = this.shiftsVisibleRows(report);
+        // The rows *drawn* are a page of the rows *held*. The table paints one page; the strip,
+        // the file and the printed sheet are all built from every row the view matches.
+        const painted = this.shiftsPaintedRows(shown);
+        const coverage = this.shiftsCoverageHtml(report, shown);
         const totals = filtering ? this.sumShiftsRows(shown) : (report.totals || {});
         const noMatches = filtering && rows.length > 0 && shown.length === 0;
         // Hours only, and the four ways the timesheet is read: how much time the period
@@ -8669,20 +9372,23 @@ ${sessionsFact}${statusFact}
         // off, ``quiet`` for the break that is not part of the paid figure beside it - and
         // it is a role the stylesheet knows, not a panel of colour names.
         const cards = [
-            ['hours', 'hours', this.hoursLabel(totals.hours), ''],
-            ['approved_hours', 'shiftsApproved', this.hoursLabel(totals.approved_hours), ''],
-            ['awaiting_approval_hours', 'shiftsPendingHours', this.hoursLabel(totals.awaiting_approval_hours), 'warn'],
-            ['awaiting_approval', 'shiftsPendingShifts', String(totals.awaiting_approval || 0), 'warn'],
-            // Beside the counted hours, because the two together are what a door-to-door
-            // reconciliation is about: 8.0 h counted out of 8.5 h on site.
-            ['break_hours', 'shiftsBreak', this.hoursLabel(totals.break_hours), 'quiet'],
-            ['shifts', 'shiftsWorked', String(totals.shifts || 0), ''],
-            ['workers', 'shiftsWorkers', String(totals.workers || 0), ''],
-            // The one card that is not about hours: how much of the period walked in after
-            // its window. Amber only when there is something to look at - a zero is the
-            // good news, and a permanent amber cell stops meaning anything.
+            ['hours', 'hours', this.hoursLabel(totals.hours), '', 'shiftsHoursHint'],
+            ['approved_hours', 'shiftsApproved', this.hoursLabel(totals.approved_hours), '', ''],
+            ['awaiting_approval_hours', 'shiftsPendingHours', this.hoursLabel(totals.awaiting_approval_hours), 'warn', ''],
+            ['awaiting_approval', 'shiftsPendingShifts', String(totals.awaiting_approval || 0), 'warn', ''],
+            // The one card that is not about hours, and the only one that is a count of something
+            // going wrong: how much of the period walked in after its window. Amber only when there
+            // is something to look at - a zero is the good news, and a permanent amber cell stops
+            // meaning anything. It sits with the two amber figures above it rather than at the end
+            // of the row, because those three are the ones that ask for somebody's attention.
             ['late_arrivals', 'shiftsLateArrivals', String(totals.late_arrivals || 0),
-                totals.late_arrivals ? 'warn' : ''],
+                totals.late_arrivals ? 'warn' : '', ''],
+            ['shifts', 'shiftsWorked', String(totals.shifts || 0), '', ''],
+            ['workers', 'shiftsWorkers', String(totals.workers || 0), '', ''],
+            // Beside the counted hours, because the two together are what a door-to-door
+            // reconciliation is about: 8.0 h counted out of 8.5 h on site. Last, and the quietest,
+            // because it is the number that explains the first one rather than a figure of its own.
+            ['break_hours', 'shiftsBreak', this.hoursLabel(totals.break_hours), 'quiet', 'shiftsBreakHint'],
         ];
         const dayChip = day ? `
             <div style="margin-bottom:16px">
@@ -8705,11 +9411,12 @@ ${sessionsFact}${statusFact}
         // than eight. ``data-total`` / ``data-value`` stay adjacent -
         // the product suite reads the figures off that pair.
         const cardsHtml = noMatches ? '' : `
-            <div class="ops-stats" style="margin-bottom:20px">
-                ${cards.map(([key, label, value, tone]) => `
+            <div class="ops-stats shifts-stats">
+                ${cards.map(([key, label, value, tone, hint]) => `
                     <div class="ops-stat${tone ? ' is-' + tone : ''}" data-total="${key}" data-value="${value}">
                         <span class="ops-stat-label">${this.escapeHtml(I18n.__(label))}</span>
                         <span class="ops-stat-value">${this.escapeHtml(value)}</span>
+                        ${hint ? `<span class="ops-stat-hint">${this.escapeHtml(I18n.__(hint))}</span>` : ''}
                     </div>`).join('')}
             </div>`;
         const body = shown.length === 0
@@ -8717,14 +9424,14 @@ ${sessionsFact}${statusFact}
                     <span class="ui-empty-icon">${this.OPS_ICONS.table}</span>
                     <p class="ui-empty-title">${this.escapeHtml(I18n.__(noMatches ? 'shiftsNoMatches' : 'shiftsEmpty'))}</p>
                </div>`
-            : this.shiftsRowsHtml(shown);
+            : this.shiftsRowsHtml(painted) + this.shiftsMoreHtml(shown, painted);
         return `
             <div class="ui-section-head" style="margin-bottom:12px">
                 <p class="ui-section-note">${this.escapeHtml(I18n.__('shiftsPeriod'))}:
                     <span class="ops-name">${this.escapeHtml(period.start || '')} \u2192 ${this.escapeHtml(period.end || '')}</span></p>
                 <p class="ui-section-note" style="max-width:52ch">${this.escapeHtml(I18n.__('shiftsApprovedOnly'))}</p>
             </div>
-            ${dayChip}${filterNote}${cardsHtml}${body}`;
+            ${dayChip}${filterNote}${cardsHtml}${coverage}${body}`;
     },
 
     shiftsRowsHtml(rows) {
@@ -8740,7 +9447,7 @@ ${sessionsFact}${statusFact}
         if (Device.isMobile) {
             return `<div class="ui-stack">${rows.map(row => `
                 <div class="ui-card is-stacked"${this.shiftAttr(row)}>
-                    <dl class="ui-stack is-tight">
+                    <dl class="ui-stack is-tight shifts-facts">
                         ${columns.map(key => `
                             <div class="ui-spread" style="align-items:baseline">
                                 <dt class="ui-note is-strong" data-shift-label>${this.shiftsColumnLabel(key)}</dt>
@@ -8751,18 +9458,18 @@ ${sessionsFact}${statusFact}
                 </div>`).join('')}</div>`;
         }
         return `
-            <div class="ui-table-wrap">
+            <div class="ui-table-wrap shifts-table-wrap">
                 <table class="ui-table" data-shifts-table="true">
                     <caption class="sr-only">${this.escapeHtml(I18n.__('shifts'))}</caption>
                     <thead>
                         <tr>
-                            ${columns.map(key => `<th>${this.shiftsColumnLabel(key)}</th>`).join('')}
+                            ${columns.map(key => this.shiftsSortHeaderHtml(key)).join('')}
                             <th><span class="sr-only">${this.escapeHtml(I18n.__('shiftsPrintWorker'))}</span></th>
                         </tr>
                     </thead>
                     <tbody>
                         ${rows.map(row => `<tr${this.shiftAttr(row)}>
-                            ${columns.map(key => `<td>${this.shiftsCellHtml(row, key)}</td>`).join('')}
+                            ${columns.map(key => `<td${this.shiftsCellClass(key)}>${this.shiftsCellHtml(row, key)}</td>`).join('')}
                             <td>${this.shiftPrintActionHtml(row)}</td>
                         </tr>`).join('')}
                     </tbody>
@@ -9288,7 +9995,8 @@ ${sessionsFact}${statusFact}
      */
     shiftsVisibleRows(report) {
         const rows = (report && report.rows) || [];
-        return this.shiftsMatches(this.shiftsRowsInCategory(rows), this.shiftsQuery());
+        const selected = this.shiftsAttentionRows(this.shiftsRowsInCategory(rows));
+        return this.shiftsSorted(this.shiftsMatches(selected, this.shiftsQuery()));
     },
 
     /**
@@ -9302,6 +10010,51 @@ ${sessionsFact}${statusFact}
         const category = this.shiftsCategory();
         if (!category) return rows;
         return rows.filter((row) => String(row.site_category || '') === category);
+    },
+
+    /** How many rows the table paints before it offers to paint more. */
+    shiftsPageSize() {
+        return 50;
+    },
+
+    /**
+     * The rows the table actually paints: the first page of what the view holds.
+     *
+     * A busy month is around 1 400 shifts, and every one of them is eleven cells inside a single
+     * HTML string - a phone pays for that in layout, and the reader pays for it in scrolling past
+     * rows they have already read. The cap is on what is *drawn* and nothing else: the file and
+     * the printed sheet are built from the rows the view holds, so neither of them can quietly
+     * become a download of whatever somebody had scrolled to.
+     */
+    shiftsPaintedRows(rows) {
+        const grown = Math.max(this.shiftsPageSize(), Number(State.shiftsLimit) || 0);
+        return rows.slice(0, grown);
+    },
+
+    /** One more page, painted from the report already in hand. */
+    showMoreShifts() {
+        const shown = this.shiftsRowsOnScreen();
+        State.shiftsLimit = this.shiftsPaintedRows(shown).length + this.shiftsPageSize();
+        return this.repaintShiftsFromCache();
+    },
+
+    /**
+     * How much of the view is painted, and the one control that paints more.
+     *
+     * The count is not decoration: a table that stopped at fifty rows with nothing saying so
+     * would be read as a period with fifty shifts in it - which is the failure this tab was
+     * rebuilt around, so it is not one to reintroduce one page at a time.
+     */
+    shiftsMoreHtml(shown, painted) {
+        if (shown.length <= painted.length) return '';
+        const line = I18n.__('shiftsShowing')
+            .replace('{shown}', String(painted.length))
+            .replace('{total}', String(shown.length));
+        return `
+            <div class="shifts-more" data-shifts-count="${shown.length}">
+                <p class="ui-note">${this.escapeHtml(line)}</p>
+                <button type="button" class="ui-btn ui-btn-sm" data-shifts-more>${this.escapeHtml(I18n.__('shiftsShowMore'))}</button>
+            </div>`;
     },
 
     /** The rows the table is showing right now, for the period on screen. */
