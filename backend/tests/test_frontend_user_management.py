@@ -121,7 +121,7 @@ function render(env) {
 
 /** Every row, the way the admin sees it: the id, its actions, and the published state. */
 function rowsOf(markup) {
-    const rows = markup.match(/<tr data-user="[^"]*"[\s\S]*?<\/tr>/g) || [];
+    const rows = markup.match(/<li class="roster-row"[^>]*>[\s\S]*?<\/li>/g) || [];
     return rows.map((row) => ({
         id: (/data-user="([^"]*)"/.exec(row) || [])[1],
         status: (/data-status="([^"]*)"/.exec(row) || [])[1],

@@ -35,7 +35,7 @@ from security import hash_password
 #: ``MIGRATIONS``. ``readiness`` refuses to start a deployment whose database is older, so a
 #: migration added without bumping this is a server that will not boot; the invariant is
 #: asserted in ``tests/test_site_shift_windows.py`` rather than left to memory.
-SCHEMA_VERSION = 30
+SCHEMA_VERSION = 31
 
 #: Magic number stamped into the SQLite header so we can recognise "this is our
 #: database" - cheap protection against pointing DATABASE_PATH at some other file.
@@ -1738,13 +1738,16 @@ def migration_29_registration_intake_switch(conn: sqlite3.Connection) -> None:
     both states ``REGISTRATION_ENABLED`` can be in. ``0`` is a decision: an operator closed the
     intake, and only an operator can open it again.
 
-    WHAT THIS COLUMN CAN NEVER DO
-    -----------------------------
-    Override the deployment switch. ``registrations.intake_state`` reads the two as a ceiling
-    and a day-to-day position, and the ceiling wins: a public endpoint that accepts a face from
-    a stranger must not be switchable on by whoever holds an administrator session on a site
-    that deliberately does not run one. The console says which of the two is holding it shut,
-    rather than offering a button that appears to do nothing.
+    WHAT THIS COLUMN COULD NOT DO, AND DOES NOW
+    -------------------------------------------
+    Originally it was a *ceiling*: ``registrations.intake_state`` read the deployment flag and
+    this row, and the flag won - a public endpoint that accepts a face from a stranger was not
+    to be switchable on by whoever held an administrator session on a site that deliberately
+    runs no walk-up registration. The argument that reversed it is the one the public form was
+    already making: a closed link says "ask your site administrator to open it", and on a
+    deployment whose flag ships off that administrator had no control anywhere that could. So
+    this row is now the switch and the flag is the position it starts at; the NULL semantics
+    above are unchanged by the reversal, and the console draws the same lever either way.
 
     (``registration_settings`` rather than a column on an existing row: ``shift_rules`` is
     about hours and ``company_settings`` about the lockup, and a settings table whose columns
@@ -1811,6 +1814,77 @@ def migration_30_self_service_registration(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_users_status ON users(status)")
 
 
+def migration_31_registration_link(conn: sqlite3.Connection) -> None:
+    """The walk-up form is no longer a URL anybody can open: it is a link the console mints.
+
+    WHY THIS MIGRATION EXISTS AT ALL
+    --------------------------------
+    Migration 24 made the walk-up form a *permanent public address*, and migration 29 gave an
+    operator a switch to open and close it. Neither made it something the company hands out: the
+    URL was printed once, and from then on every stranger who found it could put a face and a
+    password into a real account. What this adds is the missing half of the sentence - the link
+    is *issued* by an administrator, out of the console, and the address the applicant opens
+    carries that link's token.
+
+    WHY THE TOKEN IS DERIVED RATHER THAN STORED
+    -------------------------------------------
+    The console has to be able to *show* the link - an administrator who cannot copy it has
+    nothing to send - and the two established answers are both wrong here. Storing the token in
+    clear would put a working link in every database dump and every backup; storing its hash
+    would mean the console could show it exactly once and could never show it again, which is a
+    "send the link" button that works once a deployment. So the token is *computed*:
+
+        token = "<generation>.<HMAC(SECRET_KEY, 'registration-link|v1|<generation>')>"
+
+    Nothing secret is at rest, the URL is reproducible for as long as the deployment keeps its
+    ``SECRET_KEY``, and the whole link is revoked by one integer - bump ``link_generation`` and
+    every URL minted before that moment stops verifying, because the signature no longer covers
+    the generation the row now carries. That is the same property ``quick_links`` gets from
+    revoking a row, bought for one column instead of a table, and it is why the rotation is
+    audited: the row says *that* the link was replaced, and ``audit_log`` says by whom.
+
+    WHY THE COLUMNS GO ON ``registration_settings`` AND NOT A TABLE OF THEIR OWN
+    ---------------------------------------------------------------------------
+    Because it is the same feature's row. Migration 29's note argues against stuffing columns
+    from unrelated features into one settings table, and that argument is exactly why the intake
+    switch lives here rather than on ``shift_rules``: the row is the walk-up link's own state.
+    The generation of the link that row's switch opens and closes belongs on it for the same
+    reason. ``link_rotated_*`` are recorded beside the integer they explain so an operator
+    reading the console can see when the link they are holding was minted, without a join into
+    the audit trail.
+
+    WHAT AN UNTOUCHED ROW MEANS
+    ---------------------------
+    ``link_generation`` defaults to ``0``, which is a real generation with a real signature, not
+    a missing one - so a deployment that has never opened the console has a link it can show the
+    moment somebody asks, and the migration changes nothing about which address a printed page
+    carries. The old ``GET /register`` and ``POST /register`` - the un-tokened pair - are gone in
+    the same release; a URL without a token is refused rather than silently accepted, because a
+    form that still works from an address in an old chat thread is the thing being removed.
+    """
+    # The table first, in case a database reaches this version without migration 29's row (an
+    # ``ALTER`` against a table that is not there raises, and ``add_column`` guards columns, not
+    # tables). The columns below are then added to both shapes.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS registration_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            intake_open INTEGER,
+            updated_at DATETIME,
+            updated_by TEXT,
+            link_generation INTEGER NOT NULL DEFAULT 0,
+            link_rotated_at DATETIME,
+            link_rotated_by TEXT
+        )
+        """
+    )
+    # ``NOT NULL DEFAULT 0`` backfills every existing row, which is what makes generation 0 a
+    # link that already verifies rather than a NULL the reader has to interpret.
+    add_column(conn, "registration_settings", "link_generation", "INTEGER NOT NULL DEFAULT 0")
+    add_column(conn, "registration_settings", "link_rotated_at", "DATETIME")
+    add_column(conn, "registration_settings", "link_rotated_by", "TEXT")
+
+
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "audit_notifications_shift_rules", migration_1_audit_notifications_shift_rules),
     (2, "provenance_columns_status_code", migration_2_provenance_columns),
@@ -1841,6 +1915,7 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (27, "transit_to_site_shifts", migration_27_transit_to_site_shifts),
     (29, "registration_intake_switch", migration_29_registration_intake_switch),
     (30, "self_service_registration", migration_30_self_service_registration),
+    (31, "registration_link", migration_31_registration_link),
     # (28, "attendance_timestamps_to_utc", migration_28_attendance_timestamps_to_utc),
     #
     # NOT REGISTERED YET, ON PURPOSE. Migration 28 and its column contract

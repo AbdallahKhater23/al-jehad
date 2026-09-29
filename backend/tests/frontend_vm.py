@@ -410,6 +410,52 @@ function boot(options) {
         };
         return NotificationStub;
     }
+
+    // A server-sent event response, as a body the page can read in pieces.
+    //
+    // The board's stream is read with ``fetch`` and ``body.getReader()`` (not ``EventSource``,
+    // which cannot carry an Authorization header), so a stub without a readable body would make
+    // the whole path untestable - ``API.stream`` refuses a response it cannot read, which is the
+    // right thing for it to do and the wrong thing to learn here. ``frames`` are the bytes the
+    // server would send, in order and verbatim: the suite writes the ``event:``/``data:`` lines
+    // itself, so what this hands over is exactly what an assertion about the wire can describe.
+    //
+    // ``signal`` is honoured because leaving the Live Ops tab must close the stream, and "the
+    // connection was released" is a claim a test can only make if aborting has an observable
+    // effect. The frames already queued are still readable - a real stream behaves the same way -
+    // and the stream ends rather than erroring, which is what a cancelled response looks like.
+    //
+    // ``hold`` is the other, and commoner, shape: the frames (often none) go out and the response
+    // then stays open. That is what an untouched board is sitting on - an idle connection that has
+    // nothing to say - so it is what a suite that is not *about* the stream is given by default
+    // (see ``fetch`` below). Without it a board in every other suite would take the failure path,
+    // which is a real branch with a real fallback and not the ordinary state of a quiet gate.
+    function makeEventStream(frames, signal, hold) {
+        const encoder = new TextEncoder();
+        return new ReadableStream({
+            start(controller) {
+                let index = 0;
+                let closed = false;
+                const finish = () => {
+                    if (closed) return;
+                    closed = true;
+                    try { controller.close(); } catch (err) { /* already closed */ }
+                };
+                const pump = () => {
+                    if (closed) return;
+                    if (signal && signal.aborted) return finish();
+                    if (index >= frames.length) return hold ? undefined : finish();
+                    try { controller.enqueue(encoder.encode(String(frames[index++]))); }
+                    catch (err) { closed = true; return; }
+                    pump();
+                };
+                if (signal && typeof signal.addEventListener === 'function') {
+                    signal.addEventListener('abort', finish);
+                }
+                pump();
+            }
+        });
+    }
     // A registration records its scope; ``getRegistration`` answers what was stored. The
     // container starts null so ``'serviceWorker' in navigator`` style probes (and the
     // app's own feature test) see a browser without push support until it is installed.
@@ -530,6 +576,10 @@ function boot(options) {
 
     const vmContext = vm.createContext({
         console, setTimeout, clearTimeout, TextEncoder, TextDecoder, FormData, Blob, URLSearchParams,
+        // The stream surface: ``API.stream`` builds a real ``ReadableStream`` reader and aborts
+        // the connection when the board is left, so both have to exist here for that code to run
+        // as written rather than through a branch the tests never reach.
+        ReadableStream, AbortController,
         Date,
         // Node's WebCrypto, so ``crypto.getRandomValues`` is exercised for real instead
         // of the generator's fallback branch being the only one ever covered.
@@ -593,11 +643,46 @@ function boot(options) {
             const headers = (init && init.headers) || {};
             requests.push({ url: String(url), headers, method: (init && init.method) || 'GET', body: (init && init.body) });
             const answer = responder(String(url), init);
+            // Only the stream answers with a body to read in pieces; every JSON route has none,
+            // which is what makes ``API.stream``'s refusal of an unreadable response a path a
+            // suite can reach rather than a branch nobody covers.
+            //
+            // A suite that says nothing about the stream gets an *idle* one - open, silent,
+            // never ending - because that is the connection a board with nothing happening is
+            // holding, and it is the state every suite that is not about the stream is in. A
+            // suite that wants the fallback says so with a status, and one that wants events
+            // hands them over as ``events`` (and ``hold: true`` to keep the connection open
+            // after them, as the real endpoint does).
+            const isStream = String(url).indexOf('/live_ops/stream') >= 0;
+            const events = Array.isArray(answer.events) ? answer.events : null;
             return {
                 ok: answer.status < 400,
                 status: answer.status,
                 json: async () => answer.body,
-                blob: async () => ({ size: 1, type: answer.contentType || 'text/csv' })
+                body: isStream && answer.status < 400
+                    ? makeEventStream(events || [], init && init.signal, events ? !!answer.hold : true)
+                    : undefined,
+                // A real ``Response`` has both, and which one a caller wants is the point: the
+                // console reads JSON from the API and *text* from the two routes that answer a
+                // file (the report export). A stub with only ``json`` would make "the download
+                // holds what the server sent" unassertable, which is the one thing a saved file
+                // has to be. A body that is not a string is stringified rather than refused,
+                // because a suite answering one URL with a CSV and another with a payload is
+                // exactly how the two are told apart here.
+                text: async () => (typeof answer.body === 'string'
+                    ? answer.body
+                    : JSON.stringify(answer.body === undefined ? null : answer.body)),
+                // A real ``Blob``, not a stand-in with the right shape: the console now saves
+                // bytes it did not build itself (the server's own .xlsx), and "the file holds
+                // what the server sent" is only assertable if the blob can be read back. The
+                // image paths pass this straight to ``createObjectURL`` and never inspect it,
+                // so the stronger type costs them nothing.
+                blob: async () => new Blob(
+                    [typeof answer.body === 'string'
+                        ? answer.body
+                        : JSON.stringify(answer.body === undefined ? null : answer.body)],
+                    { type: answer.contentType || 'text/csv' }
+                )
             };
         }
     });
@@ -676,7 +761,22 @@ function boot(options) {
 """.replace("__DEFAULT_SCRIPTS__", json.dumps(list(DEFAULT_SCRIPTS)))
 
 _EPILOGUE = """
-    process.stdout.write(JSON.stringify(results));
+    // Written *and then exited*, rather than left for the event loop to drain by itself.
+    //
+    // A page is allowed to keep a timer running for as long as it is open, and one now does:
+    // the Live Ops stream reconnects on a 3 s timer every time the server closes it (which the
+    // server does on purpose every fifteen minutes). A suite that watches a clean end - the one
+    // that has to prove the reconnect is scheduled - therefore ends its scenarios with a live
+    // timer that reschedules itself each time it fires, and Node would sit on it until the
+    // harness was killed. That is the frontend behaving correctly and the scaffold depending on
+    // something it never promised, so the exit is explicit: the scenarios are done, so the
+    // process is done, whatever the page still has on its event loop.
+    //
+    // ``fs`` rather than ``process.stdout``: a pipe write is asynchronous, and exiting on top
+    // of one can truncate the results it just wrote. ``writeSync`` puts the whole object on fd 1
+    // before the exit is reached.
+    fs.writeSync(1, JSON.stringify(results));
+    process.exit(0);
 })().catch((err) => {
     console.error((err && err.stack) || String(err));
     process.exit(1);
@@ -688,8 +788,9 @@ def script(body: str) -> str:
     """The shared environment, a suite's scenarios, and the exit that prints them.
 
     The body is the *inside* of an async IIFE: it declares ``const results = {}``, drives
-    the UI, and fills ``results`` in. Returning it is this module's job, so a suite never
-    has to remember the ``process.stdout.write`` contract.
+    the UI, and fills ``results`` in. Returning it is this module's job - and so is flushing
+    it to stdout and ending the process (``_EPILOGUE``), so a suite never has to remember
+    either half of that contract.
     """
     return PRELUDE + "\n(async () => {\n" + body + "\n" + _EPILOGUE
 

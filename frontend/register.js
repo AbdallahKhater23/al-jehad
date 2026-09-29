@@ -1,12 +1,24 @@
 /**
- * The page the walk-up registration link opens.
+ * The page the console's registration link opens.
+ *
+ * WHAT IT IS SERVED UNDER
+ * -----------------------
+ * ``/register/<token>``, where the token is the link an administrator copied out of the
+ * Credentials tab. The page reads it out of its own path and sends it with both calls, so the
+ * address it can be reached at is the link itself: there is no un-tokened form to open, and a
+ * copy of the link that has been replaced stops working the moment the console replaces it.
+ * The bare ``/register`` is served as well - deliberately, and this file is why - so that
+ * somebody who typed the address from memory, or whose chat client cut the link in half, reads
+ * one sentence about asking for a link rather than a browser error page. That is the whole of
+ * ``noLink`` below.
  *
  * WHY THIS EXISTS
  * ---------------
- * ``GET /register`` publishes the policy and ``POST /register`` takes a submission, creating the
- * account it is for as ``pending_approval``; an administrator's approval is what lets that
- * account record attendance. What this file is is the half a person uses - nobody without a
- * session could fill anything in, so applications could only be filed by hand.
+ * ``GET /register/<token>`` publishes the policy and ``POST /register/<token>`` takes a
+ * submission, creating the account it is for as ``pending_approval``; an administrator's
+ * approval is what lets that account record attendance. What this file is is the half a person
+ * uses - nobody without a session could fill anything in, so applications could only be filed by
+ * hand.
  *
  * WHAT IT PRODUCES
  * ----------------
@@ -38,8 +50,26 @@
 
     var $ = function (id) { return document.getElementById(id); };
 
-    //: The server's answer to ``GET /register``: the roles this link may register, the photo
-    //: policy, and the shortest password. Null until it arrives, which is why nothing the
+    /**
+     * The link's token, out of this page's own path: ``/register/<token>``.
+     *
+     * Empty at ``/register``, which is a page that says so rather than a form. The token is not
+     * validated here and could not be: what makes it a link is a signature only the server holds
+     * the key to, so this page sends it and reads the answer - a 404 is the server saying the
+     * link was replaced or never existed, and it arrives through ``sayRefusal`` like every other
+     * refusal.
+     */
+    var TOKEN = (function () {
+        var path = String(location.pathname || "");
+        var match = path.match(/\/register\/([^/]+)\/?$/);
+        return match ? decodeURIComponent(match[1]) : "";
+    }());
+
+    //: Where both calls go: the link's own address, under the API prefix.
+    var ENDPOINT = API + "/register/" + encodeURIComponent(TOKEN);
+
+    //: The server's answer to ``GET /register/<token>``: the roles this link may register, the
+    //: photo policy, and the shortest password. Null until it arrives, which is why nothing the
     //: applicant types is checked against it before then.
     var policy = null;
 
@@ -140,7 +170,7 @@
     }
 
     function loadPolicy() {
-        fetch(API + "/register")
+        fetch(ENDPOINT)
             .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
             .then(function (res) {
                 if (!res.ok) {
@@ -216,7 +246,7 @@
         if (camera) camera.arm(false);
         $("status-line").textContent = Capture.t("register.sending");
 
-        fetch(API + "/register", { method: "POST", body: form })
+        fetch(ENDPOINT, { method: "POST", body: form })
             .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
             .then(function (res) {
                 $("status-line").textContent = "";
@@ -264,6 +294,18 @@
         $("btn-retake").addEventListener("click", function () { camera.retake(); });
         $("btn-submit").addEventListener("click", submit);
         $("file").addEventListener("change", function (event) { camera.chooseFromInput(event.target); });
+
+        // No token is not a closed form and not a broken one, it is a person who reached this
+        // address without the link - so the page answers with the one thing that is true and
+        // useful ("ask your administrator for a link") and asks the server nothing at all. The
+        // intro card goes with the form: it explains what a submission does, and there is no
+        // submission here to explain.
+        if (!TOKEN) {
+            sayKey("register.needLink", "err");
+            $("step-intro").classList.add("hidden");
+            disarm();
+            return;
+        }
 
         Capture.applyPolicy();
         loadPolicy();

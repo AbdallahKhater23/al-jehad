@@ -1453,6 +1453,192 @@ def residue() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# what is on disk
+# ---------------------------------------------------------------------------
+#: How many files one inventory walk will stat before it stops and *says so*. The walk is
+#: bounded because it runs on a request path, and a deployment with a year of punches is tens
+#: of thousands of files - but a bound that silently rounded the answer down would turn "how
+#: much does this deployment hold" into a number that stops being true as it matters more, so
+#: the cap is reported next to the count it cut short.
+INVENTORY_MAX_FILES = 50_000
+
+
+def inventory_stores() -> list[dict[str, Any]]:
+    """Every place this application keeps its own files, in the order a person reads them.
+
+    Pointed at the *modules* that own each directory rather than at ``settings``, and that is
+    load-bearing rather than tidiness: the module attribute is what a running process - and the
+    test suite, which must never stat a real worker's face - repoints, and the sweeps read it
+    the same way. An inventory that described the configured path while the sweep worked on the
+    live one would report on a directory nothing writes to.
+
+    Imported inside the function like every other cross-import here: ``main`` imports this
+    module, and these are the modules that *write* what this one deletes.
+    """
+    import corpus
+    import punch_frames
+    import quick_links
+    import registrations
+
+    references, selfies = biometrics.directories()
+    return [
+        # A person, first: the selfie an administrator compares against when a match is
+        # disputed, and the template every punch is scored with. Both live under an id nothing
+        # can count upwards (see ``biometrics``), which is also why the *names* are not listed
+        # here - a directory listing is not something this panel is for.
+        {"key": "worker_photos", "path": selfies, "kind": "live", "recursive": False},
+        {"key": "local_references", "path": references, "kind": "live", "recursive": False},
+        # Then what a punch leaves behind, which is the part that grows with the gate rather
+        # than with the roster.
+        {"key": "punch_frames", "path": punch_frames.FRAMES_DIR, "kind": "live", "recursive": False},
+        {"key": "quick_link_photos", "path": quick_links.PHOTOS_DIR, "kind": "live", "recursive": False},
+        {"key": "registration_photos", "path": registrations.PHOTOS_DIR, "kind": "live", "recursive": False},
+        # The labelled corpus is a *measurement* rather than a record of anybody's day, and it
+        # is the one store this module does not sweep (see ``corpus`` for why it purges by
+        # hand). It is still disk this deployment is holding, so it is still listed.
+        {"key": "calibration_corpus", "path": corpus.ROOT_DIR, "kind": "live", "recursive": True},
+        # Last, and marked for what it is: a copy. A backup directory holds a second copy of
+        # every face above, so folding it into the same total would answer "how much of this
+        # disk is this deployment's own data" with twice the truth.
+        {"key": "backups", "path": str(settings.backup_dir), "kind": "copy", "recursive": True},
+    ]
+
+
+def _inventory_walk(directory: str, *, recursive: bool, limit: int | None = None) -> dict[str, Any]:
+    """Count and measure a directory, without decoding or hashing one byte of it.
+
+    One walk and one ``stat`` per file: the question is how much disk is in use, and a size is
+    a stat. Nothing here opens a file, so a corrupt photograph, a locked template or a huge
+    video somebody copied into the wrong folder costs the same as any other file.
+
+    Symlinks are neither followed nor counted. Following one would let a listing walk out of
+    the tree and report the whole filesystem as this application's data - and the same rule is
+    already how ``developer._directory_size`` measures a snapshot - while *counting* a link
+    would report bytes the deployment is not storing. They are simply not files here.
+
+    A missing or unreadable directory is zero files rather than an error: a deployment that has
+    never taken a registration link has no intake directory, and that is a state, not a fault.
+
+    The cap is read from the module at call time rather than bound into the signature as a
+    default: a default argument freezes whatever ``INVENTORY_MAX_FILES`` said when this module
+    was first imported, so the constant would describe a bound that is not the one in force - and
+    a test (or an operator) lowering it to see what the report does would be changing nothing.
+    """
+    if limit is None:
+        limit = int(INVENTORY_MAX_FILES)
+    files = 0
+    total = 0
+    oldest: float | None = None
+    newest: float | None = None
+    truncated = False
+    stack = [directory]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    if recursive:
+                        stack.append(entry.path)
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    # A symlink, a socket, a device node: not bytes this application stored.
+                    continue
+                stat = entry.stat(follow_symlinks=False)
+            except OSError:  # a file that vanished between the listing and the stat
+                continue
+            if files >= limit:
+                truncated = True
+                break
+            files += 1
+            total += int(stat.st_size)
+            oldest = stat.st_mtime if oldest is None else min(oldest, stat.st_mtime)
+            newest = stat.st_mtime if newest is None else max(newest, stat.st_mtime)
+        if truncated:
+            break
+    return {
+        "files": files,
+        "bytes": total,
+        "oldest": _stamp(datetime.fromtimestamp(oldest)) if oldest is not None else None,
+        "newest": _stamp(datetime.fromtimestamp(newest)) if newest is not None else None,
+        "truncated": truncated,
+    }
+
+
+def _database_store() -> dict[str, Any]:
+    """The database and its journal - the one store here that is a file, not a directory.
+
+    ``-wal`` and ``-shm`` are measured with it because they are the same data: a write-ahead
+    log holding committed pages is disk the deployment is using, and a report that showed only
+    ``times.db`` while the log beside it was the same size again would be wrong in the one
+    place an operator is looking for "what is actually taking the space".
+    """
+    base = str(settings.database_path)
+    files = 0
+    total = 0
+    oldest: float | None = None
+    newest: float | None = None
+    for path in (base, base + "-wal", base + "-shm"):
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        files += 1
+        total += int(stat.st_size)
+        oldest = stat.st_mtime if oldest is None else min(oldest, stat.st_mtime)
+        newest = stat.st_mtime if newest is None else max(newest, stat.st_mtime)
+    return {
+        "key": "database",
+        "kind": "live",
+        "path": base,
+        "files": files,
+        "bytes": total,
+        "oldest": _stamp(datetime.fromtimestamp(oldest)) if oldest is not None else None,
+        "newest": _stamp(datetime.fromtimestamp(newest)) if newest is not None else None,
+        "truncated": False,
+    }
+
+
+def storage_inventory() -> dict[str, Any]:
+    """What this deployment is holding on disk right now: files, bytes and age, per store.
+
+    WHY THIS EXISTS
+    ---------------
+    Everything retention does is *invisible* when it works: a sweep that erases a departed
+    worker's face on time and a sweep that quietly stopped both produce an application that
+    looks exactly the same. The three read-only answers an operator can already get are the
+    policy (``policy``), the last run (``last_run``) and the residue a query cannot see
+    (``residue``). What none of them says is the thing the question actually starts from: how
+    much is *there*, and is any of it growing.
+
+    So this is a description, not a decision. It walks each store once, counts, and adds up -
+    nothing here deletes, nothing here opens a file, and nothing here reads a row. What it
+    would delete is a different question with a different answer: ``sweep(dry_run=True)``,
+    which is the only thing in this application entitled to decide that.
+
+    ``live_bytes`` and ``copy_bytes`` are kept apart for the reason the stores carry a ``kind``:
+    a backup directory holds a second copy of the live data, so one total over everything
+    would overstate what the deployment is holding by exactly the size of its own safety net.
+    """
+    stores = [
+        {**store, **_inventory_walk(store["path"], recursive=bool(store["recursive"]))}
+        for store in inventory_stores()
+    ]
+    stores.append(_database_store())
+    return {
+        "as_of": _stamp(_now()),
+        "stores": stores,
+        "files_total": sum(int(store["files"]) for store in stores),
+        "live_bytes": sum(int(store["bytes"]) for store in stores if store["kind"] == "live"),
+        "copy_bytes": sum(int(store["bytes"]) for store in stores if store["kind"] == "copy"),
+        "truncated": any(bool(store["truncated"]) for store in stores),
+    }
+
+
+# ---------------------------------------------------------------------------
 # the scheduled sweep
 # ---------------------------------------------------------------------------
 _stop_event = threading.Event()

@@ -48,6 +48,7 @@ import harness
 import punch_frames
 import quick_links
 import retention
+from config import settings
 from harness import (
     ADMIN,
     HEAD_ADMIN,
@@ -1087,6 +1088,158 @@ def test_an_unexpected_error_is_reported_rather_than_raised(client, app_module, 
 
 
 # ---------------------------------------------------------------------------
+# what is on disk
+# ---------------------------------------------------------------------------
+def _stores(report: dict) -> dict[str, dict]:
+    return {store["key"]: store for store in report["stores"]}
+
+
+def test_the_inventory_counts_every_store_and_keeps_copies_apart(client, app_module, monkeypatch, tmp_path):
+    """Per directory: the files, the bytes, and the span of ages across them.
+
+    ``live_bytes`` excludes the backup directory on purpose. A backup holds a second copy of
+    every face above it, so folding the two into one total would answer "how much of this disk is
+    this deployment's own data" with twice the truth - which is why the stores carry a ``kind``
+    and the total is reported twice.
+
+    Nothing here deletes: the files are checked to be where they were when the walk finished.
+    """
+    monkeypatch.setattr(settings, "backup_dir", tmp_path / "backups")
+    # The seeded accounts have references of their own, so every figure below is the *change* a
+    # planted file makes rather than an absolute count: what this test is about is that the walk
+    # attributes each file to the right store, and a delta says that without depending on how
+    # many templates the harness happens to seed.
+    before_report = retention.storage_inventory()
+    before = _stores(before_report)
+
+    template = _file(Path(harness.REFS_DIR), "inv-ref.json", content=b"x" * 10)
+    selfie = _file(Path(harness.PHOTOS_DIR), "inv-face.jpg", content=b"x" * 30)
+    link = _punch_photo("inv-link.jpg", age_days=3)
+    # ``punch_frames.FRAMES_DIR`` rather than ``harness.FRAMES_DIR``: the autouse fixture above
+    # repoints the module attribute at its own directory, and the module attribute is what the
+    # walk reads - planting anywhere else would be measuring a folder nothing counts.
+    frame = _file(Path(punch_frames.FRAMES_DIR), "inv-frame.jpg", content=b"x" * 5)
+    snapshot = _file(tmp_path / "backups", "snapshot.zip", content=b"x" * 4000)
+
+    report = retention.storage_inventory()
+    stores = _stores(report)
+
+    def grew(key: str) -> tuple[int, int]:
+        return stores[key]["files"] - before[key]["files"], stores[key]["bytes"] - before[key]["bytes"]
+
+    assert {store["key"] for store in report["stores"]} == {
+        "worker_photos",
+        "local_references",
+        "punch_frames",
+        "quick_link_photos",
+        "registration_photos",
+        "calibration_corpus",
+        "backups",
+        "database",
+    }
+    assert grew("local_references") == (1, 10)
+    assert grew("worker_photos") == (1, 30)
+    assert grew("punch_frames") == (1, 5)
+    assert grew("quick_link_photos") == (1, 9)
+    assert stores["backups"]["kind"] == "copy"
+    assert grew("backups") == (1, 4000)
+
+    # Files are counted once each, in every total - but the bytes are split by kind.
+    assert report["files_total"] == sum(store["files"] for store in report["stores"])
+    assert report["live_bytes"] == sum(store["bytes"] for store in report["stores"] if store["kind"] == "live")
+    assert report["copy_bytes"] == stores["backups"]["bytes"]
+    # The snapshot's bytes land in the copy total and nowhere else: one total over everything
+    # would overstate what the deployment is holding by the size of its own safety net.
+    assert report["copy_bytes"] - before_report["copy_bytes"] == 4000
+    assert [store["key"] for store in report["stores"] if store["kind"] == "copy"] == ["backups"]
+    assert report["as_of"]
+    assert report["truncated"] is False
+
+    # The selfie planted three days ago is what the span is measuring, to the day.
+    # Timestamps come back in the application's own format, and the selfie planted three days ago
+    # is the one the span is measuring - to the minute, which is all a day column needs.
+    three_days_ago = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d %H:%M")
+    assert stores["quick_link_photos"]["newest"].startswith(three_days_ago)
+    assert stores["quick_link_photos"]["oldest"] == stores["quick_link_photos"]["newest"]
+    assert stores["local_references"]["newest"] >= stores["local_references"]["oldest"]
+
+    for path in (template, selfie, link, frame, snapshot):
+        assert path.exists(), f"the inventory deleted {path}"
+
+
+def test_the_inventory_does_not_follow_or_count_a_symlink(client, app_module, tmp_path):
+    """Following one would report the whole filesystem as this deployment's data.
+
+    *Counting* one would report bytes the deployment is not storing, twice - so they are neither
+    walked nor counted, the same rule ``developer._directory_size`` measures a snapshot by.
+    """
+    real = _file(tmp_path / "elsewhere", "outside.jpg", content=b"x" * 500)
+    try:
+        os.symlink(real, Path(quick_links.PHOTOS_DIR) / "link.jpg")
+    except (OSError, NotImplementedError, AttributeError):
+        pytest.skip("symlinks are not available on this filesystem")
+
+    store = _stores(retention.storage_inventory())["quick_link_photos"]
+    assert store["files"] == 0
+    assert store["bytes"] == 0
+
+
+def test_a_store_that_is_not_there_is_zero_files_rather_than_an_error(client, app_module, monkeypatch, tmp_path):
+    """A deployment that has never taken a punch has no frames directory, and that is a state.
+
+    The alternative - an error, or a store missing from the report - would make the panel read
+    "this deployment holds nothing" and "this deployment could not be read" the same way.
+    """
+    monkeypatch.setattr(punch_frames, "FRAMES_DIR", str(tmp_path / "never-created"))
+
+    store = _stores(retention.storage_inventory())["punch_frames"]
+    assert (store["files"], store["bytes"]) == (0, 0)
+    assert store["oldest"] is None and store["newest"] is None
+    assert store["truncated"] is False
+
+
+def test_the_inventory_stops_at_its_cap_and_says_so(client, app_module, monkeypatch):
+    """The walk is bounded because it runs on a request path.
+
+    A bound that rounded the answer down in silence would turn "how much does this deployment
+    hold" into a number that stops being true exactly as it starts to matter, so the cap is
+    reported next to the count it cut short - per store and for the report as a whole.
+    """
+    monkeypatch.setattr(retention, "INVENTORY_MAX_FILES", 3)
+    for index in range(5):
+        _punch_photo(f"cap-{index}.jpg")
+
+    report = retention.storage_inventory()
+    store = _stores(report)["quick_link_photos"]
+    assert store["files"] == 3
+    assert store["truncated"] is True
+    assert report["truncated"] is True
+
+
+def test_the_inventory_reports_the_recursive_corpus_and_the_database_beside_it(
+    client, app_module, monkeypatch, tmp_path
+):
+    """Two stores that are not a flat directory of faces, counted the way they are really stored.
+
+    The calibration corpus nests (measurement sets inside a root), so it is walked recursively -
+    and the database is a file plus its journal, which is why its size is measured over all
+    three names: a write-ahead log holding committed pages is disk this deployment is using.
+    """
+    import corpus
+
+    monkeypatch.setattr(settings, "backup_dir", tmp_path / "backups")
+    _file(Path(corpus.ROOT_DIR) / "set-a" / "nested", "frame.jpg", content=b"x" * 12)
+    database_file = Path(harness.DB_PATH)
+    assert database_file.exists()
+
+    stores = _stores(retention.storage_inventory())
+    assert stores["calibration_corpus"]["files"] >= 1
+    assert stores["database"]["files"] >= 1
+    assert stores["database"]["bytes"] >= database_file.stat().st_size
+    assert Path(stores["database"]["path"]).resolve() == database_file.resolve()
+
+
+# ---------------------------------------------------------------------------
 # the HTTP surface
 # ---------------------------------------------------------------------------
 def test_the_retention_endpoint_is_admin_only(client):
@@ -1115,6 +1268,26 @@ def test_the_retention_endpoint_reports_residue_that_the_database_cannot_see(cli
     body = client.get("/api/v1/admin/retention", headers=bearer(ADMIN)).json()
     assert body["residue"]["orphaned_biometric_files"] >= 1
     assert body["residue"]["listed"]
+
+
+def test_the_retention_endpoint_reports_what_is_on_disk(client, app_module, monkeypatch, tmp_path):
+    """The panel's figures, over HTTP: one block per store, and the totals that add them up.
+
+    This is the answer the console cannot get from anywhere else - the policy says what *should*
+    be gone and the last run says what a sweep did, but neither says how much is actually there.
+    """
+    monkeypatch.setattr(settings, "backup_dir", tmp_path / "backups")
+    _file(Path(harness.REFS_DIR), "http-inv.json", content=b"x" * 8)
+
+    body = client.get("/api/v1/admin/retention", headers=bearer(ADMIN)).json()
+    stores = _stores(body["storage"])
+
+    assert stores["local_references"]["files"] >= 1
+    assert body["storage"]["files_total"] == sum(store["files"] for store in body["storage"]["stores"])
+    assert body["storage"]["as_of"]
+    # The panel draws a path on each row's tooltip rather than in a column, so a store without
+    # one would be a store the reader cannot place. The database is the single file among them.
+    assert all(store["path"] for store in body["storage"]["stores"])
 
 
 def test_the_dry_run_endpoint_writes_nothing(client, app_module):

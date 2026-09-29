@@ -3032,6 +3032,9 @@ async def verify_worker(
                         lon,
                     ),
                 )
+                # A shift that was not on the board now is: the journey is what the site column
+                # shows until the arrival below, so the gate's own screen has to draw it.
+                live_ops.board_changed()
                 _audit(
                     conn,
                     action="attendance_transit_departure",
@@ -3102,6 +3105,9 @@ async def verify_worker(
                     "liveness_class = ? WHERE worker_id = ?",
                     (arrival_site, late_flag, liveness_class, current.id),
                 )
+                # Same body, a different site and a different late flag - which is three of the
+                # five facts the board compares, so a journey becoming a shift is a change.
+                live_ops.board_changed()
                 transit_seconds = (
                     shift_hours.elapsed_seconds(transit_start, now) if transit_start else 0
                 )
@@ -3226,6 +3232,7 @@ async def verify_worker(
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (current.id, detected_site, now_str, "online", late_flag, liveness_class),
             )
+            live_ops.board_changed()
             status_msg += f" (Clocked In at {detected_site})"
             if late_flag:
                 flag_reason = " | ".join(part for part in (flag_reason, late_flag) if part)
@@ -3315,6 +3322,10 @@ async def verify_worker(
                     "UPDATE active_sessions SET site_name = ?, is_transit = 0 WHERE worker_id = ?",
                     (arrived_at, current.id),
                 )
+                # The transit row's site and its flag are two facts the board draws, and this is
+                # the tap that confirms the trip - so it is a change even though the shift's
+                # ``clock_in_time``, and therefore its length, is untouched.
+                live_ops.board_changed()
                 session = conn.execute(
                     "SELECT worker_id, site_name, clock_in_time, is_transit, transit_start_time "
                     "FROM active_sessions WHERE worker_id = ?",
@@ -3348,6 +3359,9 @@ async def verify_worker(
             break_taken = record["break_hours"]
             hours_note = record["description"]
             conn.execute("DELETE FROM active_sessions WHERE worker_id = ?", (current.id,))
+            # The gate is one person lighter, and the board's list is nothing but open shifts:
+            # this is the change an operator watching the board is waiting for.
+            live_ops.board_changed()
 
             # Overtime is tracked, not silently approved: the one resolver decides whether
             # this shift has reached the line, and how much of it is held back.
@@ -4556,17 +4570,22 @@ async def delete_site_category(
 # ---------------------------------------------------------------------------
 # admin: data retention
 # ---------------------------------------------------------------------------
-@router.get("/admin/retention")
-async def retention_status(current: CurrentUser = Depends(admin_only)):
-    """The retention policy in force, the last sweep, and what is still on disk that should not be.
+def _retention_status() -> dict[str, Any]:
+    """The retention payload, assembled. Blocking by nature: see the route below.
 
-    Three questions, in the order an auditor asks them: *what is the policy*, *is anything
-    actually running it*, and *is the data gone*. The third is answered from the filesystem
-    rather than from a query (``retention.residue``), because the whole point is to find the
-    faces the database can no longer name - which is precisely what a query cannot see.
+    Four questions, in the order an auditor asks them: *what is the policy*, *is anything
+    actually running it*, *is the data gone*, and - the one an operator starts from - *how much
+    is there*. The third is answered from the filesystem rather than from a query
+    (``retention.residue``), because the whole point is to find the faces the database can no
+    longer name, which is precisely what a query cannot see; the fourth is the same walk over
+    every store this application owns (``retention.storage_inventory``).
 
     ``last_run`` is the row the sweeper writes, so it survives a restart; that is what
     distinguishes "scheduled and working" from "scheduled and quietly dead".
+
+    Splitting the handler in two is what lets the route hand this to a worker thread: three of
+    these four answers are directory walks, and a console poll that blocks the event loop is a
+    punch at the gate waiting behind a page nobody is reading.
     """
     return {
         "policy": retention.policy().as_dict(),
@@ -4579,11 +4598,22 @@ async def retention_status(current: CurrentUser = Depends(admin_only)):
         },
         "last_run": retention.last_run(),
         "residue": retention.residue(),
+        "storage": retention.storage_inventory(),
         "attendance_logs": (
             "never deleted automatically: the hours a person worked are pay records. The "
             "sweep reports their age and deletes nothing."
         ),
     }
+
+
+@router.get("/admin/retention")
+async def retention_status(current: CurrentUser = Depends(admin_only)):
+    """The retention policy, the last sweep, what is still on disk, and what is holding space.
+
+    Read-only, and incapable of deleting anything: the only route in this application that can
+    is ``/admin/retention/dry-run`` for a report and the sweeper itself for real.
+    """
+    return await run_in_threadpool(_retention_status)
 
 
 @router.post("/admin/retention/dry-run")
@@ -5230,6 +5260,7 @@ async def force_clock_in(
             "VALUES (?, ?, ?, 'admin_override')",
             (req.worker_id, req.site_name, now_str),
         )
+        live_ops.board_changed()
         log_id = _insert_log(
             conn,
             worker_id=req.worker_id,
@@ -5340,6 +5371,7 @@ async def force_clock_out(
         now_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
         conn.execute("DELETE FROM active_sessions WHERE worker_id = ?", (req.worker_id,))
+        live_ops.board_changed()
         log_id = _insert_log(
             conn,
             worker_id=req.worker_id,
@@ -6341,18 +6373,26 @@ async def enrollment_page(token: str):  # noqa: ARG001 - the token is read by th
 
 
 @app.get("/register", include_in_schema=False)
+@app.get("/register/{token}", include_in_schema=False)
 async def registration_page():
-    """Serve the walk-up registration form - the one permanent public link.
+    """Serve the console's registration form, under the token that is the link.
 
     Its own page for the same reason ``/enroll`` and ``/q`` have one: the person filling it in
     has no account, which is the entire point of the form, so it cannot load the console's
-    bundle or show them a sign-in screen. Unlike those two it is served at the root rather
-    than under a token - the link is one static URL the company prints - so its assets are
-    its siblings and the page asks for them without a ``../``.
+    bundle or show them a sign-in screen. Like those two it is served under a token, and for the
+    reason this module's registrations counterpart gives: a form that puts a face and a password
+    into a real account is not something that should answer on a permanent public address. The
+    page reads the token out of its own path and sends it with both API calls.
+
+    The bare ``/register`` is served as well, and serves the *same* page: a person who typed the
+    address from memory, or opened one whose token was cut off by a chat client, is owed one
+    sentence saying the link is not valid rather than a browser error or - worse - a working
+    form. Which of the two it is, is decided in the page, from whether it has a token at all.
 
     Serving it says nothing about whether it accepts anything: the switch is
-    ``settings.registration_enabled`` (off by default), and ``GET /api/v1/register`` is what
-    the page reads that from. A link that has been switched off still has to answer.
+    ``settings.registration_enabled`` (off by default) over the console's own intake row, and the
+    token-checked ``GET /api/v1/register/<token>`` is what the page reads both from. A link that
+    has been switched off still has to answer.
     """
     page = os.path.join(FRONTEND_DIR, "register.html")
     if not os.path.exists(page):  # pragma: no cover - packaging accident

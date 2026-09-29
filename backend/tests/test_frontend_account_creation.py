@@ -4,10 +4,12 @@ WHY THIS EXISTS
 ---------------
 The Credentials tab can start an account in the two ways an administrator actually needs:
 type it in here (id, name, role, generated password, and a photo that registers the face),
-or send a one-time *enrollment* link for an account that already exists. The API tests in
-``test_account_creation.py`` prove the server does the right thing; what they cannot see is
-whether the screen reaches it - which fields travel, whether the photo is attached, whether
-the password is shown once, and whether a 6 MB photo is refused before it is uploaded.
+or hand out the *registration* link, which somebody who has no account opens to apply. The API
+tests in ``test_account_creation.py`` and ``test_walk_up_registration.py`` prove the server
+does the right thing; what they cannot see is whether the screen reaches it - which fields
+travel, whether the photo is attached, whether the password is shown once, whether a 6 MB photo
+is refused before it is uploaded, and whether the link the panel copies is the one the server is
+telling it to hand out.
 
 So this suite drives the real ``admin_modules.js``:
 
@@ -20,10 +22,12 @@ So this suite drives the real ``admin_modules.js``:
    password exactly once afterwards - then forgets it when the panel closes;
 5. an id that is not a whole number never leaves the browser, and one the deleted per-role
    id blocks would have refused does - the server is the authority on which ids it accepts;
-6. issuing a link posts an account id and *nothing else* - no name, no role, no contact
-   details, because all of those belong to the account - and the answer is offered as a
-   copyable URL, a WhatsApp message and a QR code;
-7. a server refusal (an id already taken) is reported as the reason, not as a success - and
+6. opening the link panel *reads* the link - there is nothing to create, so there is no form
+   to fill in - and the answer is offered as a copyable URL, a WhatsApp message and a QR code,
+   with the intake switch's state beside it;
+7. replacing the link posts once and shows the new URL, which is the only way an administrator
+   can take back a link that has reached the wrong person;
+8. a server refusal (an id already taken) is reported as the reason, not as a success - and
    answered, because that one refusal is about a number: the form offers the next free id and
    takes it in one tap.
 
@@ -64,13 +68,26 @@ const OPERATOR = {
 const ROSTER = [ACTOR, OPERATOR];
 
 const createCalls = [];
-const inviteCalls = [];
+const linkCalls = [];
+//: Every write to the intake switch, in order, and the position the fake server is holding.
+//: The switch starts *open* here so the panels drawn in every other scenario are the ordinary
+//: ones; the scenario about moving it closes it first.
+const intakeCalls = [];
+let intakeOpen = true;
 //: Ids the roster already carries, as the server's unique index would answer: 400, with the
 //: sentence ``/admin/users/create`` raises. The status matters as much as the text - the
 //: console has to be reacting to the refusal the server actually sends.
 const takenIds = [];
 let createFail = false;
-let inviteFail = false;
+let linkFail = false;
+//: The link's own address for this run. Generation 0 is the generation a deployment that has
+//: never replaced its link carries; a ``POST`` to the panel's route answers with generation 1,
+//: so the two are different URLs and "the panel re-read what the server just gave it" is a
+//: claim a test can tell apart from "the panel remembered the first one".
+const LINK_URLS = {
+    0: 'https://site.example.test/register/0.tok-one',
+    1: 'https://site.example.test/register/1.tok-two'
+};
 
 function responders(url, init) {
     // The create endpoint lives under /admin/users, so it is matched first: a roster
@@ -93,18 +110,44 @@ function responders(url, init) {
             }
         };
     }
-    if (url.indexOf('/admin/enrollment/invites') >= 0) {
-        inviteCalls.push({ url: String(url), method: (init && init.method) || 'GET', body: (init && init.body) || null, headers: (init && init.headers) || {} });
-        if (inviteFail) return { status: 404, body: { detail: 'Worker ID not found. Create the user first.' } };
+    if (url.indexOf('/admin/registrations/intake') >= 0) {
+        const wanted = (init && String(init.method || 'GET').toUpperCase() === 'POST')
+            ? JSON.parse(init.body) : null;
+        if (wanted) {
+            intakeCalls.push(wanted);
+            intakeOpen = !!wanted.open;
+        }
         return {
             status: 200,
             body: {
-                status: 'success', kind: 'enroll', invite_id: 9, worker_id: '77',
-                worker_name: 'Link Worker', role: 'worker',
-                url: 'https://site.example.test/enroll/tok-one-time',
-                token: 'tok-one-time', expires_at: '2026-09-18 12:00:00', max_uses: 1,
+                status: 'success',
+                accepting: intakeOpen,
+                reason: intakeOpen ? 'open' : 'closed_by_console',
+                deployment_enabled: false,
+                decided: true,
+                updated_at: null,
+                updated_by: '5000'
+            }
+        };
+    }
+    if (url.indexOf('/admin/registrations/link') >= 0) {
+        const replaced = (init && init.method) === 'POST';
+        linkCalls.push({ url: String(url), method: (init && init.method) || 'GET', body: (init && init.body) || null, headers: (init && init.headers) || {} });
+        if (linkFail) return { status: 500, body: { detail: 'The registration link could not be read.' } };
+        return {
+            status: 200,
+            body: {
+                status: 'success',
+                url: replaced ? LINK_URLS[1] : LINK_URLS[0],
+                generation: replaced ? 1 : 0,
+                rotated_at: replaced ? '2026-09-19 08:30:00' : null,
+                rotated_by: replaced ? '5000' : null,
                 qr_png_data_uri: 'data:image/png;base64,AAAA',
-                note: 'Send this link once.'
+                // The link read carries the switch's state, and this deployment ships with it
+                // off: what the panel offers to move is the switch, on a form that starts shut.
+                accepting: intakeOpen,
+                reason: intakeOpen ? 'open' : 'closed_by_default',
+                deployment_enabled: false
             }
         };
     }
@@ -142,11 +185,13 @@ function render(env) {
 function consoleEnv(role) {
     const actor = role === 'admin' ? OPERATOR : ACTOR;
     createFail = false;
-    inviteFail = false;
+    linkFail = false;
     // Each scenario counts its own requests: a shared tally would make "one tap, one
     // account" true only for whichever scenario ran first.
     createCalls.length = 0;
-    inviteCalls.length = 0;
+    linkCalls.length = 0;
+    intakeCalls.length = 0;
+    intakeOpen = true;
     takenIds.length = 0;
     const env = boot();
     env.setResponder(responders);
@@ -167,9 +212,9 @@ async function fill(env, values) {
     }
 }
 
-async function openInvite(env) {
+async function openLink(env) {
     await env.evaluate("UI.renderAdminTab('Credentials')");
-    await env.evaluate("UI_MODULES.openCredentialsMode('invite')");
+    await env.evaluate("UI_MODULES.openCredentialsMode('link')");
 }
 
 // How many requests a panel added on top of the roster fetch that opened the tab.
@@ -186,13 +231,14 @@ const results = {};
     const markup = render(env);
     results.entry = {
         create_button: markup.indexOf('data-open-create') >= 0,
-        invite_button: markup.indexOf('data-open-invite') >= 0,
+        link_button: markup.indexOf('data-open-link') >= 0,
         // Read through ``evaluate``: the app's ``const`` bindings live in the context the
-        // frontend files were run in, so the suite asks that context rather than
+        // frontend files were run with, so the suite asks that context rather than
         // referencing them directly.
         create_labelled: markup.indexOf(env.evaluate("I18n.__('credentialsNewAccount')")) >= 0,
-        invite_labelled: markup.indexOf(env.evaluate("I18n.__('credentialsLink')")) >= 0,
-        invite_is_an_enrollment_link: env.evaluate("I18n.__('credentialsLink')").indexOf('Registration') < 0,
+        link_labelled: markup.indexOf(env.evaluate("I18n.__('credentialsRegistrationLink')")) >= 0,
+        link_is_a_registration_link:
+            env.evaluate("I18n.__('credentialsRegistrationLink')").indexOf('Registration') >= 0,
         no_create_form_yet: markup.indexOf('data-create-panel') < 0,
         requests: env.requests.map((r) => r.url.replace(/^.*\/api\/v1/, ''))
     };
@@ -419,73 +465,118 @@ const results = {};
     };
 }
 
-// 6. the enrollment link: what is posted, and what is offered back
+// 6. the registration link: it is read, not created, and it is offered back to be sent
 {
     const env = consoleEnv('head_admin');
     await env.evaluate("UI.renderAdminTab('Credentials')");
     const rosterOnly = env.requests.length;
-    await env.evaluate("UI_MODULES.openCredentialsMode('invite')");
+    await env.evaluate("UI_MODULES.openCredentialsMode('link')");
     const markup = render(env);
-    results.invite_panel = {
-        has_panel: markup.indexOf('data-invite-panel') >= 0,
-        id_field: markup.indexOf('credentialsLinkId') >= 0,
-        // The fields the retired registration link was fed, and which no longer exist: a
-        // name or a role written here would be a second place to set what the account
-        // already says.
+    results.link_panel = {
+        has_panel: markup.indexOf('data-registration-link="true"') >= 0,
+        url_field: markup.indexOf('credentialsLinkUrl') >= 0,
+        // No field of its own: the link is not *for* anybody, which is the whole difference
+        // between it and the enrollment link this panel used to hold.
+        has_worker_field: markup.indexOf('credentialsLinkId') >= 0,
         has_name_field: markup.indexOf('credentialsLinkName') >= 0,
-        has_role_field: markup.indexOf('credentialsLinkRole') >= 0,
-        requests: afterOpening(env, rosterOnly)
+        asks_on_open: afterOpening(env, rosterOnly),
+        // Whether the form is accepting is answered beside the URL, and moved beside it too:
+        // the panel is where an administrator stands when they send the link.
+        accepting: attr(markup, 'data-link-accepting="([^"]*)"'),
+        why: attr(markup, 'data-link-why="([^"]*)"'),
+        has_replace: markup.indexOf('replaceCredentialsLink') >= 0
     };
-    await fill(env, { credentialsLinkId: '77' });
-    await env.evaluate("UI_MODULES.issueCredentialsLink()");
 
-    const call = inviteCalls[inviteCalls.length - 1];
-    const sent = JSON.parse(call.body);
-    results.invite_call = {
-        count: inviteCalls.length,
+    const call = linkCalls[linkCalls.length - 1];
+    results.link_call = {
+        count: linkCalls.length,
         path: call.url.replace(/^.*\/api\/v1/, ''),
         method: call.method,
-        sent_keys: Object.keys(sent).sort(),
-        worker_id: sent.worker_id,
         authorized: call.headers['Authorization']
     };
 
-    const issued = render(env);
-    const url = html_module_unescape(inputValue(issued, 'credentialsLinkUrl'));
-    const anchor = env.lastAnchor();
+    const shown = html_module_unescape(inputValue(markup, 'credentialsLinkUrl'));
     await env.evaluate("UI_MODULES.copyCredentialsLink()");
-    results.invite_issued = {
-        panel_for: attr(issued, 'data-link-issued="([^"]*)"'),
-        url: url,
-        qr: issued.indexOf('data:image/png;base64,AAAA') >= 0,
-        expiry_shown: issued.indexOf('2026-09-18 12:00:00') >= 0,
-        has_whatsapp: issued.indexOf('shareCredentialsLink') >= 0,
+    results.link_shown = {
+        url: shown,
+        qr: markup.indexOf('data:image/png;base64,AAAA') >= 0,
+        has_whatsapp: markup.indexOf('shareCredentialsLink') >= 0,
         copied: env.copiedUrls.slice(-1)[0]
     };
     await env.evaluate("UI_MODULES.shareCredentialsLink()");
     const shared = env.lastAnchor();
-    results.invite_shared = {
+    results.link_shared = {
         href: shared ? String(shared.href) : null,
-        carries_the_link: shared ? String(shared.href).indexOf(encodeURIComponent(url)) >= 0 : false,
-        first_anchor_was_the_same_kind: !!anchor
+        carries_the_link: shared ? String(shared.href).indexOf(encodeURIComponent(shown)) >= 0 : false
     };
 }
 
-// 6b. a refused invite is reported, and no link is offered as if it existed
+// 6b. replacing the link: one POST, and the panel shows what came back
 {
     const env = consoleEnv('head_admin');
-    await openInvite(env);
-    await fill(env, { credentialsLinkId: '77' });
-    inviteFail = true;
-    await env.evaluate("UI_MODULES.issueCredentialsLink()");
-    results.invite_refused = {
-        panel: render(env).indexOf('data-link-issued') >= 0,
+    // The panel asks before it can be replaced, and the confirmation is answered for it - the
+    // one dialog in this file, because the action it guards is the only irreversible one here.
+    env.evaluate("globalThis.confirm = () => true");
+    await openLink(env);
+    const before = linkCalls.length;
+    await env.evaluate("UI_MODULES.replaceCredentialsLink()");
+    const replaced = render(env);
+    const call = linkCalls[linkCalls.length - 1];
+    results.link_replaced = {
+        calls: linkCalls.length - before,
+        method: call.method,
+        path: call.url.replace(/^.*\/api\/v1/, ''),
+        url: html_module_unescape(inputValue(replaced, 'credentialsLinkUrl')),
         toast: toasts(env).slice(-1)[0],
-        calls: inviteCalls.length
+        says: env.evaluate("I18n.__('credentialsRegistrationLinkReplaced')")
     };
 }
 
-// 6c. a taken id comes back with a free one beside it, and one tap takes it
+// 6c. the switch beside the link: the panel handing the URL out is where it gets opened
+{
+    const env = consoleEnv('head_admin');
+    // The state the applicant's own closed page is refusing from - and on this deployment the
+    // flag is off underneath it, so this panel is the only lever there is.
+    intakeOpen = false;
+    await openLink(env);
+    const closedMarkup = render(env);
+    const lever = attr(closedMarkup, 'data-registration-intake="([^"]*)"');
+    await env.evaluate("UI_MODULES.toggleRegistrationsIntake('open')");
+    const openedMarkup = render(env);
+    results.link_switch = {
+        accepting_before: attr(closedMarkup, 'data-link-accepting="([^"]*)"'),
+        why_before: attr(closedMarkup, 'data-link-why="([^"]*)"'),
+        lever: lever,
+        labelled: closedMarkup.indexOf(env.evaluate("I18n.__('registrationsIntakeOpen')")) >= 0,
+        posts: intakeCalls.slice(),
+        accepting_after: attr(openedMarkup, 'data-link-accepting="([^"]*)"'),
+        why_after: attr(openedMarkup, 'data-link-why="([^"]*)"'),
+        // The repaint follows the reader rather than the lever: the switch has two homes and
+        // this is the one the panel's reader was standing in.
+        still_the_panel: openedMarkup.indexOf('data-registration-link="true"') >= 0,
+        tab: env.evaluate('State.adminTab'),
+        url_kept: html_module_unescape(inputValue(openedMarkup, 'credentialsLinkUrl')),
+        toast: toasts(env).slice(-1)[0],
+        says: env.evaluate("I18n.__('registrationsIntakeOpened')")
+    };
+}
+
+// 6d. a link the server will not hand over is reported, and nothing is offered as if it existed
+{
+    const env = consoleEnv('head_admin');
+    linkFail = true;
+    await openLink(env);
+    const failed = render(env);
+    results.link_refused = {
+        panel: failed.indexOf('data-registration-link="true"') >= 0,
+        says_so: failed.indexOf(env.evaluate("I18n.__('credentialsRegistrationLinkFailed')")) >= 0,
+        offers_retry: failed.indexOf('loadCredentialsLink') >= 0,
+        toast: toasts(env).slice(-1)[0],
+        calls: linkCalls.length
+    };
+}
+
+// 6e. a taken id comes back with a free one beside it, and one tap takes it
 {
     const env = consoleEnv('head_admin');
     await openCreate(env);
@@ -525,21 +616,21 @@ const results = {};
     };
 }
 
-// 7. the link needs an id and nothing else; without one nothing is sent
+// 7. the link is the same link until somebody replaces it, and it is read every time
 {
     const env = consoleEnv('head_admin');
-    await openInvite(env);
-    const before = inviteCalls.length;
-    await env.evaluate("UI_MODULES.issueCredentialsLink()");
-    const empty = inviteCalls.length - before;
-    const emptyToast = toasts(env).slice(-1)[0];
-    await fill(env, { credentialsLinkId: '77' });
-    await env.evaluate("UI_MODULES.issueCredentialsLink()");
-    results.invite_needs_id = {
-        calls_before_an_id: empty,
-        empty_toast: emptyToast,
-        calls: inviteCalls.length - before,
-        toast: toasts(env).slice(-1)[0]
+    await openLink(env);
+    const url = html_module_unescape(inputValue(render(env), 'credentialsLinkUrl'));
+    // Closed and opened again: the panel asks the server a second time rather than reusing
+    // what it painted, because another administrator may have replaced the link since.
+    await env.evaluate("UI_MODULES.closeCredentialsMode()");
+    await env.evaluate("UI_MODULES.openCredentialsMode('link')");
+    const again = html_module_unescape(inputValue(render(env), 'credentialsLinkUrl'));
+    results.link_read_again = {
+        first: url,
+        second: again,
+        calls: linkCalls.length,
+        same: url === again
     };
 }
 
@@ -550,10 +641,12 @@ const results = {};
     await env.evaluate("UI_MODULES.closeCredentialsMode()");
     const closed = render(env);
     results.closed = {
-        no_panel: closed.indexOf('data-create-panel') < 0 && closed.indexOf('data-invite-panel') < 0,
+        no_panel:
+            closed.indexOf('data-create-panel') < 0 &&
+            closed.indexOf('data-registration-link') < 0,
         still_has_rows: closed.indexOf('data-user=') >= 0,
-        still_has_both_buttons: closed.indexOf('data-open-create') >= 0 && closed.indexOf('data-open-invite') >= 0,
-        requests: env.requests.filter((r) => r.url.indexOf('/create') >= 0 || r.url.indexOf('/invites') >= 0).length
+        still_has_both_buttons: closed.indexOf('data-open-create') >= 0 && closed.indexOf('data-open-link') >= 0,
+        requests: env.requests.filter((r) => r.url.indexOf('/create') >= 0 || r.url.indexOf('/registrations/link') >= 0).length
     };
 }
 """
@@ -578,13 +671,15 @@ def unescaped(value: str) -> str:
 
 
 def test_both_ways_to_start_an_account_are_on_the_credentials_tab(results):
-    """A button that creates an account, and a button that hands the job over."""
+    """A button that creates an account, and a button that hands out the way to apply."""
     assert results["entry"]["create_button"] is True
-    assert results["entry"]["invite_button"] is True
+    assert results["entry"]["link_button"] is True
     assert results["entry"]["create_labelled"] is True
-    assert results["entry"]["invite_labelled"] is True
-    assert results["entry"]["invite_is_an_enrollment_link"] is True, (
-        "the button is an enrollment link now: nothing on this screen creates an account from a link"
+    assert results["entry"]["link_labelled"] is True
+    assert results["entry"]["link_is_a_registration_link"] is True, (
+        "the button hands out the registration link: somebody who does not exist yet is the "
+        "case this screen cannot answer by creating an account, and the enrollment link it "
+        "used to hold (for an account that already exists) is gone from here"
     )
     assert results["entry"]["no_create_form_yet"] is True, "the form opens on request, not by default"
     assert results["entry"]["requests"] == ["/admin/users"], "opening a tab fetches the roster and nothing else"
@@ -771,51 +866,124 @@ def test_the_new_account_password_can_be_typed_instead_of_generated(results):
     assert typed["sent"] != typed["generated"], "and not the one the field opened on"
 
 
-def test_an_enrollment_link_is_issued_for_an_account_that_already_exists(results):
-    panel = results["invite_panel"]
-    assert panel["has_panel"] is True
-    assert panel["id_field"] is True, "the account the link is for is the panel's one field"
-    assert panel["has_name_field"] is False, "a name here would be a second place to write one"
-    assert panel["has_role_field"] is False, "a link hands out no role: the account's role is its own"
-    assert panel["requests"] == 0
+def test_the_link_panel_reads_the_link_instead_of_creating_one(results):
+    """There is no form here: the link exists, and the panel asks the server what it is.
 
-    call = results["invite_call"]
+    That is the difference from the enrollment link this panel used to hold - that one was
+    *minted* per account, so it had an id field and a Create button and a warning that the
+    token could never be shown again. This one is the address of a form, so the panel's whole
+    job is to hand it over: one read on the way in, and the URL, the copy button, the WhatsApp
+    message and the QR code beside it.
+    """
+    panel = results["link_panel"]
+    assert panel["has_panel"] is True
+    assert panel["url_field"] is True, "the panel has nowhere to show the link it read"
+    assert panel["has_worker_field"] is False, "an account id here would be the old per-person link"
+    assert panel["has_name_field"] is False, "a name here would be a second place to write one"
+    assert panel["asks_on_open"] == 1, "opening the panel asks for the link, and nothing else"
+    assert panel["has_replace"] is True, "the only way back from a link that leaked"
+
+    call = results["link_call"]
     assert call["count"] == 1
-    assert call["path"].endswith("/admin/enrollment/invites")
-    assert call["method"] == "POST"
-    assert call["sent_keys"] == ["worker_id"], (
-        "the id is the whole request: no name, no role, no kind, nothing a link could mint with"
-    )
-    assert call["worker_id"] == "77"
+    assert call["path"].endswith("/admin/registrations/link")
+    assert call["method"] == "GET", "reading the link must not mint or rotate anything"
     assert call["authorized"] == "Bearer tok-5000"
 
 
-def test_the_issued_link_is_copyable_shareable_and_shows_its_expiry(results):
-    issued = results["invite_issued"]
-    assert issued["panel_for"] == "77"
-    assert issued["url"].endswith("/enroll/tok-one-time")
-    assert issued["copied"] == issued["url"], "Copy hands over the link, not something that looks like it"
-    assert issued["qr"] is True, "the QR is offered when the server can render one"
-    assert issued["expiry_shown"] is True
-    assert issued["has_whatsapp"] is True
+def test_the_acceptance_state_travels_with_the_link(results):
+    """An administrator about to send a link is told whether the form will take it.
 
-    shared = results["invite_shared"]
+    Two objects, and the panel says so: the link is what makes the form *reachable* and the
+    intake switch is what makes it *accept*. Handing out a URL while the switch is shut is the
+    one way this panel can waste somebody's message, so the answer comes back with the URL
+    rather than being discovered by the applicant.
+    """
+    panel = results["link_panel"]
+    assert panel["accepting"] == "true"
+    assert panel["why"] == "open", "the server's own reason code, not a guess from the flag"
+
+
+def test_the_link_panel_opens_the_closed_form_it_is_handing_out(results):
+    """The switch is drawn where the link is, and it moves the form the applicant is looking at.
+
+    This is the half that made the feature work for the person the form refuses: the public page
+    says "ask your site administrator to open it", and a panel that only *reported* the state - in
+    a different tab, behind a switch that a deployment shipping with registration off never drew
+    - left that sentence with nobody who could act on it. Here the lever is beside the URL, on a
+    deployment whose own default is closed, and the panel is redrawn from the server's answer.
+    """
+    switch = results["link_switch"]
+    assert switch["accepting_before"] == "false", "this deployment starts with the form shut"
+    assert switch["why_before"] == "closed_by_default", (
+        "the panel did not say why the form it is handing out refuses everybody"
+    )
+    assert switch["lever"] == "open", "the one lever that can open the form was not drawn"
+    assert switch["labelled"], "the lever has no words on it"
+    assert switch["posts"] == [{"open": True}], switch["posts"]
+    assert switch["accepting_after"] == "true", "the form opened and the panel still says closed"
+    assert switch["why_after"] == "open", switch["why_after"]
+    assert switch["says"] in (switch["toast"] or ""), "a silent switch is one nobody trusts"
+    # ...and the reader stays where they were: the switch has two homes, and this is the one
+    # they pressed it in (the URL they were about to send is still on the screen).
+    assert switch["still_the_panel"] is True, "the panel was replaced by the queue"
+    assert switch["tab"] == "Credentials", switch["tab"]
+    assert switch["url_kept"].endswith("/register/0.tok-one"), switch["url_kept"]
+
+
+def test_the_link_is_copyable_shareable_and_carries_a_qr(results):
+    shown = results["link_shown"]
+    assert shown["url"].endswith("/register/0.tok-one"), (
+        "the panel invented a URL instead of showing the one the server sent"
+    )
+    assert shown["copied"] == shown["url"], "Copy hands over the link, not something that looks like it"
+    assert shown["qr"] is True, "the QR is offered when the server can render one"
+    assert shown["has_whatsapp"] is True
+
+    shared = results["link_shared"]
     assert shared["href"] and shared["href"].startswith("https://wa.me/?text=")
     assert shared["carries_the_link"] is True, "the message carries the link itself, ready to send"
 
 
-def test_a_refused_link_does_not_pretend_to_exist(results):
-    refused = results["invite_refused"]
+def test_replacing_the_link_posts_once_and_shows_what_came_back(results):
+    """Replacing is the revocation, so it is a POST that hands back the link to use now.
+
+    The panel must not keep painting the URL it read on the way in: the whole point of the
+    action is that the old address stops working, so a screen still showing it would be a
+    screen handing out a dead link.
+    """
+    replaced = results["link_replaced"]
+    assert replaced["calls"] == 1, "replacing hands out one link, not a second one behind it"
+    assert replaced["method"] == "POST"
+    assert replaced["path"].endswith("/admin/registrations/link")
+    assert replaced["url"].endswith("/register/1.tok-two"), (
+        "the panel is still showing the link it read before it was replaced"
+    )
+    assert replaced["toast"] == replaced["says"], (
+        "the administrator is told the replace happened"
+    )
+
+
+def test_a_link_the_server_will_not_hand_over_says_so_and_offers_a_retry(results):
+    """The read can fail, and the answer is the panel's own sentence - not a blank panel."""
+    refused = results["link_refused"]
     assert refused["calls"] == 1
-    assert refused["panel"] is False
-    assert "not found" in refused["toast"], "the server's reason, not a success"
+    assert refused["panel"] is False, "a URL was painted for a link the server never sent"
+    assert refused["says_so"] is True, "the panel does not say the read failed"
+    assert refused["offers_retry"] is True, "there is nothing one-shot here, so a retry is offered"
+    assert "could not be read" in refused["toast"], "the server's reason, not a success"
 
 
-def test_a_link_needs_an_id_and_nothing_else(results):
-    needed = results["invite_needs_id"]
-    assert needed["calls_before_an_id"] == 0, "an empty form is not worth a request"
-    assert "ID" in needed["empty_toast"], "and the admin is told what is missing"
-    assert needed["calls"] == 1, "the id alone is enough to issue a link"
+def test_the_link_is_the_same_link_until_it_is_replaced_and_is_read_every_time(results):
+    """Closed and opened again, the panel asks rather than reusing the screen it painted.
+
+    The link is stable - it is a function of the deployment's secret and one integer, so there
+    is nothing that goes stale by itself - but the *panel* must not be the authority on it:
+    another administrator can replace the link between two openings, and a screen that reused
+    the first answer would hand out a URL that no longer opens anything.
+    """
+    read = results["link_read_again"]
+    assert read["same"] is True, "the link changed without anybody replacing it"
+    assert read["calls"] == 2, "the second opening reused the first answer instead of asking"
 
 
 def test_closing_a_panel_returns_to_the_roster_untouched(results):

@@ -391,10 +391,12 @@ class Settings(BaseModel):
 
     # -- walk-up registration (see ``registrations``) -----------------------
     #  One persistent public link anybody can submit to, and an administrator's decision
-    #  before any account exists. Closed by default, on the same reasoning as the
-    #  calibration switch below: a public endpoint that collects a face is not something a
-    #  deployment should *discover* it is running, and this switch is also the kill switch
-    #  for a link that has been forwarded too far.
+    #  before any account exists. Off by default, on the same reasoning as the calibration
+    #  switch below: a public endpoint that collects a face is not something a deployment
+    #  should *discover* it is running. It is the *default position* of the console's own
+    #  intake switch rather than a ceiling over it (see ``registrations.intake_state``):
+    #  an administrator or a head administrator opens and closes the link from the console
+    #  either way, and this is what a deployment nobody has touched does.
     registration_enabled: bool = False
     #  How many requests may sit waiting for a decision at once. Enforced inside the same
     #  write that inserts one - a cap read before the insert is only advice.

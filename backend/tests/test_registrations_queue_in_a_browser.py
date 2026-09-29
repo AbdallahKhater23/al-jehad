@@ -105,10 +105,18 @@ def two_applications(app_module, client, monkeypatch):
     is written here is what the browser finds.
     """
     monkeypatch.setattr(settings, "registration_enabled", True)
+    # The link's own address, off the console's own read - what the browser would have been
+    # sent, rather than a path assembled here: the token is the whole reachability of the form
+    # now, so a fixture that guessed at one would be testing a URL nobody has.
+    link = client.get(
+        "/api/v1/admin/registrations/link", headers=harness.bearer(harness.HEAD_ADMIN)
+    )
+    assert link.status_code == 200, link.text[:400]
+    public = "/api/v1/register/" + link.json()["url"].rsplit("/register/", 1)[1]
     ids = []
     for index, (name, role) in enumerate((("Nadia Saleh", "worker"), ("Omar Farouk", "moallem"))):
         submitted = client.post(
-            "/api/v1/register",
+            public,
             data={
                 "full_name": name,
                 "password": STRONG_PASSWORD,

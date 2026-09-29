@@ -285,7 +285,7 @@ ENROLL_MY_OWN_FACE = r"""
     const tab = await waitFor(() => document.querySelector('[data-admin-tab="Credentials"]'));
     out.tab = tab !== null;
     if (tab) tab.click();
-    out.roster = (await waitFor(() => document.querySelector('[data-credentials-table]'))) !== null;
+    out.roster = (await waitFor(() => document.querySelector('[data-credentials-list]'))) !== null;
 
     window.__enrollStarts = 0;
     Camera.start = async () => { window.__enrollStarts += 1; return { getTracks: () => [] }; };
@@ -302,10 +302,17 @@ ENROLL_MY_OWN_FACE = r"""
         out.label.indexOf(I18n.__('credentialsFaceReplace')) >= 0
         || out.label.indexOf(I18n.__('credentialsFaceEnroll')) >= 0
     );
-    const row = button && button.closest('tr');
+    // The row the button belongs to, whichever element the roster draws it as: the table's
+    // ``<tr>`` and the list's ``<li>`` both carry ``data-user``, so ``[data-user]`` finds the
+    // owner without this probe having to know which of the two shapes is on screen.
+    const row = button && button.closest('[data-user]');
     out.row = row ? row.getAttribute('data-user') : null;
     out.mine = row ? row.getAttribute('data-user') === String(State.user.id) : false;
-    out.face_cell = row ? row.querySelector('[data-face]').getAttribute('data-face') : null;
+    // The face state is the *row's* own attribute now, and was the cell's before that: ask the
+    // row first and fall back to a descendant, so this reads *what* the state is rather than
+    // *where* it was put.
+    const face = row ? (row.hasAttribute('data-face') ? row : row.querySelector('[data-face]')) : null;
+    out.face_cell = face ? face.getAttribute('data-face') : null;
 
     if (button) button.click();
     const open = await waitFor(() => document.getElementById('enrollOverlay'));
@@ -355,9 +362,12 @@ EDIT_REFERENCE_PHOTO = r"""
     const tab = await waitFor(() => document.querySelector('[data-admin-tab="Credentials"]'));
     out.tab = tab !== null;
     if (tab) tab.click();
-    out.roster = (await waitFor(() => document.querySelector('[data-credentials-table]'))) !== null;
+    out.roster = (await waitFor(() => document.querySelector('[data-credentials-list]'))) !== null;
 
-    const row = await waitFor(() => Array.from(document.querySelectorAll('tr[data-user]'))
+    // ``[data-user]`` rather than ``tr[data-user]``: the roster is a list of rows now rather
+    // than a table, and pinning the tag here is exactly how this probe stops finding the row it
+    // exists to drive.
+    const row = await waitFor(() => Array.from(document.querySelectorAll('[data-user]'))
         .find((candidate) => candidate.querySelector('[data-edit-user]')) || null);
     out.row = row ? row.getAttribute('data-user') : null;
     out.own_row = row ? row.getAttribute('data-user') === String(State.user.id) : null;

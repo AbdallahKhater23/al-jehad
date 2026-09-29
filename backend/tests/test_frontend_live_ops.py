@@ -118,6 +118,22 @@ function responders(url) {
     return { status: 200, body: {} };
 }
 
+// A counted read, shaped exactly as ``GET /admin/live_ops/count`` answers: the board's own
+// figures with the open-shift rows deliberately absent, which is the whole point of it.
+function countOf(onSite, late, ids, longestId, siteName) {
+    return {
+        as_of: '2026-01-01 06:00:00',
+        on_site: onSite,
+        late: late,
+        sites: [{ site_name: siteName, workers: onSite }],
+        worker_ids: ids,
+        longest: {
+            worker_id: longestId, name: 'Yousef Adel', site_name: siteName,
+            clock_in_time: ago(10), seconds_on_site: 36000
+        }
+    };
+}
+
 const ADMIN = { id: '5000', name: 'Seed Head Admin', role: 'head_admin' };
 
 function bootBoard(options) {
@@ -532,19 +548,179 @@ const results = {};
     results.mobile_sort = { has_select: mobile.indexOf('id="liveOpsSort"') >= 0, options: (mobile.match(/<option/g) || []).length };
 }
 
-// 8. the timers start with the board and die with it
+// 8. the clock, the stream and the fallback timer start with the board and die with it
 {
     const env7 = bootBoard();
     await env7.evaluate("UI.renderAdminTab('Live Ops')");
-    const started = env7.evaluate("[UI_MODULES._liveOpsTick !== null, UI_MODULES._liveOpsPoll !== null]");
+    // The board's upkeep is three pieces now, and which of them is live is the point: the 1 s
+    // tick always, the stream in place of the poll, and the poll *not* running beside it.
+    const started = env7.evaluate(
+        "[UI_MODULES._liveOpsTick !== null, UI_MODULES._liveOpsStreaming, UI_MODULES._liveOpsPoll === null]"
+    );
+    // The connection is *held*: an idle stream is a response that has not ended, which is the
+    // thing a poll can never do and the reason this costs nothing while nothing happens.
+    const held = env7.evaluate("UI_MODULES._liveOpsAbort !== null && !UI_MODULES._liveOpsAbort.signal.aborted");
     await env7.evaluate("UI.renderAdminTab('Sites')");
-    const afterSwitch = env7.evaluate("[UI_MODULES._liveOpsTick, UI_MODULES._liveOpsPoll]");
+    const afterSwitch = env7.evaluate(
+        "[UI_MODULES._liveOpsTick, UI_MODULES._liveOpsPoll, UI_MODULES._liveOpsAbort, UI_MODULES._liveOpsStreaming]"
+    );
     await env7.evaluate("UI.renderAdminTab('Live Ops')");
     await env7.evaluate("UI.logout()");
+    const streamRequests = env7.requests.filter((r) => r.url.indexOf('/admin/live_ops/stream') >= 0);
     results.lifecycle = {
         started,
+        held,
         after_switch: afterSwitch,
-        after_logout: env7.evaluate("[UI_MODULES._liveOpsTick, UI_MODULES._liveOpsPoll]")
+        after_logout: env7.evaluate(
+            "[UI_MODULES._liveOpsTick, UI_MODULES._liveOpsPoll, UI_MODULES._liveOpsAbort, UI_MODULES._liveOpsStreaming]"
+        ),
+        // One per tab that held it, and the bearer token every other call carries: the whole
+        // reason this is a ``fetch`` reader and not the browser's ``EventSource``.
+        stream_reads: streamRequests.length,
+        stream_accept: streamRequests.length
+            ? String(streamRequests[0].headers.Accept || '') === 'text/event-stream'
+            : false,
+        stream_bearer: streamRequests.length
+            ? String(streamRequests[0].headers.Authorization || '') === 'Bearer tok-5000'
+            : false
+    };
+}
+
+// 8b. what the server pushes down the stream is the board's figures - and only a *moved*
+//     board costs a row read for them
+{
+    // The board's own counted read, and the two pushes sent down the connection: one that
+    // repeats it (a quiet afternoon) and one that is a different afternoon.
+    const COUNT = countOf(4, 1, ['w1', 'w2', 'w3', 'w4'], 'w1', 'Downtown Tower A');
+    const MOVED = countOf(2, 0, ['w1', 'w3'], 'w3', 'Downtown Tower A');
+
+    function streamResponder(pushes) {
+        return function (url, init) {
+            if (url.indexOf('/admin/live_ops/stream') >= 0) {
+                // The wire, verbatim: the frames are the ``event:``/``data:`` lines a server
+                // sends, including the comment line an idle stream lives on - which must not
+                // be read as an event.
+                return {
+                    status: 200,
+                    hold: true,
+                    events: ['retry: 5000\\n\\n']
+                        .concat(pushes.map((board) => 'event: board\\ndata: ' + JSON.stringify(board) + '\\n\\n'))
+                        .concat([': keep-alive\\n\\n'])
+                };
+            }
+            if (url.indexOf('/admin/live_ops/count') >= 0) return { status: 200, body: COUNT };
+            return responders(url, init);
+        };
+    }
+
+    // The render reads the rows once - a board is a list of who is at the gate. Nothing after
+    // that should, while the figures are arriving on their own.
+    const quiet = bootBoard();
+    quiet.setResponder(streamResponder([COUNT]));
+    await quiet.evaluate("UI.renderAdminTab('Live Ops')");
+    const rowsAfterRender = quiet.requests.filter((r) => r.url.indexOf('/admin/active_sessions') >= 0).length;
+    quiet.evaluate("UI_MODULES._liveOpsProbe = UI_MODULES._liveOps");
+    quiet.evaluate("UI_MODULES._liveOpsPaneBefore = document.getElementById('liveOpsBoard').innerHTML");
+    for (let turn = 0; turn < 4; turn += 1) {
+        await quiet.evaluate('new Promise((resolve) => setTimeout(resolve, 0))');
+    }
+    results.stream_quiet = {
+        counted: quiet.evaluate("UI_MODULES.liveOpsStats(UI_MODULES._liveOps).counted"),
+        on_site: quiet.evaluate("UI_MODULES.liveOpsStats(UI_MODULES._liveOps).onSite"),
+        rows_read_after_the_push: quiet.requests.filter(
+            (r) => r.url.indexOf('/admin/active_sessions') >= 0
+        ).length - rowsAfterRender,
+        pane_unchanged: quiet.evaluate(
+            "document.getElementById('liveOpsBoard').innerHTML === UI_MODULES._liveOpsPaneBefore"
+        ),
+        figures_stored: quiet.evaluate("UI_MODULES._liveOps !== UI_MODULES._liveOpsProbe"),
+        failures: quiet.evaluate("UI_MODULES._liveOpsStreamFails"),
+        still_streaming: quiet.evaluate("UI_MODULES._liveOpsStreaming"),
+        poll_is_not_running: quiet.evaluate("UI_MODULES._liveOpsPoll === null"),
+        pushed_accept: quiet.requests.some(
+            (r) => r.url.indexOf('/admin/live_ops/stream') >= 0 &&
+                String(r.headers.Accept || '') === 'text/event-stream'
+        )
+    };
+
+    const moved = bootBoard();
+    moved.setResponder(streamResponder([MOVED]));
+    await moved.evaluate("UI.renderAdminTab('Live Ops')");
+    const rowsBeforeMove = moved.requests.filter((r) => r.url.indexOf('/admin/active_sessions') >= 0).length;
+    for (let turn = 0; turn < 4; turn += 1) {
+        await moved.evaluate('new Promise((resolve) => setTimeout(resolve, 0))');
+    }
+    results.stream_moved = {
+        on_site: moved.evaluate("UI_MODULES.liveOpsStats(UI_MODULES._liveOps).onSite"),
+        late: moved.evaluate("UI_MODULES.liveOpsStats(UI_MODULES._liveOps).late"),
+        rows_read_after_the_push: moved.requests.filter(
+            (r) => r.url.indexOf('/admin/active_sessions') >= 0
+        ).length - rowsBeforeMove,
+        repainted: boardPane(moved).indexOf('data-session') >= 0,
+        still_streaming: moved.evaluate("UI_MODULES._liveOpsStreaming"),
+        poll_is_not_running: moved.evaluate("UI_MODULES._liveOpsPoll === null")
+    };
+}
+
+// 8c. the stream will not open here: the board goes back to asking, on the old timer
+{
+    const env9 = bootBoard();
+    env9.setResponder(function (url, init) {
+        if (url.indexOf('/admin/live_ops/stream') >= 0) {
+            // A middle box that hands the response back whole, or a proxy that refuses long
+            // requests. Either way there is no stream to read, which is a *failure* rather than
+            // an idle connection - and the one state that must end in the poll, not in silence.
+            return { status: 502, body: { detail: 'Bad gateway.' } };
+        }
+        return responders(url, init);
+    });
+    // Two tries, 3 s apart (``LIVE_OPS_STREAM_FAILS``/``LIVE_OPS_STREAM_RETRY_MS``) - and the
+    // retry clock has to be shortened *before* the board opens its first stream, because the
+    // first failure is what arms the timer. Set afterwards, the second try is still 3 s out
+    // when the suite stops waiting, and "it only ever tried once" reads as the fallback working
+    // when in fact the retry was never given a chance. The wait itself is the page's own timer,
+    // driven short rather than slept through.
+    env9.evaluate('UI_MODULES.LIVE_OPS_STREAM_RETRY_MS = 1');
+    await env9.evaluate("UI.renderAdminTab('Live Ops')");
+    await env9.evaluate('new Promise((resolve) => setTimeout(resolve, 10))');
+    await env9.evaluate('new Promise((resolve) => setTimeout(resolve, 10))');
+    results.no_stream = {
+        tries: env9.requests.filter((r) => r.url.indexOf('/admin/live_ops/stream') >= 0).length,
+        stopped_trying: env9.evaluate("UI_MODULES._liveOpsStreaming") === false,
+        fell_back_to_the_poll: env9.evaluate("UI_MODULES._liveOpsPoll !== null"),
+        // The stream is the optimisation; the board itself was never waiting on it. Read from
+        // the *render*, not from the by-id pane: this stub never parses the markup written into
+        // ``#adminContent``, so the pane stays empty until something repaints it in place - and a
+        // board that has just been drawn has repainted nothing. Asking the pane here would say
+        // "no board" about the render that is on screen either way.
+        board_on_screen: rendered(env9).indexOf('data-session') >= 0
+    };
+}
+
+// 8d. an end is not a failure: the server closing the stream on purpose reconnects
+{
+    const env10 = bootBoard();
+    env10.setResponder(function (url, init) {
+        if (url.indexOf('/admin/live_ops/stream') >= 0) {
+            // What the server's own lifetime sends: one event, then the close. No ``hold``, so
+            // the body ends, which is a clean end and must not count against the deployment.
+            return {
+                status: 200,
+                events: ['event: bye\\ndata: {}\\n\\n']
+            };
+        }
+        return responders(url, init);
+    });
+    await env10.evaluate("UI.renderAdminTab('Live Ops')");
+    await env10.evaluate('new Promise((resolve) => setTimeout(resolve, 0))');
+    await env10.evaluate('new Promise((resolve) => setTimeout(resolve, 0))');
+    results.stream_end = {
+        failures_not_counted: env10.evaluate("UI_MODULES._liveOpsStreamFails") === 0,
+        still_streaming: env10.evaluate("UI_MODULES._liveOpsStreaming"),
+        // A reconnect is a timer, not an immediate loop: a board reconnecting in a tight loop
+        // would be worse than the poll it replaced.
+        reconnect_is_scheduled: env10.evaluate("UI_MODULES._liveOpsStreamTimer !== null"),
+        poll_is_not_running: env10.evaluate("UI_MODULES._liveOpsPoll === null")
     };
 }
 
@@ -1221,11 +1397,69 @@ def test_two_shifts_fit_without_a_fold(results):
 # ---------------------------------------------------------------------------
 # Live without flicker, and no leaks
 # ---------------------------------------------------------------------------
-def test_the_timers_start_with_the_board_and_stop_when_it_is_left(results):
+def test_the_clock_and_the_stream_start_with_the_board_and_stop_when_it_is_left(results):
     lifecycle = results["lifecycle"]
-    assert lifecycle["started"] == [True, True], "the board starts both its tick and its poll"
-    assert lifecycle["after_switch"] == [None, None], "switching tabs stops them"
-    assert lifecycle["after_logout"] == [None, None], "logging out stops them"
+    assert lifecycle["started"] == [True, True, True], (
+        "the board runs its 1 s clock and holds a stream open - and starts no poll beside it"
+    )
+    assert lifecycle["held"], "the connection is *held*, which is what an idle board costs"
+    assert lifecycle["stream_reads"] == 2, (
+        "one connection per turn on the tab: the second render opened the second stream"
+    )
+    assert lifecycle["stream_accept"], "the connection asks for a stream rather than a payload"
+    assert lifecycle["stream_bearer"], (
+        "and it carries the same bearer token as every other call, which is the whole reason "
+        "it is a fetch reader and not the browser's EventSource"
+    )
+    assert lifecycle["after_switch"] == [None, None, None, False], "switching tabs stops all of it"
+    assert lifecycle["after_logout"] == [None, None, None, False], "logging out stops all of it"
+
+
+def test_a_push_that_says_nothing_moved_costs_no_row_read_and_no_repaint(results):
+    quiet = results["stream_quiet"]
+    assert quiet["pushed_accept"], "the console asked for a stream, not a payload"
+    assert quiet["counted"], "the pushed figures are a counted read, not a row list"
+    assert quiet["on_site"] == 4, "and the board is drawing the server's count"
+    assert quiet["figures_stored"], "the push is not thrown away - it is the board's latest count"
+    assert quiet["rows_read_after_the_push"] == 0, (
+        "being told is the point: an unchanged board reads no rows for the figures it already has"
+    )
+    assert quiet["pane_unchanged"], "and nothing on screen moves, so nothing is repainted"
+    assert quiet["failures"] == 0, "a comment line is not an event, and not a failure either"
+    assert quiet["still_streaming"], "the connection stays open after the event it carried"
+    assert quiet["poll_is_not_running"], "and no timer is asking the same question beside it"
+
+
+def test_a_push_that_says_the_gate_moved_repaints_from_one_row_read(results):
+    moved = results["stream_moved"]
+    assert moved["on_site"] == 2, "the new figures are the board's - the pushed ones, not the rows'"
+    assert moved["late"] == 0, "and so is every other numeral on it"
+    assert moved["rows_read_after_the_push"] == 1, (
+        "a moved board reads the rows once, to put the names the figures describe on screen"
+    )
+    assert moved["repainted"], "which is what the row read is for: the pane is rewritten"
+    assert moved["still_streaming"], "and the connection that carried the change is still open"
+    assert moved["poll_is_not_running"], "no poll beside the stream"
+
+
+def test_a_stream_that_will_not_open_falls_back_to_the_poll(results):
+    no_stream = results["no_stream"]
+    assert no_stream["tries"] >= 2, "a failed stream is retried before the board gives up on it"
+    assert no_stream["stopped_trying"], "and then it stops trying rather than hammering it"
+    assert no_stream["fell_back_to_the_poll"], "the board goes back to asking on the old timer"
+    assert no_stream["board_on_screen"], (
+        "which is the point of the fallback: the board was never waiting on the stream"
+    )
+
+
+def test_the_server_closing_the_stream_is_not_a_failure(results):
+    ended = results["stream_end"]
+    assert ended["failures_not_counted"], (
+        "the server closes these on purpose, so an end must not count against the deployment"
+    )
+    assert ended["still_streaming"], "the board is still trying to hold one"
+    assert ended["reconnect_is_scheduled"], "with the reconnect on a timer, not in a tight loop"
+    assert ended["poll_is_not_running"], "and still no poll beside it"
 
 
 def test_a_poll_that_finds_no_change_repaints_nothing(results):

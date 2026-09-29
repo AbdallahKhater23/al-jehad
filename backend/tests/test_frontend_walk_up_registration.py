@@ -72,6 +72,8 @@ REGISTER_KEYS = (
     "register.photoUnreadable",
     "register.failed",
     "register.uploadFailed",
+    "register.needLink",
+    "register.linkInvalid",
 )
 
 #: The roles the server publishes, and the words the page shows for them. The names are
@@ -94,26 +96,26 @@ def capture_body() -> str:
 # ---------------------------------------------------------------------------
 # The assets: this page is served at the root, and the two link pages are not
 # ---------------------------------------------------------------------------
-def test_the_page_asks_for_its_assets_as_siblings():
-    """``/register`` is at the root; ``/enroll/<token>`` is one segment deep.
+def test_the_page_asks_for_its_assets_one_level_up():
+    """``/register/<token>`` is one segment deep, so its files are one level up.
 
-    The two link pages had to learn this the expensive way - a bare ``src="enroll.js"``
-    resolved to ``/enroll/enroll.js``, the token route answered with the page itself as
-    HTML, and the browser refused to execute it, so the page sat on its placeholders
-    looking like a hung connection. This page has the opposite convention, and getting it
-    wrong is the same class of bug in the other direction: ``../capture.js`` from
-    ``/register`` resolves *up* from the root, and there is nothing above the root to
-    serve it.
+    This page used to be a permanent address at the root, and its assets were therefore its
+    siblings. It is served under the link's own token now, which puts the document's base at
+    ``/register/``: a bare ``src="capture.js"`` resolves to ``/register/capture.js``, which is
+    not a file, and the token route answers the request with the page itself as HTML - the
+    browser refuses to execute it and the page sits on its placeholders looking like a hung
+    connection. That is the failure the two link pages already had; this pins it here rather
+    than rediscovering it.
     """
     sources = re.findall(r'<script[^>]*\bsrc="([^"]+)"', page_body())
-    assert sources == ["api-config.js", "capture.js", FLOW], (
-        f"{PAGE} loads {sources}. Served at the root, its own files are its siblings: no "
-        f"``../``, and the shared capture module before the page's own flow"
+    assert sources == ["../api-config.js", "../capture.js", f"../{FLOW}"], (
+        f"{PAGE} loads {sources}. Served under a token, its own files are one level up, and "
+        "the shared capture module comes before the page's own flow"
     )
     for src in sources:
-        assert not src.startswith(("../", "/")), (
-            f'{PAGE} asks for "{src}". This page is not served under a token, so a relative '
-            "path is resolved from the root and a leading ``../`` walks off it"
+        assert src.startswith("../"), (
+            f'{PAGE} asks for "{src}": a name that is not one level up resolves into the '
+            "token's own segment, where the server answers with this page instead of a script"
         )
 
 
@@ -245,7 +247,7 @@ def test_the_page_reads_the_policy_before_it_asks_for_anything():
     would be a form that fails after the photograph has been uploaded over a phone tether.
     """
     flow = flow_body()
-    assert 'fetch(API + "/register")' in flow, "the page never reads the policy"
+    assert "fetch(ENDPOINT)" in flow, "the page never reads the policy"
     assert "min_password_length" in flow, "the password floor it enforces is not the server's"
     assert 'Capture.t("role." + roles[i])' in flow, (
         "the role names are not read from the server's list, so an offered role could be one "
@@ -253,6 +255,28 @@ def test_the_page_reads_the_policy_before_it_asks_for_anything():
     )
     assert "Capture.setPolicy(res.body.photo_policy)" in flow, (
         "the photo policy the browser refuses on is not the server's"
+    )
+
+
+def test_the_page_is_a_form_only_when_it_carries_the_link():
+    """The token is read out of the page's own path, and a page without one is a sentence.
+
+    This is the half of "no public form" the server cannot enforce: the route at the bare path
+    is refused, but a page that still drew the form there would show an applicant a form that
+    could never be submitted - and it would have to *ask* the server for its policy to draw it,
+    which is a request nobody holding a cut-off link should be making. So the flow reads its own
+    path first, and with no token it paints one sentence and stops.
+    """
+    flow = flow_body()
+    assert "location.pathname" in flow, "the flow never reads the link's token out of its path"
+    assert 'var ENDPOINT = API + "/register/" + encodeURIComponent(TOKEN)' in flow, (
+        "the calls do not carry the token, so they would hit the bare path and be refused"
+    )
+    assert flow.count("fetch(ENDPOINT") == 2, (
+        "both calls - the policy read and the submission - have to go to the link's own address"
+    )
+    assert 'sayKey("register.needLink", "err")' in flow, (
+        "a page with no token does not say so, so it would look like a broken link"
     )
 
 

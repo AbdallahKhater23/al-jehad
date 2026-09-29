@@ -48,7 +48,7 @@ THE SECOND HALF OF THE SAME DECISION
 filter applied in Python still hands back the count of what it removed, and a count is an
 enumeration - the roster closed that hole and a dashboard that ignored it would re-open it.
 So the clause travels with every user-shaped count here: accounts, active, enrolled, by
-role, never-clocked-in, joined-this-week.
+role, never-clocked-in, joined-this-week, onboarding and dormant.
 
 WHAT THIS MODULE DOES NOT DO
 ----------------------------
@@ -133,6 +133,17 @@ _TS = "%Y-%m-%d %H:%M:%S"
 
 #: How far back "joined this week" looks.
 NEW_ACCOUNT_DAYS = 7
+
+#: How long an active account may go without a punch before it is reported as *dormant*.
+#:
+#: A month, and the length is chosen rather than picked: thirty days is the payroll cycle, so
+#: an account this quiet has missed one whole pay run - long enough that a worker on a
+#: fortnight's leave is not named, short enough that somebody who stopped coming in is caught
+#: while somebody still remembers them turning up. It is *not* the same question as
+#: ``never_clocked_in``: that account has no punch at all and is a hire who never started,
+#: where this one worked and then stopped, which is the harder fact to notice. The two figures
+#: are deliberately disjoint, and the queries below are what keeps them so.
+DORMANT_DAYS = 30
 
 #: The period panel's default window: the last seven days, today included.
 #:
@@ -257,6 +268,16 @@ def _people(conn: sqlite3.Connection, current: CurrentUser, now: datetime) -> di
     an account in quarantine can sign in, so it is not gone, and it cannot punch, so it is not
     active - and the panel that folded it in with the deactivated ones was reporting a queue as
     a roster somebody had switched off.
+
+    TWO OF THE FIGURES ARE *WATCHES* RATHER THAN COUNTS OF A STATE - ``dormant`` and
+    ``onboarding`` - and they exist because the roster counts above describe a deployment
+    without ever saying that anything about it has gone wrong. Dormant is an account that worked
+    here and has not been seen for ``DORMANT_DAYS``; onboarding is one that joined inside
+    ``NEW_ACCOUNT_DAYS`` and has never clocked in at all. They are the two ways an account stops
+    being a worker without anybody deciding anything, and both would otherwise be noticed by
+    payroll or a headcount review rather than by the front door. Neither is a count of a status,
+    so both carry the window they were counted over; and both are disjoint from
+    ``never_clocked_in``, for the reason that query's comment gives.
     """
     hide_sql, hide_params = developer.visibility_clause(current, column="id")
 
@@ -299,6 +320,10 @@ def _people(conn: sqlite3.Connection, current: CurrentUser, now: datetime) -> di
     # ``retention`` never deletes an ``attendance_logs`` row (it is the record of hours owed -
     # see that module's "what is never deleted"), so the absence of a row really does mean a
     # worker who has never punched rather than one whose punches aged out.
+    #
+    # The same fact is what makes ``dormant`` below answerable at all, and that is why this
+    # query is spelled out rather than folded into it: this is the complement of "has punched",
+    # and dormant is the complement of "has punched *lately*" over the accounts that have.
     never = conn.execute(
         "SELECT COUNT(*) FROM users u WHERE "
         + _ACTIVE_SQL.replace("status", "u.status")
@@ -313,13 +338,41 @@ def _people(conn: sqlite3.Connection, current: CurrentUser, now: datetime) -> di
     # ``users`` is what keeps this a count of *accounts* rather than of events: a deleted
     # account's audit row cannot inflate it. ``audit_days`` (365 by default) prunes audit rows,
     # which is why this asks a seven-day question of a one-year log.
+    #
+    # Two figures from the one scan, because the second is a *sub-question* of the first: how
+    # many of this week's accounts have never clocked in is the onboarding follow-up the plan
+    # asks for ("they never signed in" / "their face was never enrolled"), and counting it here
+    # rather than in a statement of its own is what makes ``onboarding <= new_this_week`` true by
+    # construction instead of by careful upkeep.
     since = (now - timedelta(days=NEW_ACCOUNT_DAYS)).strftime(_TS)
-    new_this_week = conn.execute(
-        "SELECT COUNT(*) FROM users u WHERE u.id IN ("
+    joined = conn.execute(
+        "SELECT COUNT(*) AS new_this_week, "
+        "SUM(CASE WHEN u.id NOT IN (SELECT DISTINCT worker_id FROM attendance_logs "
+        "WHERE worker_id IS NOT NULL) THEN 1 ELSE 0 END) AS onboarding "
+        "FROM users u WHERE u.id IN ("
         "SELECT entity_id FROM audit_log WHERE entity = 'users' AND entity_id IS NOT NULL "
         f"AND action IN ({_CREATION_SQL}) AND created_at >= ? "
         ")" + hide_sql,
         (*ACCOUNT_CREATION_ACTIONS, since, *hide_params),
+    ).fetchone()
+
+    # Dormant: an account that may record attendance, has worked here, and has not been seen for
+    # ``DORMANT_DAYS``. The first half of the predicate is what keeps it disjoint from
+    # ``never_clocked_in`` - an account with no punch at all is not dormant, it is a hire who
+    # never started, and a figure that counted both would report a roster of dormant staff on a
+    # deployment that has simply not opened yet. The window is on
+    # ``attendance_logs.timestamp``: see the UTC note in the module docstring for the boundary
+    # this moves with.
+    dormant_since = (now - timedelta(days=DORMANT_DAYS)).strftime(_TS)
+    dormant = conn.execute(
+        "SELECT COUNT(*) FROM users u WHERE "
+        + _ACTIVE_SQL.replace("status", "u.status")
+        + " AND u.id IN (SELECT DISTINCT worker_id FROM attendance_logs "
+        "WHERE worker_id IS NOT NULL)"
+        " AND u.id NOT IN (SELECT DISTINCT worker_id FROM attendance_logs "
+        "WHERE worker_id IS NOT NULL AND timestamp >= ?)"
+        + hide_sql,
+        (dormant_since, *hide_params),
     ).fetchone()[0]
 
     return {
@@ -338,8 +391,18 @@ def _people(conn: sqlite3.Connection, current: CurrentUser, now: datetime) -> di
         # ``accounts`` and a reader never has to work out what the remainder was.
         "no_face": accounts - enrolled,
         "no_password": int(row["no_password"] or 0),
-        "new_this_week": int(new_this_week or 0),
+        "new_this_week": int(joined["new_this_week"] or 0),
         "never_clocked_in": int(never or 0),
+        "onboarding": int(joined["onboarding"] or 0),
+        "dormant": int(dormant or 0),
+        # The two windows the figures above were counted over, sent *with* the figures for the
+        # reason the period panel's window travels with its own: "dormant: 4" is not a fact
+        # until the reader knows what "dormant" meant, and a label that says thirty days while
+        # the query counted forty-five is a number nobody can check. They are not counts and are
+        # named apart from them - but a window that is not on the wire is a window the console
+        # would have to keep its own copy of, which is how the two start disagreeing.
+        "dormant_days": DORMANT_DAYS,
+        "onboarding_days": NEW_ACCOUNT_DAYS,
     }
 
 

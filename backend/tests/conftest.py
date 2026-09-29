@@ -137,11 +137,13 @@ def site(app_module, client):
 
 @pytest.fixture
 def link_paths(client):
-    """The two token paths a worker is actually sent, minted by the real endpoints.
+    """The three token paths a person is actually sent, minted by the real endpoints.
 
     The browser needs a URL that exists, and the point of these pages is that the token is
-    *in* the path - so this issues one of each through the admin API rather than writing a
-    row, so what the browser opens is what the console would have sent.
+    *in* the path - so this asks for one of each through the API rather than writing a row,
+    so what the browser opens is what the console would have sent. The registration link is
+    the one of the three that is *read* rather than issued: it belongs to the deployment
+    rather than to a worker, which is exactly why its page is on this list.
 
     Per test, not per session: the suite restores a pristine database before every test and
     a live link is a credential, so a token minted once would be a hash that no longer
@@ -157,4 +159,15 @@ def link_paths(client):
         json={"worker_id": harness.WORKER, "kind": "enroll"},
     )
     assert invite.status_code == 200, invite.text
-    return {"quick": f"/q/{quick.json()['token']}", "enroll": f"/enroll/{invite.json()['token']}"}
+    register = client.get(
+        "/api/v1/admin/registrations/link", headers=harness.bearer(harness.HEAD_ADMIN)
+    )
+    assert register.status_code == 200, register.text
+    # The URL the console would copy, reduced to the path the browser opens: the token is the
+    # last segment of it, and building the path from the response is what makes this the same
+    # address an applicant would be sent rather than one this fixture assembled.
+    return {
+        "quick": f"/q/{quick.json()['token']}",
+        "enroll": f"/enroll/{invite.json()['token']}",
+        "register": "/register/" + register.json()["url"].rsplit("/register/", 1)[1],
+    }

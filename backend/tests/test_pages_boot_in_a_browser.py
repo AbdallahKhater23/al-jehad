@@ -50,6 +50,8 @@ def token_path(page, link_paths: dict[str, str]) -> str:
         return page.path.format(quick=link_paths["quick"].rsplit("/", 1)[-1])
     if "{enroll}" in page.path:
         return page.path.format(enroll=link_paths["enroll"].rsplit("/", 1)[-1])
+    if "{register}" in page.path:
+        return page.path.format(register=link_paths["register"].rsplit("/", 1)[-1])
     return page.path
 
 

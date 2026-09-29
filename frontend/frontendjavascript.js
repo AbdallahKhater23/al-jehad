@@ -150,6 +150,12 @@ const State = {
     // Held here so switching tabs (or language, which re-renders) does not silently
     // drop the search an admin is in the middle of reading the roster through.
     credentialsQuery: '',
+    // Which role the roster is narrowed to, or ``'all'``. Held for the same reason as the
+    // search: opening an account and coming back must not widen the list again.
+    credentialsRole: 'all',
+    // How many roster rows are on screen. A page rather than a filter - the roster is read
+    // ten at a time, and this is the number "Show more" moves.
+    credentialsLimit: 0,
     // Same reason for the notes inbox: an admin working through "what is waiting"
     // should not lose the filter every time they open a note and come back.
     notesQuery: '',
@@ -410,6 +416,129 @@ const API = {
     },
 
     /**
+     * Read a response that keeps arriving, and hand each event to a callback.
+     *
+     * ``request`` above is one round trip and one JSON body. This is the other shape: a
+     * response that stays open and is read as it comes, which is why it cannot be the same
+     * method - and why the two share the headers below rather than being wrapped in something
+     * "generic" that would send an ``Accept: application/json`` to a stream.
+     *
+     * NOT ``EventSource``, AND THAT IS THE WHOLE REASON THIS EXISTS. ``EventSource`` is the
+     * browser's own server-sent-event client and it cannot carry an ``Authorization`` header -
+     * there is no option for one. The two ways round that are both a downgrade of the security
+     * this app already has: a session token in the query string is a live credential written
+     * into every access log between the browser and the server, and a cookie just for the
+     * stream is a second way to authenticate the same session, with a second set of rules
+     * about when it expires. An authenticated ``fetch`` whose body happens to be read in
+     * pieces has neither problem, so that is what this is.
+     *
+     * Resolves when the server ends the response, which is an ordinary end - the server closes
+     * these on purpose (see ``live_ops._STREAM_LIFETIME_SECONDS``) and the caller reconnects.
+     * Rejects the way ``request`` does when the failure is not the end of a stream.
+     */
+    async stream(endpoint, { onEvent, signal } = {}) {
+        const headers = { Accept: 'text/event-stream' };
+        const token = State.token;
+        if (token) headers['Authorization'] = `Bearer ${token}`;
+        if (this.isTunnelHost()) headers['ngrok-skip-browser-warning'] = 'true';
+
+        const response = await fetch(`${this.baseURL}${endpoint}`, {
+            headers,
+            signal,
+            // A stream is not a file: no intermediary may hand back a stored one, and the
+            // browser must not either - reopening a closed board would otherwise replay it.
+            cache: 'no-store'
+        });
+        if (!response.ok) {
+            // The same three answers ``request`` gives, and for the same reasons - including
+            // the 401 that signs the console out rather than reporting a refused stream, since
+            // a dead session is not a stream problem.
+            const err = await response.json().catch(() => null);
+            if (response.status === 401) {
+                if (State.user) {
+                    State.clearUser();
+                    if (typeof UI !== 'undefined') UI.renderApp();
+                }
+                throw new Error(I18n.__('sessionExpiredSignInAgain'));
+            }
+            const failure = new Error(this.describeError(err, response));
+            failure.status = response.status;
+            const detail = err && err.detail;
+            if (detail && typeof detail === 'object' && !Array.isArray(detail)) {
+                failure.errorCode = detail.error_code || null;
+                failure.detail = detail;
+            }
+            throw failure;
+        }
+        // A response without a readable body is one this environment cannot stream - an older
+        // browser, or a proxy that handed the whole thing back at once. Refused as such rather
+        // than silently returning nothing: whoever called this has a poll to fall back to, and
+        // it cannot make that decision if a stream that never delivers looks like one that did.
+        if (!response.body || typeof response.body.getReader !== 'function') {
+            throw new Error(I18n.__('liveOpsStreamUnavailable'));
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        try {
+            for (;;) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                // ``\r\n`` is normalised because the event separator is a blank line and a
+                // carriage return is invisible in it: whichever ending the hops between here and
+                // the server settled on, the blocks below are divided the same way. A ``\r``
+                // split across two chunks is left in the buffer until the next one arrives.
+                buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+                let split = buffer.indexOf('\n\n');
+                while (split >= 0) {
+                    const block = buffer.slice(0, split);
+                    buffer = buffer.slice(split + 2);
+                    const event = this.parseEvent(block);
+                    if (event && onEvent) onEvent(event);
+                    split = buffer.indexOf('\n\n');
+                }
+            }
+        } finally {
+            // Cancelled rather than left dangling: a reader nobody reads keeps the socket's
+            // buffer alive, and the caller has usually aborted for the reason this runs.
+            try { reader.cancel(); } catch (err) { /* already closed */ }
+        }
+    },
+
+    /**
+     * One server-sent-event block, as ``{event, data}`` - or ``null`` for a comment.
+     *
+     * The format is five lines of specification and this is all of it that matters: ``field:
+     * value`` per line, a leading colon for a comment (that is the keep-alive - a stream with
+     * nothing to say still has to say something, or the hop in the middle reaps it), ``data``
+     * lines joined with newlines when there is more than one, and ``event`` naming the type.
+     * An unknown field is ignored rather than refused, which is what the format asks for and
+     * what lets the server add a ``retry:`` hint without this needing to know about it.
+     */
+    parseEvent(block) {
+        let name = 'message';
+        const data = [];
+        for (const line of String(block || '').split('\n')) {
+            if (!line || line.charAt(0) === ':') continue;
+            const colon = line.indexOf(':');
+            const field = colon < 0 ? line : line.slice(0, colon);
+            const value = colon < 0 ? '' : line.slice(colon + 1).replace(/^ /, '');
+            if (field === 'event') name = value;
+            else if (field === 'data') data.push(value);
+        }
+        if (name === 'message' && data.length === 0) return null;   // the keep-alive
+        const text = data.join('\n');
+        try {
+            return { event: name, data: JSON.parse(text) };
+        } catch (err) {
+            // A block this page cannot read is not a reason to tear the screen down: the
+            // events that matter are JSON and a malformed one is dropped like an unknown one.
+            return null;
+        }
+    },
+
+    /**
      * Save text the page built itself - a CSV assembled from the rows on screen.
      *
      * There is no request here on purpose. A download that has to be re-derived on the
@@ -420,6 +549,24 @@ const API = {
     saveFile(filename, text, mime = 'text/csv;charset=utf-8;') {
         const link = document.createElement('a');
         link.href = URL.createObjectURL(new Blob([text], { type: mime }));
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+    },
+
+    /**
+     * Save bytes the *server* produced rather than ones this page assembled.
+     *
+     * ``saveFile`` above is the other half, and it takes text because nearly every file this
+     * app writes is a CSV it built from the rows on screen - which is what makes a download
+     * unable to disagree with the table it came from. An .xlsx is not text: it is a ZIP of
+     * XML, and no round trip through a JavaScript string survives it. So the one download the
+     * server composes itself goes to the anchor as the bytes that arrived.
+     */
+    saveBlob(filename, blob) {
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
         link.download = filename;
         document.body.appendChild(link);
         link.click();

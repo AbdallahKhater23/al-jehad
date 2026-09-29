@@ -69,6 +69,7 @@ from pydantic import BaseModel, field_validator
 
 import face_detector
 import face_engine
+import live_ops
 import liveness
 import notifications
 import overtime
@@ -953,6 +954,7 @@ async def submit_quick_punch(
             break_taken = record["break_hours"]
             hours_note = record["description"]
             conn.execute("DELETE FROM active_sessions WHERE worker_id = ?", (worker["id"],))
+            live_ops.board_changed()
 
             log_status = main.STATUS_APPROVED
             status_code = "approved"
@@ -1038,6 +1040,7 @@ async def submit_quick_punch(
                 "late_flag, liveness_class) VALUES (?, ?, ?, ?, ?, ?)",
                 (worker["id"], detected_site, now_str, "quick_link", late_flag, liveness_class),
             )
+            live_ops.board_changed()
             if late_flag:
                 flag_reason = " | ".join(part for part in (flag_reason, late_flag) if part)
                 notifications.notify(

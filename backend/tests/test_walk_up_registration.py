@@ -1,4 +1,4 @@
-"""Walk-up registration: one permanent public link, and an account held for approval.
+"""Walk-up registration: one issued link, and an account held for approval.
 
 WHY THIS EXISTS
 ---------------
@@ -6,7 +6,9 @@ The registration link that already ships is *per person*, for an account an admi
 already created: whoever opens it registers their face against that account. That is the right
 shape for one named hire and the wrong one for a walk-up, where nobody has applied yet. This
 suite is about the second shape, and every assertion in it is a way that shape could be wrong
-and silent:
+and silent. The form itself is one address the company hands out, and that address is the
+*link*: the whole surface below is reached through it and refused without it, so "who can open
+this form" is a question the console answers rather than the internet.
 
 1. **The account exists the moment the form is sent**, and it is quarantined. The applicant is
    told their id on the spot, signs in with it immediately, and cannot record a single punch
@@ -57,8 +59,17 @@ from harness import (
 )
 
 STRONG_PASSWORD = "site-attendance-2026"
-PUBLIC = "/api/v1/register"
+#: The link's own address, token and all. Generation 0 is the generation every deployment that
+#: has never replaced its link carries, which is every database this suite runs against - so the
+#: token can be computed here instead of fetched, and everything below goes through the same
+#: address an applicant would have been sent. ``test_the_link_can_be_replaced`` rotates it and
+#: builds the new one from the answer, which is the only test here that cannot use this constant.
+PUBLIC = f"/api/v1/register/{registrations.link_token(0)}"
+#: The bare path, with no token: what a link pasted without its last segment, or an address typed
+#: from memory, actually asks for.
+PUBLIC_BARE = "/api/v1/register"
 REVIEW = "/api/v1/admin/registrations"
+LINK = "/api/v1/admin/registrations/link"
 LOGIN = "/api/v1/auth/login"
 
 
@@ -311,7 +322,7 @@ def test_a_closed_intake_refuses_the_submission_as_well_as_the_page(client):
 
 
 # ---------------------------------------------------------------------------
-# 1b. the intake switch: the deployment's ceiling, and the console's own
+# 1b. the intake switch: the console's, starting where the deployment left it
 # ---------------------------------------------------------------------------
 INTAKE = f"{REVIEW}/intake"
 
@@ -329,14 +340,16 @@ def set_intake(client, want_open: bool, *, as_user: str = ADMIN):
 def test_an_untouched_switch_follows_the_deployment_flag(client, monkeypatch):
     """The state before anybody opens the console, which is the state every database starts in.
 
-    A ``NULL`` row is *no decision*, not "closed": the deployment's own switch is the answer, so
-    a deployment that never touches this screen behaves exactly as it did before the table
-    existed - which is the only reason adding a second switch is safe.
+    A ``NULL`` row is *no decision*, not "closed": the deployment's own flag is the position the
+    switch starts at, so a deployment that never touches this screen behaves exactly as it did
+    before the table existed - which is the only reason adding a switch is safe. The two closed
+    codes are different sentences about the same state: nothing has opened it yet, versus
+    somebody closed it.
     """
     monkeypatch.setattr(settings, "registration_enabled", False)
     closed = intake_state(client)
     assert closed["accepting"] is False
-    assert closed["reason"] == "closed_by_deployment"
+    assert closed["reason"] == "closed_by_default"
     assert closed["deployment_enabled"] is False
     assert closed["decided"] is False, "nothing has been decided on a fresh database"
     assert client.get(PUBLIC).json()["enabled"] is False
@@ -345,7 +358,6 @@ def test_an_untouched_switch_follows_the_deployment_flag(client, monkeypatch):
     opened = intake_state(client)
     assert opened["accepting"] is True
     assert opened["reason"] == "open"
-    assert opened["console_open"] is True, "an untouched switch is not a closed one"
     assert opened["decided"] is False
     assert client.get(PUBLIC).json()["enabled"] is True
 
@@ -394,26 +406,37 @@ def test_an_administrator_closes_and_reopens_the_permanent_link(client, intake):
     assert json.loads(rows[1][0])["intake_open"] == 1
 
 
-def test_the_console_switch_cannot_open_a_deployment_that_does_not_run_one(client):
-    """The deployment flag is a ceiling, and the console says so rather than pretending.
+def test_the_console_opens_a_deployment_that_ships_closed(client):
+    """The switch the applicant's own sentence points at, and it works on a fresh deployment.
 
-    This is the security half of the feature: a public endpoint that collects a face must not be
-    switchable on by whoever holds an administrator session on a site that deliberately does not
-    run one. The write is still *stored* - the operator's intent is recorded and takes effect if
-    the deployment is ever started with intake enabled - but it never opens the form.
+    The public form's refusal tells the person holding the phone to ask their site administrator
+    to open it, so an administrator has to be able to - including on the deployment that has
+    never run walk-up registration before, which is exactly the one that ships with the flag off
+    and the one whose first applicant sees that sentence. ``REGISTRATION_ENABLED`` is where the
+    switch *starts*, not a ceiling over it: ``test_an_untouched_switch_follows_the_deployment_flag``
+    above is the half that keeps a deployment from discovering it is running a public
+    face-collecting form, and this is the half that makes the console's lever real.
     """
-    assert settings.registration_enabled is False
+    assert settings.registration_enabled is False, "this is the shipped-off deployment"
 
     answer = set_intake(client, True)
     assert answer.status_code == 200, answer.text[:300]
     body = answer.json()
-    assert body["accepting"] is False, "a console click opened a public biometric endpoint"
-    assert body["reason"] == "closed_by_deployment"
-    assert body["deployment_enabled"] is False
-    assert body["console_open"] is True, "the decision is stored even though it cannot act"
-    assert client.get(PUBLIC).json()["enabled"] is False
-    assert submit(client).status_code == 403
+    assert body["accepting"] is True, "the console clicked open and the form stayed shut"
+    assert body["reason"] == "open"
+    assert body["deployment_enabled"] is False, "the flag is still reported as the default"
+    assert body["updated_by"] == ADMIN
+    assert client.get(PUBLIC).json()["enabled"] is True
     assert db_scalar("SELECT intake_open FROM registration_settings WHERE id = 1") == 1
+    accepted = submit(client, name="Walk Up")
+    assert accepted.status_code == 200, accepted.text[:300]
+    assert db_scalar("SELECT COUNT(*) FROM users WHERE name = 'Walk Up'") == 1
+
+    # ...and the same lever closes it again, with the flag off underneath it.
+    shut = set_intake(client, False)
+    assert shut.json()["accepting"] is False
+    assert shut.json()["reason"] == "closed_by_console"
+    assert submit(client).status_code == 403
 
 
 def test_the_intake_switch_is_administrators_only(client, intake):
@@ -995,3 +1018,137 @@ def test_an_abandoned_intake_photo_is_swept_and_a_fresh_one_is_not(app_module):
     assert registrations.sweep_orphan_photos() == 1
     assert not os.path.exists(abandoned), "the leftover was not removed"
     assert os.path.exists(fresh), "the sweep removed an upload younger than the stale window"
+
+
+# ---------------------------------------------------------------------------
+# 7. the link is the door
+# ---------------------------------------------------------------------------
+def test_a_request_without_the_link_is_refused(client, intake):
+    """No token is not "closed": it is an address that was never issued to anybody.
+
+    The distinction is the feature. A closed form is a form, and the applicant is owed a
+    sentence about it; a URL with no link behind it is a stranger who should not be looking at
+    this surface at all, and it is refused before the policy is answered rather than after.
+    """
+    reading = client.get(PUBLIC_BARE)
+    assert reading.status_code == 404
+    assert reading.json()["detail"]["error_code"] == "registration_link_invalid"
+
+    writing = client.post(
+        PUBLIC_BARE,
+        data={"full_name": "Nobody", "password": STRONG_PASSWORD, "role": "worker", "consent": "true"},
+        files={"photo": ("photo.jpg", photo(900), "image/jpeg")},
+    )
+    assert writing.status_code == 404
+    assert writing.json()["detail"]["error_code"] == "registration_link_invalid"
+    assert harness.db_rows("SELECT id FROM users WHERE name = ?", ("Nobody",)) == [], (
+        "a refused request with no link created something"
+    )
+
+
+def test_a_token_for_a_generation_that_was_never_current_is_refused(client, intake):
+    """The signature is over the generation, so a fabricated token cannot be replayed.
+
+    ``generation + 1`` is the next link rather than an arbitrary string, and it is the sharpest
+    case: it is a *real* token shape for a link this deployment will mint the moment somebody
+    replaces the current one, and it is refused until then.
+    """
+    future = f"/api/v1/register/{registrations.link_token(registrations.link_generation() + 1)}"
+    assert client.get(future).status_code == 404
+    assert client.get(PUBLIC).status_code == 200, (
+        "refusing the next link must not have disturbed the current one"
+    )
+
+
+def test_the_link_is_readable_by_an_administrator_and_by_nobody_else(client, intake):
+    """Handing out the company's own application form is an operator's decision.
+
+    The read is the dangerous half of the pair - a link copied out of this response is how a
+    stranger gets a form - so the audience is ``admin_only``, the same audience the switch beside
+    it has, and a non-administrator is refused rather than shown a URL.
+    """
+    allowed = client.get(LINK, headers=bearer(ADMIN))
+    assert allowed.status_code == 200, allowed.text[:300]
+    body = allowed.json()
+    assert body["url"].startswith("http")
+    assert body["url"].endswith(registrations.link_token())
+    assert body["accepting"] is True, "the switch is open in this fixture"
+    assert body["reason"] == "open"
+
+    for who in (WORKER, MOALLEM, OFF_OFFICE):
+        headers = bearer(who)
+        assert_denied(
+            client.get(LINK, headers=headers),
+            endpoint=LINK,
+            detail=f"{who} read the registration link",
+        )
+        assert_denied(
+            client.post(LINK, headers=headers),
+            endpoint=LINK,
+            detail=f"{who} replaced the registration link",
+        )
+    assert_denied(
+        client.get(LINK), endpoint=LINK, detail="an anonymous caller read the link"
+    )
+
+
+def test_replacing_the_link_kills_every_copy_of_the_old_one_and_keeps_the_queue(
+    client, intake
+):
+    """One action, and the two things it must not do are the two that matter.
+
+    The link has no per-person identity to revoke against, so the revocation is the link: the
+    old address stops answering, the new one answers, and nothing already submitted is touched -
+    the applicants under the old link have accounts, photographs and a place in the queue, and
+    replacing a URL must not be a way to lose them.
+    """
+    waiting = submit(client, name="Before Replace", image=photo(401)).json()["user_id"]
+
+    replaced = client.post(LINK, headers=bearer(ADMIN))
+    assert replaced.status_code == 200, replaced.text[:300]
+    fresh = replaced.json()
+    assert fresh["generation"] == registrations.link_generation()
+    new_path = "/api/v1/register/" + fresh["url"].rsplit("/register/", 1)[1]
+    assert new_path != PUBLIC
+
+    assert client.get(PUBLIC).status_code == 404, "the link that was already sent still works"
+    assert client.get(new_path).status_code == 200, "the replacement does not work"
+
+    still_waiting = [row["id"] for row in client.get(REVIEW, headers=bearer(ADMIN)).json()["requests"]]
+    assert waiting in still_waiting, (
+        "replacing the link threw away the applications already waiting"
+    )
+    assert db_scalar("SELECT name FROM users WHERE id = ?", (waiting,)) == "Before Replace"
+
+
+def test_a_lost_race_for_the_number_is_retried_not_handed_to_the_applicant(
+    client, intake, monkeypatch
+):
+    """Ten phones on one link do not take turns, so the insert can be the loser.
+
+    ``BEGIN IMMEDIATE`` serializes the submissions that go through it, so the scan-then-insert
+    is safe in the common case and needs no retry at all. What this pins is the uncommon one: a
+    number taken between the scan and the insert. The wrong answer there is ``409`` telling
+    somebody who has sent the form once to send it again - the applicant has one photograph and
+    one password already in hand, and the lost race was the server's to absorb (see
+    ``ALLOCATION_ATTEMPTS``).
+    """
+    real = registrations._next_workforce_id
+    asked: list[int] = []
+
+    def racing(conn):
+        asked.append(1)
+        # The seeded worker's number: the roster already carries it, so the first insert is the
+        # one that loses, exactly as it would if another writer had just committed it.
+        return WORKER if len(asked) == 1 else real(conn)
+
+    # Read before the submission: the account about to be created is what takes this number, so
+    # asking afterwards would be asking for the one *after* it.
+    expected = lowest_free_id()
+    monkeypatch.setattr(registrations, "_next_workforce_id", racing)
+    answer = submit(client, name="Racer", image=photo(402))
+    assert answer.status_code == 200, answer.text[:300]
+    assert len(asked) >= 2, "a lost race was not retried"
+    assert answer.json()["user_id"] == str(expected), (
+        "the retry did not hand out the lowest free number"
+    )

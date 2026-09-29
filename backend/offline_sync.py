@@ -113,6 +113,7 @@ from pydantic import BaseModel, Field, field_validator
 import biometrics
 import face_detector
 import face_engine
+import live_ops
 import liveness
 import migrations
 import notifications
@@ -820,6 +821,9 @@ def materialize_worker(conn: sqlite3.Connection, worker_id: str) -> dict:
                 "VALUES (?, ?, ?, 'offline', ?, ?)",
                 (worker_id, site, row["effective_time"], row["flag_reason"], LIVENESS_OFFLINE),
             )
+            # A queued arrival syncing late is still an arrival: the board's list is of open
+            # shifts, and this one has been open on a phone since the dead spot.
+            live_ops.board_changed()
             # The arrival is not approved either - but it is not put in the review queue, and
             # that is a deliberate difference. It carries no hours, so there is no money for a
             # reviewer to decide; and a ``pending_review`` row blocks this worker's next
@@ -887,6 +891,7 @@ def materialize_worker(conn: sqlite3.Connection, worker_id: str) -> dict:
                     "mark; hours recorded as punched, verify before approving",
                 )
             conn.execute("DELETE FROM active_sessions WHERE worker_id = ?", (worker_id,))
+            live_ops.board_changed()
 
             #: Named in full rather than ``overtime``: the module of that name announces the
             #: crossing below, and a local shadowing it breaks the call that matters.

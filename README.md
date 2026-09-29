@@ -523,13 +523,13 @@ Key settings (all optional except `SECRET_KEY`, full list in `backend/config.py`
 | `WORKER_PHOTOS_DIR` | `worker_photos` | reference selfies, one per enrolled account |
 | `PUNCH_FRAMES_DIR` | `punch_frames` | the downscaled evidence frame stored with a punch |
 | `QUICK_LINK_PHOTOS_DIR` | `quick_link_photos` | the selfie a quick-link punch arrives with |
-| `REGISTRATION_ENABLED` | `0` | the walk-up onboarding link (`GET`/`POST /api/v1/register`), and the *ceiling* over the console's own intake switch: while off the link answers as closed and every submission is refused, whatever an administrator sets on `POST /api/v1/admin/registrations/intake` |
-| `REGISTRATION_PHOTOS_DIR` | `registration_photos` | the selfie a walk-up applicant sends - a *staging* area, not a store: the file is read once for the face and deleted in the same request, and the two residues (a request that died, a reference that could not be written) are swept by age |
+| `REGISTRATION_ENABLED` | `0` | the registration link (`GET`/`POST /api/v1/register/<token>`), and the *default position* of the console's own intake switch: an installation nobody has touched follows it (off means the link starts closed), and an administrator or a head administrator opens and closes the link from the console either way (`POST /api/v1/admin/registrations/intake`) |
+| `REGISTRATION_PHOTOS_DIR` | `registration_photos` | the selfie an applicant sends - a *staging* area, not a store: the file is read once for the face and deleted in the same request, and the two residues (a request that died, a reference that could not be written) are swept by age |
 | `REGISTRATION_PENDING_CAP` | `200` | how many accounts may be waiting for approval at once; the next submission is refused rather than letting the quarantine grow without bound |
-| `REGISTRATION_RATE_LIMIT` | `20/minute` | per-IP ceiling on submissions to the public link |
+| `REGISTRATION_RATE_LIMIT` | `20/minute` | per-IP ceiling on submissions to the registration link |
 | `REGISTRATION_PHOTO_STALE_HOURS` | `168` | how long a leftover intake photograph is kept before the startup sweep deletes it; age is the only test there is, because nothing in the database points into that directory |
 | `MIN_PASSWORD_LENGTH` | `8` | shortest password the server will set, in the console and on a registration link |
-| `ENROLLMENT_TOKEN_TTL_HOURS` | `72` | how long an enrollment or registration link stays usable |
+| `ENROLLMENT_TOKEN_TTL_HOURS` | `72` | how long an *enrollment* link stays usable. The registration link does not expire: it belongs to the deployment rather than to one worker, and an address that dies while somebody is holding it is worse than one an administrator can replace (see *The registration link*) |
 | `OVERTIME_WATCHER_INTERVAL_SECONDS` | `60` | how often that timer runs |
 | `FACE_INFERENCE_CONCURRENCY` | `2` | how many face verifications may run at once - see below before raising it |
 | `FACE_INFERENCE_QUEUE` | `64` | how many may wait for a slot before the server answers `503` + `Retry-After` |
@@ -1095,63 +1095,72 @@ their own phone, captures their face at `/enroll/<token>`, and the template is w
 The token is single-use, expires (72 h default), and only its SHA-256 is stored, so a
 database dump cannot be replayed.
 
-**Registration links (self-service, for a person who does not exist yet).** The same
-endpoint with `"kind":"register"` reserves a *new* account and lets its owner finish it:
+**Registration links are the site's, not a worker's, and they live in the Credentials tab.**
+The retired `"kind":"register"` invite - a per-person link that minted the account it was
+named after - no longer exists: `POST /api/v1/admin/enrollment/invites` accepts `enroll` only,
+and answers `400` to anything else. What replaced it is below.
 
-```bash
-curl -X POST localhost:8000/api/v1/admin/enrollment/invites \
-  -H "Authorization: Bearer <admin token>" -H 'Content-Type: application/json' \
-  -d '{"worker_id":"77","kind":"register","name":"Ali Hassan","role":"worker"}'
-```
+**The registration link (one issued address, and a real account the moment it is sent).** An
+enrollment invite is issued per worker; the *registration* link is the opposite - one address
+for the whole company, sent to whoever should apply, where the **server picks the number**. It
+is not a public form: the link *is* the address, and a request without the token in its path is
+refused before the form's own policy is answered.
 
-They open the link at `/enroll/<token>`, choose their own password and take their own
-photo; `POST /api/v1/enroll/<token>/register` creates the account, writes the face
-template and consumes the link, in that order - every step that can fail happens before
-anything is written, so a rejected password or an unreadable photo costs a retry rather
-than the link. The **id and the role are the administrator's**: a link can create a
-`worker`, a `moallem` or an off-office worker (never an administrator), it is single-use whatever `max_uses`
-says, and it refuses an id that is already taken or already **reserved by another live link**.
-The reservation is real rather than cosmetic: the number lives on the invite row until the link
-is claimed, and the walk-up allocator below treats it as taken, so the two creation flows can
-never hand the same id to two people. Revoking, expiring or claiming the invite releases it. The Credentials tab has this behind one
-button, with the URL, a copy button, a WhatsApp message and the QR code.
+The Credentials tab has it behind one button (see *Starting an account*). The link is a function
+of the deployment's own `SECRET_KEY` over one integer -
+`<generation>.<HMAC(SECRET_KEY, "registration-link|v1|<generation>")>` - so nothing secret is at
+rest, the console can show the same URL as often as it likes, and **Replace link** bumps the
+generation and invalidates every copy already sent, by arithmetic rather than by a row somebody
+has to remember to revoke. Nothing already submitted is affected: the applications in the queue
+keep their accounts, their photographs and their places.
 
-**Walk-up registration (one standing link, and a real account the moment it is sent).** An
-invite is issued per person; a *walk-up* link is the opposite - a single public URL a site can
-print or display, where anybody applies. `GET /api/v1/register` reports whether it is open and
-what the form must satisfy. `POST /api/v1/register` **creates the account there and then**: a
-real row in `users`, with a real id, the applicant's own password, their work details as
-`registration_note`, and `status = 'pending_approval'`. There is no second, half-made kind of
-person for the rest of the system to know about, and the number they were hired under is theirs
-from the first second - so the form can tell them what it is and sign them in with it. What the
-account may *not* do is punch (see the quarantine below). The id is the **lowest free number in
-the workforce band** (1..999; the administrative tiers start at `ADMIN_TIER_ID_FLOOR`, 1000), the
-role is one of `worker`, `moallem`, `off_office` and never an administrator, and the queue the
-administrator reviews is that same table read the other way round. `GET
-/api/v1/admin/registrations` lists the accounts waiting (and takes
-`?status=pending_approval|active|inactive`), the photo is at `.../{id}/photo`, and *then* somebody
-approves or rejects:
+`GET /api/v1/register/<token>` reports whether it is open and what the form must satisfy.
+`POST /api/v1/register/<token>` **creates the account there and then**: a real row in `users`,
+with a real id, the applicant's own password, their work details as `registration_note`, and
+`status = 'pending_approval'`. There is no second, half-made kind of person for the rest of the
+system to know about, and the number they were hired under is theirs from the first second - so
+the form can tell them what it is and sign them in with it. What the account may *not* do is
+punch (see the quarantine below). The id is the **lowest free number in the workforce band**
+(1..999; the administrative tiers start at `ADMIN_TIER_ID_FLOOR`, 1000), the role is one of
+`worker`, `moallem`, `off_office` and never an administrator, and the queue the administrator
+reviews is that same table read the other way round. `GET /api/v1/admin/registrations` lists the
+accounts waiting (and takes `?status=pending_approval|active|inactive`), the photo is at
+`.../{id}/photo`, and *then* somebody approves or rejects:
 
 ```
-GET  /api/v1/register                      -> whether it is open, the roles, the photo policy
-POST /api/v1/register                      multipart: photo + name, phone, role, password,... -> the account
+GET  /api/v1/register/<token>              -> whether it is open, the roles, the photo policy
+POST /api/v1/register/<token>              multipart: photo + name, phone, role, password,... -> the account
+GET  /api/v1/admin/registrations/link      the URL to send, its QR, and whether the switch is open
+POST /api/v1/admin/registrations/link      -> replaces the link; every copy already sent stops working
 GET  /api/v1/admin/registrations           the accounts awaiting approval, oldest id first, no password
-GET  /api/v1/admin/registrations/intake    is the link accepting, and which switch decided it
+GET  /api/v1/admin/registrations/intake    is the link accepting, and why not if it is not
 POST /api/v1/admin/registrations/intake    {"open": true|false} -> opens or closes the link
 GET  /api/v1/admin/registrations/{id}/photo     the applicant's photo, while the account is pending
 POST /api/v1/admin/registrations/{id}/approve   {"note": "..."} -> the status becomes active
 POST /api/v1/admin/registrations/{id}/reject    {"note": "..."} -> the account goes, its face with it
 ```
 
-There are **two intake switches**, because they answer two different questions.
-`REGISTRATION_ENABLED` is the *deployment's* - may this installation collect walk-up
-applications at all - and it is a ceiling that no API call can move. The row behind
-`/admin/registrations/intake` is the *operator's*: is the standing link accepting today, a
-shift-to-shift decision the Registrations tab turns into one button, with no restart. The
-effective state is `REGISTRATION_ENABLED and (the row is not 0)`, an untouched row follows the
-deployment flag, and both the form and the queue read report the effective state rather than the
-env var. The console names which of the two is holding the link shut, and draws no button at all
-when the deployment switch is the one doing it.
+**One link, ten phones.** The link is shared, so the band scan and the `INSERT` that consumes
+it are racing by design. They are serialized by `BEGIN IMMEDIATE`, so the ordinary case is ten
+distinct numbers and no retry; when the insert does lose the race - a number taken between the
+scan and the write - the submission **retries the allocation inside its own transaction** rather
+than answering `409` to somebody who has already sent their one photograph and chosen their one
+password. `ALLOCATION_ATTEMPTS` bounds it, and a band that loses every attempt answers `409`.
+
+There are **three questions**, because they are three things. Is the *link* valid (the token
+verifies against the console's current generation - otherwise `404 registration_link_invalid`)?
+Is the *form* accepting today (the switch behind `/admin/registrations/intake`, a shift-to-shift
+decision the console turns into one button and applies with no restart)? And is there *room* for
+another application (`REGISTRATION_PENDING_CAP`, below)? The switch is the console's, and
+`REGISTRATION_ENABLED` is the position it starts at: an untouched row follows the deployment flag
+exactly, so an installation nobody has touched behaves as it always did, and a deployment whose
+flag ships off is still a link an administrator can open from the console. That last part is
+deliberate, and it is the applicant's own sentence that argues for it - the closed page says
+"ask your site administrator to open it", so the site administrator has to be able to. The reason
+comes back as a code (`open` / `closed_by_console` / `closed_by_default`) rather than a sentence,
+because the sentence is the reader's language: the console translates it, and both places that
+draw the switch - the Registrations tab and the Credentials panel beside the URL - draw it with
+the lever that moves it.
 
 **The quarantine.** A pending account **can sign in**. `POST /api/v1/auth/login` answers its
 token, its id, its name, its role and `"approval_status": "pending_approval"`, so a new worker
@@ -1181,9 +1190,11 @@ an alert nobody can act on is how a queue screen comes to look broken. Both deci
 `audit_log` (`registration_approved`, `registration_rejected_purged`, and the submission itself
 as `user_self_registered`).
 
-The link is off unless `REGISTRATION_ENABLED=1` *and* the console's intake switch is open (see
-above), capped by `REGISTRATION_PENDING_CAP` - now a cap on pending *accounts* - and rate-limited
-per IP (`REGISTRATION_RATE_LIMIT`). The cap and the switch are read inside the insert's own
+The link is closed until the console's intake switch is opened (see above): it starts wherever
+`REGISTRATION_ENABLED` put it - off by default, so a deployment nobody has touched is a
+deployment that is not collecting applications - and an administrator or a head administrator
+moves it from the console either way. It is also capped by `REGISTRATION_PENDING_CAP` - now a cap
+on pending *accounts* - and rate-limited per IP (`REGISTRATION_RATE_LIMIT`). The cap and the switch are read inside the insert's own
 transaction: a count taken before the write is advice, and N concurrent submissions would each
 read `cap - 1`. The public route *does* do the model work - the submitted frame is embedded at
 intake, so that a face the gate cannot read is refused while the applicant is still standing
@@ -1212,12 +1223,11 @@ row never aborts the batch.
 The admin console does not ship a dedicated enrollment screen any more: the
 **Credentials** tab (see *Accounts and access* below) replaced the old enroll dashboard.
 It reports whether each account already has a face template, it can create an account
-with its photo in one step, and it can issue the link above. Enrolling - by invite link,
-by registration link, by bulk job, or by `POST /api/v1/admin/enroll` - is all still
-available.
+with its photo in one step, and it hands over the registration link above. Enrolling - by
+invite link, by bulk job, or by `POST /api/v1/admin/enroll` - is all still available.
 
 **One upload policy, everywhere.** The clock-in selfie, the console's enrollment photo,
-the photo a registration link carries, the self-service capture and every photo inside a
+the photo an applicant sends through the registration link, the self-service capture and every photo inside a
 bulk ZIP are all measured by `backend/uploads.py`:
 
 * **5 MB** (`UPLOAD_MAX_PHOTO_BYTES`), enforced *while reading* the body - a limit checked
@@ -1279,9 +1289,21 @@ one either, and a spoof it finds is recorded and notified without touching what 
 GET /api/v1/admin/dashboard?days=7    what this deployment is, counted
 ```
 
-One read, five panels. **People**: accounts by role and state, how many have a face on file, how
+One read, and a screen in two parts. The **vital strip** never moves: the five figures somebody needs
+before deciding whether to read anything - shifts awaiting a review, applications awaiting a decision,
+who is on site, days present in the current window, and the hours nobody has signed for yet. Every tile
+is the server's own field (nothing is added up in the browser), every tile is one button into the tab
+that owns that queue, and a figure whose own panel could not be read is drawn as an em dash and never as
+a zero, because on this strip a zero is good news. Under the strip, **one view at a time**, picked from
+a segmented control instead of by scrolling: five cards down a page is five screens of scrolling, and
+the figure that decides whether anybody is needed is the one that ends up below the fold. Switching
+makes no request - it redraws from the payload already on screen and leaves the `as_of` stamp where it
+was - so no view can disagree with the strip above it about which read it came from.
+
+The five views are the five panels that used to stack. **People**: accounts by role and state, how many
+have a face on file, how
 many have no password, how many joined this week, how many have never clocked in - and how many are
-*quarantined*, an account the public form created and nobody has approved yet, counted apart from
+*quarantined*, an account the registration link created and nobody has approved yet, counted apart from
 the deactivated ones because a queue of applications is not a roster that has been switched off.
 **Places**: sites, categories, which sites override the shared clock-in window, and the ones nobody
 has clocked into today. **Waiting**: shifts awaiting a review, applications awaiting a decision,
@@ -1308,12 +1330,12 @@ overtime rule written in SQL. `offline_waiting` is the materialiser's own predic
 punch with no `materialized_log_id` yet - not `processed_at IS NULL`, which is stamped on
 rejections too and so would report a signature this deployment already refused as work somebody
 still owes. `refused_24h` is a **rate to watch rather than a queue**: a refused punch has no triage
-state anybody can clear, and the panel says so under the figure.
+state anybody can clear, and the view says so under the figure.
 
-**The period** is the one panel about a window rather than a moment: `?days=` takes a number of days
+**The period** is the one view about a window rather than a moment: `?days=` takes a number of days
 (default seven, today included) or the word `month` for the calendar month so far, and the window
 travels back with the figures (`start`, `end`, `days`, `preset`) so the control can say which one is
-in effect and the two linkages can name the period they open. The whole panel is
+in effect and the two linkages can name the period they open. The whole view is
 `reports.attendance_period` - the counted twin of `/admin/reports/attendance`, run through the
 dashboard's own connection rather than a second one - so "days present", "days expected", "late
 arrivals", "average attendance rate" and the hours are the report's definitions and not a second
@@ -1325,6 +1347,63 @@ ordered, capped list (three, by lowest attendance rate and then most late arriva
 into that person's own rows over exactly that window, because a ranking tells a reader somebody is
 at the bottom and a link lets them find out why.
 
+Under those figures the window draws its own shape: one column per day, its bar the present days and
+its numeral the late arrivals, scaled against the busiest day *in the window* with that busiest day
+named in words - because "the whole week was short-staffed" and "Tuesday was short-staffed" are
+different problems with different fixes, and this is the one question a total cannot answer. `by_day`
+is counted in the same read as the figures, so the strip costs no request at all; a day nobody worked
+draws an empty column rather than a two-pixel stub; and nothing is carried by colour or by height
+alone - each column states its own date and both figures, a late arrival is printed as a numeral on the
+day it happened, and the column labels itself in full for a reader who cannot see a bar.
+
+**Two of the roster figures are watches rather than headcounts**, and they exist because the counts
+beside them describe a deployment without ever saying that anything about it has gone wrong.
+`dormant` is an active account that has worked here and has not punched in thirty days - long enough
+that a worker on a fortnight's leave is not named, short enough that somebody who stopped coming in is
+caught before a pay run notices. `onboarding` is an account created inside the last week that has never
+clocked in at all, which is the follow-on to the approval notice: "they never signed in", or "their face
+was never enrolled". Both are disjoint from `never_clocked_in` - an account with no punch at all is a
+hire who never started, not a dormant one - and both carry the window they were counted over
+(`people.dormant_days`, `people.onboarding_days`), because a label that says thirty days over a query
+that counted forty-five is a number nobody can check. `onboarding` is computed in the same scan as
+`new_this_week`, so it is a subset of it by construction rather than by upkeep.
+
+**Payroll readiness** is the question this application exists to answer, drawn on the period card: the
+approved hours, the hours still waiting on a signature, and - the figure that makes it actionable -
+`awaiting_approval_shifts`, how many *shifts* are holding those hours, counted in the same statement and
+from the same status tuple as the hours themselves. A reader can see that 12 hours are waiting but not
+that they are four decisions somebody has to make, and a `pending_overtime` row whose hold came to
+zero still counts, because somebody still has to sign it. The card says which of the two states the
+window is in, and when it is not ready it says what that costs - a pay run now would leave those hours
+out - and links into the queue that clears it; a ready window links nowhere, because a button into an
+empty queue is a control that only ever answers *nothing here*.
+
+**The window can hand itself over as a file.** The period card carries one control per artifact -
+**Download CSV**, **Download Excel** and **Print** - because those are the three things genuinely on
+offer, and the button says what it hands over rather than naming a verb. The two downloads call
+`/admin/reports/export?kind=attendance&format=csv|xlsx` for exactly the dates the card was drawn from,
+with this session's token (the route is `admin_only`), and save under the route's own
+`attendance_YYYYMMDD-YYYYMMDD` convention - so a sheet pulled from the front door and one pulled from
+the API are visibly the same report. What neither is, is a file assembled in the browser: the card
+holds aggregates, and aggregates cannot be turned back into rows, so a file built here would be a
+second report wearing the same window.
+
+The two formats differ in exactly two places, and both are about bytes rather than content: CSV is text
+the page hands to `saveFile`, and XLSX is a ZIP of XML that only `saveBlob` can put on disk intact.
+Excel is the optional `openpyxl` extra, so it is offered unconditionally and *refused in words* where
+the package is absent - the route answers a 501 saying so, and the control prints that sentence rather
+than "could not be downloaded", because one of them an operator can act on.
+
+**Print** is the third artifact, and the one that needs no server: the browser's own dialog is what
+writes the PDF, as it is for the timesheets next door, so the console holds no PDF library and the
+reader's own fonts and direction render the page. What goes on the sheet is the card's own content in
+three blocks - the figures, the window day by day, and the two people worth opening - drawn from the
+same list the facts grid is drawn from, so paper and screen cannot show two different sets of figures
+for one window. It is *not* the attendance report; the summary is what this card is, and the note at
+the sheet's foot says which figures count. Its frame (title, period line with the `as_of` stamp, the
+table, the company's own lockup) and taking the page out of the console and putting it back are
+`PrintReport`'s, shared with every other sheet this app prints.
+
 `alerts` is `null` rather than `0` for anybody but the root tier: that queue is not an
 administrator's to read, and a zero would say "nothing is waiting" about a surface they cannot
 open. The same rule, the other way round, is what a whole panel does - a panel whose own queries
@@ -1334,11 +1413,14 @@ wrong.
 
 The **Dashboard** tab is the console's landing screen for every console role, and it is a
 *snapshot*, not a board: `as_of` is stamped on the panel and it re-reads when the Refresh button is
-pressed, never on a timer. Live Ops next door polls deliberately - it answers *who is on site* and
-has to be current to the second - and it asks `GET /admin/live_ops/count` on that timer, reading the
-shift rows only when the count says something moved. This answers *how many, and is that normal*,
-and a polled aggregate is a query every few seconds against the same SQLite writer that serves the
-gate.
+pressed, never on a timer. Switching a view is not a re-read - it repaints from the payload already on
+screen and leaves the stamp where it is, so moving between views costs nothing and cannot put two
+different reads side by side. Live Ops next door is live to the second, and it is *pushed* rather
+than polled: the board holds `GET /admin/live_ops/stream` open and the server sends the counted read
+only when something moved (see *Live Ops* below). This answers *how many, and is that normal* - the
+one question a snapshot is for - because the other one is answered by a connection that says nothing
+until it has something to say, rather than by a query every few seconds against the same SQLite
+writer that serves the gate.
 
 ## Reporting
 
@@ -1352,8 +1434,10 @@ GET /api/v1/admin/reports/export?kind=shifts&format=csv|xlsx
 `/admin/reports/shifts` was called `/admin/reports/payroll` until the tab was renamed, and
 `kind=payroll` on the export was the matching default. Both still answer, unchanged, so a
 saved command or a link shared before the rename keeps working; the app, the docs and the
-tests all use the new names. (`/admin/reports/export` is the export for scripts and for
-`format=xlsx`; the admin console builds its CSV from the rows on screen instead.)
+tests all use the new names. (`/admin/reports/export` is the export for scripts and for `format=xlsx`; the console's own
+tables build their CSV from the rows on screen instead, and the one panel that calls this route for
+both formats is the dashboard's period summary, whose figures are aggregates no local row list could
+reproduce.)
 
 `/admin/reports/shifts` is a **timesheet**, not a payroll report: one row per shift, with the
 day it ended, the worker, their id, the site, the hours it counts for, whether an
@@ -1588,13 +1672,33 @@ counter). Every query is the board's own join - `active_sessions` joined to `use
 session whose account has been deleted is dropped by the figures and by the rows in the same
 breath. The dashboard's `now` panel borrows the same read rather than repeating that join.
 
-Two things follow from it, and both are deliberate. The **poll** asks the counted read first and
-fetches the rows only when the answer says something moved - who is on shift, where, how many
-arrived late, which shift is oldest - so a board nobody is acting on costs one aggregate query
-every 45 s rather than a row payload. A *renamed* worker is the one change that answer cannot
-see; the new name arrives with the next row read, or with the operator's own Refresh. And the
-**force-in panel's roster is loaded when the panel is opened**, not with the board behind it:
-the panel is a roster and that is exactly where a roster-sized read belongs.
+**The board is pushed, not polled.** `GET /api/v1/admin/live_ops/stream` holds a server-sent event
+connection open and says nothing until the board changes, where the poll it replaces asked a cheap
+question every 45 seconds - an HTTP round trip, a worker, a rate-limit decision and an aggregate
+query - to be told, on a quiet afternoon, that nothing had happened. Every write that can move the
+board (a clock-in or clock-out, a force-clock-out, an offline punch syncing up, an approved
+overtime, a quick-link punch) calls `live_ops.board_changed()`, and each listener re-runs the
+counted read and pushes the whole figure set only when the answer's *fingerprint* moved: a change
+arrives when it is filed rather than up to 45 seconds later, and an unchanged board costs one idle
+connection. The fingerprint is blind to names and to the stamp on purpose - a rename, or a new
+`as_of` on the same board, is not the board moving, and a repaint nobody asked for is what steals
+focus from the search box somebody is typing in. It is a `fetch` reader rather than the browser's
+`EventSource`, because it has to carry the `Authorization` header every route here is guarded by
+and `EventSource` cannot send one. The connection is bounded like any other long request: a
+keep-alive comment every 15 s so a middle box does not time out a quiet connection, a sweep every
+120 s in case a wake was missed, and `event: bye` after 15 minutes, which the client reads as a
+clean end and reconnects on.
+
+**The poll is still there, and it is the fallback.** A stream is an optimisation over a working
+board, never a precondition for one: if it cannot be opened at all - a proxy that buffers the
+response and never delivers a piece of it, a browser with no readable body - the board retries
+once and then goes back to the counted read on the 45 s timer it has always had, saying so in a
+toast. Either way the **rows** are fetched only when the counted read says something moved - who is
+on shift, where, how many arrived late, which shift is oldest - so a board nobody is acting on
+costs one aggregate query rather than a row payload. A *renamed* worker is the one change that
+answer cannot see; the new name arrives with the next row read, or with the operator's own
+Refresh. And the **force-in panel's roster is loaded when the panel is opened**, not with the board
+behind it: the panel is a roster and that is exactly where a roster-sized read belongs.
 
 `late` is the flag's own reading, not a re-derivation: `active_sessions.late_flag` holds the
 sentence `shift_windows.describe` wrote when an arrival missed its window (or nothing), and the
@@ -1662,6 +1766,35 @@ quietly doing half a sweep - that is a structural guarantee, not a convention. T
 report is available to an administrator as `POST /api/v1/admin/retention/dry-run`, and
 `GET /api/v1/admin/retention` shows the policy, whether the timer is running, the last
 sweep, and what is still on disk past its window.
+
+**The console's *Admin -> Data & retention* panel is that report on a screen** - the one
+place an operator can see this without a shell. It answers the question none of the API's
+other answers start from: how much is *there*. Per store (reference selfies, face
+templates, punch frames, quick-link selfies, registration photos, the calibration corpus,
+the backups, the database and its journal) it shows the file count, the bytes, and the span
+of ages across the directory, next to the period each store is kept for, the last completed
+sweep, and how much residue is still on disk that a query can no longer name.
+
+Its one control is a **Check**, and that is deliberate: a read-only button whose whole job
+is to say what the next sweep would take. It draws the rows and files past their windows,
+the space they hold, and then says in words that **it deleted nothing** - because a list of
+things about to be deleted, without that sentence, reads as a log of things that were.
+There is no erase-now button: the schedule already runs the sweep, and a control that
+erases faces by hand would turn the policy into something somebody can override at 03:00
+rather than the thing that is documented.
+
+The figures come from `retention.storage_inventory`, which walks each directory once and
+`stat`s what it finds - it opens no file, decodes and hashes nothing, and deletes nothing,
+so a corrupt photograph or a locked template costs the same as any other file. Two
+properties of that walk are worth knowing when reading the numbers. A **backup directory is
+counted apart from the live data** (`live_bytes` versus `copy_bytes`), because a backup
+holds a second copy of every face above it and one total over everything would answer "what
+is this deployment holding" with twice the truth; and the walk is **bounded** by
+`retention.INVENTORY_MAX_FILES` (50 000 files), reporting `truncated` rather than rounding
+the answer down - a count that quietly stops being true exactly as it starts to matter is
+worse than no count at all. Symlinks are neither followed nor counted, and the database is
+measured together with its `-wal` and `-shm`, since a write-ahead log holding committed
+pages is disk in use.
 
 **What "wiped" honestly means.** `retention.wipe_file` overwrites the bytes in place,
 fsyncs and unlinks - which is the most a portable application can do, and less than it
@@ -1834,9 +1967,26 @@ says which mode this process is in.
 
 ## Accounts and access
 
-The console's account screen is the **Credentials** tab: one row per account with its id,
-role, contact details, whether a face template is enrolled, the password *state*, and how
-many sessions a reset has invalidated.
+The console's account screen is the **Credentials** tab: one row per account - the name, the
+id and the role, the contact details - and then the facts that decide whether the person can
+get in at all (a face template, a password) followed by the ones that are *news* and are
+therefore drawn only where there is some: an account somebody switched off, a reset that
+killed sessions.
+
+It is a list rather than a table, and the same list at every width. The nine-column table
+that used to be here did not fit the laptop an administrator actually uses, so the roster
+slid sideways under a scrollbar - and the two facts this screen exists for, *no template*
+and *no password ever set*, were the ones parked off its right edge. A long name is
+ellipsised with a `title`, and the two facts that are always on the row are the pair that
+answers "why can this person not get through the gate".
+
+Two questions narrow it, and neither costs a request: the search box (name, id, role or
+phone), and a row of role chips - *Everyone*, then whichever of worker, moallem, off-office,
+admin and head admin are actually in this roster, each chip carrying the count it would hand
+over. **Ten rows are drawn at a time**, with the roster's own size under them ("Showing 10 of
+137") and a *Show more* button for the rest; the page is what keeps the screen about the
+person being looked up rather than about the list, and the button repaints from the roster
+already in hand rather than reading the server again.
 
 It does **not** show passwords, because there are none to show: passwords are stored as
 bcrypt hashes (`backend/security.py`), which are one-way. A column of "the password" would
@@ -2045,14 +2195,20 @@ to (`MIN_PASSWORD_LENGTH`, plus the common-password list), and an id outside its
 block (`worker` 1-499, `moallem` 500-749, off-office 750-999, `admin` 1000-4999, `head_admin` 5000+) is
 refused in the browser and again on the server.
 
-**Registration link** does not create anything: it issues the `register` invite described
-under *Worker enrollment*, for the case where the person is not in front of you. The id
-and the role are still chosen here; only the password and the face are theirs.
+**Registration link** creates nothing and is not *for* anybody: it hands over the address
+described under *Worker enrollment*, for the case where the person is not in front of you -
+or is not known to the company yet. Opening the panel reads the link from the server (there is
+nothing to mint), shows the URL, a copy button, a WhatsApp message and the QR code, draws the
+intake switch beside it - answering whether the form accepts, and opening or closing it in the
+same place, so the switch and the link it decides the fate of are one screen - and offers
+**Replace link** for the copy that reached the wrong person. The id and the role are not chosen here: the server hands out the lowest free
+worker number, and the roles are the three the form offers. Only the password and the face are
+the applicant's, and an administrator still approves the account before it can clock in.
 
 ```
 POST /api/v1/admin/users/create                 id, name, role, password[, photo]  (multipart)
-POST /api/v1/admin/enrollment/invites           {"kind":"register", ...} -> url + token + QR
-POST /api/v1/enroll/<token>/register            password + photo -> the account
+GET  /api/v1/admin/registrations/link           -> the URL + QR + whether intake is open
+POST /api/v1/admin/registrations/link           -> replaces it; copies already sent stop working
 ```
 
 The console's three old account tabs are gone: **Users** (the enroll dashboard, whose only

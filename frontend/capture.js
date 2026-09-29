@@ -165,6 +165,8 @@
             "register.passwordShort": "The password needs at least {n} characters.",
             "register.passwordMismatch": "The two passwords do not match.",
             "register.closed": "Registration is closed at the moment. Ask your site administrator to open it.",
+            "register.needLink": "This is not a registration link. Ask your administrator for the link, and open it on this phone.",
+            "register.linkInvalid": "This registration link is not valid any more. Ask your administrator for a new one.",
             "register.roleNotAvailable": "This link cannot register an administrator. An administrator account is created by an administrator.",
             "register.consentRequired": "Please read and tick the consent line before sending.",
             "register.queueFull": "There are too many requests waiting for review. Try again later.",
@@ -280,6 +282,8 @@
             "register.passwordShort": "كلمة المرور تحتاج {n} حرفاً على الأقل.",
             "register.passwordMismatch": "كلمتا المرور غير متطابقتين.",
             "register.closed": "التسجيل مغلق حالياً. اطلب من مدير موقعك فتحه.",
+            "register.needLink": "هذا ليس رابط تسجيل. اطلب الرابط من المشرف وافتحه على هذا الهاتف.",
+            "register.linkInvalid": "رابط التسجيل هذا لم يعد صالحاً. اطلب من المشرف رابطاً جديداً.",
             "register.roleNotAvailable": "هذا الرابط لا يمكنه تسجيل حساب مدير. حساب المدير ينشئه مدير.",
             "register.consentRequired": "اقرأ سطر الموافقة وحدّده قبل الإرسال.",
             "register.queueFull": "هناك طلبات كثيرة في انتظار المراجعة. حاول لاحقاً.",
@@ -395,6 +399,8 @@
             "register.passwordShort": "पासवर्ड में कम से कम {n} अक्षर चाहिए।",
             "register.passwordMismatch": "दोनों पासवर्ड एक जैसे नहीं हैं।",
             "register.closed": "इस समय रजिस्ट्रेशन बंद है। अपने साइट एडमिन से इसे खोलने को कहें।",
+            "register.needLink": "यह रजिस्ट्रेशन लिंक नहीं है। एडमिन से लिंक माँगें और उसे इसी फ़ोन पर खोलें।",
+            "register.linkInvalid": "यह रजिस्ट्रेशन लिंक अब मान्य नहीं है। एडमिन से नया लिंक माँगें।",
             "register.roleNotAvailable": "यह लिंक एडमिन का खाता नहीं बना सकता। एडमिन का खाता एडमिन बनाता है।",
             "register.consentRequired": "भेजने से पहले सहमति की पंक्ति पढ़ें और उस पर टिक करें।",
             "register.queueFull": "समीक्षा के लिए बहुत सारे अनुरोध लंबित हैं। बाद में कोशिश करें।",
@@ -509,6 +515,8 @@
             "register.passwordShort": "پاس ورڈ میں کم از کم {n} حروف چاہیے۔",
             "register.passwordMismatch": "دونوں پاس ورڈ ایک جیسے نہیں ہیں۔",
             "register.closed": "اس وقت رجسٹریشن بند ہے۔ اپنے سائٹ ایڈمنسٹریٹر سے اسے کھلوانے کو کہیں۔",
+            "register.needLink": "یہ رجسٹریشن لنک نہیں ہے۔ ایڈمنسٹریٹر سے لنک مانگیں اور اسی فون پر کھولیں۔",
+            "register.linkInvalid": "یہ رجسٹریشن لنک اب درست نہیں ہے۔ ایڈمنسٹریٹر سے نیا لنک مانگیں۔",
             "register.roleNotAvailable": "یہ لنک ایڈمنسٹریٹر کا اکاؤنٹ نہیں بنا سکتا۔ ایڈمنسٹریٹر کا اکاؤنٹ ایڈمنسٹریٹر بناتا ہے۔",
             "register.consentRequired": "بھیجنے سے پہلے رضامندی کی سطر پڑھ کر اس پر نشان لگائیں۔",
             "register.queueFull": "جائزے کے لیے بہت سی درخواستیں زیرِ التوا ہیں۔ بعد میں کوشش کریں۔",
@@ -561,6 +569,7 @@
     //: applicant can fix (a missing tick, a password that is too short) or cannot (the queue
     //: is full, registration is switched off).
     var REGISTRATION_REFUSALS = {
+        registration_link_invalid: "register.linkInvalid",
         registration_closed: "register.closed",
         role_not_available: "register.roleNotAvailable",
         consent_required: "register.consentRequired",

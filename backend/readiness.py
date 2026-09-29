@@ -936,17 +936,28 @@ PUBLIC_ROUTES: dict[str, str] = {
     ),
     "POST /api/v1/enroll/{token}": "the same invite token; submits the capture.",
     "GET /api/v1/register": (
-        "the walk-up registration link's own page reads the policy it has to satisfy - the "
-        "upload ceiling, the accepted roles, the shortest password - before anybody has an "
-        "account. It answers with that policy and no data of any kind, and it says so when "
-        "intake is switched off rather than 404-ing a link the company printed."
+        "the registration link's path with no token on it - what a link pasted without its last "
+        "segment asks for. It answers one 404 ``registration_link_invalid`` and nothing else, "
+        "deliberately: the alternative is the framework's ``Not Found``, which is true and gives "
+        "the person holding the phone nothing to act on."
     ),
-    "POST /api/v1/register": (
-        "the same permanent link, submittable by anybody: it is how a person who has no "
-        "account applies for one. Single static URL by design, off by default, per-IP rate "
-        "limited, capped by a pending-queue limit enforced inside the insert's transaction, "
-        "and it creates nothing - no account, no roster row, no id - until an administrator "
-        "approves the request."
+    "POST /api/v1/register": "the same bare path; the same refusal, before any upload is read.",
+    "GET /api/v1/register/{token}": (
+        "the registration link's own page reads the policy it has to satisfy - the upload "
+        "ceiling, the accepted roles, the shortest password - before anybody has an account. "
+        "The link token in the path is the credential: it is an HMAC of the deployment's "
+        "SECRET_KEY over the link's generation, so a request without it is refused before the "
+        "policy is answered, and replacing the link invalidates every copy by arithmetic. "
+        "It answers with that policy and no data of any kind, and it says so when intake is "
+        "switched off rather than 404-ing a link the company already handed out."
+    ),
+    "POST /api/v1/register/{token}": (
+        "the same link, submitted by the person it was sent to: it is how somebody who has no "
+        "account applies for one. Reachable only through the console's link, off by default "
+        "under the deployment switch, per-IP rate limited, capped by a pending-queue limit "
+        "enforced inside the insert's transaction - and it creates an account that is "
+        "quarantined: it can sign in, and it cannot record a punch until an administrator "
+        "approves it."
     ),
     "GET /api/v1/q/{token}": (
         "one-tap clock link: the link token in the path is the credential. Reusing one does "
@@ -977,7 +988,13 @@ SELF_GATED_ROUTES: dict[str, str] = {
 #: file from ``frontend/``. Kept apart from the list above so that half stays a list of
 #: endpoints that deliberately parse a request.
 PAGE_ROUTES: frozenset[str] = frozenset(
-    {"GET /", "GET /enroll/{token}", "GET /q/{token}", "GET /register"}
+    {
+        "GET /",
+        "GET /enroll/{token}",
+        "GET /q/{token}",
+        "GET /register",
+        "GET /register/{token}",
+    }
 )
 
 
@@ -1368,11 +1385,11 @@ def _check_registration_intake(ctx: dict) -> Check:
     Three facts an operator has to be able to see without asking the application, because each
     of them is invisible until somebody complains:
 
-    * a **closed intake** is a supported state rather than a fault - the deployment switch ships
-      off, and an operator closing the link for the afternoon is a decision rather than a fault -
-      so this reports it as an ok check that says so, and exists for the other two. Which of the
-      two switches closed it is named, because that is the whole difference between "this
-      deployment does not run walk-up registration" and "somebody closed it this morning";
+    * a **closed intake** is a supported state rather than a fault - the switch ships closed, and
+      an operator closing the link for the afternoon is a decision rather than a fault - so this
+      reports it as an ok check that says so, and exists for the other two. *Why* it is closed is
+      named, because "nobody has opened this yet" and "somebody closed it this morning" are one
+      state and two different things to do about it;
     * a **full queue** stops accepting submissions (the cap is enforced inside the insert's
       transaction), and it is the one way this feature fails *quietly*: the applicant is refused
       and the administrator sees nothing, because a queue only looks long when somebody reads it;
@@ -1387,9 +1404,11 @@ def _check_registration_intake(ctx: dict) -> Check:
     import registrations
     from database import db as _db
 
-    # The effective state, not the env flag: an intake an administrator closed from the console
-    # is closed, and reporting the counts it cannot act on (a full queue, a photo directory) would
-    # be this check describing a link that is refusing everything anyway.
+    # The effective state, not the env flag: the console's switch is what decides, so reporting
+    # the counts it cannot act on (a full queue, a photo directory) would be this check
+    # describing a link that is refusing everything anyway. The flag is still in the payload,
+    # because "this deployment does not run walk-up registration" is worth knowing from a boot
+    # log - it is what a link that nobody has opened yet is following.
     state = registrations.intake_state()
     if not state["accepting"]:
         return Check(

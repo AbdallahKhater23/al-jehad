@@ -38,7 +38,7 @@ enumeration. A total that ignores the clause re-opens the hole the roster closed
 
 ```
 GET /api/v1/admin/dashboard?days=7          admin_only
-POST /api/v1/admin/dashboard/export?...     the period as CSV/XLSX, reusing reports/export
+GET  /api/v1/admin/reports/export?...       the period as CSV/XLSX - see §15; print is the browser's
 ```
 
 ```json
@@ -110,6 +110,11 @@ needs (accepted as a small, additive change to that module, not a fork).
 ---
 
 ## 3. The panels
+
+*What each panel contains is below and is unchanged. How they are **drawn** changed on 2026-09-29:
+five cards stacked down a page became a vital strip over one panel at a time. Read §14 for the screen
+as it now ships; §13's note about the period being "the fifth in the shell" is the one sentence here
+that the redesign supersedes.*
 
 **Waiting on a person** — first, because it is the only panel that changes behaviour. Pending
 reviews, pending registrations (with the intake switch state, which the Registrations tab already
@@ -207,6 +212,13 @@ Every label, every panel heading, every state sentence, in all four tables (`i18
 placeholder mismatch, so this is a mechanical cost to budget, not an afterthought. Number
 formatting goes through the existing degree/day formatters rather than a new one.
 
+The parity suite proves a translation *exists* and says nothing about whether it is right, so the
+dashboard's three non-English tables were reviewed by reading each new string against every other use
+of the same concept: **`docs/DASHBOARD_I18N_REVIEW.md`**, covering the 18 keys and 54 strings the
+switch to views, the day strip and phase 4 introduced. It flags, it does not fix - the two findings
+that matter are that a *dormant* account reads as a *deactivated* one in Hindi and Urdu, and that all
+three languages are missing a word for dormant altogether.
+
 ---
 
 ## 9. Phasing
@@ -216,7 +228,7 @@ formatting goes through the existing degree/day formatters rather than a new one
 | 1 - built | `GET /admin/dashboard` with `people`, `places`, `waiting` (no Health); the Dashboard tab, first in `ADMIN_TABS`, painted from one read; the landing-tab assertions updated. What shipped, and where it went past this plan, is in §11 |
 | 2 - built | `now` panel (active sessions, crossings, punch queue, refused punches), reusing `overtime.open_crossings`. What shipped, and the three definitions that moved under it, is in §12 |
 | 3 - built | `period` panel: the additive `totals` change in `reports.py`, the range control, the extremes with links. What shipped is in §13 |
-| 4 | Export, dormant accounts, onboarding watch, payroll readiness |
+| 4 - built | Export as three artifacts (CSV, Excel, a printable sheet), dormant accounts, onboarding watch, payroll readiness. What shipped, and the one thing it added to the payload, is in §15 |
 | 5 | Root-tier Health from the Developer reads |
 
 Landing on the dashboard needs no new routing: `renderAdminTab` already falls back to the first
@@ -470,3 +482,237 @@ the Shifts tab itself; a tap on the other preset re-asking the server with `?day
 states that are not numbers - a window nobody worked (zeroes and two "nobody was present" lines, with
 the window still described) and a panel that could not be read (no figures, no window control, the
 panels beside it untouched).
+
+---
+
+## 14. The redesign, as built (2026-09-29)
+
+**One thing this plan did not foresee, and the reason for the redesign: the shape of the page was the
+navigation.** Five panels stacked down a page gave the screen a reading order nobody had chosen - the
+eye had to travel from the top, and the answer to *is anything wrong* could be four scrolls down, so the
+screen was read by habit rather than by need. The panels were right. Their arrangement was the problem.
+
+So the front door is two things instead of one column.
+
+**The vital strip** - always on screen, never switched away - is five tiles: shifts awaiting a review,
+applications awaiting a decision, who is on site, days present in the current window, and the hours
+awaiting approval. That is the set somebody needs *before* deciding whether to read the rest, and the set
+that would otherwise be scattered across the bottom of four panels. Each tile prints one field of the
+payload with no arithmetic on it - the strip's idea of "waiting on a person" is the server's `waiting`,
+not four queues added up in the browser, which is §1's rule applied to the strip and the reason the tiles
+carry the queues separately. Each tile is a `<button>` - the whole tile, not a word inside it, because the
+reader this console was written for is a phone in gloves - and it carries `data-dashboard-go` only when
+the tab that owns the queue is one this reader is offered, so a tile can never lead to a tab the rail
+does not have. The tone is a **state, not decoration**: a queue with something in it takes the warn tone,
+"on shift" takes the live tone only when somebody is actually on site, and a queue at zero is not marked
+at all. A figure whose panel could not be read is drawn as an em dash under `is-unknown`, never as a
+zero, for phase 1's reason - on this strip a zero is good news, and inventing good news is the one output
+this screen must not produce.
+
+**One view at a time**, chosen by a segmented control built from the console's own `ops-seg` vocabulary
+and wired as a real tablist: `role="tablist"`, `role="tab"`, `aria-selected`, an `aria-controls` that
+points at the drawn panel's `id`, and a roving `tabindex` so only the selected tab is in the tab order,
+with ArrowLeft/ArrowRight/ArrowUp/ArrowDown wrapping through the five and Home/End jumping to the ends.
+`preventDefault` is called only for a key that was handled, so a key this control has no use for keeps
+its browser behaviour. The order is *oldest question first* - waiting, now, people, places, period - and
+the remembered view lives in `State.dashboardMetric`, so it survives a tab switch and a language change.
+**A switch makes no request.** It repaints the shell from the payload already in memory, which is the
+whole point: the `as_of` stamp does not move, so no view can show a figure from a different read than the
+strip above it, and the switcher costs nothing on the phones that pay for every request. A remembered id
+that is not one of the five falls back to the first view rather than to a blank screen.
+
+No counts on the tabs, deliberately. A tab that carried a figure would need the *sum* of that panel's
+queues - adding numbers up in the browser is the one thing §1 refuses, and the strip above already carries
+each queue as the server counted it. A count on a tab would also have to move when a queue moved, which
+means a re-read on switch, which is exactly the request a switch must not make.
+
+**The panel bodies are the phase 1-3 renderers, unchanged.** `dashboardViewBodyHtml` is a map from view
+id to the body renderer that already existed; what the redesign added is the shell around them
+(`dashboardShellHtml`), the strip, the switcher, the keyboard walk, and the one-at-a-time rule. A view
+whose own payload section is `null` draws the unreadable note *inside* that view and leaves the other
+four readable - the degradation is unchanged, it is simply not drawn until somebody asks for it.
+
+### The day strip, and the read it needed
+
+The period view gained one thing the payload did not carry: **`by_day`**. "132 present days" and "4 late
+arrivals" say how a window went; they do not say *which* days it came apart on, and "the whole week was
+short-staffed" and "Tuesday was short-staffed" are different problems with different fixes. It is added
+inside `reports.attendance_period` - the counted twin - so it arrives in the read the view already makes
+and the strip costs no second request. `_period_by_day` fills the gap days (a day nobody worked is a
+zero, not a missing column), and the window's own clamp moved to `reports.MAX_WINDOW_DAYS = 366`, which
+`dashboard.PERIOD_MAX_DAYS` now points at rather than repeating, so the strip can never be asked to draw
+more days than the read will count.
+
+The drawing follows the two rules §4 set for numbers-with-shape while still refusing to add a chart
+library: **the scale is named in words** ("each of the 7 days in this window, against the busiest at 32"),
+because a chart whose scale is only implied is a chart nobody can read, and **colour never carries the
+meaning alone** - a late arrival is printed as a numeral on the day it happened, the column's `aria-label`
+states its date, its present days and its late arrivals, and the whole `<ol>` carries the caption as its
+accessible name (plus `role="list"`, because a markerless list loses its list semantics in Safari and
+VoiceOver, which would leave the columns as unlabelled spans). The bars are scaled against the busiest
+day *in the window* rather than against the roster: an absolute scale would make a quiet deployment look
+like a dead one. A day with nobody on site draws an empty column rather than a two-pixel stub - "nobody
+came in" and "one person came in" have to be different pictures - and a day with one person in it draws
+at least an 8% bar, because a bar rounded down to zero would say "nobody came in" by accident. The last
+two digits of the date sit under each column, enough to find a bar on a month-long strip.
+
+### Tests, as shipped (the redesign)
+
+`test_admin_dashboard.py` (30) - the `by_day` additions on top of phase 3's suite: every day of the window
+present including the quiet ones, the per-day sum equal to the view's own `present_days`, a day row's
+fields exactly `{day, present, late}`, and the 366-day clamp holding for `by_day` as well as for the
+figures.
+
+`test_frontend_dashboard.py` (22) - rewritten around the switcher. An `eachView` helper paints the tab and
+then switches through the other four, so every view's markup is asserted against the same fixture; the
+switch scenarios assert that changing view issues **zero** requests, that the `as_of` stamp is identical
+before and after, that the arrow keys walk and wrap in the documented order, that an unhandled key moves
+nothing, and that a remembered view costs exactly one read on a return. The day strip has its own: seven
+columns, the caption with its busiest day, three numeral late markers, one empty column for the day nobody
+worked, the tallest column at 100% and the shortest at 38%, and the column's own label. The
+failed-payload test asserts the em dash, the `is-unknown` class, that the other views still draw after a
+switch, and that exactly one panel is on screen at a time.
+
+Nothing above added an inline handler: every hook is a `data-` attribute and the CSP budget in
+`test_frontend_xss.py` is unchanged (`admin_modules.js` 67) - the rule is that it may only fall.
+
+---
+
+## 15. Phase 4, as built (2026-09-29)
+
+§4's list, in the order it was worth taking: the two figures that are a *watch* rather than a count,
+payroll readiness, and the window as a file. One item of the six - unmanned sites ranked by size - is
+not here, and it is not an omission: the places view lists the sites with no clock-in today by name,
+which is the fact, and "ranked by size" is a sort of a list the dashboard deliberately does not draw.
+
+### Dormant accounts and the onboarding watch
+
+**Dormant is an account that worked here and stopped.** ``DORMANT_DAYS = 30`` - the payroll cycle, so
+the figure has missed a whole pay run before it appears, and long enough that a worker on a
+fortnight's leave is not named. The predicate is a conjunction and the first half is the important
+one: an *active* account that **has** an attendance row, and has none in the last thirty days. That
+makes it disjoint from ``never_clocked_in``, which is the count of accounts with no punch at all -
+and the two are deliberately different questions, because "the deployment has not opened yet" and "a
+roster of dormant staff" are the same number otherwise. §13's extremes comment already pointed at
+this panel as the place where "nobody has seen this person in three weeks" belongs; this is it, with
+the window written down rather than implied.
+
+**Onboarding is a sub-question of a count that already existed.** §4.2 asks for accounts created or
+approved inside N days that have never clocked in, and ``new_this_week`` is already that set - so the
+figure is computed in the *same scan* (one ``SELECT`` returning both), which is what makes
+``onboarding <= new_this_week`` true by construction rather than by careful upkeep. It picks up the
+walk-up path for free, because ``registration_approved`` is one of the creation actions, so an
+applicant an administrator approved yesterday and who has never signed in is in it - which is exactly
+the follow-on to the approval notice that made this worth building.
+
+**The two windows travel in the payload**, and that is the one place this phase gave the panel a field
+that is not a count: ``people.dormant_days`` and ``people.onboarding_days``. The reason is the period
+panel's, applied to a label: "dormant: 4" is not a fact until the reader knows what dormant meant, and
+a sentence that says thirty days over a query that counted forty-five is a number nobody can check. The
+console draws the label from the payload and carries the same two numbers as fallbacks for a server too
+old to send them - so the frontend suite drives 45 and 10 and asserts the label says *those* rather than
+the constants. Both figures are account-shaped, so ``developer.visibility_clause`` travels with them,
+and ``test_the_root_account_is_absent_from_every_total`` covers them by comparing the whole panel.
+
+### Payroll readiness
+
+"Is this window ready to be paid" is the question this application exists to answer and the one §4.3
+says is answered today by reading a report. It is now three fields on the period card: the approved
+hours, the hours awaiting approval, and - the addition - **``awaiting_approval_shifts``**, the count
+behind the second figure. A reader can see that 12 hours are waiting but not that they are four
+shifts somebody has to open, and four decisions is a different afternoon's work from one.
+
+The count is counted *in the same statement* as the hours and from the same tuple
+(``AWAITING_APPROVAL_CODES``), not from a second list of statuses that could drift from it. That has a
+consequence worth stating: a ``pending_overtime`` row whose hold came to zero still counts as one
+shift, because somebody still has to sign it - which is why this is a count of rows rather than of the
+rows ``awaiting > 0`` would name. The count also reaches ``reports.attendance_rows``'s ``totals``,
+because that block spreads ``_period_hours`` whole: additive, and the attendance report's own totals
+now say how many shifts in its window are undecided.
+
+The card draws two states and no third. Ready says everything is signed off; not-ready says how many
+shifts and how many hours, and - this is the point - *what that costs*: a pay run now would leave those
+hours out. "3 shifts awaiting approval" reads as housekeeping until somebody says it is money. The link
+into the Approvals queue is drawn only in the not-ready state, because a button into an empty queue is
+a control that only ever answers "nothing here".
+
+### The window as a file, a spreadsheet and a sheet
+
+§2 proposed ``POST /api/v1/admin/dashboard/export`` and a single CSV. What shipped is **one button per
+artifact** - ``[data-dashboard-export="csv"|"xlsx"|"print"]`` - because those are the three things
+genuinely on offer, and a button that says what it hands over ("Download CSV") is a reader's own
+sentence where "Export" needs a second thought. The two downloads call
+``GET /api/v1/admin/reports/export?kind=attendance&format=csv|xlsx``, which is the deviation worth
+recording: a second route would be a second thing to keep in step with the report's columns, and the
+artifact an administrator wants out of a *period summary* is the attendance sheet for exactly those
+days - the same file the route already hands a script. The control adds nothing to the payload: it
+reads the window off the snapshot its own card was drawn from (the extreme links' rule), so a file named
+for one period cannot hold another.
+
+The two downloads differ in exactly two places, and both are about bytes rather than content. CSV is
+text, and goes to ``API.saveFile``; XLSX is a ZIP of XML that no round trip through a JavaScript string
+survives, so this phase added ``API.saveBlob`` - the anchor, the object URL, the bytes as they arrived.
+Excel is the optional ``openpyxl`` extra, so the button is offered unconditionally and the *refusal is
+read rather than replaced*: the route's 501 says which package to install, which an operator can act
+on, where "could not be downloaded" is a sentence nobody can do anything with. The dispatch on the
+three values lands an unknown one on the **narrowest** format (CSV) rather than on whichever branch
+happens to be last, because a control that cannot tell what was asked for must not open a print dialog.
+
+**Print** is the third artifact and the only one that needs no server: the browser's dialog writes the
+PDF, as it does for the timesheets, so the console pins no PDF library and the reader's own fonts and
+direction render the page. What goes on the sheet is the card's own content in three blocks - the
+figures (from ``dashboardPeriodFacts``, the same list the facts grid is drawn from, so paper and screen
+cannot disagree), the window day by day, and both linkages by name - inside ``PrintReport.sheetHtml``'s
+frame, which is where the title, the period line, the table, the company's lockup and the act of taking
+the page out of the console live for every sheet this app prints. It is deliberately **not** the
+attendance report: the card holds aggregates and aggregates cannot be turned back into rows, so the
+sheet is the summary the reader is looking at, and its foot says which figures count. Every value off
+the wire is escaped into its cell - a worker's name is text somebody typed, and paper is the last place
+a stray tag would be noticed.
+
+The file name stays the route's own convention, ``attendance_YYYYMMDD-YYYYMMDD``, with no extension at
+all for the sheet: the print dialog names the file after the *document title* and appends its own, so a
+title ending in ``.csv`` would save as ``....csv.pdf``. ``shiftsExportName`` carries the same rule for
+the same reason.
+
+These are the one control on this screen whose effect leaves the app, which makes them the one place the
+frontend suite has to read what was *downloaded* rather than what was drawn: the URL (this window, and
+one request per format), the token (the route is ``admin_only``, so an unauthenticated fetch would save
+a 401 as a CSV), the bytes (the server's answer - the fixture answers the XLSX URL with a marker only
+that path could have produced), and the saved name.
+
+### Frontend
+
+Two rows in the people view, drawn in the queue shape rather than in the facts grid, because unlike a
+headcount these are things to go and do - each with the window in its label and neither with a link,
+since the roster is where they are handled and the people view already carries its link into
+Credentials. The period card gains the shift count as a fact, the readiness sentence, and the three
+artifacts. No new CSS for the phase-4 figures (``.dashboard-queues``, ``.ui-note.is-warn`` and
+``.dashboard-link`` were all in place) - only the export row's own wrap - and no inline handler:
+``[data-dashboard-export]`` is bound by the same pass as every other hook, and the CSP budget in
+``test_frontend_xss.py`` did not move.
+
+### Tests, as shipped (phase 4)
+
+`test_admin_dashboard.py` (32): a plant with one account per *edge* of both watch predicates - dormant,
+too recent, never punched, switched off, just inside the window, onboarding, joined-and-working, and
+never-punched-but-old - asserted figure by figure, with the two windows held to the module's constants
+and the disjointness of `dormant` and `never_clocked_in` asserted rather than assumed. The window is
+driven too: the dormant account is given a punch today and the figure has to fall to zero while the
+rest of the panel is untouched, which is what proves it is a fact about the last punch rather than a
+label. Payroll readiness is held to the timesheet's own tuple on the planted rows (four awaiting
+shifts, of which one is a zero-hold pending overtime) and to the report's totals for the same window.
+
+`test_frontend_dashboard.py` (24, +1): the watch rows, their windows (the fixture sends 45 and 10, *not*
+the console's 30 and 7) and the readiness sentence in both states - including that a ready window draws
+no queue link. The export is its own scenario, because it is the only control whose effect is not on the
+page: one request per format with its own ``format=``, the bearer token, the window's two dates, the
+saved names, the server's bytes in the blob, and the fact that a download is not a read - the snapshot
+behind it does not move. The sheet is a test of its own (``test_the_window_prints_as_a_sheet_of_its_own_figures``)
+and asserts the opposite: **no request at all**, the title with no extension, the page muted while the
+dialog is open, and then the paper itself - the two headings, the figures under the card's own words,
+both figures on every day, the two linkages by name, the readiness sentence, the note, and the brand
+head the helper draws. ``test_frontend_payload.py`` counts the new keys across the four tables,
+``test_frontend_xss.py`` holds the handler budget where it was, and ``test_frontend_print_sheet.py``
+(6) keeps the frame, the stylesheet and the page-restore rules in one place - which is what makes the
+dashboard's sheet inherit them instead of copying them.

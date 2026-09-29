@@ -6,14 +6,15 @@
 <meta name="theme-color" content="#162F29" />
 <title>Register for an account — Site Attendance</title>
 <!--
-  The company's column in the tab and on the home screen. No ``../`` here, and that is the
-  difference between this page and the two link pages: they are served one segment deep under
-  a token (``/enroll/<token>``, ``/q/<token>``), so anything relative to them resolves into
-  the token segment. This page is served at ``/register``, at the root, so its assets are its
-  siblings and ``src="capture.js"`` is already the right URL.
+  The company's column in the tab and on the home screen. ``../`` and not ``./``, which is the
+  one thing this page now shares with the two link pages: all three are served one segment deep
+  under a token (``/register/<token>``, ``/enroll/<token>``, ``/q/<token>``), so a bare
+  ``capture.js`` resolves into the token's own segment - ``/register/<token>/capture.js`` is not
+  a file. The bare ``/register`` is served too, where the page says the link is not valid, and
+  ``../`` is correct there as well: it resolves up from the root to the root.
 -->
-<link rel="icon" type="image/svg+xml" href="icon.svg">
-<link rel="apple-touch-icon" href="icon.svg">
+<link rel="icon" type="image/svg+xml" href="../icon.svg">
+<link rel="apple-touch-icon" href="../icon.svg">
 <meta name="apple-mobile-web-app-title" content="Al-Jehad">
 <style>
   /* The company's palette, written out rather than linked, for the reason the two link pages
@@ -170,7 +171,7 @@
     console's copy of it.
   -->
   <div class="brand">
-    <span class="brand-mark" aria-hidden="true"><img src="logo-mark.svg" alt="" width="38" height="50"></span>
+    <span class="brand-mark" aria-hidden="true"><img src="../logo-mark.svg" alt="" width="38" height="50"></span>
     <span class="brand-lockup">
       <span class="brand-name">AL-JEHAD</span>
       <span class="brand-legal">INTERNATIONAL CO.</span>
@@ -292,11 +293,10 @@
 <footer class="credit" id="credit">Powered by دوامك اسهل</footer>
 
 <!--
-  Three scripts, all siblings: this page is served at ``/register``, at the root. See the note
-  at the top for why that makes these names correct here and wrong on the link pages.
+  One level up, because this page is served under a token. See the note at the top.
 -->
-<script src="api-config.js"></script>
-<script src="capture.js"></script>
-<script src="register.js"></script>
+<script src="../api-config.js"></script>
+<script src="../capture.js"></script>
+<script src="../register.js"></script>
 </body>
 </html>
