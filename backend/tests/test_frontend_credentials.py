@@ -71,6 +71,15 @@ const ROSTER = [
         status: 'active', face_enrolled: true, enrolled_at: '2026-09-10 06:00:00',
         password_set: false, password_changed_at: null, sessions_revoked: 0
     },
+    // The other end of the screen from those two: an account somebody switched off, with a
+    // reset behind it. Both facts exist so the two that are drawn *only* when they carry news
+    // have something to be drawn for - and so the rows that carry no news can be asserted to
+    // say nothing at all.
+    {
+        id: '602', name: 'Tariq Aziz', role: 'worker', phone: '+200000000602', email: '',
+        status: 'inactive', face_enrolled: true, enrolled_at: '2026-09-12 06:00:00',
+        password_set: true, password_changed_at: null, sessions_revoked: 4
+    },
     {
         id: '777', name: '<img src=x onerror=alert(1)>Mallory', role: 'worker',
         phone: '<b>123</b>', email: '', status: 'active', face_enrolled: true,
@@ -83,8 +92,55 @@ const ROSTER = [
     OPS_ADMIN
 ];
 
+// A deployment with a roster worth paging: twelve accounts across the five roles, so the
+// page (ten), the "Show more" button and every chip's count have something to be wrong
+// about. The six-account fixture above cannot tell a capped list from an uncapped one.
+const WIDE = (() => {
+    const people = [];
+    for (let i = 0; i < 6; i += 1) {
+        people.push({
+            id: String(200 + i), name: 'Worker ' + (i + 1), role: 'worker',
+            phone: '+200000000' + (200 + i), email: '', status: 'active',
+            face_enrolled: i % 2 === 0, enrolled_at: null, password_set: true,
+            password_changed_at: null, sessions_revoked: 0
+        });
+    }
+    people.push({
+        id: '300', name: 'Ana Torres', role: 'moallem', phone: '+200000000300', email: '',
+        status: 'active', face_enrolled: true, enrolled_at: null, password_set: true,
+        password_changed_at: null, sessions_revoked: 0
+    });
+    people.push({
+        id: '301', name: 'Noor Haddad', role: 'moallem', phone: '', email: '',
+        status: 'active', face_enrolled: true, enrolled_at: null, password_set: true,
+        password_changed_at: null, sessions_revoked: 0
+    });
+    people.push({
+        id: '400', name: 'Office Clerk', role: 'off_office', phone: '', email: '',
+        status: 'active', face_enrolled: true, enrolled_at: null, password_set: true,
+        password_changed_at: null, sessions_revoked: 0
+    });
+    people.push({
+        id: '500', name: 'Ops One', role: 'admin', phone: '', email: '',
+        status: 'active', face_enrolled: true, enrolled_at: null, password_set: true,
+        password_changed_at: null, sessions_revoked: 0
+    });
+    people.push({
+        id: '501', name: 'Ops Two', role: 'admin', phone: '', email: '',
+        status: 'active', face_enrolled: true, enrolled_at: null, password_set: true,
+        password_changed_at: null, sessions_revoked: 0
+    });
+    people.push({
+        id: '900', name: 'Head One', role: 'head_admin', phone: '', email: '',
+        status: 'active', face_enrolled: true, enrolled_at: null, password_set: true,
+        password_changed_at: null, sessions_revoked: 0
+    });
+    return people;
+})();
+
 let actorRole = 'head_admin';
 let usersFail = false;
+let wideRoster = false;
 
 const editCalls = [];
 
@@ -104,7 +160,7 @@ function responders(url, init) {
     }
     if (url.indexOf('/admin/users') >= 0) {
         if (usersFail) return { status: 503, body: { detail: 'Database is locked.' } };
-        return { status: 200, body: ROSTER };
+        return { status: 200, body: wideRoster ? WIDE : ROSTER };
     }
     return { status: 200, body: {} };
 }
@@ -120,27 +176,77 @@ function textOf(cell) {
     return cell.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-// Every account row, read the way the admin sees it: cells in order, plus the two state
-// attributes the module publishes, so an assertion never depends on a class name - that is
-// a decision for the stylesheet, and the phone card and the desktop row share the hooks.
+// Every account row, read the way the admin sees it: the facts by name rather than by
+// column index, plus the state attributes the module publishes. A row is a list item now
+// rather than a table row, and reading it by *name* is what makes this parser survive the
+// next layout change - the old one counted cells, so a new column moved every assertion.
 function rowsOf(markup) {
-    const rows = markup.match(/<tr data-user="[^"]*"[\s\S]*?<\/tr>/g) || [];
-    return rows.map((row) => ({
-        id: (/data-user="([^"]*)"/.exec(row) || [])[1],
-        face: (/data-face="([^"]*)"/.exec(row) || [])[1],
-        password: (/data-password="([^"]*)"/.exec(row) || [])[1],
-        button: row.indexOf('data-set-password=') >= 0,
-        protected_hint: row.indexOf('data-protected="true"') >= 0,
-        cells: (row.match(/<td[^>]*>[\s\S]*?<\/td>/g) || []).map(textOf)
+    const rows = markup.match(/<li class="roster-row"[^>]*>[\s\S]*?<\/li>/g) || [];
+    return rows.map((row) => {
+        const facts = factsOf(row);
+        return {
+            id: (/data-user="([^"]*)"/.exec(row) || [])[1],
+            role: (/data-role="([^"]*)"/.exec(row) || [])[1],
+            status: (/data-status="([^"]*)"/.exec(row) || [])[1],
+            face: (/data-face="([^"]*)"/.exec(row) || [])[1],
+            password: (/data-password="([^"]*)"/.exec(row) || [])[1],
+            sessions: (/data-sessions="([^"]*)"/.exec(row) || [])[1],
+            // ``[^>]*`` after the class list: the name carries a ``title`` as well, because
+            // the one name long enough to be ellipsised is the one a reader needs to read.
+            name: textOf((/class="ops-name roster-name"[^>]*>([\s\S]*?)<\/span>/.exec(row) || [])[1] || ''),
+            role_label: textOf((/class="roster-role">([\s\S]*?)<\/span>/.exec(row) || [])[1] || ''),
+            contact: textOf((/roster-contact">([\s\S]*?)<\/span>/.exec(row) || [])[1] || ''),
+            button: row.indexOf('data-set-password=') >= 0,
+            protected_hint: row.indexOf('data-protected="true"') >= 0,
+            facts: facts
+        };
+    });
+}
+
+// The access facts of a row, by the name the module publishes rather than by counting whatever
+// order they happen to be in - and only the ones the row actually draws. Two of the four are
+// drawn only when they carry news (an account somebody switched off, a reset that killed
+// sessions), so an absent fact is a state this parser has to report as *absent* rather than as
+// empty. Each slice runs to the next fact that is on the row: slicing to the next name in the
+// list instead ran a lone fact through the button block after it, which is how "3" became
+// "3 Set password Edit Deactivate Delete".
+function factsOf(row) {
+    const names = ['face', 'password', 'sessions', 'status'];
+    const drawn = names
+        .map((name) => ({ name: name, at: row.indexOf('data-fact="' + name + '"') }))
+        .filter((fact) => fact.at >= 0);
+    const out = {};
+    drawn.forEach((fact, index) => {
+        const stop = index + 1 < drawn.length ? drawn[index + 1].at : row.indexOf('roster-actions');
+        out[fact.name] = textOf(row.slice(fact.at, stop > fact.at ? stop : row.length));
+    });
+    return out;
+}
+
+// The role chips, as the reader sees them: the label, the count it offers, and whether it
+// is the one in force.
+function chipsOf(markup) {
+    const chips = markup.match(/<button[^>]*data-credentials-role="[^"]*"[\s\S]*?<\/button>/g) || [];
+    return chips.map((chip) => ({
+        role: (/data-credentials-role="([^"]*)"/.exec(chip) || [])[1],
+        count: textOf((/data-role-count="[^"]*">([\s\S]*?)<\/span>/.exec(chip) || [])[1] || ''),
+        label: textOf(chip.slice(0, chip.indexOf('<span class="roster-chip-count"'))),
+        pressed: /aria-pressed="true"/.test(chip)
     }));
 }
 
-function cardsOf(markup) {
-    const cards = markup.match(/<div class="[^"]*" data-user="[^"]*"[\s\S]*?<\/div>\s*<\/div>/g) || [];
-    return cards.map((card) => ({
-        id: (/data-user="([^"]*)"/.exec(card) || [])[1],
-        text: textOf(card)
-    }));
+function listedIds(markup) {
+    return rowsOf(markup).map((row) => row.id);
+}
+
+function rosterCount(markup) {
+    const match = /data-roster-count="true">([\s\S]*?)<\/p>/.exec(markup);
+    return match ? textOf(match[1]) : null;
+}
+
+function showMoreLabel(markup) {
+    const match = /<button[^>]*data-credentials-more[^>]*>([\s\S]*?)<\/button>/.exec(markup);
+    return match ? textOf(match[1]) : null;
 }
 
 function toasts(env) {
@@ -376,7 +482,8 @@ const results = {};
         cleared: rowsOf(render(env)).map((row) => row.id),
         requests_added: env.requests.length - before,
         no_matches_flag: markupNone.indexOf('data-no-matches') >= 0,
-        no_table_when_empty: markupNone.indexOf('<table') < 0
+        no_list_when_empty: markupNone.indexOf('data-credentials-list') < 0,
+        chips_still_there: markupNone.indexOf('data-credentials-filters') >= 0
     };
 }
 
@@ -394,18 +501,29 @@ const results = {};
     };
 }
 
-// 8. the phone layout gets one card per account
+// 8. a phone gets the same list, not a second layout
+//
+// It used to be cards below 768px and a nine-column table above it: two renderers saying the
+// same facts, and the table is the half that had to go. So what a phone gets now is the same
+// row, stacked by the stylesheet - which is why this scenario reads the *row* hooks rather
+// than a card shape, and why the desktop assertion in it is worth making.
 {
     const env = credentialsEnv();
     env.evaluate("localStorage.setItem('layoutOverride', 'mobile')");
     await env.evaluate("UI.renderAdminTab('Credentials')");
     const markup = render(env);
-    results.mobile = {
-        cards: cardsOf(markup).map((card) => card.id),
+    const rows = rowsOf(markup);
+    results.phone = {
+        rows: rows.map((row) => row.id),
         has_table: markup.indexOf('<table') >= 0,
-        first_card: cardsOf(markup).length > 0 ? cardsOf(markup)[0].text : null,
+        has_list: markup.indexOf('data-credentials-list') >= 0,
+        first_row_name: rows.length > 0 ? rows[0].name : null,
+        first_row_facts: rows.length > 0 ? rows[0].facts : null,
+        count_line: rosterCount(markup),
+        chips: chipsOf(markup).map((chip) => chip.role),
         has_search_box: markup.indexOf('id="credentialsQuery"') >= 0
     };
+    env.evaluate("localStorage.removeItem('layoutOverride')");
 }
 
 // 9. a dead server says so instead of showing an empty roster
@@ -422,29 +540,103 @@ const results = {};
     };
 }
 
-// 10. the action row refuses to wrap in the table and wraps on the card
+// 10. every action on a row is an icon, and every icon carries a name
 //
-// Four labelled buttons are 426px wide together. In the nine-column roster that is the
-// reason for ``nowrap``: wrapping them doubled the height of every row. On the phone card
-// the same row on a 320px screen made the *whole document* 472px wide - a sideways-
-// scrolling credentials screen, with the fixed tab bar stopping short of the content.
-// That overflow is invisible to every assertion in this file, because the stub VM has no
-// layout engine and reports no geometry at all; what it can see is which of the two shapes
-// carries ``nowrap``, which is the decision the fix turned on.
+// The row is roomy now - three blocks rather than nine columns - but four labelled buttons
+// still cost the line they sit on, so the four actions stay glyphs with a tooltip and an
+// accessible name. That trade is only honest if the name is really there: an icon-only
+// button with neither is a control nobody can explain, and one whose text is a translation
+// *key* would be read out as "credentialsDelete". Both halves are checked here, and the
+// glyphs are checked too - a button that quietly grew a word back is a row that wraps.
 {
     const env = credentialsEnv();
-    const rowStyle = (markup) => {
-        const match = /<span class="ui-row" style="([^"]*)"/.exec(markup);
-        return match ? match[1] : null;
+    await env.evaluate("UI.renderAdminTab('Credentials')");
+    const markup = render(env);
+    const row = (markup.match(/<li class="roster-row"[^>]*>[\s\S]*?<\/li>/g) || [])
+        .filter((entry) => entry.indexOf('data-user="1"') >= 0)[0] || '';
+    const buttons = row.match(/<button[^>]*data-(?:set-password|edit-user|user-status|delete-user)[^>]*>[\s\S]*?<\/button>/g) || [];
+    results.action_names = {
+        count: buttons.length,
+        // What is left of a button once its glyph is taken out: an empty string means the
+        // button *is* the glyph.
+        words: buttons.map((button) => button.slice(button.indexOf('>') + 1)
+            .replace(/<\/button>[\s\S]*$/, '')
+            .replace(/<svg[\s\S]*?<\/svg>/g, '')
+            .replace(/<[^>]*>/g, '')
+            .replace(/\s+/g, ' ')
+            .trim()),
+        titles: buttons.map((button) => (/title="([^"]*)"/.exec(button) || [])[1] || null),
+        labels: buttons.map((button) => (/aria-label="([^"]*)"/.exec(button) || [])[1] || null),
+        nowrap: row.indexOf('nowrap') >= 0
     };
-    env.evaluate("localStorage.setItem('layoutOverride', 'mobile')");
+}
+
+// 11. twelve accounts, read ten at a time, and narrowed by role without asking again
+//
+// The page is the answer to "do not show me the whole crew": ten rows, a line that says how
+// many there really are, and a button for the rest. The chips answer the other half - "show
+// me the moallems", "show me the admins" - out of the same roster, so neither control costs
+// a request. Both are driven through their own binder rather than by calling the methods, so
+// what is asserted is what a tap does.
+{
+    const env = credentialsEnv();
+    wideRoster = true;
     await env.evaluate("UI.renderAdminTab('Credentials')");
-    const phone = rowStyle(render(env));
-    env.evaluate("localStorage.setItem('layoutOverride', 'desktop')");
-    await env.evaluate("UI.renderAdminTab('Credentials')");
-    const table = rowStyle(render(env));
-    env.evaluate("localStorage.removeItem('layoutOverride')");
-    results.action_row = { phone: phone, table: table };
+    const before = env.requests.length;
+    const first = render(env);
+    const firstPage = listedIds(first);
+
+    await env.evaluate(`(async () => {
+        const button = { addEventListener: (type, handler) => { if (type === 'click') button.handler = handler; } };
+        UI_MODULES.bindCredentialsControls({ querySelectorAll: (selector) => (selector === '[data-credentials-more]' ? [button] : []) });
+        await button.handler({ preventDefault: () => {} });
+    })()`);
+    const opened = render(env);
+
+    const tapRole = async (role) => {
+        await env.evaluate(`(async () => {
+            const chip = {
+                getAttribute: () => ${JSON.stringify(role)},
+                addEventListener: (type, handler) => { if (type === 'click') chip.handler = handler; }
+            };
+            UI_MODULES.bindCredentialsControls({ querySelectorAll: (selector) => (selector === '[data-credentials-role]' ? [chip] : []) });
+            await chip.handler({ preventDefault: () => {} });
+        })()`);
+        return render(env);
+    };
+    const moallems = await tapRole('moallem');
+    const workers = await tapRole('worker');
+
+    // A search that matches nobody *in the chosen role*: the message has to blame the role
+    // rather than the search, and the chips have to stay on screen so there is a way back.
+    env.evaluate("document.getElementById('credentialsQuery').value = 'nobody-here'");
+    await env.evaluate("UI_MODULES.applyCredentialsSearch()");
+    const empty = render(env);
+
+    results.listing = {
+        page_size: firstPage.length,
+        first_page: firstPage,
+        count_line: rosterCount(first),
+        more_label: showMoreLabel(first),
+        chips: chipsOf(first),
+        after_more: listedIds(opened).length,
+        count_after_more: rosterCount(opened),
+        more_after_more: showMoreLabel(opened),
+        moallems: listedIds(moallems),
+        moallem_count_line: rosterCount(moallems),
+        moallem_pressed: chipsOf(moallems).filter((chip) => chip.pressed).map((chip) => chip.role),
+        moallem_chip_counts: chipsOf(moallems).map((chip) => [chip.role, chip.count]),
+        workers: listedIds(workers),
+        workers_pressed: chipsOf(workers).filter((chip) => chip.pressed).map((chip) => chip.role),
+        empty: {
+            flagged: empty.indexOf('data-no-matches') >= 0,
+            list: empty.indexOf('data-credentials-list') >= 0,
+            words: textOf((/ui-empty-title">([\s\S]*?)<\/p>/.exec(empty) || [])[1] || ''),
+            chips: chipsOf(empty).map((chip) => chip.role)
+        },
+        requests_added: env.requests.length - before
+    };
+    wideRoster = false;
 }
 """
 
@@ -513,30 +705,63 @@ def test_a_retired_tab_does_not_quietly_still_work(results):
 
 
 def test_the_roster_shows_every_account_with_its_access_state(results):
-    """This is the information the enroll dashboard never had, next to the password."""
+    """This is the information the enroll dashboard never had, next to the password.
+
+    Read by *name* rather than by column index: the row is a list item now, and the facts are
+    four labelled spans, so this test survives the next time the layout moves - the old
+    cell-index version would have moved every assertion with it.
+    """
     rows = {row["id"]: row for row in results["roster"]["rows"]}
-    assert sorted(rows, key=int) == ["1", "600", "601", "777", "1000", "1001"]
+    assert sorted(rows, key=int) == ["1", "600", "601", "602", "777", "1000", "1001"]
     seed = rows["1"]
-    assert seed["cells"][0] == "Seed Worker"
-    assert seed["cells"][2] == "Worker", "roles are labelled for the reader, not raw codes"
-    assert seed["cells"][3] == "+200000000001 · seed@example.test", "phone and email together"
+    assert seed["name"] == "Seed Worker"
+    assert seed["role_label"] == "Worker", "roles are labelled for the reader, not raw codes"
+    assert seed["role"] == "worker", "and the raw role is published, for a filter to read"
+    assert seed["contact"] == "+200000000001 · seed@example.test", "phone and email together"
     assert seed["face"] == "enrolled"
     assert seed["password"] == "set"
-    assert seed["cells"][5].startswith("Set"), "the state, plus when it last changed"
-    assert "2026-08-02 08:30:00" in seed["cells"][5]
-    assert seed["cells"][6] == "3", "sessions the last reset killed"
+    assert "Set" in seed["facts"]["password"], "the state, plus when it last changed"
+    assert "2026-08-02 08:30:00" in seed["facts"]["password"]
+    assert seed["sessions"] == "3", "sessions the last reset killed"
     assert seed["button"] is True
 
 
 def test_a_missing_face_or_password_is_visible_rather_than_blank(results):
+    """The two "why can this person not get in" facts, which the table used to park off-screen."""
     rows = {row["id"]: row for row in results["roster"]["rows"]}
     assert rows["600"]["face"] == "missing", "no template on file"
-    assert rows["600"]["cells"][4] == "None"
-    assert rows["600"]["cells"][2] == "Moallem"
+    assert "None" in rows["600"]["facts"]["face"]
+    assert rows["600"]["role_label"] == "Moallem"
     assert rows["601"]["password"] == "never"
-    assert rows["601"]["cells"][5] == "Never set"
-    assert rows["601"]["cells"][3] == "bilal@example.test", "one contact field is enough"
+    assert "Never set" in rows["601"]["facts"]["password"]
+    assert rows["601"]["contact"] == "bilal@example.test", "one contact field is enough"
     assert results["roster"]["users_requests"] == 1, "one roster, one request"
+
+
+def test_a_row_says_nothing_it_has_nothing_to_say_about(results):
+    """Only the facts that are news, so ten rows read down the page rather than across it.
+
+    Every account is active until somebody switches it off, and most have never had a session
+    revoked - so a green "Active" badge and a "Sessions revoked 0", on every row, were two
+    facts an administrator never scans *for*, and between them they pushed the access block
+    onto a second line of every row on the laptop this screen is read on. What is always there
+    is the pair that decides whether the man at the gate can get in at all: his face, and his
+    password. The other two are drawn where they are news - which is also what makes an
+    exception visible at a glance instead of being one badge among four.
+    """
+    rows = {row["id"]: row for row in results["roster"]["rows"]}
+    assert sorted(rows["600"]["facts"]) == ["face", "password"], rows["600"]["facts"]
+    assert "status" not in rows["600"]["facts"], "an active account needs no badge to say so"
+    assert "sessions" not in rows["601"]["facts"], "and no reset is not a fact either"
+    assert "sessions" in rows["1"]["facts"], "but one that killed sessions is the news itself"
+    # The state is still *on the row* - it is the drawing that is conditional, not the fact.
+    assert rows["1"]["status"] == "active"
+    assert rows["601"]["sessions"] == "0"
+    # And the two that are news, drawn on the account that has them.
+    assert "Deactivated" in rows["602"]["facts"]["status"], "a switched-off account says so"
+    assert rows["602"]["sessions"] == "4", "sessions the last reset killed"
+    assert "4" in rows["602"]["facts"]["sessions"]
+    assert rows["602"]["button"] is True, "the exception explains the button beside it"
 
 
 def test_the_screen_never_carries_a_password_or_a_hash(results):
@@ -641,8 +866,9 @@ def test_the_search_narrows_the_roster_without_a_new_request(results):
     assert search["and_terms"] == ["601"], "two terms narrow to one account, not two"
     assert search["none"] == []
     assert search["no_matches_flag"] is True
-    assert search["no_table_when_empty"] is True, "an empty table reads as 'everyone is fine'"
-    assert search["cleared"] == ["1", "600", "601", "777", "1000", "1001"]
+    assert search["no_list_when_empty"] is True, "an empty list reads as 'everyone is fine'"
+    assert search["chips_still_there"] is True, "and the way back out stays on screen"
+    assert search["cleared"] == ["1", "600", "601", "602", "777", "1000", "1001"]
     assert search["requests_added"] == 0, "the roster was already in hand"
 
 
@@ -653,23 +879,86 @@ def test_a_name_or_phone_number_cannot_inject_markup(results):
     assert escaped["raw_phone"] is False and escaped["escaped_phone"] is True
 
 
-def test_the_phone_layout_shows_one_card_per_account(results):
-    mobile = results["mobile"]
-    assert mobile["has_table"] is False
-    assert mobile["cards"] == ["1", "600", "601", "777", "1000", "1001"]
-    assert "Seed Worker" in mobile["first_card"]
-    assert "Never set" not in mobile["first_card"], "the card belongs to the first account"
-    assert mobile["has_search_box"] is True
-
-
-def test_the_action_row_wraps_on_the_card_and_not_in_the_table(results):
-    row = results["action_row"]
-    assert row["phone"] is not None, "the card has no action row to inspect"
-    assert "nowrap" not in row["phone"], (
-        "a 426px action row inside a 320px card makes the credentials page scroll sideways"
+def test_a_phone_gets_the_same_list_rather_than_a_second_layout(results):
+    """One renderer, two widths: the table that slid sideways was the half that had to go."""
+    phone = results["phone"]
+    assert phone["has_table"] is False, "no table anywhere, at any width"
+    assert phone["has_list"] is True
+    assert phone["rows"] == ["1", "600", "601", "602", "777", "1000", "1001"]
+    assert phone["first_row_name"] == "Seed Worker"
+    assert "Never set" not in phone["first_row_facts"]["password"], (
+        "the row belongs to the first account"
     )
-    assert row["table"] is not None, "the table has no action row to inspect"
-    assert "nowrap" in row["table"], "the nine-column roster needs its four actions on one line"
+    assert phone["count_line"] is not None, "the phone gets the roster's own size too"
+    assert phone["chips"] == ["all", "worker", "moallem", "admin", "head_admin"], (
+        "the role filter is a control a phone needs most"
+    )
+    assert phone["has_search_box"] is True
+
+
+def test_every_action_on_a_row_is_a_glyph_with_a_name_to_say(results):
+    """The four actions are icons, so the tooltip and the accessible name are the whole label."""
+    row = results["action_names"]
+    assert row["count"] == 4, "set the password, edit, deactivate, delete"
+    for words in row["words"]:
+        assert words == "", "a button that grew a word back is a row that wraps"
+    for name in row["titles"] + row["labels"]:
+        assert name, "an icon-only button with no name is a control nobody can explain"
+        assert not name.startswith("credentials"), f"a raw translation key reached the markup: {name}"
+    assert row["nowrap"] is True, "the four actions stay on the line they were designed for"
+
+
+def test_the_roster_is_read_ten_at_a_time_and_the_rest_is_a_button(results):
+    """Twelve accounts, ten rows, and the count line that says so.
+
+    A deployment's roster is hundreds of accounts on a phone somebody carries; the page is
+    what keeps the screen about the person being looked up rather than about the list.
+    """
+    listing = results["listing"]
+    assert listing["page_size"] == 10, listing["first_page"]
+    assert listing["first_page"] == [
+        "200", "201", "202", "203", "204", "205", "300", "301", "400", "500"
+    ], "the server's own order, cut at ten"
+    assert listing["count_line"] == "Showing 10 of 12", listing["count_line"]
+    assert listing["more_label"] == "Show 2 more", listing["more_label"]
+    assert listing["after_more"] == 12, "the button hands over exactly the rest"
+    assert listing["count_after_more"] == "Showing 12 of 12", listing["count_after_more"]
+    assert listing["more_after_more"] is None, "and goes away when there is nothing left"
+    assert listing["requests_added"] == 0, "a page is not a read of the roster"
+
+
+def test_the_role_chips_narrow_the_list_without_a_request(results):
+    """"Who are my moallems" is one tap, and the counts are what the tap would hand over."""
+    listing = results["listing"]
+    assert [(chip["role"], chip["label"], chip["count"]) for chip in listing["chips"]] == [
+        ("all", "Everyone", "12"),
+        ("worker", "Worker", "6"),
+        ("moallem", "Moallem", "2"),
+        ("off_office", "Off-Office Worker", "1"),
+        ("admin", "Administrator", "2"),
+        ("head_admin", "Head administrator", "1"),
+    ], listing["chips"]
+    assert listing["chips"][0]["pressed"] is True, "everybody is the state it starts in"
+    assert listing["moallems"] == ["300", "301"], listing["moallems"]
+    assert listing["moallem_pressed"] == ["moallem"], "the chip says it is the one in force"
+    assert listing["moallem_chip_counts"] == [[chip["role"], chip["count"]] for chip in listing["chips"]], (
+        "a chip's count is what tapping it would hand over, so choosing a role must not zero the rest"
+    )
+    assert listing["moallem_count_line"] == "Showing 2 of 2", listing["moallem_count_line"]
+    assert listing["workers"] == ["200", "201", "202", "203", "204", "205"]
+    assert listing["workers_pressed"] == ["worker"]
+    assert listing["requests_added"] == 0, "a filter is a question about the list in hand"
+
+
+def test_a_role_with_nothing_in_it_says_so_and_keeps_the_way_back(results):
+    """An empty list under a pressed chip must not read as a roster that failed to load."""
+    empty = results["listing"]["empty"]
+    assert empty["flagged"] is True
+    assert empty["list"] is False, "no headers over nothing: that shape reads as a broken load"
+    assert empty["words"] == "No accounts with this role.", empty["words"]
+    assert empty["chips"] == ["all", "worker", "moallem", "off_office", "admin", "head_admin"], (
+        "the chips stay, so the reader can pick another role"
+    )
 
 
 def test_a_dead_server_says_so_instead_of_showing_an_empty_roster(results):

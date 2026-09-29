@@ -1,25 +1,36 @@
-"""Walk-up registration: one permanent public link, one photograph, one administrator's decision.
+"""Walk-up registration: one issued link, one photograph, one administrator's decision.
 
 WHY THIS IS NOT A PER-PERSON INVITE
 -----------------------------------
 ``enrollment`` issues a link *per person*, for an account that already exists: an administrator
 creates the account, and the link registers its owner's face. That is the right shape for one
 named hire and the wrong one for a walk-up, where nobody has applied yet and so there is no
-account to hold a face. Here there is one link for the whole site, anybody can submit to it, and
-the account it creates waits for an administrator: it can be signed into immediately, and it
-cannot record a single punch until somebody approves it.
+account to hold a face. Here there is one link for the whole company, issued from the console and
+sent to whoever should apply, and the account it creates waits for an administrator: it can be
+signed into immediately, and it cannot record a single punch until somebody approves it.
+
+WHY THE LINK IS MINTED RATHER THAN PERMANENT
+--------------------------------------------
+This module used to serve a permanent address at ``/register`` that anybody could open - a public
+form with a face on it, reachable by whoever found the URL and never revoked. What replaced it is
+a link the console *issues*: ``/register/<token>``, where the token is signed by the deployment's
+``SECRET_KEY`` over one integer, so there is nothing secret at rest, the console can show the
+address at any time, and replacing the link invalidates every copy of it by arithmetic
+(``link_token``, ``rotate_link``, and migration 31's note for the argument). The form is still
+reachable without a session - the person filling it in has no account, which is the point - but it
+is no longer reachable without having been given the form's address by somebody who works here.
 
 WHAT THE THREE PARTS ARE FOR
 ----------------------------
-* **The intake switch** is two switches, because they answer two different questions.
-  ``settings.registration_enabled`` (``REGISTRATION_ENABLED``) is the *deployment's*: may this
-  installation collect walk-up applications at all. It ships off, and it is the kill switch - on
-  the same reasoning as the calibration switch, a public endpoint that collects a face is not
-  something a deployment should *discover* it is running. The ``registration_settings`` row is
-  the *operator's*: is the permanent link accepting applications today, a shift-to-shift decision
-  made in the console with no restart. The deployment switch is a ceiling over the operator's
-  (``intake_state``), so an administrator session can never switch on an intake a deployment
-  deliberately does not run - and the console says which of the two is holding the link shut.
+* **The intake switch** is the console's, with the deployment's flag as its default.
+  ``settings.registration_enabled`` (``REGISTRATION_ENABLED``) is the *deployment's*: whether
+  this installation runs walk-up applications out of the box. It ships off - on the same
+  reasoning as the calibration switch, a public endpoint that collects a face is not something a
+  deployment should *discover* it is running - and an untouched installation follows it exactly.
+  The ``registration_settings`` row is what an administrator moves, from the console, with no
+  restart: is the permanent link accepting applications today. Moving it is the same action
+  whether the flag shipped on or off, because the applicant's sentence ("ask your site
+  administrator to open it") has to be something a site administrator can act on.
 * **The quarantine** is ``users.status``. A submission writes a real account - the id, the name,
   the contact, the password and the face - as ``pending_approval``, and answers the applicant with
   the id: they sign in with it at once and cannot clock in or out (``main.verify_worker`` refuses
@@ -107,6 +118,8 @@ account exists or does not, and a migration that dropped them would destroy the 
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -144,7 +157,9 @@ log = logging.getLogger("attendance.registrations")
 #: suite through ``harness.FILE_TREES``, like every other file tree the application writes.
 PHOTOS_DIR = str(settings.registration_photos_dir)
 
-#: The one permanent public link. Additive: nothing already served moved.
+#: The form itself, one segment under its token: ``/api/v1/register/<token>``, beside the page
+#: at ``/register/<token>`` that carries it. A request without the token is refused (see
+#: ``require_link``); nothing here answers on the bare path any more.
 public_router = APIRouter(prefix="/register", tags=["registration"])
 #: The review surface. The same audience as every other administrative read of a person.
 admin_router = APIRouter(prefix="/admin/registrations", tags=["registration"])
@@ -273,14 +288,17 @@ def _next_workforce_id(conn: sqlite3.Connection) -> str:
 
 
 # ---------------------------------------------------------------------------
-# the intake switch: two answers to "is the permanent link accepting today"
+# the intake switch: an answer to "is the permanent link accepting today"
 # ---------------------------------------------------------------------------
 #: The link is accepting submissions. The only reason code that means yes.
 INTAKE_OPEN = "open"
-#: The deployment does not run walk-up registration at all, so nothing here can open it.
-INTAKE_CLOSED_BY_DEPLOYMENT = "closed_by_deployment"
-#: An administrator closed the link from the console. Only an administrator can open it again.
+#: Somebody closed the link from the console, and the console is what opens it again.
 INTAKE_CLOSED_BY_CONSOLE = "closed_by_console"
+#: Nobody has moved the switch and the deployment's own default is *off*, so the link is shut
+#: because it starts shut. The console opens it exactly as it opens the one above - the code
+#: exists so a sentence can say "nobody has opened this yet" rather than "somebody closed it",
+#: which are the same state and not the same instruction to the person reading.
+INTAKE_CLOSED_BY_DEFAULT = "closed_by_default"
 
 
 def intake_row() -> Any:
@@ -299,29 +317,34 @@ def intake_row() -> Any:
 
 
 def intake_state() -> dict[str, Any]:
-    """Whether the link accepts a submission right now, and which switch is deciding it.
+    """Whether the link accepts a submission right now, and what is holding it shut if not.
 
-    TWO SWITCHES, AND ONLY ONE OF THEM IS A CEILING
-    ----------------------------------------------
-    ``settings.registration_enabled`` says whether this *deployment* runs walk-up registration
-    at all: a capability, set where the process is started, and the one thing that can stop a
-    console click from opening a public endpoint that collects faces. The
-    ``registration_settings`` row says whether that capability is *being used* right now, which
-    is a shift-to-shift decision an administrator makes in the console::
+    THE CONSOLE OWNS THIS, AND THE DEPLOYMENT'S OWN FLAG IS ITS DEFAULT
+    ------------------------------------------------------------------
+    ``settings.registration_enabled`` (``REGISTRATION_ENABLED``) answers what this installation
+    does *out of the box*: a deployment nobody has touched follows it exactly, so an operator
+    who deliberately runs no walk-up registration never finds one running because a schema
+    change shipped it on. It is a starting position rather than a ceiling. The
+    ``registration_settings`` row is the switch an administrator or a head administrator moves
+    from the console::
 
-        accepting = REGISTRATION_ENABLED and (stored is not 0)
+        accepting = the console's position, which *is* the deployment's flag until somebody
+                    moves it, and is whatever they left it at afterwards
 
-    An untouched row - ``NULL``, and the whole of every database before migration 29 - follows
-    the deployment flag exactly, so none of this changes what an existing deployment does.
-    ``0`` is a decision: the console closed the link, and the console is what opens it again.
+    It used to be a ceiling - ``REGISTRATION_ENABLED and not closed`` - and the difference is
+    who can act on it: with the flag off, the public form said "ask your site administrator to
+    open it" and the site administrator had no control anywhere in the console that could. So
+    a link that ships closed is now a link an administrator can open, which is the decision
+    that made this a setting rather than a deploy.
 
-    WHY BOTH ARE REPORTED
-    ---------------------
-    A closed form has two possible owners, and an operator looking at one is entitled to know
-    which switch to move before they conclude the console is broken. ``reason`` is that answer
-    as a code (``open`` / ``closed_by_deployment`` / ``closed_by_console``) rather than as a
-    sentence, because the sentence is the reader's language and belongs in the console's own
-    translation tables - see ``registrationsIntakeWhy*`` in ``frontend/i18n.js``.
+    WHY THE FLAG IS STILL REPORTED
+    ------------------------------
+    "This deployment does not run registration links" and "nobody has opened this one yet" are
+    the same state from the applicant's side and different facts for whoever is standing at the
+    console, and the second one is an instruction. ``reason`` carries that as a code (``open`` /
+    ``closed_by_console`` / ``closed_by_default``) rather than as a sentence, because the
+    sentence is the reader's language and belongs in the console's own translation tables - see
+    ``registrationsIntakeWhy*`` in ``frontend/i18n.js``.
     """
     row = intake_row()
     stored: int | None = None
@@ -333,19 +356,20 @@ def intake_state() -> dict[str, Any]:
             # failure direction that keeps a walk-up link that used to work working.
             stored = None
     deployment = bool(settings.registration_enabled)
-    if not deployment:
-        reason = INTAKE_CLOSED_BY_DEPLOYMENT
-    elif stored == 0:
-        reason = INTAKE_CLOSED_BY_CONSOLE
+    if stored is None:
+        accepting = deployment
+        reason = INTAKE_OPEN if accepting else INTAKE_CLOSED_BY_DEFAULT
     else:
-        reason = INTAKE_OPEN
+        accepting = stored != 0
+        reason = INTAKE_OPEN if accepting else INTAKE_CLOSED_BY_CONSOLE
     return {
-        "accepting": reason == INTAKE_OPEN,
+        "accepting": accepting,
         "reason": reason,
+        # The deployment's own default - what an untouched switch follows, and what the console
+        # says when it explains why a link it has never been asked about is shut.
         "deployment_enabled": deployment,
-        # The console's own switch position. ``True`` when nobody has touched it, because an
-        # untouched switch is not a closed one - the deployment flag is what it follows.
-        "console_open": stored != 0,
+        # Whether anybody has moved it. ``NULL`` is the whole of every database before migration
+        # 29, and is not the same as a decision: the console draws the same switch either way.
         "decided": stored is not None,
         "updated_at": row["updated_at"] if row is not None else None,
         "updated_by": row["updated_by"] if row is not None else None,
@@ -355,6 +379,144 @@ def intake_state() -> dict[str, Any]:
 def intake_accepting() -> bool:
     """The one call the gates make: may a submission be taken, may the form offer itself."""
     return bool(intake_state()["accepting"])
+
+
+#: What the link's signature covers. Versioned like every other canonical string in this
+#: application, so that changing what a signature means is a new prefix rather than a silent
+#: reinterpretation of the old one.
+_LINK_MESSAGE_PREFIX = "registration-link|v1"
+
+#: How many times a submission re-reads the band after the insert it built the id from lost a
+#: race. One retry is the common case (the other writer had already committed by the time the
+#: statement ran); the bound exists so that a band genuinely being hammered answers 409 rather
+#: than spinning.
+ALLOCATION_ATTEMPTS = 5
+
+
+def _link_signature(generation: int) -> str:
+    """The signature half of a registration token: nothing secret is stored, see migration 31."""
+    message = f"{_LINK_MESSAGE_PREFIX}|{int(generation)}".encode("utf-8")
+    return hmac.new(str(settings.secret_key).encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+
+def link_token(generation: int | None = None) -> str:
+    """The token half of the link: the generation it was minted for, and its signature.
+
+    A function of the deployment's ``SECRET_KEY`` and one integer, which is what lets the console
+    show the link at any time while the database holds no token at all (migration 31's note has
+    the argument for that). It is not a secret that admits anybody: what it opens is a form, and
+    what the form produces is an account that cannot clock in until an administrator approves it.
+    """
+    value = int(generation) if generation is not None else link_generation()
+    return f"{value}.{_link_signature(value)}"
+
+
+def _link_generation_from_token(token: str) -> int | None:
+    """The generation a token claims, or ``None`` when the signature does not hold.
+
+    Read defensively and never raising: this is handed a string out of a URL, so it has to answer
+    "not a link" for anything at all - a bare word, a number with no signature, a signature of
+    the right shape over the wrong generation. ``compare_digest`` rather than ``==`` so the
+    comparison does not leak how much of a guessed signature was right.
+    """
+    raw = str(token or "").strip()
+    head, separator, signature = raw.partition(".")
+    if separator != "." or not head.isdigit():
+        return None
+    try:
+        generation = int(head)
+    except ValueError:  # pragma: no cover - ``isdigit`` already decided this
+        return None
+    if not hmac.compare_digest(_link_signature(generation), signature.strip().lower()):
+        return None
+    return generation
+
+
+def link_generation() -> int:
+    """The generation the live link was minted for. ``0`` when nobody has rotated it yet.
+
+    Never raises, for the same reason ``intake_row`` never does: a database older than migration
+    31 has no such column, and a link that predates the console having a link is generation 0 -
+    which is exactly what the migration's ``DEFAULT 0`` writes for every existing row.
+    """
+    row = intake_row()
+    if row is None:
+        return 0
+    try:
+        return max(0, int(row["link_generation"] or 0))
+    except (IndexError, KeyError, TypeError, ValueError):
+        return 0
+
+
+def link_row() -> Any:
+    """The settings row, for the rotated-at/by pair the console shows beside the link."""
+    return intake_row()
+
+
+def link_url(request: Request, base_url: str | None = None) -> str:
+    """The address to send somebody: the console's base URL, the path, and the token."""
+    return f"{enrollment._public_base_url(request, base_url)}register/{link_token()}"
+
+
+def rotate_link(request: Request, current: CurrentUser) -> str:
+    """Replaces the link: every URL minted before this call stops verifying.
+
+    One write, and the revocation is the whole point of it - the signature covers the generation,
+    so a token that carried the old one is refused by arithmetic rather than by a row somebody has
+    to remember to revoke (migration 31's note). The row is created if this is the first rotation
+    on a deployment that has never written one, so a console that was never opened still gets a
+    link it can hand out rather than a 500 about a missing settings row.
+    """
+    stamp = _now()
+    with immediate() as conn:
+        conn.execute(
+            "INSERT INTO registration_settings (id, intake_open, updated_at, updated_by) "
+            "VALUES (1, NULL, ?, NULL) ON CONFLICT(id) DO NOTHING",
+            (stamp,),
+        )
+        before = int(
+            conn.execute(
+                "SELECT COALESCE(link_generation, 0) FROM registration_settings WHERE id = 1"
+            ).fetchone()[0]
+        )
+        conn.execute(
+            "UPDATE registration_settings SET link_generation = ?, link_rotated_at = ?, "
+            "link_rotated_by = ? WHERE id = 1",
+            (before + 1, stamp, current.id),
+        )
+        _audit(
+            conn,
+            action="registration_link_rotate",
+            actor=current,
+            entity="registration_settings",
+            entity_id="1",
+            before={"link_generation": before},
+            after={"link_generation": before + 1, "rotated_at": stamp},
+            request=request,
+        )
+    return link_token(before + 1)
+
+
+def require_link(token: str) -> None:
+    """Refuses a request whose URL does not carry the live link, with the server's own reason.
+
+    A 404 rather than a 403, and deliberately the same answer for every way a URL can be wrong -
+    an unknown address, an old link somebody replaced, a guessing script, a link from a deployment
+    with a different ``SECRET_KEY``. What an applicant can act on is "this link is not valid any
+    more, ask for a new one"; which of those it was is an operator's question, and the console
+    that can mint a link is where they ask it.
+    """
+    if _link_generation_from_token(token) != link_generation():
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error_code": "registration_link_invalid",
+                "message": (
+                    "This registration link is not valid any more. Ask your administrator for a "
+                    "new one."
+                ),
+            },
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -613,9 +775,9 @@ class Decision(BaseModel):
 class IntakeSwitch(BaseModel):
     """The console's answer to "is the permanent link accepting today".
 
-    A boolean and nothing else. There is deliberately no way to set the *deployment* side of the
-    question through this API: ``REGISTRATION_ENABLED`` is a fact about the process that is
-    running, and an endpoint that could change the ceiling would make the ceiling decorative.
+    A boolean and nothing else - the *effective* position, not a pair of switches. It is the
+    position and not a delta, so two administrators pressing opposite buttons a second apart
+    produce one state and not a conflict, and the answer to either of them is the same read.
     """
 
     open: bool
@@ -625,23 +787,47 @@ class IntakeSwitch(BaseModel):
 # the public link
 # ---------------------------------------------------------------------------
 @public_router.get("")
-@limiter.limit(settings.registration_rate_limit)
-async def registration_intake(request: Request):  # noqa: ARG001 - the limiter needs it
-    """What the public form has to satisfy, and whether intake is open at all.
+@public_router.post("")
+async def registration_link_required():
+    """The bare path, with no token: the link's own refusal, said out loud.
 
-    Public by necessity: the person filling the form in has no account, which is the entire point
-    of the form. What it exposes is the *policy* - the upload ceiling, the accepted formats, the
-    roles somebody may ask for, the shortest password - and no data of any kind: not a count of
-    the queue, not a name, not an id.
+    A route rather than an accident. Without it the framework answers ``404 {"detail": "Not
+    Found"}``, which is true and useless - the person holding the phone cannot tell a broken
+    link from a typo, and the console cannot tell a link somebody replaced from one that was
+    never cut properly. Answering the same ``registration_link_invalid`` the token check raises
+    costs one handler and makes the bare path a *sentence*: this is not a link, ask for one.
 
-    ``enabled: false`` still answers 200 rather than 404. A permanent link that has been
-    switched off has to be able to *say* it is switched off, or an applicant sees a broken page
-    and tries again tomorrow.
-
-    ``enabled`` is the *effective* state of two switches rather than the deployment flag alone:
-    since the console owns a switch of its own (see ``intake_state``), reading the env flag here
-    would offer the form to somebody the very next line would refuse.
+    Public, and in the same sense as the two routes below: no session, no data, no policy - just
+    the refusal, which is the only thing true of an address with no link behind it.
     """
+    require_link("")
+
+
+@public_router.get("/{token}")
+@limiter.limit(settings.registration_rate_limit)
+async def registration_intake(request: Request, token: str):
+    """What the form has to satisfy, and whether intake is open at all.
+
+    Public because the person filling it in has no account, which is the entire point of the
+    form - but not *addressable* by the public: the token in the path is the console's own link,
+    and a request without it is refused before a single policy field is answered. The link is
+    what makes this a private door rather than a permanent address on the open internet, and the
+    console mints, shows and replaces it (``GET``/``POST /admin/registrations/link``).
+
+    Public still, in the sense that matters: no session, no account, and no header. What it
+    exposes is the *policy* - the upload ceiling, the accepted formats, the roles somebody may
+    ask for, the shortest password - and no data of any kind: not a count of the queue, not a
+    name, not an id.
+
+    ``enabled: false`` still answers 200 rather than 404. A link that has been switched off has
+    to be able to *say* it is switched off, or an applicant sees a broken page and tries again
+    tomorrow.
+
+    ``enabled`` is the *effective* state rather than the deployment flag alone: the console's
+    switch is the one that decides (see ``intake_state``), so reading the env flag here would
+    offer the form to somebody the very next line would refuse.
+    """
+    require_link(token)
     state = intake_state()
     # ``enabled`` alone, and no reason code: an applicant gets one sentence either way, and
     # *which* switch closed the link is an operator's question - it is answered with the rest of
@@ -662,10 +848,11 @@ async def registration_intake(request: Request):  # noqa: ARG001 - the limiter n
     }
 
 
-@public_router.post("")
+@public_router.post("/{token}")
 @limiter.limit(settings.registration_rate_limit)
 async def submit_registration(
     request: Request,
+    token: str,
     full_name: str = Form(...),
     password: str = Form(...),
     role: str = Form(default="worker"),
@@ -675,14 +862,22 @@ async def submit_registration(
     consent: str = Form(default=""),
     photo: UploadFile = File(...),
 ):
-    """Accept one walk-up registration, and create the account it is for.
+    """Accept one registration from the console's link, and create the account it is for.
 
     The order is the argument. Everything that can be refused is refused before a file is
-    written: the switch, the text, the role, the consent and the password. Then the photo is
-    streamed to disk through the shared policy - one chunk of memory whatever its size - decoded
-    once for its embedding, and the account is inserted. Any failure after the file exists takes
-    the file with it, so a refused submission cannot leave a face in a directory nobody is going
-    to look at.
+    written: the link, the switch, the text, the role, the consent and the password. Then the
+    photo is streamed to disk through the shared policy - one chunk of memory whatever its size -
+    decoded once for its embedding, and the account is inserted. Any failure after the file
+    exists takes the file with it, so a refused submission cannot leave a face in a directory
+    nobody is going to look at.
+
+    WHY THE LINK IS CHECKED BEFORE THE SWITCH
+    -----------------------------------------
+    They answer two different questions and the link's is the narrower one. A closed intake is
+    something an applicant may be told - "ask your site administrator to open it" is a sentence
+    somebody can act on, and it is what the form itself will have shown them. A URL that is not
+    this deployment's live link is not a person who found the form closed; it is an address that
+    should never have reached them, and it is answered as one thing whatever is wrong with it.
 
     WHAT THE APPLICANT GETS BACK
     ----------------------------
@@ -702,7 +897,19 @@ async def submit_registration(
     The switch is read the same way: it is the *effective* intake state (``intake_state``), not
     the deployment flag alone, so closing the link from the console refuses exactly the
     submissions the form has stopped offering.
+
+    ONE LINK, TEN PHONES, AT THE SAME MOMENT
+    ----------------------------------------
+    The link is shared, which means the band scan and the ``INSERT`` that consumes it are racing
+    by design: ten applicants opening one WhatsApp message do not take turns. They are serialized
+    by ``immediate()``, so the tenth reads the band after the ninth has committed and the common
+    case is ten distinct numbers with no retry - but a writer outside this lock, or a lock taken
+    between the scan and the insert, leaves the primary key to catch it. That is a *lost race*
+    rather than a bad request, and it is retried here rather than handed to the applicant as
+    ``409 registration_conflict`` with "send the form again": they sent the form once, the
+    failure was the server's, and the photograph and the embedding are already in hand.
     """
+    require_link(token)
     if not intake_accepting():
         raise HTTPException(
             status_code=403,
@@ -809,32 +1016,45 @@ async def submit_registration(
                         ),
                     },
                 )
-            assigned = _next_workforce_id(conn)
-            try:
-                conn.execute(
-                    "INSERT INTO users (id, name, email, phone, password_hash, role, status, "
-                    "enrolled_at, template_version, biometric_id, registration_note) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
-                    (
-                        assigned,
-                        full_name,
-                        email,
-                        phone,
-                        password_hash,
-                        role,
-                        STATUS_PENDING_APPROVAL,
-                        stamp,
-                        # The face about to be filed can never be confused with whoever held
-                        # this number before: the number is reused, and a previous holder's
-                        # leftover file is moved aside here (see ``biometrics.new_account_id``).
-                        biometrics.new_account_id(assigned),
-                        work_details or None,
-                    ),
-                )
-            except sqlite3.IntegrityError:
-                # The allocator and its ``INSERT`` are one transaction, so this can only be a
-                # race with a writer that does not use this lock - the primary key is the last
-                # line of defence, and answering 409 says what actually happened.
+            assigned = ""
+            for _attempt in range(ALLOCATION_ATTEMPTS):
+                candidate = _next_workforce_id(conn)
+                try:
+                    conn.execute(
+                        "INSERT INTO users (id, name, email, phone, password_hash, role, status, "
+                        "enrolled_at, template_version, biometric_id, registration_note) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                        (
+                            candidate,
+                            full_name,
+                            email,
+                            phone,
+                            password_hash,
+                            role,
+                            STATUS_PENDING_APPROVAL,
+                            stamp,
+                            # The face about to be filed can never be confused with whoever held
+                            # this number before: the number is reused, and a previous holder's
+                            # leftover file is moved aside here (see ``biometrics.new_account_id``).
+                            biometrics.new_account_id(candidate),
+                            work_details or None,
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    # The number was taken between the scan and the insert - by a writer outside
+                    # this lock, since ``immediate()`` serializes the ones inside it. The write
+                    # was a statement, not the transaction, so the band is scanned again here
+                    # rather than the applicant being told to send the form a second time: one
+                    # shared link is used by many phones at once, and losing that race is the
+                    # server's problem to absorb (see the docstring above).
+                    continue
+                assigned = candidate
+                break
+            if not assigned:
+                # Every attempt lost. Either the band is being written by something that does not
+                # take this lock at all, or the queue is far busier than one submission's worth of
+                # retries can absorb - and both are answered the same way, because the applicant
+                # can only do one thing about either.
                 raise HTTPException(
                     status_code=409,
                     detail={
@@ -844,7 +1064,7 @@ async def submit_registration(
                             "send the form again."
                         ),
                     },
-                ) from None
+                )
             _audit(
                 conn,
                 action="user_self_registered",
@@ -1002,8 +1222,8 @@ async def read_intake_switch(current: CurrentUser = Depends(admin_only)):  # noq
 
     A site administrator's to read and to write. ``admin_only``, not the root tier: opening or
     closing the company's own public form is an operational decision about this site, which is
-    exactly the kind of thing this console exists for - the deployment-level switch underneath it
-    is the part that is not reachable from here at all.
+    exactly the kind of thing this console exists for. A head administrator is included in that
+    guard and has no extra power here - there is one switch, and it is the site's.
     """
     return {"status": "success", **intake_state()}
 
@@ -1016,18 +1236,17 @@ async def set_intake_switch(
 ):
     """Open or close the permanent link, from the console, with no restart.
 
-    WHAT THIS CANNOT DO
-    -------------------
-    Turn on a deployment that does not run walk-up registration: ``REGISTRATION_ENABLED`` is the
-    ceiling and this writes only the position under it. So the answer says which switch is
-    holding the link shut (``reason``), and the console draws no button at all when the answer is
-    the deployment's - a control that appears pressable and changes nothing is worse than no
-    control, because the operator concludes the screen is broken and stops using it.
+    THE ONE SWITCH THAT DECIDES IT
+    ------------------------------
+    Whether this deployment runs walk-up registration *out of the box* is
+    ``REGISTRATION_ENABLED``, and it is a default rather than a ceiling: writing 1 here accepts
+    applications on a deployment whose flag is off, which is the point of the button and the
+    reason it is drawn beside the link whoever is holding the phone was given. 0 refuses them
+    the same way, whatever the flag said, until somebody opens it again here.
 
-    It is written even when the deployment switch is off, and that is deliberate: the decision is
-    stored, reported, and takes effect the moment the deployment allows intake at all. Refusing
-    the write would lose an operator's intent and leave them nothing to look at but a button that
-    answers "not yet" with no record of why.
+    The answer is read back rather than assumed - the route answers with the state a read would
+    - because the console's own panel is about to draw it, and one source of truth for "is this
+    form accepting" is the whole reason the read and the write share a shape.
 
     Audited with the position it replaced, because "the form was open all weekend" is a question
     somebody will ask, and this row's own ``updated_at`` can only answer it for the latest change.
@@ -1057,6 +1276,80 @@ async def set_intake_switch(
             request=request,
         )
     return {"status": "success", **intake_state()}
+
+
+def _link_payload(request: Request, state: dict[str, Any]) -> dict[str, Any]:
+    """The link's own answer: the address, when it was last replaced, and whether it is open.
+
+    ``accepting`` travels with the URL on purpose. An administrator who copies a link is about to
+    send it to somebody, and the one thing that would make that a wasted message - the switch
+    being shut - is answered here rather than left for the applicant to discover as a closed
+    form. The panel can therefore *move* it as well as say it: the link and the switch are two
+    objects (replacing a URL does not close the form, and closing the form does not invalidate
+    the URL), so the panel offers both controls instead of pretending they are one.
+    """
+    row = link_row()
+    rotated_at: Any = None
+    rotated_by: Any = None
+    if row is not None:
+        try:
+            rotated_at = row["link_rotated_at"]
+            rotated_by = row["link_rotated_by"]
+        except (IndexError, KeyError):
+            pass
+    url = link_url(request)
+    return {
+        "status": "success",
+        "url": url,
+        "generation": link_generation(),
+        "rotated_at": rotated_at,
+        "rotated_by": rotated_by,
+        "qr_png_data_uri": enrollment._qr_data_uri(url),
+        "accepting": state["accepting"],
+        "reason": state["reason"],
+        "deployment_enabled": state["deployment_enabled"],
+    }
+
+
+@admin_router.get("/link")
+async def read_registration_link(
+    request: Request, current: CurrentUser = Depends(admin_only)
+):  # noqa: ARG001 - the guard is the point
+    """The registration link - the URL an administrator sends to somebody who wants to apply.
+
+    WHY THIS IS A GET AND NOT A REVEAL
+    ----------------------------------
+    There is no "create a link" step and no one-time token to copy: the link is a function of the
+    deployment's ``SECRET_KEY`` and one integer (see ``link_token``), so it can be asked for as
+    often as anybody wants and is the same answer every time until it is replaced. That is the
+    property that makes "a link in the console" work at all - an administrator who wants to send
+    it in three messages does not have to mint three links, and one who lost the chat thread does
+    not have to revoke the link that is already with an applicant.
+
+    Reachable by a site administrator, ``admin_only`` like the switch beside it: handing out the
+    company's own application form is the same kind of decision as opening it.
+    """
+    return _link_payload(request, intake_state())
+
+
+@admin_router.post("/link")
+async def replace_registration_link(request: Request, current: CurrentUser = Depends(admin_only)):
+    """Replaces the link. Every copy already sent stops working, immediately.
+
+    This is the revocation, and it is the only one there is - which is deliberate rather than
+    missing. A link is not shared with named people (anybody the company sends it to can use it),
+    so "which applicant is this link for" has no answer to revoke against; what can be revoked is
+    the link itself, and one bump of the generation does exactly that. An administrator who is
+    replacing a link because it reached the wrong person has one action to take and no rows to
+    hunt for.
+
+    Nothing already submitted is affected. A submission that arrived under the old link has its
+    account, its photograph and its place in the queue; what stops working is the *form*, not the
+    applications. The console says so beside the button, because "replace the link" reads like it
+    might throw away the queue.
+    """
+    rotate_link(request, current)
+    return _link_payload(request, intake_state())
 
 
 @admin_router.get("/{user_id}/photo")

@@ -708,16 +708,25 @@ def _shift_period_hours_sql() -> tuple[str, list]:
         "COALESCE(SUM("
         + _AWAITING_HOURS_SQL.format(awaiting=awaiting)
         + "), 0.0) AS awaiting_approval_hours, "
-        "COALESCE(SUM(COALESCE(l.overtime_hours, 0)), 0.0) AS overtime_hours "
+        "COALESCE(SUM(COALESCE(l.overtime_hours, 0)), 0.0) AS overtime_hours, "
+        # How many shifts the hours above are *owed by*, and it is the same predicate rather
+        # than a second opinion about it: "is payroll ready to run" is answered by a count of
+        # rows, and a figure that counted by its own list could disagree with the hours it is
+        # printed beside. Fails closed like the hours do - a ``pending_overtime`` row is one
+        # shift waiting even though its standard day has already been credited.
+        f"COALESCE(SUM(CASE WHEN l.status_code IN ({awaiting}) THEN 1 ELSE 0 END), 0) "
+        "AS awaiting_approval_shifts "
         "FROM attendance_logs l "
         "WHERE l.action = 'Clock Out' AND l.timestamp >= ? AND l.timestamp < ?"
     )
     # The approved case first (its code list, then the pending-overtime comparison), then the
-    # awaiting case (the same comparison, then its code list), then the range.
+    # awaiting case (the same comparison, then its code list), then the same code list again for
+    # the shift count, then the range.
     params = [
         *PAYABLE_CODES,
         PENDING_OVERTIME_CODE,
         PENDING_OVERTIME_CODE,
+        *AWAITING_APPROVAL_CODES,
         *AWAITING_APPROVAL_CODES,
     ]
     return sql, params
@@ -837,7 +846,13 @@ def _period_presence(
 def _period_hours(
     conn: sqlite3.Connection, *, start: str, end: str, worker_id: str | None = None
 ) -> dict:
-    """``(approved_hours, awaiting_approval_hours, overtime_hours)`` over the same range."""
+    """``(approved_hours, awaiting_approval_hours, overtime_hours, awaiting_approval_shifts)``.
+
+    The last of the four is the *count* behind the third figure, and it is what makes "is this
+    window ready to be paid" answerable from a summary: a reader can see that 12 hours are
+    waiting, but not that they are four shifts somebody has to open - and four decisions is a
+    different afternoon's work from one.
+    """
     sql, params = _shift_period_hours_sql()
     if worker_id:
         sql += " AND l.worker_id = ?"
@@ -847,6 +862,7 @@ def _period_hours(
         "approved_hours": round(float(row["approved_hours"] or 0.0), 4),
         "awaiting_approval_hours": round(float(row["awaiting_approval_hours"] or 0.0), 4),
         "overtime_hours": round(float(row["overtime_hours"] or 0.0), 4),
+        "awaiting_approval_shifts": int(row["awaiting_approval_shifts"] or 0),
     }
 
 

@@ -78,9 +78,10 @@ let approveWritesTemplate = true;
 //: three credentials a first sign-in is typed with.
 let approveContact = { email: 'nadia@example.com', phone: '+965 555 0101' };
 
-//: Which switch is deciding the link's state, as the fake server reports it. ``open`` is the
-//: ordinary case; the other two are the two ways it can be shut, and the console is required to
-//: tell them apart - one of them is a lever it can move and the other is not.
+//: The link's state, as the fake server reports it. ``open`` is the ordinary case; the other two
+//: are the two ways it can be shut and the console is required to tell them apart, because
+//: "nobody has opened this yet" and "somebody closed it this morning" are the same state and
+//: different sentences. Both are states this console can leave.
 let intakeReason = 'open';
 let intakeFails = null;         // a status to answer the intake read with, or null
 const intakePosts = [];         // every intake write, in order
@@ -90,8 +91,7 @@ function intakeBody() {
         status: 'success',
         accepting: intakeReason === 'open',
         reason: intakeReason,
-        deployment_enabled: intakeReason !== 'closed_by_deployment',
-        console_open: intakeReason !== 'closed_by_console',
+        deployment_enabled: intakeReason !== 'closed_by_default',
         decided: intakeReason === 'closed_by_console',
         updated_at: null,
         updated_by: intakeReason === 'closed_by_console' ? '1000' : null
@@ -150,12 +150,11 @@ function responders(url, init) {
         if (init && String(init.method || 'GET').toUpperCase() === 'POST') {
             const wanted = JSON.parse(init.body);
             intakePosts.push({ path: path, body: wanted });
-            // The *answer* is the state, not the request: a deployment that does not run walk-up
-            // registration stores the operator's intent and still answers "closed by
-            // deployment", and the console is required to draw that rather than what it asked.
-            if (intakeReason !== 'closed_by_deployment') {
-                intakeReason = wanted.open ? 'open' : 'closed_by_console';
-            }
+            // The *answer* is the state, not the request, and the console draws what came back -
+            // so the fake server's job is to move the switch the way the real one does: this
+            // route writes the position, and the position is what decides, whatever the
+            // deployment's own default was.
+            intakeReason = wanted.open ? 'open' : 'closed_by_console';
         }
         return { status: 200, body: intakeBody() };
     }
@@ -510,18 +509,24 @@ const results = {};
     };
 }
 
-// 14. a deployment that does not run walk-up registration is drawn with no lever at all
+// 14. a deployment that ships closed is a link the console can open - which is the whole point
 {
     const env = consoleEnv();
-    intakeReason = 'closed_by_deployment';
+    intakeReason = 'closed_by_default';
     await env.evaluate("UI.renderAdminTab('Registrations')");
-    const markup = render(env);
-    results.intake_deployment_off = {
-        state: (/data-registrations-intake-state="([^"]*)"/.exec(markup) || [])[1],
+    const closing = render(env);
+    // ...and the tap reaches the server, whose answer is then what the card is drawn from.
+    await env.evaluate("UI_MODULES.toggleRegistrationsIntake('open')");
+    const opened = render(env);
+    results.intake_default_off = {
+        state: (/data-registrations-intake-state="([^"]*)"/.exec(closing) || [])[1],
         // ``data-registration-intake`` is the button; ``data-registrations-intake`` is the card.
-        lever: markup.indexOf('data-registration-intake=') >= 0,
-        text: textOf((/<div class="ui-card" data-registrations-intake="[^"]*"[\s\S]*?<\/p>/.exec(markup) || [])[0] || ''),
-        sentence: env.evaluate("I18n.__('registrationsIntakeWhyClosedByDeployment')")
+        lever: (/data-registration-intake="([^"]*)"/.exec(closing) || [])[1],
+        text: textOf((/<div class="ui-card" data-registrations-intake="[^"]*"[\s\S]*?<\/p>/.exec(closing) || [])[0] || ''),
+        sentence: env.evaluate("I18n.__('registrationsIntakeWhyClosedByDefault')"),
+        posts: intakePosts.slice(),
+        opened_state: (/data-registrations-intake-state="([^"]*)"/.exec(opened) || [])[1],
+        opened_action: (/data-registration-intake="([^"]*)"/.exec(opened) || [])[1]
     };
 }
 
@@ -819,8 +824,9 @@ def test_the_intake_switch_is_drawn_with_its_state_and_one_action(results):
 
     The public form is a URL the company prints once, so opening and closing it is an operator's
     decision on the day. What the card has to carry is both the *state* - the reader has to be
-    able to tell open from closed without pressing anything - and which switch decided it, since
-    only one of the two is movable from here.
+    able to tell open from closed without pressing anything - and *why*, because a link nobody
+    has ever opened and a link somebody closed this morning need different things said about
+    them.
     """
     intake = results["intake"]
     assert intake["open_state"] == "open", "the card is not drawn in the server's own state"
@@ -837,9 +843,10 @@ def test_the_intake_switch_is_drawn_with_its_state_and_one_action(results):
 def test_closing_the_link_posts_the_switch_and_draws_what_came_back(results):
     """The answer is the state, and the screen is redrawn from it rather than from the request.
 
-    A write the deployment flag refuses stores the operator's intent and still leaves the link
-    shut - so a console that repeated what it asked for would report an open form while the form
-    refuses every applicant.
+    The switch is written for a position and read back for what it now is, so a console that
+    repeated what it asked for would report a form the server has not agreed to - and the two
+    only have to disagree once (another administrator moving the same switch, a request the
+    server refuses) for that to be a screen handing out a link that refuses everybody.
     """
     intake = results["intake"]
     assert intake["posts"], "the control posted nothing at all"
@@ -853,20 +860,26 @@ def test_closing_the_link_posts_the_switch_and_draws_what_came_back(results):
     assert intake["closed_sentence"] in intake["closed_text"], intake["closed_text"]
 
 
-def test_a_deployment_that_does_not_run_registration_is_drawn_without_a_lever(results):
-    """One of the two switches cannot be moved from here, and the card says which.
+def test_a_deployment_that_ships_closed_is_a_link_the_console_can_open(results):
+    """The lever is drawn in the state where it is the *only* thing that can open the link.
 
-    A lever that cannot move the thing beside it is worse than no lever: the operator presses it,
-    nothing changes, and what they conclude is that this screen is broken - rather than that the
-    deployment does not run walk-up registration at all. Same rule the rail follows for a tab the
-    reader cannot act on.
+    A deployment that has never run walk-up registration ships with the link shut, so this is
+    the state the first applicant's page is refusing from - the page whose own sentence tells
+    them to ask their site administrator to open it. A card that named the deployment instead of
+    offering the lever is what made that sentence impossible to act on.
     """
-    blocked = results["intake_deployment_off"]
-    assert blocked["state"] == "closed_by_deployment"
-    assert blocked["lever"] is False, (
-        "a control was drawn for a switch this console cannot move"
+    shipped = results["intake_default_off"]
+    assert shipped["state"] == "closed_by_default"
+    assert shipped["lever"] == "open", (
+        "the one state where the console is the only way in drew no lever"
     )
-    assert blocked["sentence"] in blocked["text"], blocked["text"]
+    assert shipped["sentence"] in shipped["text"], shipped["text"]
+
+    # The tap is a write to the same route as any other, and the card follows the answer.
+    assert shipped["posts"], "the lever posted nothing at all"
+    assert shipped["posts"][0]["body"] == {"open": True}, shipped["posts"][0]
+    assert shipped["opened_state"] == "open", "the form opened and the card still says closed"
+    assert shipped["opened_action"] == "close", "the card did not turn round with the state"
 
 
 def test_a_switch_that_could_not_be_read_leaves_no_control_behind(results):

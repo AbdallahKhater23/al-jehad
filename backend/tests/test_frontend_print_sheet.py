@@ -8,8 +8,9 @@ title carries the name the print dialog offers to save under, and all of it is p
 the dialog closes - on ``afterprint``, because Firefox and Safari render the sheet *after*
 ``print()`` returns, so emptying it early hands the reader a blank page.
 
-Both readers print: an administrator's Shifts tab, and the self-hours screen that a worker,
-a lead worker or a normal administrator reads on the handset. Those three rules were written
+Both readers print: an administrator's Shifts tab (and, since phase 4, the dashboard's own
+summary of the period it is looking at), and the self-hours screen that a worker, a lead
+worker or a normal administrator reads on the handset. Those three rules were written
 out in each of the two files - the same lines twice. Identical on the day they were written,
 and a pair that diverges the first time somebody fixes the cleanup in one of them, which is
 how a screen ends up printing a stale sheet behind its own or handing back a title it
@@ -51,10 +52,11 @@ HELPER = "frontendjavascript.js"
 READERS = ("admin_modules.js", "worker_modules.js")
 
 #: How many *sheets* each reader builds, and therefore how many times it asks the helper
-#: for a period line. The console prints its whole period and one worker's month; the
-#: self-hours screen prints the reader's own. Written out, so a third sheet is a deliberate
-#: change here rather than a second way of describing a period slipping in unnoticed.
-SHEETS_PER_READER = {"admin_modules.js": 2, "worker_modules.js": 1}
+#: for a period line. The console prints its whole period, the dashboard's own summary of
+#: that period, and one worker's month; the self-hours screen prints the reader's own.
+#: Written out, so a fourth sheet is a deliberate change here rather than a second way of
+#: describing a period slipping in unnoticed.
+SHEETS_PER_READER = {"admin_modules.js": 3, "worker_modules.js": 1}
 
 
 @pytest.fixture(scope="module")

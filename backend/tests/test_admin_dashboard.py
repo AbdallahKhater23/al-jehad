@@ -462,6 +462,10 @@ def plant_period_world(now: datetime | None = None) -> dict:
         "approved_hours": 46.0,       # 8 + 7.5 + 8.5 + 8 + 8, and 6 of the pending-overtime day
         "overtime_hours": 3.0,        # the hour authorised on one shift and the hold on another
         "awaiting_approval_hours": 10.0,   # the pending review, and the pending overtime's hold
+        # Two rows nobody has signed off - the pending review and the pending overtime - and
+        # the ``auto_closed_8h`` row is deliberately *not* one of them: it is payable by policy,
+        # which is why the count and the hours are counted in the same statement.
+        "awaiting_approval_shifts": 2,
         # One day present each, and the late count breaking the tie: 3 arrives late, 4 and 9 do
         # not - so the quietest list is those three, and the fourth candidate (a two-day worker)
         # is where the limit cuts.
@@ -758,7 +762,7 @@ def test_the_period_panel_counts_the_planted_window(client):
     for key in (
         "days", "preset", "start", "end", "workers", "expected_days", "present_days",
         "late_arrivals", "average_attendance_rate", "approved_hours", "overtime_hours",
-        "awaiting_approval_hours", "by_day",
+        "awaiting_approval_hours", "awaiting_approval_shifts", "by_day",
     ):
         assert period[key] == expected[key], (
             f"period.{key} is {period[key]!r}, expected {expected[key]!r}"
@@ -902,6 +906,16 @@ def test_the_period_hours_are_the_timesheets_own_arithmetic(client):
     assert period["approved_hours"] == round(approved, 4), (period, approved)
     assert period["awaiting_approval_hours"] == round(awaiting, 4), (period, awaiting)
     assert period["overtime_hours"] == round(overtime, 4), (period, overtime)
+    # The count behind those hours is the same predicate in SQL and not a second opinion about
+    # it: one *shift* per row whose code is one the timesheet calls awaiting, whatever its hours
+    # came to. A ``pending_overtime`` row holding nothing is still a decision somebody owes, so
+    # this is a count of rows rather than of the rows ``awaiting > 0`` would name.
+    awaiting_rows = [
+        row for row in rows if str(row["status_code"] or "") in reports.AWAITING_APPROVAL_CODES
+    ]
+    assert len(awaiting_rows) == 4, awaiting_rows
+    assert period["awaiting_approval_shifts"] == len(awaiting_rows), (period, awaiting_rows)
+    assert period["awaiting_approval_shifts"] <= len(HOURS_CASES), period
     # The two halves of the timesheet's own contract, on the planted rows: what a clock-out is
     # worth is either approved or waiting, never both and never neither.
     assert period["approved_hours"] + period["awaiting_approval_hours"] > 0, period
@@ -929,6 +943,7 @@ def test_the_period_totals_agree_with_the_attendance_report(client):
     for key in (
         "workers", "expected_days", "present_days", "late_arrivals", "average_attendance_rate",
         "approved_hours", "overtime_hours", "awaiting_approval_hours",
+        "awaiting_approval_shifts",
     ):
         assert period[key] == totals[key], (
             f"the panel and the report disagree about {key}: {period[key]!r} vs {totals[key]!r}"
@@ -1041,6 +1056,154 @@ def test_a_period_that_cannot_be_counted_answers_null_and_takes_nothing_with_it(
     assert body["now"] == whole["now"]
     assert body["waiting"] == whole["waiting"]
     assert body["as_of"], body
+
+
+# ---------------------------------------------------------------------------
+# 2d. the two watch figures: dormant and onboarding
+# ---------------------------------------------------------------------------
+#: The watch world, one account per *edge* of each predicate:
+#: ``(id, status, last punch in days - None for never, created days ago - None for older)``.
+#:
+#: Two counts and four ways to be excluded from each, because these are the figures that can be
+#: wrong by including somebody: an account that has never punched is not dormant (it is the
+#: separate ``never_clocked_in`` figure), an account that has punched is not onboarding, a
+#: switched-off account is neither, and a punch from just inside the window clears dormancy.
+WATCH_ACCOUNTS = (
+    ("d1", "active", 40, None),      # worked here, then stopped: dormant
+    ("d2", "active", 2, None),       # worked this week: not dormant
+    ("d3", "active", None, None),    # never punched at all: never, and *not* dormant
+    ("d4", "inactive", 40, None),    # switched off: not dormant, however long it has been
+    ("d5", "active", 29, None),      # just inside the window: not dormant
+    ("o1", "active", None, 3),       # joined this week and never punched: onboarding
+    ("o2", "active", 1, 3),          # joined this week and already working: not onboarding
+    ("o3", "active", None, 40),      # never punched, but joined long ago: not onboarding
+)
+
+
+def plant_watch_world(now: datetime | None = None) -> dict:
+    """Replace the roster and the audit log with one built around the two watch figures.
+
+    ``dormant_days + 10`` rather than a literal forty: the account has to be dormant *whatever the
+    window is*, so a build that changes ``DORMANT_DAYS`` moves the plant with it instead of
+    quietly making this a test of a different edge.
+    """
+    now = now or datetime.now()
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def at(days_ago: int, hour: int = 6) -> str:
+        return (day_start - timedelta(days=days_ago) + timedelta(hours=hour)).strftime(TS)
+
+    with writing() as conn:
+        # The roster, the attendance history *and* the audit log, because all three are read: an
+        # assertion like "one account is onboarding" has to be a fact about this plant rather
+        # than about whichever creation rows a shared snapshot happened to carry.
+        conn.execute("DELETE FROM users")
+        conn.execute("DELETE FROM attendance_logs")
+        conn.execute("DELETE FROM audit_log WHERE entity = 'users'")
+
+        # The harness's own administrators come with it: this suite signs in as them, and a token
+        # naming an account that is not in the roster is refused with 401 before the dashboard is
+        # ever reached. They are ordinary active accounts otherwise - no punch, no audit row - so
+        # they are in ``active`` and ``never_clocked_in`` and in neither watch figure.
+        conn.executemany(
+            "INSERT INTO users (id, name, email, phone, password_hash, role, status, "
+            "enrolled_at, template_version, biometric_id) "
+            "VALUES (?,?,?,'','a-stored-hash',?,?,NULL,1,NULL)",
+            [
+                (user_id, f"Row {user_id}", "", "worker", status)
+                for user_id, status, _, _ in WATCH_ACCOUNTS
+            ]
+            + [
+                (ADMIN, "Row admin", "", "admin", "active"),
+                (HEAD_ADMIN, "Row head", "", "head_admin", "active"),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO attendance_logs (worker_id, site_name, action, timestamp, hours, score, "
+            "status, status_code) VALUES (?, ?, 'Clock In', ?, 0.0, 0.9, 'Approved', 'approved')",
+            [
+                (user_id, A, at(days_ago))
+                for user_id, _, days_ago, _ in WATCH_ACCOUNTS
+                if days_ago is not None
+            ],
+        )
+        # The audit log's own shape: an account *joined* when one of the three creation actions
+        # was written against it, which is the only evidence of "new" this schema has.
+        conn.executemany(
+            "INSERT INTO audit_log (created_at, actor_id, actor_role, action, entity, entity_id) "
+            "VALUES (?, '5000', 'head_admin', 'user_create', 'users', ?)",
+            [
+                (at(created), user_id)
+                for user_id, _, _, created in WATCH_ACCOUNTS
+                if created is not None
+            ],
+        )
+
+    return {
+        "accounts": 10,            # the eight watch accounts and the two the suite signs in as
+        "active": 9,
+        "deactivated": 1,          # d4, and only d4
+        # d3, o1, o3, and the two administrators: the accounts with no punch at all.
+        "never_clocked_in": 5,
+        "new_this_week": 2,        # o1 and o2: created inside ``NEW_ACCOUNT_DAYS``
+        "onboarding": 1,           # ...and of those, only o1 has never punched
+        "dormant": 1,              # d1: it worked here and stopped; d2 and d5 are too recent
+    }
+
+
+def test_the_watch_figures_name_the_ones_who_stopped_and_the_ones_who_never_started(client):
+    """The two figures that are not a *state*: they are the ways an account stops being a worker.
+
+    Both can be wrong by including somebody, which is why the plant carries one account per edge of
+    each predicate rather than one account per figure - and why the two are asserted together:
+    "dormant" and "never clocked in" describe opposite histories, and a build that folded them into
+    one number would report a deployment that has not opened yet as a roster of dormant staff.
+    """
+    expected = plant_watch_world()
+    people = payload(client)["people"]
+
+    for key, want in expected.items():
+        assert people[key] == want, f"people.{key} is {people[key]!r}, expected {want!r}"
+
+    # The windows the figures were counted over travel with them.
+    assert people["dormant_days"] == dashboard.DORMANT_DAYS
+    assert people["onboarding_days"] == dashboard.NEW_ACCOUNT_DAYS
+    # ``onboarding`` is a sub-question of ``new_this_week`` by construction rather than by
+    # upkeep: both come out of the one scan of the week's creations, so this cannot be false
+    # without the SQL itself being wrong.
+    assert people["onboarding"] <= people["new_this_week"], people
+    # And the two watch figures are disjoint, which is the claim the query makes: an account with
+    # no punch at all can never be counted as dormant.
+    never = db_scalar(
+        "SELECT COUNT(*) FROM users u WHERE u.id NOT IN "
+        "(SELECT DISTINCT worker_id FROM attendance_logs WHERE worker_id IS NOT NULL)"
+    )
+    assert people["never_clocked_in"] == never == expected["never_clocked_in"], (people, never)
+    assert people["dormant"] + people["never_clocked_in"] <= people["active"], people
+
+
+def test_an_account_that_punches_again_stops_being_dormant(client):
+    """Dormancy is a fact about the last punch, not a label written on the account.
+
+    The planted world asserts one number; this drives the *window* the number is measured with, by
+    giving the dormant account a punch today and reading again. A figure that was computed from a
+    stored flag, or from the wrong end of the range, would keep saying 1 here.
+    """
+    plant_watch_world()
+    assert payload(client)["people"]["dormant"] == 1
+
+    with writing() as conn:
+        conn.execute(
+            "INSERT INTO attendance_logs (worker_id, site_name, action, timestamp, hours, score, "
+            "status, status_code) VALUES ('d1', ?, 'Clock In', ?, 0.0, 0.9, 'Approved', 'approved')",
+            (A, datetime.now().strftime(TS)),
+        )
+
+    after = payload(client)["people"]
+    assert after["dormant"] == 0, after
+    # ...and the figures that do not depend on the punch are untouched, because it is the same
+    # account: this is a change of window, not of roster.
+    assert after["accounts"] == 10 and after["never_clocked_in"] == 5, after
 
 
 # ---------------------------------------------------------------------------
@@ -1451,7 +1614,8 @@ def test_the_panel_names_are_the_ones_the_console_draws(client):
     assert body["status"] == "success"
     assert set(body["people"]) == {
         "accounts", "active", "pending_approval", "deactivated", "by_role", "enrolled",
-        "no_face", "no_password", "new_this_week", "never_clocked_in",
+        "no_face", "no_password", "new_this_week", "never_clocked_in", "onboarding",
+        "dormant", "dormant_days", "onboarding_days",
     }, sorted(body["people"])
     assert set(body["now"]) == {
         "on_shift", "by_site", "overtime_open", "offline_waiting", "refused_24h",
@@ -1466,8 +1630,12 @@ def test_the_panel_names_are_the_ones_the_console_draws(client):
     assert set(body["period"]) == {
         "days", "preset", "start", "end", "workers", "expected_days", "present_days",
         "late_arrivals", "average_attendance_rate", "approved_hours", "overtime_hours",
-        "awaiting_approval_hours", "by_day", "quietest", "most_late",
+        "awaiting_approval_hours", "awaiting_approval_shifts", "by_day", "quietest", "most_late",
     }, sorted(body["period"])
+    # The two windows the watch figures were counted over travel with them, because a label that
+    # says thirty days while the query counted forty-five is a number nobody can check.
+    assert body["people"]["dormant_days"] == dashboard.DORMANT_DAYS
+    assert body["people"]["onboarding_days"] == dashboard.NEW_ACCOUNT_DAYS
     assert len(body["period"]["by_day"]) == body["period"]["days"], body["period"]["by_day"]
     assert set(body["period"]["by_day"][0]) == {"day", "present", "late"}, body["period"]["by_day"]
     # The window travels with the figures, in the fields the console's control and links read.

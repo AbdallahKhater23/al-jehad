@@ -39,10 +39,17 @@ browser* is exactly what this file exercises:
    fold, so the shell is a vital strip that never leaves and one view at a time; switching is a
    redraw from the snapshot already in hand, which is why a switch must make *no* request and must
    leave the stamp where it was - the alternative is a request per tap for an answer this page
-   already holds. The tabs are a real ``tablist``, so the arrow keys have to walk them.
-12. **the day strip makes a number answerable.** "132 present days" does not say which days came
-   apart, so the window is drawn day by day against its own busiest day - and the late count is a
-   numeral on the day it happened rather than a colour, because colour alone is not a fact.
+   already holds. The tabs are a real ``tablist``, so the arrow keys have to walk them.12. **the day strip makes a number answerable.** "132 present days" does not say which days came
+    apart, so the window is drawn day by day against its own busiest day - and the late count is a
+    numeral on the day it happened rather than a colour, because colour alone is not a fact.
+13. **the two figures that are a watch rather than a headcount** are drawn with the window they
+    were counted over, taken from the payload rather than from a constant in the console; and the
+    period card answers "is this window ready to be paid" in words, with the queue that clears it.
+14. **the window can hand itself over as a file.** The one control on this screen that leaves the
+    app, so it is the one place the suite has to read what was actually downloaded: the URL (this
+    window), the token (the route is ``admin_only``), and the bytes (the server's answer, not
+    something assembled here).
+
 
 Node is optional; without it these skip rather than fail.
 """
@@ -72,7 +79,11 @@ function panel(overrides) {
         people: {
             accounts: 41, active: 38, pending_approval: 2, deactivated: 3,
             by_role: { worker: 30, moallem: 4, off_office: 2, admin: 1, head_admin: 1 },
-            enrolled: 36, no_face: 5, no_password: 0, new_this_week: 4, never_clocked_in: 2
+            enrolled: 36, no_face: 5, no_password: 0, new_this_week: 4, never_clocked_in: 2,
+            // The two watch figures, and the windows they were counted over - deliberately *not*
+            // the console's fallbacks (30 and 7), so a label that printed a constant instead of
+            // the server's own window fails here rather than in somebody's headcount review.
+            onboarding: 3, dormant: 6, dormant_days: 45, onboarding_days: 10
         },
         // The moment: the board's own figure, and the three ways a punch can be waiting. The
         // by-site list carries the hostile name too - it is the second *list* of server text
@@ -106,6 +117,9 @@ function panel(overrides) {
             approved_hours: 488.5,
             overtime_hours: 6.0,
             awaiting_approval_hours: 12.0,
+            // The count behind those hours: "12 h waiting" does not say whether that is one
+            // shift or four, and four decisions is a different afternoon's work.
+            awaiting_approval_shifts: 3,
             // The shape of the window, as the server counted it: one entry per day, and these
             // seven add up to ``present_days`` above - so the fixture cannot describe a week the
             // strip and the figure beside it disagree about.
@@ -130,8 +144,24 @@ const ROOT_PANEL = panel();
 let reads = 0;              // how many times the dashboard was asked for this scenario
 let answered = null;        // the body to answer with; null means "the shared one"
 let failure = null;         // {status, detail} to answer the next read with
+let exportUrl = null;       // the export the window's download actually asked for
 
 function responders(url, init) {
+    // The export route, which answers a *file* rather than a payload: the two are told apart by
+    // what the console does with the answer, and this is the only place either file exists. The
+    // Excel half answers with a marker no CSV row could contain - a PK header - because that is the
+    // difference between the console's two savers, and the whole reason it has two.
+    if (url.indexOf('/admin/reports/export') >= 0) {
+        exportUrl = String(url);
+        if (url.indexOf('format=xlsx') >= 0) {
+            return {
+                status: 200,
+                body: 'PK\x00xlsx\x00',
+                contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            };
+        }
+        return { status: 200, body: 'Employee,id,site,hours\r\nRow 1,1,Depot,8\r\n', contentType: 'text/csv' };
+    }
     if (url.indexOf('/admin/dashboard') >= 0) {
         reads += 1;
         if (failure) {
@@ -304,7 +334,18 @@ async function eachView(who, overrides) {
             new_this_week: fact(views.people, 'new_this_week'),
             never_clocked_in: fact(views.people, 'never_clocked_in'),
             workers: (/data-dashboard-role="worker">([^<]*)</.exec(views.people) || [])[1],
-            roles: (views.people.match(/data-dashboard-role="/g) || []).length
+            roles: (views.people.match(/data-dashboard-role="/g) || []).length,
+            // The two watch figures, each in the queue shape (a value to act on) rather than in
+            // the facts grid (a headcount) - and each label carrying the window the *server*
+            // counted, which is the fixture's 45 and 10 rather than the console's own defaults.
+            watch: (views.people.match(/data-dashboard-watch="/g) || []).length,
+            watch_list: views.people.indexOf('data-dashboard-watch-list="true"') >= 0,
+            dormant: fact(views.people, 'dormant'),
+            onboarding: fact(views.people, 'onboarding'),
+            dormant_label: (/data-dashboard-watch="dormant"[\s\S]*?dashboard-queue-label">([^<]*)</
+                .exec(views.people) || [])[1] ?? null,
+            onboarding_label: (/data-dashboard-watch="onboarding"[\s\S]*?dashboard-queue-label">([^<]*)</
+                .exec(views.people) || [])[1] ?? null
         },
         places: {
             panel: (/data-dashboard-panel="([^"]*)"/.exec(views.places) || [])[1] ?? null,
@@ -343,6 +384,17 @@ async function eachView(who, overrides) {
         active: (/<button[^>]*data-dashboard-preset="([^"]*)"[^>]*aria-pressed="true"/.exec(markup) || [])[1] ?? null,
         pressed: (markup.match(/aria-pressed="true"/g) || []).length,
         presets: (markup.match(/data-dashboard-preset="/g) || []).length,
+        // Payroll readiness: the count beside the hours, and the sentence that says what the
+        // count costs a reader who is about to run a pay cycle.
+        payroll_shifts: fact(markup, 'awaiting_approval_shifts'),
+        payroll_state: (/data-dashboard-payroll="([^"]*)"/.exec(markup) || [])[1] ?? null,
+        payroll_text: (/data-dashboard-payroll="[^"]*"[\s\S]*?<span>([^<]*)</.exec(markup) || [])[1] ?? null,
+        payroll_link: (/data-dashboard-payroll="[^"]*"[\s\S]*?data-dashboard-go="([^"]*)"/
+            .exec(markup) || [])[1] ?? null,
+        // The artifacts: one button per format, in the order the card draws them, each naming
+        // what it hands over rather than the word "export".
+        export_formats: (markup.match(/data-dashboard-export="([^"]*)"/g) || [])
+            .map((entry) => entry.replace('data-dashboard-export="', '').replace('"', '')),
         quietest: (/data-dashboard-extreme="quietest"[\s\S]*?<\/div>/.exec(markup) || [])[0],
         most_late: (/data-dashboard-extreme="most_late"[\s\S]*?<\/div>/.exec(markup) || [])[0],
         rows: (markup.match(/data-dashboard-extreme-row="/g) || []).length,
@@ -604,7 +656,29 @@ async function eachView(who, overrides) {
         UI_MODULES.dashboardViews().map((view) => I18n.__(view.label)).join('/'),
         I18n.__('dashboardPeriodDays').replace('{days}', '7').replace('{busiest}', '18'),
         I18n.__('dashboardPeriodDayAria').replace('{day}', '2026-09-25').replace('{present}', '26').replace('{late}', '2'),
-        I18n.__('dashboardVitalOfExpected').replace('{expected}', '5')
+        I18n.__('dashboardVitalOfExpected').replace('{expected}', '5'),
+        // Phase 4's own vocabulary: the two watch figures, payroll readiness in both states, the
+        // export control and the one sentence it can fail with.
+        I18n.__('dashboardWatch'),
+        I18n.__('dashboardDormant').replace('{days}', '45'),
+        I18n.__('dashboardOnboarding').replace('{days}', '10'),
+        I18n.__('dashboardPeriodAwaitingShifts'),
+        I18n.__('dashboardPayrollWaiting').replace('{shifts}', '3').replace('{hours}', '12'),
+        I18n.__('dashboardPayrollReady').replace('{hours}', '488.5'),
+        I18n.__('dashboardPayrollLink').replace('{tab}', 'Approvals'),
+        // The period's three artifacts, and the sheet's own words - the block the export control
+        // turned into when it stopped being one button.
+        I18n.__('dashboardPeriodExportCsv'),
+        I18n.__('dashboardPeriodExportExcel'),
+        I18n.__('dashboardPeriodPrint'),
+        I18n.__('dashboardPeriodExportFailed'),
+        I18n.__('dashboardPeriodPrintFailed'),
+        I18n.__('dashboardPeriodPrintTitle'),
+        I18n.__('dashboardPeriodPrintFigure'),
+        I18n.__('dashboardPeriodPrintValue'),
+        I18n.__('dashboardPeriodPrintEachDay'),
+        I18n.__('dashboardPeriodPrintDay').replace('{present}', '26').replace('{late}', '2'),
+        I18n.__('dashboardPeriodPrintNote')
     ]`);
     // ``I18n.__`` reads ``I18n.lang``, and all four tables are loaded in this environment, so
     // the same key is asked of each table by name - which is the whole question: does the
@@ -672,6 +746,10 @@ async function eachView(who, overrides) {
     quiet.period.late_arrivals = 0;
     quiet.period.quietest = [];
     quiet.period.most_late = [];
+    // A window nobody worked and nobody is holding hours in: the *ready* state of the payroll
+    // sentence, which is the one state that must not offer a queue to go and work.
+    quiet.period.awaiting_approval_hours = 0;
+    quiet.period.awaiting_approval_shifts = 0;
     // The strip has to agree with the figure beside it, so an empty week is seven empty columns
     // rather than the fixture's seven days of work.
     quiet.period.by_day = quiet.period.by_day.map((entry) => ({ day: entry.day, present: 0, late: 0 }));
@@ -687,7 +765,14 @@ async function eachView(who, overrides) {
         // day, every bar empty, and not one late numeral.
         strip_columns: (views.period.match(/data-dashboard-day="/g) || []).length,
         strip_empty: (views.period.match(/class="dashboard-day-bar is-empty"/g) || []).length,
-        strip_late: (views.period.match(/data-dashboard-day-late="/g) || []).length
+        strip_late: (views.period.match(/data-dashboard-day-late="/g) || []).length,
+        // Nothing is unsigned, so the sentence says so and points at no queue - a *ready* window
+        // with a button into the approvals queue would send somebody to work an empty list. The
+        // link is looked for *after* the sentence: the vital strip above it carries a tile into
+        // the same tab, and a whole-markup search would find that one instead.
+        payroll: (/data-dashboard-payroll="([^"]*)"/.exec(views.period) || [])[1] ?? null,
+        payroll_link: (/data-dashboard-payroll="[^"]*"[\s\S]*?data-dashboard-go="([^"]*)"/
+            .exec(views.period) || [])[1] ?? null
     };
 
     const broken = await eachView(undefined, panel({ period: null }));
@@ -702,6 +787,59 @@ async function eachView(who, overrides) {
         // The view under the unreadable one is reached by a switch, which makes no request at
         // all - so a window the server could not count cannot block the rest of the screen.
         other_views: fact(broken.now, 'on_shift') === '12' && fact(broken.people, 'accounts') === '41'
+    };
+}
+
+// 12b. the window's three artifacts: two files and a sheet, each asked for by its own button
+{
+    const env = consoleEnv();
+    await env.evaluate("UI.renderAdminTab('Dashboard')");
+    const readsBefore = env.requests.length;
+    // The formats are tapped through the same binder the markup uses, one at a time, so what is
+    // asserted is what a reader's tap does rather than what a handler called directly would do.
+    const tap = async (format) => {
+        exportUrl = null;
+        await env.evaluate(`(async () => {
+            const button = {
+                getAttribute: () => ${JSON.stringify(format)},
+                addEventListener: (type, handler) => { if (type === 'click') button.handler = handler; }
+            };
+            UI_MODULES.bindDashboardControls({ querySelectorAll: (selector) => (selector === '[data-dashboard-export]' ? [button] : []) });
+            await button.handler();
+        })()`);
+        return {
+            url: exportUrl,
+            name: env.lastAnchor() ? env.lastAnchor().download : null,
+            file: await env.lastBlobText()
+        };
+    };
+
+    const csv = await tap('csv');
+    const xlsx = await tap('xlsx');
+    const asked = env.requests.filter((r) => r.url.indexOf('/reports/export') >= 0);
+    // The sheet needs no server at all: it is the card's own content, printed by the browser.
+    const sheetCountBefore = env.printed.length;
+    const print = await tap('print');
+    const printed = env.printed[env.printed.length - 1] || {};
+
+    results.export = {
+        csv: csv,
+        xlsx: xlsx,
+        // The route is ``admin_only``, so a download without this header is a 401 saved as a file.
+        auth: asked.length ? (asked[0].headers || {}).Authorization : null,
+        formats: asked.map((r) => (/format=([a-z]+)/.exec(r.url) || [])[1] || null),
+        // The sheet: the dialog's file name, the fact that the page was pulled out of the paper,
+        // and the content itself - what the helper drew from the card's own figure list.
+        print: {
+            asked_nothing: print.url === null,
+            prints: env.printed.length - sheetCountBefore,
+            title: printed.title || null,
+            printing: printed.printing === true,
+            sheet: printed.sheet || ''
+        },
+        // The export is a request, but not a *read* of the dashboard: the snapshot is untouched
+        // and the stamp on it does not move. The sheet makes no request at all.
+        reads: env.requests.length - readsBefore
     };
 }
 
@@ -857,6 +995,12 @@ def test_the_other_views_draw_the_same_server_fields_when_they_are_switched_to(r
     # Every role the payload carried, under the role's own translated label.
     assert people["roles"] == 5, people
     assert people["workers"] == "30", people
+    # The two watch figures are the server's own fields, in the queue shape - a value to act on
+    # rather than a headcount - and each label names the window the *server* counted over.
+    assert people["watch"] == 2 and people["watch_list"] is True, people
+    assert (people["dormant"], people["onboarding"]) == ("6", "3"), people
+    assert people["dormant_label"] == "Dormant — no punch in 45 days", people
+    assert people["onboarding_label"] == "Joined in the last 10 days, never clocked in", people
 
     places = results["views"]["places"]
     assert [places["sites"], places["categories"], places["no_category"], places["overriding_window"]] == [
@@ -1022,7 +1166,7 @@ def test_the_controls_are_bound_by_hook_and_reach_the_right_screen(results):
     binding = results["binding"]
     assert binding["selectors"] == [
         "[data-dashboard-go]", "[data-dashboard-refresh]", "[data-dashboard-metric]",
-        "[data-dashboard-preset]", "[data-dashboard-worker]",
+        "[data-dashboard-preset]", "[data-dashboard-export]", "[data-dashboard-worker]",
     ], binding["selectors"]
     assert binding["bound"] == ["Approvals", "Notes"], binding
     assert binding["tab_after_click"] == "Approvals", (
@@ -1064,6 +1208,31 @@ def test_the_screens_words_come_from_the_tables(results):
     assert wording[13] == "Each of the 7 days in this window, against the busiest at 18.", wording
     assert wording[14] == "2026-09-25: 26 present, 2 late.", wording
     assert wording[15] == "of 5 expected", wording
+    # The window on each watch label is a placeholder the *screen* fills, and the payroll sentence
+    # is a template rather than five hard-coded strings: both are what keeps a translated table
+    # from having to know arithmetic.
+    assert wording[16:34] == [
+        "Worth a look",
+        "Dormant — no punch in 45 days",
+        "Joined in the last 10 days, never clocked in",
+        "Shifts awaiting approval",
+        "3 shifts (12 h) in this window are not approved yet, so a pay run now would leave them out.",
+        "Everything in this window is signed off: 488.5 h approved, nothing waiting on a decision.",
+        "Sign them off in Approvals",
+        # Three artifacts rather than one button: each says what it hands over.
+        "Download CSV",
+        "Download Excel",
+        "Print sheet",
+        "That window could not be downloaded.",
+        "This window is not on the screen to print.",
+        # ...and the sheet's own words, including the block the day strip becomes on paper.
+        "Attendance summary",
+        "Figure",
+        "Value",
+        "Each day",
+        "26 present · 2 late",
+        "Counted over this window only. Hours nobody has approved yet are not counted as approved.",
+    ], wording
 
     other = results["other_languages"]
     assert len(other) == 4 and all(entry.count("|") == 3 for entry in other), other
@@ -1088,6 +1257,20 @@ def test_the_period_view_draws_the_window_its_figures_belong_to(results):
     assert period["presets"] == 2 and period["pressed"] == 1, period
     assert period["active"] == "days", period
     assert period["rows"] == 2 and period["worker_links"] == 2, period
+
+    # Payroll readiness: the count behind the hours, the sentence that says what it costs, and the
+    # queue that clears it. Three figures and one link, all the server's.
+    assert period["payroll_shifts"] == "3", period
+    assert period["payroll_state"] == "waiting", period
+    assert period["payroll_text"] == (
+        "3 shifts (12 h) in this window are not approved yet, so a pay run now would leave them out."
+    ), period
+    assert period["payroll_link"] == "Approvals", (
+        "the un-ready window offers no queue to work: " + str(period)
+    )
+    # And the artifacts: the window can be handed over from the card that describes it, in each
+    # of the three forms. The order is asserted because it is the markup's, not the test's.
+    assert period["export_formats"] == ["csv", "xlsx", "print"], period
 
 
 def test_the_periods_two_linkages_open_that_person_over_that_window(results):
@@ -1215,6 +1398,9 @@ def test_a_window_nobody_worked_and_a_window_that_could_not_be_read(results):
     assert empty["window"] == "2026-09-22 to 2026-09-28", (
         "an empty summary is still a summary of a window: " + str(empty)
     )
+    # A quiet window that is also fully signed off says *that*, and offers nobody a queue.
+    assert empty["payroll"] == "ready", empty
+    assert empty["payroll_link"] is None, empty
 
     broken = results["period_unreadable"]
     assert broken["flag"] is True, broken
@@ -1230,3 +1416,83 @@ def test_a_window_nobody_worked_and_a_window_that_could_not_be_read(results):
     assert broken["other_views"] is True, (
         "one unreadable view took the views beside it: " + str(broken)
     )
+
+
+def test_the_window_hands_itself_over_as_the_files_the_api_writes(results):
+    """The two downloads: a summary that cannot hand you the file sends the reader elsewhere.
+
+    Three things make each of these an export rather than a download button: the *window* it asks
+    for is the one on screen (a file named for one period and holding another gets forwarded as the
+    period's record), the request carries this session's token (the route is ``admin_only``, so
+    without it the browser saves a 401 as ``attendance_....csv``), and the bytes that land on disk
+    are the server's answer rather than anything this screen assembled - which is why the fixture's
+    CSV is a string no frontend code holds, and why the Excel half of this test is the one that
+    proves ``saveBlob`` exists at all: an .xlsx round-tripped through a string does not survive.
+    """
+    exported = results["export"]
+    # One request per format, and each one asks for its own - the two are not the same call with a
+    # different file name.
+    assert exported["formats"] == ["csv", "xlsx"], exported
+    assert exported["auth"] == "Bearer tok-admin", exported
+
+    assert "/admin/reports/export" in exported["csv"]["url"], exported["csv"]
+    # The route's own parameters, and the window the period card was drawn from.
+    assert "kind=attendance" in exported["csv"]["url"], exported["csv"]
+    assert "start=2026-09-22" in exported["csv"]["url"], exported["csv"]
+    assert "end=2026-09-28" in exported["csv"]["url"], exported["csv"]
+    # The file's name is the route's own convention for the same window, so a file pulled from here
+    # and one pulled from the API are visibly the same report - and the extension is the format.
+    assert exported["csv"]["name"] == "attendance_20260922-20260928.csv", exported["csv"]
+    assert exported["csv"]["file"] == "Employee,id,site,hours\r\nRow 1,1,Depot,8\r\n", exported["csv"]
+    assert "format=xlsx" in exported["xlsx"]["url"], exported["xlsx"]
+    assert exported["xlsx"]["name"] == "attendance_20260922-20260928.xlsx", exported["xlsx"]
+    # The bytes are the server's: the marker the responder answered this URL with, which is not
+    # something the CSV path could have produced - the two formats do not share a reader.
+    assert exported["xlsx"]["file"] == "PK\x00xlsx\x00", exported["xlsx"]
+    # A download is a request but not a *read*: the snapshot it came from is untouched.
+    assert exported["reads"] == 2, exported
+
+
+def test_the_window_prints_as_a_sheet_of_its_own_figures(results):
+    """The third artifact: paper, drawn by the browser, from the card's own content.
+
+    It is deliberately *not* the attendance report - that is the CSV and the spreadsheet, one row
+    per worker, which the server builds and this card cannot: the card holds aggregates, and
+    aggregates cannot be turned back into rows. So the sheet is the summary the reader is looking
+    at, and the thing worth asserting is that it carries the same figures under the same words, in
+    the frame the helper draws for every report in this app.
+    """
+    printed = results["export"]["print"]
+    # No request: the sheet is built from the snapshot already in hand.
+    assert printed["asked_nothing"] is True, printed
+    assert printed["prints"] == 1, printed
+    # The dialog names the file after the document title, and the title carries the window with no
+    # extension - the dialog appends one, and "...csv.pdf" is what a title with one produces.
+    assert printed["title"] == "attendance_20260922-20260928", printed
+    # ...and the page is out of the way of the paper while the dialog is open.
+    assert printed["printing"] is True, printed
+
+    sheet = printed["sheet"]
+    # The frame: whose document it is, what it is, and which window it covers - the period line is
+    # the helper's, so both dates and the arrow between them are not this screen's opinion.
+    assert "print-sheet-title" in sheet and "Attendance summary" in sheet, sheet
+    assert "Period: 2026-09-22 \u2192 2026-09-28" in sheet, sheet
+    # The stamp travels, because a printed summary is a snapshot and paper cannot refresh itself.
+    assert "2026-09-28 14:03:11" in sheet, sheet
+    # The figures, under the sheet's own two column headings.
+    assert ">Figure<" in sheet and ">Value<" in sheet, sheet
+    assert ">Days present<" in sheet and ">132<" in sheet, sheet
+    assert ">Approved hours<" in sheet and ">488.5<" in sheet, sheet
+    # The day strip as a block of rows - every day, both figures on it, because a height on a strip
+    # is not a figure anybody can quote off paper.
+    assert ">Each day<" in sheet, sheet
+    assert ">2026-09-25<" in sheet and ">26 present · 2 late<" in sheet, sheet
+    assert ">2026-09-27<" in sheet and ">0 present · 0 late<" in sheet, sheet
+    # Both linkages, by name: the two people the card says are worth opening.
+    assert ">Least present<" in sheet and ">Row 43<" in sheet, sheet
+    assert ">Most late arrivals<" in sheet, sheet
+    # What the window adds up to, and the note that says which figures count.
+    assert "3 shifts (12 h) in this window are not approved yet" in sheet, sheet
+    assert "Counted over this window only." in sheet, sheet
+    # The company's own head, drawn by the helper from the settings row rather than by this screen.
+    assert "print-sheet-brand" in sheet, sheet

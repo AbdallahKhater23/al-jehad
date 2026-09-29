@@ -190,6 +190,11 @@ const TRANSLATIONS = {
         "credentialsReactivateConfirm": "Reactivate this account? They can sign in again, but cannot clock in until a face is enrolled again.",
         "credentialsSelfAccount": "This is your account - it cannot be deactivated or deleted.",
         "credentialsNoMatches": "No account matches this search.",
+        "credentialsNoRole": "No accounts with this role.",
+        "credentialsEveryone": "Everyone",
+        "credentialsRoleFilter": "Narrow the roster by role",
+        "credentialsShowing": "Showing {shown} of {total}",
+        "credentialsShowMore": "Show {count} more",
         "credentialsEmpty": "No accounts yet.",
         "phone": "Phone",
         "credentialsNewAccount": "New account",
@@ -213,17 +218,17 @@ const TRANSLATIONS = {
         "credentialsPhotoUnreadable": "That file could not be read. Choose a photo from the phone's gallery.",
         "credentialsPhotoEditHint": "Leave this empty to keep the photo on file. A photo chosen here replaces the template every clock-in is checked against - the one on file stops working the moment this is saved.",
         "credentialsPhotoSaved": "Reference photo saved. This person's clock-ins are checked against it from now on.",
-        "credentialsLink": "Enrollment link",
-        "credentialsLinkTitle": "Enrollment link",
-        "credentialsLinkHint": "Send this one-time link to somebody whose account already exists: they take their own photo where they normally clock in, and it becomes the face the gate checks them against. Accounts are created in the console, or approved from the site's registration link - never by a link like this one.",
-        "credentialsLinkCreate": "Create link",
-        "credentialsLinkReady": "Link created.",
-        "credentialsLinkOnce": "Send it once. It cannot be shown again, and it stops working once it has been used or the date below passes.",
-        "credentialsLinkExpires": "Expires",
+        "credentialsRegistrationLink": "Registration link",
+        "credentialsRegistrationLinkHint": "Send this link to somebody who wants to work here: they open it on their own phone, fill the form in and take their own photo, and the account it creates waits for an administrator in the Registrations tab. It is one link for everybody, so send it to as many people as you like - replacing it stops every copy already sent, and the applications already waiting are not affected.",
+        "credentialsRegistrationLinkQr": "Registration link QR code",
+        "credentialsRegistrationLinkMessage": "Apply for an account with this link:",
+        "credentialsRegistrationLinkReplace": "Replace link",
+        "credentialsRegistrationLinkReplaceConfirm": "Replace the registration link? Every copy already sent will stop opening the form. The applications already waiting for approval are not affected.",
+        "credentialsRegistrationLinkReplaced": "The registration link was replaced. The old link no longer works.",
+        "credentialsRegistrationLinkReplaceNote": "Replacing the link only stops new applications. The people already waiting in the Registrations tab keep their accounts and stay in the queue.",
+        "credentialsRegistrationLinkFailed": "The registration link could not be read. Try again in a moment.",
+        "credentialsRegistrationLinkRetry": "Try again",
         "credentialsLinkWhatsApp": "Send on WhatsApp",
-        "credentialsLinkQr": "Enrollment link QR code",
-        "credentialsLinkMessage": "Register your face for clocking in with this link:",
-        "credentialsLinkNeedsId": "An enrollment link needs the ID of an account that already exists.",
 
         "notes": "Notes",
         "notesMine": "My notes",
@@ -792,6 +797,7 @@ const TRANSLATIONS = {
         "liveOpsForceReady": "Available: {count}",
         "liveOpsRetry": "Try again",
         "liveOpsError": "The shift board could not be loaded",
+        "liveOpsStreamUnavailable": "The live board could not stay connected, so it is checking on a timer again.",
         "liveOpsHoursShort": "{hours}h {minutes}m",
         "liveOpsMinutesShort": "{minutes}m",
         "liveOpsSkeleton": "Loading who is on site...",
@@ -856,6 +862,12 @@ const TRANSLATIONS = {
         "dashboardNoPassword": "No password",
         "dashboardNewThisWeek": "Joined this week",
         "dashboardNeverClockedIn": "Never clocked in",
+        //  The two figures that are a *watch* rather than a headcount: an account that worked and
+        //  stopped, and one that joined and never started. Each carries the window it was counted
+        //  over, because the number means nothing without it.
+        "dashboardWatch": "Worth a look",
+        "dashboardDormant": "Dormant — no punch in {days} days",
+        "dashboardOnboarding": "Joined in the last {days} days, never clocked in",
         "dashboardByRole": "By role",
         "dashboardPeopleLink": "Open the roster in {tab}",
         "dashboardPlacesTitle": "Places",
@@ -902,6 +914,32 @@ const TRANSLATIONS = {
         "dashboardPeriodApprovedHours": "Approved hours",
         "dashboardPeriodOvertimeHours": "Of it, overtime",
         "dashboardPeriodAwaitingHours": "Awaiting approval",
+        "dashboardPeriodAwaitingShifts": "Shifts awaiting approval",
+        //  Payroll readiness, as the two states a reader can act on: everything signed off, or
+        //  this many shifts still holding their hours - and the second says what that costs, so
+        //  a queue of approvals does not read as housekeeping.
+        "dashboardPayrollReady": "Everything in this window is signed off: {hours} h approved, nothing waiting on a decision.",
+        "dashboardPayrollWaiting": "{shifts} shifts ({hours} h) in this window are not approved yet, so a pay run now would leave them out.",
+        "dashboardPayrollLink": "Sign them off in {tab}",
+        //  The three artifacts this window can be handed over as: the route's two formats and the
+        //  browser's own printer. Each button carries the verb, because "CSV" alone does not say
+        //  what tapping it does.
+        "dashboardPeriodExportCsv": "Download CSV",
+        "dashboardPeriodExportExcel": "Download Excel",
+        "dashboardPeriodPrint": "Print sheet",
+        //  The sheet's own words: its title, the two column headings of its table, and the block
+        //  the day strip becomes on paper - one row per day, both figures on it, because a height
+        //  on a strip is not a figure a reader can quote.
+        "dashboardPeriodPrintTitle": "Attendance summary",
+        "dashboardPeriodPrintFigure": "Figure",
+        "dashboardPeriodPrintValue": "Value",
+        "dashboardPeriodPrintEachDay": "Each day",
+        "dashboardPeriodPrintDay": "{present} present · {late} late",
+        //  The note at the foot, doing for a summary what the timesheet's note does for its rows:
+        //  saying which of the figures on the paper count.
+        "dashboardPeriodPrintNote": "Counted over this window only. Hours nobody has approved yet are not counted as approved.",
+        "dashboardPeriodExportFailed": "That window could not be downloaded.",
+        "dashboardPeriodPrintFailed": "This window is not on the screen to print.",
         "dashboardPeriodQuietest": "Least present",
         "dashboardPeriodMostLate": "Most late arrivals",
         "dashboardPeriodExtremeSub": "{days} of {expected} days present · {late} late",
@@ -948,10 +986,10 @@ const TRANSLATIONS = {
         "registrationsIntakeTitle": "Public registration link",
         "registrationsIntakeAccepting": "Accepting applications",
         "registrationsIntakeRefusing": "Closed to applications",
-        "registrationsIntakeWhyOpen": "The form at /register is accepting submissions. Closing it stops new applications; the ones already below are still decisions to make.",
-        "registrationsIntakeWhyClosedByConsole": "An administrator closed the form. The link is still served, so it answers - it just refuses submissions until it is opened again here.",
-        "registrationsIntakeWhyClosedByDeployment": "This deployment does not run walk-up registration at all (REGISTRATION_ENABLED is off), so the form is closed whatever this console says. That switch is set where the deployment is started, not here.",
-        "registrationsIntakeOpen": "Open the form again",
+        "registrationsIntakeWhyOpen": "The registration link is accepting applications. Closing it stops new ones; the applications already waiting are still decisions to make.",
+        "registrationsIntakeWhyClosedByConsole": "Somebody closed the form from this console. The link is still valid, so it answers - it just refuses applications until it is opened here again.",
+        "registrationsIntakeWhyClosedByDefault": "Walk-up registration is off on this deployment, so the link starts closed. Opening it here is what starts accepting applications, and nothing has to be restarted for it.",
+        "registrationsIntakeOpen": "Open the form",
         "registrationsIntakeClose": "Close it to new applications",
         "registrationsIntakeOpened": "The registration form is accepting applications again.",
         "registrationsIntakeShut": "The registration form is closed to new applications.",
@@ -1115,6 +1153,56 @@ const TRANSLATIONS = {
         // is created now. What was worth keeping from that panel was the explanation of the id
         // ranges, and this is it.
         "adminCreateMoved": "Accounts, administrators included, are created on the Credentials tab, in New account, where the id and the role are both chosen.",
+        //  ---- data retention (the Admin tab's panel) ----------------------------
+        //  What this deployment is holding on disk, and what the sweep would delete.
+        //
+        //  The stores are named with the words the screens that *own* them already use
+        //  (``devDb``, ``devBackups``, ``corpusTitle``, ``refusalsTitle``, ``adminAlerts``,
+        //  ``queuedPunches``, ``attendanceLogs``) rather than with a second name invented
+        //  here: an operator looking at two screens has to be able to tell they are talking
+        //  about the same directory. ``retentionDays``/``retentionForever`` carry what ``0``
+        //  means in every retention knob - keep forever - which is a fact about the policy a
+        //  reader cannot guess from a blank.
+        "retention": "Data & retention",
+        "retentionHint": "What this deployment is holding on disk, and what the sweep would delete. Nothing on this panel changes anything: the check at the foot is a report.",
+        "retentionPayRecords": "Hours worked are pay records: the sweep reports their age and deletes nothing.",
+        "retentionOnDisk": "On disk",
+        "retentionFiles": "Files",
+        "retentionSweeper": "Sweeper",
+        "retentionSweepEvery": "every {hours} h",
+        "retentionSweepNever": "has not run yet",
+        "retentionSweepOff": "switched off",
+        "retentionLeftBehind": "Left behind",
+        "retentionRunDeleted": "{count} removed, {bytes} wiped",
+        "retentionRunFailed": "{count} failed",
+        "retentionStore": "Store",
+        "retentionSize": "Size",
+        "retentionSpan": "Oldest to newest",
+        "retentionCopy": "copy",
+        "retentionCopiesNote": "Backups are a second copy of the same data, so they are counted apart from it.",
+        "retentionTruncated": "This listing stopped at its cap: the deployment is holding more files than were counted.",
+        "retentionWindow": "Kept for",
+        "retentionDays": "{days} days",
+        "retentionForever": "kept forever",
+        "retentionCheck": "Check what the next sweep would delete",
+        "retentionChecking": "Checking...",
+        "retentionPlan": "The next sweep would remove {count} items, wiping {bytes}.",
+        "retentionPlanNone": "Nothing is past its window.",
+        "retentionPlanUntouched": "A check, not a deletion: nothing was removed.",
+        "retentionPlanFailed": "The check could not be run.",
+        "retentionUnavailable": "This panel could not be read. The rest of the tab is unaffected.",
+        "retentionTargetFailed": "could not be checked",
+        "retentionData": "Data",
+        "retentionWouldGo": "Would go",
+        "retentionSpace": "Space",
+        "retentionStoreSelfies": "Reference selfies",
+        "retentionStoreTemplates": "Face templates",
+        "retentionStoreFrames": "Punch frames",
+        "retentionStoreLinkPhotos": "Link selfies",
+        "retentionStoreRegistration": "Registration photos",
+        "retentionTargetBiometric": "Biometric residue",
+        "retentionTargetNotices": "Worker notices",
+        "retentionTargetAnchors": "Device keys",
         "reload": "Reload",
         "languageUnavailable": "That language could not be downloaded. Check your connection and try again.",
         "consoleUnavailable": "The administrator console could not be loaded. Check your connection, then reload the page.",

@@ -30,6 +30,12 @@ const UI_MODULES = {
     _liveOps: null,
     _liveOpsTick: null,
     _liveOpsPoll: null,
+    //: The board's stream: the controller that closes it, the reconnect timer, whether the
+    //: console is holding one at all, and how many times in a row opening it has failed.
+    _liveOpsAbort: null,
+    _liveOpsStreamTimer: null,
+    _liveOpsStreaming: false,
+    _liveOpsStreamFails: 0,
     //: Guards against a slow render landing after a newer one (rapid tab clicks).
     _liveOpsRun: 0,
     //: The same guard for the force-in panel's roster, which is fetched on open: a panel
@@ -50,11 +56,30 @@ const UI_MODULES = {
     //: while they were reading row five, which is worse than never opening at all.
     _liveOpsExpanded: false,
 
-    //: How often the board asks whether anything has moved. One *counted* read, and the rows
-    //: behind it only when the answer is yes - polling that repaints regardless is what makes
-    //: a dashboard feel broken, and polling that re-reads the rows to find out is what makes
-    //: it cost the same as the list it is drawing.
+    //: How often the board asks whether anything has moved *when it has to ask at all*.
+    //:
+    //: This used to be the whole mechanism: one counted read every 45 seconds, and the rows
+    //: behind it only when the answer was yes. The count is cheap and the repaint is rare, but
+    //: the question was still being asked - on a quiet afternoon, forever, to be told the same
+    //: thing. What runs now is the stream below: the server says when something moved, and this
+    //: interval is only the fallback for a deployment where a stream cannot be held open (a
+    //: proxy that buffers, an old browser). See ``startLiveOpsStream``.
     LIVE_OPS_POLL_MS: 45000,
+
+    //: How long to wait before opening another stream after the last one ended.
+    //:
+    //: Not zero, because the server ends these on purpose every fifteen minutes and a console
+    //: that reconnected instantly would be a reconnect loop between two well-behaved ends.
+    //: Three seconds is invisible to somebody watching the gate and far below the 45 s the poll
+    //: this replaced would have taken.
+    LIVE_OPS_STREAM_RETRY_MS: 3000,
+
+    //: How many consecutive failures to open a stream before the board gives up on it.
+    //:
+    //: Two, not one: a single failure is an ordinary thing on a phone in a yard - a dropped
+    //: connection, a tab that was asleep - and falling back to polling for the life of the
+    //: board because of one blip would be a worse trade than one more attempt.
+    LIVE_OPS_STREAM_FAILS: 2,
 
     //: How many shifts the board shows before the fold. Two, because the board's job is the
     //: shift that needs a decision and a five-row wall of "on site, fine" is what buries it -
@@ -1012,11 +1037,122 @@ const UI_MODULES = {
         if (this._forceInOpen && !data.users) this.liveOpsPanelToggled(document.getElementById('liveOpsForceIn'));
     },
 
-    /** The 1 s tick (numerals only) and the slow poll (one request). */
+    /** The 1 s tick (numerals only), and the stream the server pushes through. */
     startLiveOps() {
         this.stopLiveOps();
         this._liveOpsTick = setInterval(() => this.tickLiveOps(), 1000);
-        this._liveOpsPoll = setInterval(() => this.pollLiveOps(), this.LIVE_OPS_POLL_MS);
+        this.startLiveOpsStream();
+    },
+
+    /**
+     * Hold a stream open, so the board is told about a change instead of asking for one.
+     *
+     * THE TRADE THIS MAKES
+     * --------------------
+     * The poll asked a cheap question on a timer, and the timer is what it cost: a request every
+     * 45 seconds from every open console, each one an HTTP round trip, a worker, a rate-limit
+     * decision and a count - spent, on a quiet afternoon, to be told nothing had happened. One
+     * open connection that says nothing until there is something to say is the same information
+     * for none of that, and it arrives the moment a punch is filed rather than up to 45 seconds
+     * later, which is the part an operator actually notices.
+     *
+     * WHY IT IS NOT THE ONLY MECHANISM
+     * --------------------------------
+     * A stream is an optimisation over a working board, not a precondition for one. If it cannot
+     * be opened - a proxy that buffers the response and never delivers a piece of it, a browser
+     * without a readable body, a deployment whose middle boxes hate long requests - the board
+     * goes back to the poll it has always had (``fallBackToLiveOpsPoll``) and nothing else
+     * changes. That is deliberate: the failure mode of the interesting half of this feature is
+     * the ordinary behaviour of the version before it.
+     */
+    startLiveOpsStream() {
+        if (this._liveOpsStreaming) return;
+        this._liveOpsStreaming = true;
+        this._liveOpsStreamFails = 0;
+        this.openLiveOpsStream();
+    },
+
+    /**
+     * One stream, from the request to its end - and then the decision about another.
+     *
+     * An *end* is not a *failure*, and the two are counted differently because they mean
+     * different things. The server closes these every fifteen minutes on purpose (so a session
+     * that was authorised a while ago is authorised again), so a clean end reconnects with no
+     * penalty. A failure to open one is the signal that this deployment cannot carry a stream,
+     * and two in a row is where the board stops trying.
+     */
+    async openLiveOpsStream() {
+        if (!this._liveOpsStreaming) return;
+        const abort = new AbortController();
+        this._liveOpsAbort = abort;
+        try {
+            await API.stream('/admin/live_ops/stream', {
+                signal: abort.signal,
+                onEvent: (event) => {
+                    if (event.event !== 'board') return;   // ``bye``, and anything added later
+                    // Not awaited: this callback is the stream reader, and a slow repaint must
+                    // not stop the connection from being read. The count arrives in order, so
+                    // two of them cannot be applied out of order.
+                    this.applyLiveOpsCount(event.data).catch(() => {});
+                }
+            });
+            // The server said goodbye, or the network dropped the stream: either way the answer
+            // is another one, and a clean end resets the failure count that would have ended
+            // the attempt.
+            this._liveOpsStreamFails = 0;
+        } catch (err) {
+            if (abort.signal.aborted) return;   // this console closed it; nothing to reconnect
+            // A dead session is not a stream problem, and the console has already been signed
+            // out and repainted by ``API.stream``: retrying would be two more 401s and a poll
+            // that 401s after them.
+            if (err && err.status === 401) {
+                this.stopLiveOpsStream();
+                return;
+            }
+            this._liveOpsStreamFails += 1;
+            if (this._liveOpsStreamFails >= this.LIVE_OPS_STREAM_FAILS) {
+                Toast.error(I18n.__('liveOpsStreamUnavailable'));
+                this.fallBackToLiveOpsPoll();
+                return;
+            }
+        }
+        if (!this._liveOpsStreaming) return;
+        this._liveOpsStreamTimer = setTimeout(
+            () => { this._liveOpsStreamTimer = null; this.openLiveOpsStream(); },
+            this.LIVE_OPS_STREAM_RETRY_MS
+        );
+    },
+
+    /**
+     * Stop holding a stream open, without touching the poll.
+     *
+     * The abort is the point of the controller: a reader that is simply abandoned keeps its
+     * half of the socket until the server's own lifetime ends, which on a phone that has left
+     * the tab is fifteen minutes of a connection nobody is reading.
+     */
+    stopLiveOpsStream() {
+        if (this._liveOpsStreamTimer !== null) {
+            clearTimeout(this._liveOpsStreamTimer);
+            this._liveOpsStreamTimer = null;
+        }
+        if (this._liveOpsAbort) {
+            try { this._liveOpsAbort.abort(); } catch (err) { /* already aborted */ }
+            this._liveOpsAbort = null;
+        }
+        this._liveOpsStreaming = false;
+    },
+
+    /**
+     * The stream is not going to work here: go back to asking, on the old 45 s timer.
+     *
+     * Only reached when nothing is polling already, so a board that has fallen back once cannot
+     * end up with two timers asking the same question.
+     */
+    fallBackToLiveOpsPoll() {
+        this.stopLiveOpsStream();
+        if (this._liveOpsPoll === null && this._liveOpsTick !== null) {
+            this._liveOpsPoll = setInterval(() => this.pollLiveOps(), this.LIVE_OPS_POLL_MS);
+        }
     },
 
     /**
@@ -1035,6 +1171,10 @@ const UI_MODULES = {
     stopLiveOps() {
         if (this._liveOpsTick !== null) { clearInterval(this._liveOpsTick); this._liveOpsTick = null; }
         if (this._liveOpsPoll !== null) { clearInterval(this._liveOpsPoll); this._liveOpsPoll = null; }
+        // The stream is closed with the timers, and for the same reason: this is called when the
+        // reader leaves the tab, and a board that is no longer on screen has no business holding
+        // a connection open - nor the next tab's render inheriting one.
+        this.stopLiveOpsStream();
         // A board somebody has left starts folded again. This is the only place the state is
         // cleared (``startLiveOps`` calls this method), and it is deliberately *not* the poll
         // or the tick: those repaint the board the operator is already reading, and the one
@@ -1108,22 +1248,7 @@ const UI_MODULES = {
             count = null;   // falls back to the rows below, which is what this poll used to do
         }
         if (!this._liveOps || State.adminTab !== 'Live Ops') return;
-        if (this.liveOpsCountedRead(count)) {
-            const fresh = { ...this._liveOps, count, at: Date.now() };
-            // Nothing the board draws moved: the figures it is showing are the ones it has,
-            // and the rows that go with them are already on the page.
-            if (!this.liveOpsMoved(count, this._liveOps.count)) { this._liveOps = fresh; return; }
-            let sessions;
-            try {
-                sessions = await API.request('/admin/active_sessions');
-            } catch (err) {
-                return;   // a blip keeps the board up, with its last known-good rows
-            }
-            if (!this._liveOps || State.adminTab !== 'Live Ops') return;
-            this._liveOps = { ...fresh, sessions: Array.isArray(sessions) ? sessions : [] };
-            this.paintLiveOps(this._liveOps);
-            return;
-        }
+        if (this.liveOpsCountedRead(count)) return this.applyLiveOpsCount(count);
         // No counted read: compare the rows themselves, exactly as this poll did before the
         // counted read existed.
         let sessions;
@@ -1137,6 +1262,33 @@ const UI_MODULES = {
         if (this.liveOpsSignature(fresh) === this.liveOpsSignature(this._liveOps)) return;
         this._liveOps = fresh;
         this.paintLiveOps(fresh);
+    },
+
+    /**
+     * Apply a counted read: the same answer whether it arrived over the stream or was asked for.
+     *
+     * One method because there is one decision to make about it, and the two ways it can arrive
+     * must not be able to disagree. A board that has fallen back to polling calls this with what
+     * the poll read; an open stream calls it with each event the server sends. Either way: store
+     * the figures, and re-read the *rows* only if the figures they describe have moved - which is
+     * the whole reason the rows are not in the payload.
+     */
+    async applyLiveOpsCount(count) {
+        if (!this._liveOps || State.adminTab !== 'Live Ops') return;
+        if (!this.liveOpsCountedRead(count)) return;   // an unreadable answer is not an answer
+        const fresh = { ...this._liveOps, count, at: Date.now() };
+        // Nothing the board draws moved: the figures it is showing are the ones it has, and the
+        // rows that go with them are already on the page.
+        if (!this.liveOpsMoved(count, this._liveOps.count)) { this._liveOps = fresh; return; }
+        let sessions;
+        try {
+            sessions = await API.request('/admin/active_sessions');
+        } catch (err) {
+            return;   // a blip keeps the board up, with its last known-good rows
+        }
+        if (!this._liveOps || State.adminTab !== 'Live Ops') return;
+        this._liveOps = { ...fresh, sessions: Array.isArray(sessions) ? sessions : [] };
+        this.paintLiveOps(this._liveOps);
     },
 
     /**
@@ -2978,12 +3130,14 @@ const UI_MODULES = {
      * because that is where its consequence shows: a queue that stops growing is otherwise a
      * queue somebody believes is broken.
      *
-     * TWO SWITCHES, AND BOTH ARE SAID OUT LOUD. The deployment's own
-     * (``REGISTRATION_ENABLED``) is a ceiling over this one and cannot be moved from here, so
-     * when *it* is what holds the link shut the button is left off the screen entirely and the
-     * sentence names the reason - the rule the rail already follows for a tab the reader
-     * cannot act on, because a control that looks pressable and answers nothing teaches an
-     * operator that this screen is broken.
+     * THE LEVER IS ALWAYS HERE, AND THE DEPLOYMENT'S OWN FLAG IS ONLY A DEFAULT.
+     * ``REGISTRATION_ENABLED`` says what this installation does out of the box; an
+     * administrator or a head administrator moves this switch either way. It used to be a
+     * ceiling, and the console drew no button at all when the flag was what held the link shut
+     * - which left the applicant's own sentence ("ask your site administrator to open it") with
+     * nobody who could act on it. The reason is still said, because "nobody has opened this yet"
+     * and "somebody closed it this morning" are one state and two different things to do about
+     * it.
      *
      * The reason codes are mapped to keys rather than interpolated into one: the table is the
      * vocabulary, and a key built by concatenation is a string no parity check can see.
@@ -2994,17 +3148,13 @@ const UI_MODULES = {
         const WHY = {
             open: 'registrationsIntakeWhyOpen',
             closed_by_console: 'registrationsIntakeWhyClosedByConsole',
-            closed_by_deployment: 'registrationsIntakeWhyClosedByDeployment'
+            closed_by_default: 'registrationsIntakeWhyClosedByDefault'
         };
         const why = WHY[intake.reason] || 'registrationsIntakeWhyClosedByConsole';
-        // Not ``!intake.accepting``: a deployment that does not run walk-up registration at
-        // all is a different answer from an operator having closed it, and only the second is
-        // this console's to change.
-        const movable = why !== 'registrationsIntakeWhyClosedByDeployment';
         const accepting = intake.accepting === true;
-        const button = movable
-            ? `<button type="button" class="ui-btn ${accepting ? 'ui-btn-danger' : 'ui-btn-primary'}" data-registration-intake="${accepting ? 'close' : 'open'}">${this.escapeHtml(I18n.__(accepting ? 'registrationsIntakeClose' : 'registrationsIntakeOpen'))}</button>`
-            : '';
+        // No state left where this would answer nothing: the console owns the switch, so the
+        // only question is which way it is pointing.
+        const button = `<button type="button" class="ui-btn ${accepting ? 'ui-btn-danger' : 'ui-btn-primary'}" data-registration-intake="${accepting ? 'close' : 'open'}">${this.escapeHtml(I18n.__(accepting ? 'registrationsIntakeClose' : 'registrationsIntakeOpen'))}</button>`;
         return `
             <div class="ui-card" data-registrations-intake="${this.escapeHtml(intake.reason)}">
                 <div class="ui-spread">
@@ -3329,15 +3479,39 @@ const UI_MODULES = {
                 body: { open: wanted }
             });
             this._registrationsIntake = answer || null;
+            this.adoptIntakeStateIntoCredentialsLink(answer);
             Toast.success(I18n.__(wanted ? 'registrationsIntakeOpened' : 'registrationsIntakeShut'));
         } catch (err) {
             if (button) button.disabled = false;
             Toast.error(err.message);
             return;
         }
+        // The repaint follows the *reader* rather than the lever, because the switch has two
+        // homes now: the queue below, and the panel beside the link that is about to be sent.
+        // Whoever pressed it stays on the screen they pressed it on; the other one reads its own
+        // state fresh the next time it is opened (the link panel re-reads on every open).
         // Awaited, so that "the switch was moved" and "the screen shows it" are the same
         // moment for whoever awaited this - the same contract the two decisions above keep.
+        if (State.adminTab === 'Credentials') return this.repaintCredentialsFromCache();
         await UI.renderAdminTab('Registrations');
+    },
+
+    /**
+     * Folds the switch's own answer into the link panel, when that panel is the one on screen.
+     *
+     * The write answers with the same state the link read carries - both are ``intake_state``
+     * plus the link's own fields - so a panel sitting beside the switch does not need a second
+     * request to stop disagreeing with it. Only the two fields that moved are touched: the URL,
+     * its QR and its rotation are the link, and this is not a link operation.
+     */
+    adoptIntakeStateIntoCredentialsLink(answer) {
+        const link = this._credentialsLink;
+        if (!link || !answer || typeof answer !== 'object') return;
+        link.accepting = answer.accepting === true;
+        link.reason = String(answer.reason || (link.accepting ? 'open' : 'closed_by_console'));
+        if (typeof answer.deployment_enabled === 'boolean') {
+            link.deployment_enabled = answer.deployment_enabled;
+        }
     },
 
     // -----------------------------------------------------------------
@@ -3370,7 +3544,7 @@ const UI_MODULES = {
     /** A password just saved: shown once, then forgotten when the panel is closed. */
     _credentialsRevealed: null,
 
-    /** Which of the two create flows is open: ``''``, ``'create'`` or ``'invite'``. */
+    /** Which of the two panels is open: ``''``, ``'create'`` or ``'link'``. */
     _credentialsMode: '',
 
     /** The photo chosen for a new account, and the password generated beside it. */
@@ -3384,8 +3558,21 @@ const UI_MODULES = {
     /** The account just created: its password is readable here once, then never again. */
     _credentialsCreated: null,
 
-    /** The enrollment link just issued - the plaintext token exists only in this object. */
-    _credentialsIssued: null,
+    /**
+     * The server's answer about the registration link: its URL, its QR, and whether the form is
+     * accepting right now. ``null`` until the panel has asked.
+     *
+     * It replaced a one-time enrollment link, which is the difference worth naming: that token
+     * existed in exactly one response and could never be shown again, so the panel held it in
+     * memory and warned that closing the panel lost it. This one is not a secret that is spent -
+     * it is the address of a form, recomputed from the deployment's own key - so the panel can
+     * ask for it every time it opens, and the same link can be sent to as many people as the
+     * company wants to hire.
+     */
+    _credentialsLink: null,
+
+    /** True while the link panel is waiting for the server, so it does not ask twice. */
+    _credentialsLinkBusy: false,
 
     /**
      * The id the server last refused for being taken, and the free number it could be.
@@ -3928,6 +4115,40 @@ const UI_MODULES = {
                 this.useSuggestedCredentialsId();
             });
         }
+        // The intake switch, when the link panel is the pane on screen. The Registrations tab
+        // binds the same attribute on its own card; the two never render into one scope, and
+        // both go through the same handler, so the switch cannot mean two things in two places.
+        const levers = scope.querySelectorAll('[data-registration-intake]');
+        for (let i = 0; i < levers.length; i += 1) {
+            const lever = levers[i];
+            if (typeof lever.addEventListener !== 'function') continue;
+            lever.addEventListener('click', (event) => {
+                event.preventDefault();
+                this.toggleRegistrationsIntake(lever.getAttribute('data-registration-intake'));
+            });
+        }
+        // The role chips and the page button. Both repaint from the roster already in hand:
+        // "which of these accounts" is a question about the list on screen, not a second read
+        // of it - so neither is a reason to ask the server again, and neither moves the
+        // password panel or the search box above them.
+        const chips = scope.querySelectorAll('[data-credentials-role]');
+        for (let i = 0; i < chips.length; i += 1) {
+            const chip = chips[i];
+            if (typeof chip.addEventListener !== 'function') continue;
+            chip.addEventListener('click', (event) => {
+                event.preventDefault();
+                this.setCredentialsRole(chip.getAttribute('data-credentials-role'));
+            });
+        }
+        const more = scope.querySelectorAll('[data-credentials-more]');
+        for (let i = 0; i < more.length; i += 1) {
+            const button = more[i];
+            if (typeof button.addEventListener !== 'function') continue;
+            button.addEventListener('click', (event) => {
+                event.preventDefault();
+                this.showMoreCredentials();
+            });
+        }
     },
 
     /** Repaints the roster from the last response; only a search or a save needs this. */
@@ -3941,6 +4162,10 @@ const UI_MODULES = {
     async applyCredentialsSearch() {
         const box = document.getElementById('credentialsQuery');
         State.credentialsQuery = box ? String(box.value || '').trim() : '';
+        // A new search is a new question, so the list starts at its first page again - and a
+        // reader who had opened four pages keeps nothing of that page count they did not ask
+        // to keep.
+        State.credentialsLimit = 0;
         return this.repaintCredentialsFromCache();
     },
 
@@ -3971,11 +4196,19 @@ const UI_MODULES = {
     },
 
     /**
-     * The two ways an account starts from this tab: made here, or made by its owner.
+     * The two ways an account starts from this tab: made here, or applied for through the link.
      *
      * Both are on the Credentials screen rather than in a tab of their own, because both
      * end in the same place - a row in the roster below - and because the question an
      * admin is answering ("this man needs access") is the question this tab already asks.
+     *
+     * The second button used to hand out a one-time *enrollment* link, for somebody who already
+     * had an account and needed their face on it. It hands out the *registration* link now, and
+     * that is the whole of the change: the two were one button only by accident - a worker who
+     * does not exist yet is the common case at a gate, and the console has no way to create an
+     * account for somebody it has never met. The enrollment link itself is not gone: an existing
+     * account's face is registered at ``/admin/enroll``, by the worker's own hand at the self
+     * service screen, or by an administrator from the row below (see ``selfEnrollButtonHtml``).
      */
     credentialsActionsHtml() {
         return `
@@ -3983,17 +4216,28 @@ const UI_MODULES = {
                 <button type="button" id="credentialsOpenCreate" data-open-create="true"
                         onclick="UI_MODULES.openCredentialsMode('create')"
                         class="ui-btn ui-btn-primary">${this.OPS_ICONS.person}${this.escapeHtml(I18n.__('credentialsNewAccount'))}</button>
-                <button type="button" id="credentialsOpenInvite" data-open-invite="true"
-                        onclick="UI_MODULES.openCredentialsMode('invite')" class="ui-btn">${this.OPS_ICONS.link}${this.escapeHtml(I18n.__('credentialsLink'))}</button>
+                <button type="button" id="credentialsOpenLink" data-open-link="true"
+                        onclick="UI_MODULES.openCredentialsMode('link')" class="ui-btn">${this.OPS_ICONS.link}${this.escapeHtml(I18n.__('credentialsRegistrationLink'))}</button>
             </div>`;
     },
 
     credentialsHtml(users) {
         const query = this.credentialsQuery();
-        const shown = this.credentialsMatches(users, query);
+        // Two questions, asked in this order: who is the reader looking for (the search box),
+        // and which kind of account (the role chips). Both narrow the same list, and both are
+        // answered from the roster already in hand - neither is a reason to ask the server
+        // again, which is why the filter controls live here rather than in the toolbar.
+        //
+        // They are kept apart rather than folded into one filter, and what depends on it is the
+        // chip counts: a chip's count is what *tapping it* would hand over, so a chip is counted
+        // over the search's own answer, not over the list the chosen role has already narrowed.
+        // Counting over the narrowed list made every other chip read 0 the moment a role was
+        // picked - "there are no workers", on a screen where tapping Worker shows nine of them.
+        const searched = this.credentialsMatches(users, query);
+        const matched = this.credentialsByRole(searched);
         // The panel sits above the list rather than inside a row: one account is being
         // edited at a time, and a password that is about to be handed over deserves to
-        // be somewhere the eye lands, not squeezed between columns.
+        // be somewhere the eye lands, not squeezed between rows.
         const panel = this.credentialsCreatorHtml() + this.credentialsPanelHtml() + this.credentialsEditPanelHtml();
         if (users.length === 0) {
             return `${panel}
@@ -4002,97 +4246,203 @@ const UI_MODULES = {
                     <p class="ui-empty-title">${this.escapeHtml(I18n.__('credentialsEmpty'))}</p>
                 </div>`;
         }
-        if (shown.length === 0) {
-            // No table at all in this state: an empty table with a header row reading
-            // "Name / Role / Password" looks like a roster that failed to load, which is
-            // the opposite of what it means.
-            return `${panel}
+        if (matched.length === 0) {
+            // No list at all in this state: an empty list under a row of role chips reads as
+            // a roster that failed to load, which is the opposite of what it means. The chips
+            // stay above it, so "none of the moallems match this" is also the way back out.
+            return `${panel}${this.credentialsFiltersHtml(searched, users)}
                 <div class="ui-empty" data-no-matches="true">
                     <span class="ui-empty-icon">${this.OPS_ICONS.search}</span>
-                    <p class="ui-empty-title">${this.escapeHtml(I18n.__('credentialsNoMatches'))}</p>
+                    <p class="ui-empty-title">${this.escapeHtml(this.credentialsRole() === 'all' ? I18n.__('credentialsNoMatches') : I18n.__('credentialsNoRole'))}</p>
                     <button type="button" class="ui-btn" onclick="UI_MODULES.clearCredentialsSearch()">${this.OPS_ICONS.close}${this.escapeHtml(I18n.__('clear'))}</button>
                 </div>`;
         }
-        const note = query ? `
-            <p class="ui-section-note" data-filter-note style="margin-top:12px">
-                ${this.escapeHtml(I18n.__('shiftsFiltered'))}: “${this.escapeHtml(query)}” · ${shown.length} / ${users.length}
-            </p>` : '';
-        return `${panel}${note}${Device.isMobile ? this.credentialsCardsHtml(shown) : this.credentialsTableHtml(shown)}`;
+        // One list, at every width. What used to be here was a nine-column table on a laptop
+        // and a card per account on a phone, and the table is exactly the shape that had to go:
+        // nine columns do not fit, so the roster slid sideways and the facts an administrator
+        // opens this tab for - no face template, no password ever set - sat off the right edge.
+        // The same row now does both jobs, which is also one layout to keep in step instead of two.
+        return `${panel}${this.credentialsFiltersHtml(searched, users)}${this.credentialsListHtml(matched)}`;
     },
 
-    credentialsTableHtml(users) {
+    /**
+     * The role chips: one question, one tap, no request.
+     *
+     * These are *filters* rather than a column, because "who are my moallems" is a question
+     * an administrator arrives with, and a column answers it only by being read. Every chip
+     * carries its own count, and the counts are taken from the *searched* roster - so what a
+     * chip promises is what tapping it delivers: after searching a name, a chip reading 0
+     * means "none of those matches", which is the honest answer and saves the tap.
+     *
+     * A pressed button rather than a link or a clickable ``<div>``: the state is announced to
+     * a screen reader, the keyboard reaches it, and the focus ring is the console's own. The
+     * ``aria-pressed`` hook is the same one the console's other chips wear
+     * (``.ui-chip[aria-pressed='true']``).
+     */
+    credentialsFiltersHtml(searched, users) {
+        const active = this.credentialsRole();
+        // The chips are drawn from the *roster* and their counts from the *search's* answer:
+        // which roles exist is a fact about the deployment, and how many of them are left to
+        // hand over is a fact about this search - not about the role already chosen, which is
+        // why the role filter is applied to the list and never to the counts. Drawing the chip
+        // set from the search would take the whole control away exactly when it is most needed:
+        // a search that matched nothing would leave a reader with one chip reading 0 and no way
+        // back to a role.
+        const counts = this.credentialsRoleCounts(searched);
+        const chip = (value, label, count) => `
+                <button type="button" class="ui-chip" data-credentials-role="${value}" aria-pressed="${active === value ? 'true' : 'false'}">${this.escapeHtml(label)}<span class="roster-chip-count" data-role-count="${value}">${this.escapeHtml(String(count))}</span></button>`;
         return `
-            <div class="ui-table-wrap" style="margin-top:12px">
-                <table class="ui-table" data-credentials-table="true">
-                    <caption class="sr-only">${this.escapeHtml(I18n.__('credentials'))}</caption>
-                    <thead>
-                        <tr>
-                            <th scope="col">${this.escapeHtml(I18n.__('name'))}</th>
-                            <th scope="col">${this.escapeHtml(I18n.__('userId'))}</th>
-                            <th scope="col">${this.escapeHtml(I18n.__('role'))}</th>
-                            <th scope="col">${this.escapeHtml(I18n.__('credentialsContact'))}</th>
-                            <th scope="col">${this.escapeHtml(I18n.__('credentialsFace'))}</th>
-                            <th scope="col">${this.escapeHtml(I18n.__('password'))}</th>
-                            <th scope="col">${this.escapeHtml(I18n.__('credentialsSessions'))}</th>
-                            <th scope="col">${this.escapeHtml(I18n.__('credentialsStatus'))}</th>
-                            <th scope="col"><span class="sr-only">${this.escapeHtml(I18n.__('credentialsActions'))}</span></th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        ${users.map(user => `<tr data-user="${this.escapeHtml(user.id)}">
-                            <!-- No avatar in this cell on purpose: it is the name column, and an
-                                 avatar's initials are text in the cell - the roster is read by
-                                 name, and "SW Seed Worker" is not a name. The phone cards
-                                 have the room for one; a nine-column table does not. -->
-                            <td><span class="ops-name">${this.escapeHtml(user.name || user.id)}</span></td>
-                            <td class="is-numeric">${this.escapeHtml(user.id)}</td>
-                            <td>${this.escapeHtml(this.roleLabel(user.role))}</td>
-                            <td class="ops-sub">${this.credentialsContact(user)}</td>
-                            <td data-face="${user.face_enrolled ? 'enrolled' : 'missing'}">${this.credentialsFace(user)}</td>
-                            <td data-password="${user.password_set ? 'set' : 'never'}">${this.credentialsPasswordState(user)}</td>
-                            <td class="is-numeric">${this.sessionsRevoked(user)}</td>
-                            <td data-status="${this.accountStatus(user)}">${this.accountStatusHtml(user)}</td>
-                            <td class="is-end">${this.credentialsActionHtml(user, true)}</td>
-                        </tr>`).join('')}
-                    </tbody>
-                </table>
+            <div class="roster-filters" role="group" data-credentials-filters="true" aria-label="${this.escapeHtml(I18n.__('credentialsRoleFilter'))}">${chip('all', I18n.__('credentialsEveryone'), searched.length)}${this.credentialsRoleOrder(users || searched).map((role) => chip(role, this.roleLabel(role), counts[role] || 0)).join('')}
             </div>`;
     },
 
     /**
-     * The phone layout: one card per account, the same fields as the table.
+     * The roles in this roster, in the order an administrator reads a roster in.
+     *
+     * The five the console knows, in the dashboard's own order - worker, then the two lead
+     * roles, then the administrative ones - *plus* any role present here that is not in that
+     * list. A deployment with a ``developer`` account would otherwise have an account no chip
+     * can name, and an extra chip is better than a row no filter can reach.
      */
-    credentialsCardsHtml(users) {
-        return `<div class="ui-stack">${users.map(user => `
-            <div class="ui-card is-stacked" data-user="${this.escapeHtml(user.id)}">
-                <div class="ui-spread">
-                    <div class="ops-row-main">
+    credentialsRoleOrder(users) {
+        const known = ['worker', 'moallem', 'off_office', 'admin', 'head_admin'];
+        const present = [];
+        (users || []).forEach((user) => {
+            const role = String(user.role || '').trim();
+            if (role && present.indexOf(role) < 0) present.push(role);
+        });
+        return known.filter((role) => present.indexOf(role) >= 0)
+            .concat(present.filter((role) => known.indexOf(role) < 0).sort());
+    },
+
+    credentialsRoleCounts(users) {
+        const counts = {};
+        (users || []).forEach((user) => {
+            const role = String(user.role || '').trim();
+            if (role) counts[role] = (counts[role] || 0) + 1;
+        });
+        return counts;
+    },
+
+    /** Which role the list is narrowed to: ``'all'`` until somebody picks one. */
+    credentialsRole() {
+        return String(State.credentialsRole || '').trim() || 'all';
+    },
+
+    /** The roster the chosen role leaves. A role nothing matches leaves nothing to draw. */
+    credentialsByRole(users) {
+        const role = this.credentialsRole();
+        if (role === 'all') return users || [];
+        return (users || []).filter((user) => String(user.role || '').trim() === role);
+    },
+
+    /**
+     * One page of rows, and a button for the rest.
+     *
+     * Ten is the page rather than a shorter list: ten accounts is what fits a laptop screen
+     * without scrolling and still fills a phone without three swipes. The count line is always
+     * drawn, because it is the roster's own size - "Showing 6 of 6" on a small deployment,
+     * "Showing 10 of 137" on a real one - and that is the figure that tells a reader whether
+     * the button is needed at all. It is also what the old filtered-note line was doing, said
+     * once for every state rather than only while a search was in force.
+     */
+    credentialsListHtml(users) {
+        const limit = this.credentialsLimit();
+        const visible = users.slice(0, limit);
+        const remaining = users.length - visible.length;
+        const more = remaining > 0
+            ? `<button type="button" class="ui-btn ui-btn-sm" data-credentials-more="true">${this.escapeHtml(I18n.__('credentialsShowMore').replace('{count}', String(Math.min(remaining, this.CREDENTIALS_PAGE_SIZE))))}</button>`
+            : '';
+        return `
+            <ul class="roster" role="list" data-credentials-list="true" aria-label="${this.escapeHtml(I18n.__('credentials'))}">${visible.map((user) => this.credentialsRowHtml(user)).join('')}
+            </ul>
+            <div class="roster-foot" data-roster-foot="true">
+                <p class="roster-count" data-roster-count="true">${this.escapeHtml(I18n.__('credentialsShowing').replace('{shown}', String(visible.length)).replace('{total}', String(users.length)))}</p>${more}
+            </div>`;
+    },
+
+    /** How many rows are drawn at once. The page, not a limit on what can be reached. */
+    CREDENTIALS_PAGE_SIZE: 10,
+
+    credentialsLimit() {
+        const limit = Number(State.credentialsLimit) || 0;
+        return limit > 0 ? limit : this.CREDENTIALS_PAGE_SIZE;
+    },
+
+    /**
+     * One account: who they are, how their access stands, and what may be done about it.
+     *
+     * The order is the reader's. The name first, because that is how somebody looks a worker
+     * up on the phone; the id and the role beside it, because two people share a name; then
+     * the facts that answer "why can this person not get in" - no template, no password,
+     * sessions killed - and only then the buttons.
+     *
+     * Two of the four are drawn *only when there is something to say*, and that is what keeps
+     * a page of ten readable: every account in a roster is active until somebody switches it
+     * off, and most have never had a session revoked, so a badge reading "Active" and a figure
+     * reading "Sessions revoked 0" were four facts on every row where three are about the
+     * account and the fourth is the absence of news. The silence is the normal state; the
+     * exception is what a reader is scanning for, and it is now the only thing drawn.
+     *
+     * Every fact keeps the ``data-`` hook the table cell used to carry, so the state of an
+     * account is readable from the markup whether the row is densed onto a laptop or stacked
+     * on a phone. ``data-sessions`` sits on the *row* rather than on the fact it may not draw,
+     * and is a number rather than a phrase for the same reason: a test may assert on it
+     * without reading a translated word.
+     */
+    credentialsRowHtml(user) {
+        const id = this.escapeHtml(user.id);
+        const name = this.escapeHtml(user.name || user.id);
+        const role = String(user.role || '').trim();
+        const sessions = this.sessionsRevoked(user);
+        // Hidden when zero, and that is the whole of the change: what a revoked-session count
+        // *is* is a note that somebody's phones were cut off, so nought of them is the state
+        // every other row is in.
+        const sessionsFact = sessions === '0'
+            ? ''
+            : `\n                        <span class="roster-fact" data-fact="sessions"><span class="roster-fact-label">${this.escapeHtml(I18n.__('credentialsSessions'))}</span><span class="roster-sessions" data-sessions="${sessions}">${sessions}</span></span>`;
+        // Same for the status: drawn only for the account somebody switched off, where it is
+        // also the explanation for the row's own "Reactivate" button.
+        const statusFact = this.accountStatus(user) === 'active'
+            ? ''
+            : `\n                        <span class="roster-fact" data-fact="status"><span class="roster-fact-label">${this.escapeHtml(I18n.__('credentialsStatus'))}</span>${this.accountStatusHtml(user)}</span>`;
+        return `
+                <li class="roster-row" data-user="${id}" data-role="${this.escapeHtml(role)}" data-status="${this.accountStatus(user)}" data-sessions="${sessions}" data-face="${user.face_enrolled ? 'enrolled' : 'missing'}" data-password="${user.password_set ? 'set' : 'never'}">
+                    <div class="roster-who">
                         ${this.liveOpsAvatarHtml(user)}
-                        <span class="ops-name">${this.escapeHtml(user.name || user.id)}</span>
+                        <span class="roster-id">
+                            <span class="ops-name roster-name" title="${name}">${name}</span>
+                            <span class="ops-sub roster-meta"><span class="roster-role">${this.escapeHtml(this.roleLabel(role))}</span><span aria-hidden="true">·</span><span class="roster-numeric">${id}</span></span>
+                            <span class="ops-sub roster-contact">${this.credentialsContact(user)}</span>
+                        </span>
                     </div>
-                    <span class="ops-sub is-numeric">${this.escapeHtml(user.id)}</span>
-                </div>
-                <p class="ops-sub" style="margin-top:4px">${this.escapeHtml(this.roleLabel(user.role))} \u00b7 ${this.credentialsContact(user)}</p>
-                <div class="ui-facts" style="margin-top:12px">
-                    <div class="ui-fact">
-                        <span class="ops-stat-label">${this.escapeHtml(I18n.__('credentialsFace'))}</span>
-                        <span>${this.credentialsFace(user)}</span>
+                    <div class="roster-access">
+                        <span class="roster-fact" data-fact="face"><span class="roster-fact-label">${this.escapeHtml(I18n.__('credentialsFace'))}</span>${this.credentialsFace(user)}</span>
+                        <span class="roster-fact" data-fact="password"><span class="roster-fact-label">${this.escapeHtml(I18n.__('password'))}</span>${this.credentialsPasswordState(user)}</span>
+${sessionsFact}${statusFact}
                     </div>
-                    <div class="ui-fact">
-                        <span class="ops-stat-label">${this.escapeHtml(I18n.__('password'))}</span>
-                        <span>${this.credentialsPasswordState(user)}</span>
-                    </div>
-                    <div class="ui-fact">
-                        <span class="ops-stat-label">${this.escapeHtml(I18n.__('credentialsSessions'))}</span>
-                        <span class="ui-fact-value">${this.sessionsRevoked(user)}</span>
-                    </div>
-                    <div class="ui-fact" data-status="${this.accountStatus(user)}">
-                        <span class="ops-stat-label">${this.escapeHtml(I18n.__('credentialsStatus'))}</span>
-                        <span>${this.accountStatusHtml(user)}</span>
-                    </div>
-                </div>
-                <div class="ui-row" style="margin-top:12px">${this.credentialsActionHtml(user)}</div>
-            </div>`).join('')}</div>`;
+                    <div class="roster-actions">${this.credentialsActionHtml(user, true)}</div>
+                </li>`;
+    },
+
+    /**
+     * Narrow the roster to one role, or to everybody.
+     *
+     * The page goes back to its first ten on purpose: a reader who had opened four pages of
+     * workers and then taps moallems is asking a new question, and forty rows of a role they
+     * have not looked at yet is not the answer to it.
+     */
+    setCredentialsRole(role) {
+        const token = String(role || '').trim();
+        State.credentialsRole = (!token || token === 'all') ? 'all' : token;
+        State.credentialsLimit = 0;
+        return this.repaintCredentialsFromCache();
+    },
+
+    /** One more page of rows, from the roster already in hand - so no request, ever. */
+    showMoreCredentials() {
+        State.credentialsLimit = this.credentialsLimit() + this.CREDENTIALS_PAGE_SIZE;
+        return this.repaintCredentialsFromCache();
     },
 
     credentialsContact(user) {
@@ -4974,13 +5324,9 @@ const UI_MODULES = {
     /** The create form's fields, kept so that a repaint never loses what was typed. */
     _credentialsDraft: { id: '', name: '', role: 'worker', email: '', phone: '' },
 
-    /** The enrollment-link form's one field, for the same reason. */
-    _credentialsInviteDraft: { id: '' },
-
     openCredentialsMode(mode) {
         const wanted = String(mode || '');
         this.readCredentialsDraft();
-        this.readInviteDraft();
         this._credentialsMode = this._credentialsMode === wanted ? '' : wanted;
         // A generated password, never an empty box: the admin has to read one out loud
         // either way, and the generator's output is the only kind that satisfies the
@@ -4990,18 +5336,72 @@ const UI_MODULES = {
             // A form the admin has just opened is not a form that was just refused.
             this._credentialsIdTaken = null;
         }
+        // The link is read from the server every time the panel opens rather than kept from the
+        // last time it did. It is one request, and the alternative is an admin copying a URL out
+        // of a screen that was painted before another administrator replaced it - which is the
+        // one way this panel can hand out a link that no longer works.
+        if (this._credentialsMode === 'link') return this.loadCredentialsLink();
         return this.repaintCredentialsFromCache();
     },
 
     closeCredentialsMode() {
         this._credentialsMode = '';
-        // The two readable secrets live in memory only, and closing is what forgets
-        // them: a password never stored cannot leak from a later screen.
+        // The readable secrets live in memory only, and closing is what forgets them: a
+        // password never stored cannot leak from a later screen, and a link that is only ever
+        // read back from the server has nothing to forget.
         this._credentialsCreated = null;
-        this._credentialsIssued = null;
+        this._credentialsLink = null;
+        this._credentialsLinkBusy = false;
         this._credentialsNewPhoto = null;
         this._credentialsPhotoError = '';
         this._credentialsIdTaken = null;
+        return this.repaintCredentialsFromCache();
+    },
+
+    /**
+     * Asks the server for the registration link and paints it.
+     *
+     * The pane goes up empty-but-saying-so first, because the answer is one request and a panel
+     * that appears only once it has arrived looks like a button that did nothing. A failure is
+     * the same panel with the server's own sentence, and the button is still there: nothing here
+     * is one-shot, so a failed read costs one more tap rather than the link.
+     */
+    async loadCredentialsLink() {
+        this._credentialsLink = null;
+        this._credentialsLinkBusy = true;
+        await this.repaintCredentialsFromCache();
+        try {
+            const answer = await API.request('/admin/registrations/link');
+            this._credentialsLink = answer && typeof answer === 'object' ? answer : null;
+        } catch (err) {
+            this._credentialsLink = null;
+            Toast.error(err.message);
+        }
+        this._credentialsLinkBusy = false;
+        return this.repaintCredentialsFromCache();
+    },
+
+    /**
+     * Replaces the link: every copy already sent stops opening the form, at once.
+     *
+     * Confirmed rather than immediate, and that is the whole reason this is not a plain button:
+     * the old link is very likely already in somebody's WhatsApp, and an administrator who taps
+     * this by accident would have to hear about it from an applicant. The confirmation also says
+     * the part that is *not* at risk - the applications already waiting in the queue - because
+     * "replace the link" reads like it might throw the queue away.
+     */
+    async replaceCredentialsLink() {
+        if (this._credentialsLinkBusy) return;
+        if (!confirm(I18n.__('credentialsRegistrationLinkReplaceConfirm'))) return;
+        this._credentialsLinkBusy = true;
+        try {
+            const answer = await API.request('/admin/registrations/link', { method: 'POST' });
+            this._credentialsLink = answer && typeof answer === 'object' ? answer : null;
+            Toast.success(I18n.__('credentialsRegistrationLinkReplaced'));
+        } catch (err) {
+            Toast.error(err.message);
+        }
+        this._credentialsLinkBusy = false;
         return this.repaintCredentialsFromCache();
     },
 
@@ -5175,23 +5575,6 @@ const UI_MODULES = {
         return this._credentialsDraft;
     },
 
-    /**
-     * The one field the link form has: the account the link is for.
-     *
-     * Nothing else travels, because nothing else may be chosen here any more. The name, the
-     * role and the contact details all belong to the account that already exists, and the
-     * server reads them off that row - a form that could send a name would be a form that
-     * could send a *different* one.
-     */
-    readInviteDraft() {
-        if (this._credentialsMode !== 'invite' || this._credentialsIssued) return this._credentialsInviteDraft;
-        const element = document.getElementById('credentialsLinkId');
-        if (element && element.value !== undefined) {
-            this._credentialsInviteDraft.id = String(element.value).trim();
-        }
-        return this._credentialsInviteDraft;
-    },
-
     /** The open create or link panel, or ``''`` when neither is.
      *
      * Rendered above the roster rather than in a modal, so the account being created and
@@ -5200,7 +5583,7 @@ const UI_MODULES = {
      */
     credentialsCreatorHtml() {
         if (this._credentialsMode === 'create') return this.credentialsCreateHtml();
-        if (this._credentialsMode === 'invite') return this.credentialsInviteHtml();
+        if (this._credentialsMode === 'link') return this.credentialsLinkHtml();
         return '';
     },
 
@@ -5269,39 +5652,73 @@ const UI_MODULES = {
             </div>`;
     },
 
-    credentialsInviteHtml() {
+    /**
+     * The registration link: the address the company sends to somebody who wants to apply.
+     *
+     * WHY IT HAS NO "CREATE" BUTTON
+     * -----------------------------
+     * The link exists the moment the panel asks for it - it is a function of the deployment's
+     * own key (see ``backend/registrations.link_token``), not a row that has to be minted - so
+     * there is nothing to create and nothing to be lost by closing this panel. What the panel
+     * offers instead is the one thing an administrator actually needs: the URL, a copy button, a
+     * WhatsApp message with it already in the box, and the QR code for a printed page.
+     *
+     * The acceptance line is drawn from the server's own reason code, and the switch that decides
+     * it is drawn beside the URL rather than described and left somewhere else. The link and the
+     * intake switch are still two objects - replacing a link does not open a closed form, and
+     * closing the form does not invalidate the link - so the panel shows both, and the reader is
+     * never handed an address that quietly refuses everybody.
+     */
+    credentialsLinkHtml() {
         const box = 'ui-alert is-info is-stacked';
         const field = this.credentialsFieldClass();
         const quiet = 'ui-btn';
-        const issued = this._credentialsIssued;
-        if (issued) {
+        const link = this._credentialsLink;
+        if (!link) {
             return `
-                <div class="${box}" data-link-issued="${this.escapeHtml(issued.worker_id || '')}">
-                    <p class="ui-card-title">${I18n.__('credentialsLinkTitle')}</p>
-                    <p class="ui-note is-body">${I18n.__('credentialsLinkOnce')}</p>
-                    <div class="ui-row">
-                        <input id="credentialsLinkUrl" readonly value="${this.escapeHtml(issued.url)}" class="${field} ui-mono is-flex">
-                        <button type="button" onclick="UI_MODULES.copyCredentialsLink()" class="${quiet}">${I18n.__('copyLink')}</button>
-                        <button type="button" onclick="UI_MODULES.shareCredentialsLink()" class="${quiet}">${I18n.__('credentialsLinkWhatsApp')}</button>
-                    </div>
-                    ${issued.qr_png_data_uri ? `<img src="${this.escapeHtml(issued.qr_png_data_uri)}" alt="${I18n.__('credentialsLinkQr')}" class="ui-qr">` : ''}
-                    <p class="ui-note">${this.escapeHtml(issued.worker_name || '')} (${this.escapeHtml(issued.worker_id || '')}) · ${I18n.__('credentialsLinkExpires')} ${this.escapeHtml(issued.expires_at || '')}</p>
-                    <button type="button" onclick="UI_MODULES.closeCredentialsMode()" class="${quiet}">${I18n.__('close')}</button>
+                <div class="${box}" data-registration-link="waiting">
+                    <p class="ui-card-title">${I18n.__('credentialsRegistrationLink')}</p>
+                    ${this._credentialsLinkBusy
+                        ? UI.loadingHtml()
+                        : `<p class="ui-note is-body">${I18n.__('credentialsRegistrationLinkFailed')}</p>
+                           <div class="ui-row">
+                               <button type="button" onclick="UI_MODULES.loadCredentialsLink()" class="ui-btn ui-btn-primary">${I18n.__('credentialsRegistrationLinkRetry')}</button>
+                               <button type="button" onclick="UI_MODULES.closeCredentialsMode()" class="${quiet}">${I18n.__('cancel')}</button>
+                           </div>`}
                 </div>`;
         }
-        const draft = this._credentialsInviteDraft;
+        const reason = String(link.reason || '');
+        const open = !!link.accepting;
+        const WHY = {
+            open: 'registrationsIntakeWhyOpen',
+            closed_by_console: 'registrationsIntakeWhyClosedByConsole',
+            closed_by_default: 'registrationsIntakeWhyClosedByDefault'
+        };
+        const why = I18n.__(WHY[reason] || (open ? 'registrationsIntakeWhyOpen' : 'registrationsIntakeWhyClosedByConsole'));
+        // The switch, drawn beside the URL it decides the fate of. This panel is where an
+        // administrator stands when they are about to send the link, so "this address refuses
+        // everybody" has to be fixable from here - a sentence that sends them to another tab to
+        // find the lever is how a working form gets handed out as a closed one. Bound by
+        // ``bindCredentialsControls`` from a ``data-`` hook rather than an inline attribute,
+        // because the inline allowance per file is pinned and may only fall.
+        const switchButton = `<button type="button" class="ui-btn ${open ? 'ui-btn-danger' : 'ui-btn-primary'}" data-registration-intake="${open ? 'close' : 'open'}">${this.escapeHtml(I18n.__(open ? 'registrationsIntakeClose' : 'registrationsIntakeOpen'))}</button>`;
         return `
-            <div class="${box}" data-invite-panel="true">
-                <p class="ui-card-title">${I18n.__('credentialsLinkTitle')}</p>
-                <p class="ui-note is-body">${I18n.__('credentialsLinkHint')}</p>
+            <div class="${box}" data-registration-link="true" data-link-accepting="${open ? 'true' : 'false'}">
+                <p class="ui-card-title">${I18n.__('credentialsRegistrationLink')}</p>
+                <p class="ui-note is-body">${I18n.__('credentialsRegistrationLinkHint')}</p>
                 <div class="ui-row">
-                    <input type="text" id="credentialsLinkId" value="${this.escapeHtml(draft.id)}" inputmode="numeric"
-                           placeholder="${I18n.__('credentialsNewId')}" class="${field}">
+                    <input id="credentialsLinkUrl" readonly value="${this.escapeHtml(link.url || '')}" class="${field} ui-mono is-flex">
+                    <button type="button" onclick="UI_MODULES.copyCredentialsLink()" class="${quiet}">${I18n.__('copyLink')}</button>
+                    <button type="button" onclick="UI_MODULES.shareCredentialsLink()" class="${quiet}">${I18n.__('credentialsLinkWhatsApp')}</button>
                 </div>
+                ${link.qr_png_data_uri ? `<img src="${this.escapeHtml(link.qr_png_data_uri)}" alt="${I18n.__('credentialsRegistrationLinkQr')}" class="ui-qr">` : ''}
+                <p class="ui-note" data-link-why="${this.escapeHtml(reason || 'open')}">${this.escapeHtml(why)}</p>
                 <div class="ui-row">
-                    <button type="button" onclick="UI_MODULES.issueCredentialsLink()" class="ui-btn ui-btn-primary">${I18n.__('credentialsLinkCreate')}</button>
-                    <button type="button" onclick="UI_MODULES.closeCredentialsMode()" class="${quiet}">${I18n.__('cancel')}</button>
+                    ${switchButton}
+                    <button type="button" onclick="UI_MODULES.replaceCredentialsLink()" class="${quiet}">${I18n.__('credentialsRegistrationLinkReplace')}</button>
+                    <button type="button" onclick="UI_MODULES.closeCredentialsMode()" class="${quiet}">${I18n.__('close')}</button>
                 </div>
+                <p class="ui-note">${I18n.__('credentialsRegistrationLinkReplaceNote')}</p>
             </div>`;
     },
 
@@ -5389,44 +5806,14 @@ const UI_MODULES = {
         }
     },
 
-    /**
-     * Issues the one-time enrollment link for an account that already exists.
-     *
-     * The account id is the whole request. An id no account carries is the server's answer
-     * to give (404), and deliberately not a range check here: the console does not know the
-     * roster, and what a link is about is a person who is already on it.
-     *
-     * The token comes back exactly once and is not stored in readable form anywhere - it
-     * is a hash in ``enrollment_invites`` - so the panel keeps it on screen until it is
-     * closed, and there is no "show it again" button to offer.
-     */
-    async issueCredentialsLink() {
-        const draft = this.readInviteDraft();
-        if (!draft.id) {
-            Toast.error(I18n.__('credentialsLinkNeedsId'));
-            return;
-        }
-        try {
-            this._credentialsIssued = await API.request('/admin/enrollment/invites', {
-                method: 'POST',
-                body: { worker_id: draft.id }
-            });
-            Toast.success(I18n.__('credentialsLinkReady'));
-        } catch (err) {
-            Toast.error(err.message);
-            return;
-        }
-        return this.repaintCredentialsFromCache();
-    },
-
     copyCredentialsLink() {
-        const issued = this._credentialsIssued;
-        if (!issued || !issued.url) return;
+        const link = this._credentialsLink;
+        if (!link || !link.url) return;
         const done = () => Toast.success(I18n.__('copied'));
         if (navigator.clipboard && navigator.clipboard.writeText) {
-            navigator.clipboard.writeText(issued.url).then(done).catch(() => prompt(I18n.__('copyLink'), issued.url));
+            navigator.clipboard.writeText(link.url).then(done).catch(() => prompt(I18n.__('copyLink'), link.url));
         } else {
-            prompt(I18n.__('copyLink'), issued.url);
+            prompt(I18n.__('copyLink'), link.url);
         }
     },
 
@@ -5439,16 +5826,16 @@ const UI_MODULES = {
      * opens WhatsApp Web.
      */
     shareCredentialsLink() {
-        const issued = this._credentialsIssued;
-        if (!issued || !issued.url) return;
-        const message = `${I18n.__('credentialsLinkMessage')} ${issued.url}`;
-        const link = document.createElement('a');
-        link.href = `https://wa.me/?text=${encodeURIComponent(message)}`;
-        link.target = '_blank';
-        link.rel = 'noopener';
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
+        const link = this._credentialsLink;
+        if (!link || !link.url) return;
+        const message = `${I18n.__('credentialsRegistrationLinkMessage')} ${link.url}`;
+        const anchor = document.createElement('a');
+        anchor.href = `https://wa.me/?text=${encodeURIComponent(message)}`;
+        anchor.target = '_blank';
+        anchor.rel = 'noopener';
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
     },
 
     /**
@@ -6719,6 +7106,21 @@ const UI_MODULES = {
             // lockup (the one resolved at boot); a company name that cannot be re-read is
             // not worth an error toast over, and the panel draws what the app is using.
         }
+        // What this deployment is holding on disk, and what the sweep would delete. Read here
+        // rather than inside the section, for the same reason the other two are: one paint,
+        // one round of reads, and a section that is handed the answer rather than fetching it.
+        //
+        // A failure is drawn *in the panel* rather than toasted, which is the one place this
+        // deviates from the two reads above. They toast because a screen without the rules is a
+        // screen that cannot do its job; this section is a report about disk, and losing the
+        // whole tab's toast to it would announce the wrong problem - an operator would read
+        // "could not load" and go looking at the rules.
+        let retentionStatus = null;
+        try {
+            retentionStatus = await API.request('/admin/retention');
+        } catch (err) {
+            retentionStatus = null;
+        }
         // The rules this panel was painted from. ``saveShiftRules`` reads a field back from
         // here when the box itself cannot answer (see that method for why).
         this._shiftRules = rules;
@@ -6726,6 +7128,7 @@ const UI_MODULES = {
             <div class="ui-page" data-admin-panel="true">
                 ${this.companyHtml(branding)}
                 ${this.shiftRulesHtml(rules)}
+                ${this.retentionHtml(retentionStatus)}
                 <p class="ui-note is-body" data-admin-create-moved="true">${this.escapeHtml(I18n.__('adminCreateMoved'))}</p>
             </div>`;
         const rulesForm = document.getElementById('shiftRulesForm');
@@ -6738,6 +7141,369 @@ const UI_MODULES = {
         if (logoInput) logoInput.onchange = () => this.pickCompanyLogo(logoInput);
         const removeLogo = document.getElementById('companyLogoRemove');
         if (removeLogo) removeLogo.onclick = () => this.removeCompanyLogo();
+        // Assigned rather than written as an ``onclick`` attribute: the dry run is the only
+        // control on this tab that *asks the server something new*, and the document's CSP
+        // allows inline handlers only within a budget that may fall (see
+        // ``test_frontend_xss.py``) - a control added today binds its own listener.
+        const retentionCheck = document.querySelector('[data-retention-check]');
+        if (retentionCheck) retentionCheck.onclick = () => this.checkRetentionPlan();
+    },
+
+    //: The stores the retention report is about, in the words the screen that owns each one
+    //: already uses. Two of them are the Developer console's own keys (``devDb``,
+    //: ``devBackups``) and two are the worker-facing names for a store an administrator meets
+    //: elsewhere (``corpusTitle``, ``refusalsTitle``): naming a directory a second time in this
+    //: panel is how two screens come to disagree about what they are describing.
+    RETENTION_STORE_KEYS: {
+        worker_photos: 'retentionStoreSelfies',
+        local_references: 'retentionStoreTemplates',
+        punch_frames: 'retentionStoreFrames',
+        quick_link_photos: 'retentionStoreLinkPhotos',
+        registration_photos: 'retentionStoreRegistration',
+        calibration_corpus: 'corpusTitle',
+        backups: 'devBackups',
+        database: 'devDb'
+    },
+
+    //: The sweep's own target names, in the same words. ``attendance_logs`` is in here because
+    //: the sweep reports it rather than deletes it - a target that is *missing* from the plan
+    //: would read as "nothing to do", when the truth is "nothing this may do".
+    RETENTION_TARGET_KEYS: {
+        punch_photos: 'retentionStoreLinkPhotos',
+        punch_frames: 'retentionStoreFrames',
+        refused_punches: 'refusalsTitle',
+        biometric_files: 'retentionTargetBiometric',
+        audit_log: 'devAudit',
+        notifications: 'adminAlerts',
+        worker_notifications: 'retentionTargetNotices',
+        punch_queue: 'queuedPunches',
+        attendance_logs: 'attendanceLogs'
+    },
+
+    //: The windows, in the order an operator reads them: the faces first, then the records.
+    //: ``0`` is the policy's own "keep forever" in every knob (see ``retention.Policy``), which
+    //: is why the value is rendered through two words rather than as a number of days.
+    RETENTION_WINDOW_KEYS: [
+        ['punch_photo_days', 'retentionStoreLinkPhotos'],
+        ['punch_frame_days', 'retentionStoreFrames'],
+        ['biometric_days', 'retentionTargetBiometric'],
+        ['audit_days', 'devAudit'],
+        ['notification_days', 'adminAlerts'],
+        ['punch_queue_days', 'queuedPunches'],
+        ['anchor_days', 'retentionTargetAnchors']
+    ],
+
+    /**
+     * What this deployment is holding on disk, and what the sweep would delete.
+     *
+     * WHY A PANEL AND NOT A LOG LINE
+     * ------------------------------
+     * Retention is invisible when it works. A sweep that erases a departed worker's face on time
+     * and a sweep that quietly stopped leave an application that looks exactly the same, which is
+     * why the module has tests rather than dashboards - but the *operator's* first question is
+     * not in any of the three answers the API already had. Those are the policy, the last run and
+     * the residue a query cannot see; none of them says how much is there, or whether any of it is
+     * growing. That is this panel, and it is why the figures come from the filesystem rather than
+     * from a query: ``retention.storage_inventory`` walks each directory and counts.
+     *
+     * Nothing here changes anything. The one control is a *check*:
+     * ``POST /admin/retention/dry-run`` opens the database read-only and reports what the next
+     * real sweep would erase. The panel says in words that it deleted nothing, because a list of
+     * things about to be deleted without that sentence reads as a log of things that were.
+     *
+     * The garbage collection itself is not offered here, and not because it is dangerous: a
+     * schedule already runs it (``retention.start_watcher``), and a button that erases faces by
+     * hand would make the policy a thing somebody can override at 3 a.m. rather than the thing
+     * that is documented.
+     */
+    retentionHtml(status) {
+        const storage = (status && status.storage) || {};
+        const policy = (status && status.policy) || {};
+        const scheduler = (status && status.scheduler) || {};
+        const lastRun = (status && status.last_run) || null;
+        const residue = this.retentionResidueCount(status);
+        return `
+            <section class="ui-card is-flat" data-retention-panel="true" aria-labelledby="retentionTitle">
+                <h3 class="ui-section-title" id="retentionTitle">${this.escapeHtml(I18n.__('retention'))}</h3>
+                <p class="ui-section-note" style="margin-top:4px">${this.escapeHtml(I18n.__('retentionHint'))}</p>
+                ${status === null
+                    ? `<p class="ui-note is-warn" data-retention-unavailable="true">${this.escapeHtml(I18n.__('retentionUnavailable'))}</p>`
+                    : this.retentionFiguresHtml(storage, policy, scheduler, lastRun, residue)}
+            </section>`;
+    },
+
+    /** The four figures, the last run, and the three things the numbers cannot say themselves. */
+    retentionFiguresHtml(storage, policy, scheduler, lastRun, residue) {
+        const files = Number(storage.files_total) || 0;
+        const live = Number(storage.live_bytes) || 0;
+        // The residue is a *badge* where it is not nought: it is the one figure on this panel
+        // that is a fault rather than a measurement - files the policy says should be gone and
+        // that a query can no longer see. An unreadable database is a third state again, and it
+        // gets the code's own words rather than a nought: "no residue" and "could not count" are
+        // the two answers a reader must never have confused for each other.
+        const residueValue = residue.error
+            ? `<span class="ui-badge is-warn" title="${this.escapeHtml(residue.error)}" data-retention-residue="error">${this.escapeHtml(I18n.__('retentionTargetFailed'))}</span>`
+            : (residue.count > 0
+                ? `<span class="ui-badge is-warn" data-retention-residue="true">${this.escapeHtml(String(residue.count))}</span>`
+                : `<span class="ui-fact-value" data-retention-residue="true">0</span>`);
+        return `
+                <div class="ui-facts" style="margin-top:16px">
+                    <div class="ui-fact">
+                        <span class="ops-stat-label">${this.escapeHtml(I18n.__('retentionOnDisk'))}</span>
+                        <span class="ui-fact-value" data-retention-fact="live">${this.escapeHtml(this.devBytes(live))}</span>
+                    </div>
+                    <div class="ui-fact">
+                        <span class="ops-stat-label">${this.escapeHtml(I18n.__('retentionFiles'))}</span>
+                        <span class="ui-fact-value" data-retention-fact="files">${this.escapeHtml(String(files))}</span>
+                    </div>
+                    <div class="ui-fact">
+                        <span class="ops-stat-label">${this.escapeHtml(I18n.__('retentionSweeper'))}</span>
+                        <span class="ui-fact-value" data-retention-fact="sweep">${this.escapeHtml(this.retentionSweepLabel(scheduler))}</span>
+                    </div>
+                    <div class="ui-fact">
+                        <span class="ops-stat-label">${this.escapeHtml(I18n.__('retentionLeftBehind'))}</span>
+                        ${residueValue}
+                    </div>
+                </div>
+                <p class="ui-section-note" data-retention-run="true">${this.escapeHtml(this.retentionRunLabel(lastRun))}</p>
+                <p class="ui-section-note" data-retention-pay="true">${this.escapeHtml(I18n.__('retentionPayRecords'))}</p>
+                <p class="ui-section-note" data-retention-copies="true">${this.escapeHtml(I18n.__('retentionCopiesNote'))}</p>
+                ${storage.truncated
+                    ? `<p class="ui-note is-warn" data-retention-truncated="true">${this.escapeHtml(I18n.__('retentionTruncated'))}</p>`
+                    : ''}
+                <div class="retention-split">
+                    ${this.retentionStoresHtml(storage.stores || [])}
+                    ${this.retentionWindowsHtml(policy)}
+                </div>
+                <div data-retention-plan="true"></div>
+                <button type="button" class="ui-btn" data-retention-check="true">${this.escapeHtml(I18n.__('retentionCheck'))}</button>`;
+    },
+
+    /** ``every 6 h``, or why the schedule is not doing that. */
+    retentionSweepLabel(scheduler) {
+        if (scheduler && scheduler.enabled === false) return I18n.__('retentionSweepOff');
+        const hours = Math.round((Number(scheduler && scheduler.interval_seconds) || 0) / 3600);
+        if (hours <= 0) return I18n.__('retentionSweepOff');
+        return I18n.__('retentionSweepEvery').replace('{hours}', String(hours));
+    },
+
+    /**
+     * The last sweep, from the row the sweeper writes - which is the whole point of that row:
+     * it survives a restart, so "was anything actually running" is answerable after one.
+     */
+    retentionRunLabel(lastRun) {
+        if (!lastRun) return I18n.__('retentionSweepNever');
+        const when = String(lastRun.finished_at || lastRun.started_at || '');
+        const parts = [
+            I18n.__('retentionRunDeleted')
+                .replace('{count}', String(Number(lastRun.deleted_total) || 0))
+                .replace('{bytes}', this.devBytes(Number(lastRun.bytes_wiped) || 0))
+        ];
+        const failures = Number(lastRun.failures_total) || 0;
+        if (failures > 0) parts.push(I18n.__('retentionRunFailed').replace('{count}', String(failures)));
+        return `${when} \u00b7 ${parts.join(' \u00b7 ')}`;
+    },
+
+    /**
+     * One row per directory, and the age span across it.
+     *
+     * The path rides on the row's ``title`` rather than in a column: what an operator does with
+     * this table is compare stores with each other, and a column of server paths would push the
+     * numbers apart to answer a question nobody asked twice.
+     */
+    retentionStoresHtml(stores) {
+        const rows = stores.map((store) => {
+            const label = this.escapeHtml(I18n.__(this.RETENTION_STORE_KEYS[store.key] || store.key));
+            const copy = store.kind === 'copy'
+                ? ` <span class="ui-badge is-quiet">${this.escapeHtml(I18n.__('retentionCopy'))}</span>`
+                : '';
+            // The span is two ``YYYY-MM-DD`` days and not two timestamps: what the column is for is
+            // "how far back does this store reach", and a pair of clock times answers that to the
+            // second while making the row twice as wide.
+            const span = store.oldest
+                ? `${this.escapeHtml(this.retentionDay(store.oldest))} \u2192 ${this.escapeHtml(this.retentionDay(store.newest || store.oldest))}`
+                : '\u2014';
+            return `
+                        <tr data-retention-store="${this.escapeHtml(store.key)}" data-retention-kind="${this.escapeHtml(store.kind || 'live')}">
+                            <td title="${this.escapeHtml(store.path || '')}">${label}${copy}</td>
+                            <td class="roster-numeric">${this.escapeHtml(String(Number(store.files) || 0))}</td>
+                            <td>${this.escapeHtml(this.devBytes(Number(store.bytes) || 0))}</td>
+                            <td>${span}</td>
+                        </tr>`;
+        }).join('');
+        return `
+                <div class="ui-table-wrap">
+                    <table class="ui-table" data-retention-stores="true">
+                        <thead>
+                            <tr>
+                                <th scope="col">${this.escapeHtml(I18n.__('retentionStore'))}</th>
+                                <th scope="col">${this.escapeHtml(I18n.__('retentionFiles'))}</th>
+                                <th scope="col">${this.escapeHtml(I18n.__('retentionSize'))}</th>
+                                <th scope="col">${this.escapeHtml(I18n.__('retentionSpan'))}</th>
+                            </tr>
+                        </thead>
+                        <tbody>${rows}</tbody>
+                    </table>
+                </div>`;
+    },
+
+    /**
+     * How long each store is kept for, from the policy the *server* is running.
+     *
+     * Not from a constant here: every one of these is a deployment's setting, and a panel that
+     * printed the shipped default would be describing an intention rather than the policy.
+     * ``0`` days is that policy's "keep forever", in every knob, so it gets words rather than a
+     * blank - a blank reads as "not configured" and a nought reads as "delete immediately".
+     */
+    retentionWindowsHtml(policy) {
+        const rows = this.RETENTION_WINDOW_KEYS.map(([field, labelKey]) => {
+            const days = Number(policy[field]) || 0;
+            const value = days > 0
+                ? I18n.__('retentionDays').replace('{days}', String(days))
+                : I18n.__('retentionForever');
+            return `
+                        <tr data-retention-window="${this.escapeHtml(field)}">
+                            <td>${this.escapeHtml(I18n.__(labelKey))}</td>
+                            <td>${this.escapeHtml(value)}</td>
+                        </tr>`;
+        }).join('');
+        return `
+                <div class="ui-table-wrap">
+                    <table class="ui-table" data-retention-policy="true">
+                        <thead>
+                            <tr>
+                                <th scope="col">${this.escapeHtml(I18n.__('retentionStore'))}</th>
+                                <th scope="col">${this.escapeHtml(I18n.__('retentionWindow'))}</th>
+                            </tr>
+                        </thead>
+                        <tbody>${rows}</tbody>
+                    </table>
+                </div>`;
+    },
+
+    /**
+     * The residue, as one number: the four kinds are the module's, not the reader's.
+     *
+     * ``{count, error}`` rather than a bare number, because ``retention.residue`` answers an
+     * unreadable database with ``{error}`` instead of counts - and a panel that added up a failed
+     * read as zero would report "nothing left behind" in the one situation where it has no idea.
+     */
+    retentionResidueCount(status) {
+        const residue = (status && status.residue) || {};
+        if (residue.error) return { count: 0, error: String(residue.error) };
+        const count = [
+            'biometric_files_for_deactivated_accounts',
+            'orphaned_biometric_files',
+            'biometric_staging_files',
+            'orphaned_punch_photos'
+        ].reduce((total, key) => total + (Number(residue[key]) || 0), 0);
+        return { count, error: null };
+    },
+
+    /**
+     * A store's age bound as a day, or ``null`` for a store with nothing in it.
+     *
+     * The stores carry the application's own timestamp format (``retention._stamp``), whose
+     * first ten characters are already the day - so that is what the column shows, and no
+     * parsing is needed to get it. An epoch is still handled rather than assumed away: a walk
+     * reporting mtimes would be just as reasonable a design, and the failure mode of guessing
+     * wrong is a column of ten-digit numbers where a person expects a date.
+     */
+    retentionDay(value) {
+        const text = String(value === null || value === undefined ? '' : value);
+        if (/^\d{4}-\d{2}-\d{2}/.test(text)) return text.slice(0, 10);
+        const seconds = Number(text);
+        if (!Number.isFinite(seconds) || seconds <= 0) return null;
+        const at = new Date(seconds * 1000);
+        return Number.isNaN(at.getTime()) ? null : this.isoDate(at);
+    },
+
+    /**
+     * Ask the server what the next sweep would erase, and draw the answer where the button is.
+     *
+     * The button is disabled while the question is in flight, because the answer walks every
+     * directory - a second tap is a second walk, and what a person does with a button that looks
+     * dead is tap it again.
+     *
+     * A refusal is drawn rather than swallowed: this is the one read on the tab whose silence
+     * would be indistinguishable from "there is nothing to delete", which is the most reassuring
+     * possible lie.
+     */
+    async checkRetentionPlan() {
+        const button = document.querySelector('[data-retention-check]');
+        const region = document.querySelector('[data-retention-plan]');
+        if (button) {
+            button.disabled = true;
+            button.textContent = I18n.__('retentionChecking');
+        }
+        try {
+            const report = await API.request('/admin/retention/dry-run', { method: 'POST' });
+            if (region) region.innerHTML = this.retentionPlanHtml(report);
+        } catch (err) {
+            if (region) {
+                region.innerHTML = `<p class="ui-note is-warn" data-retention-plan-failed="true">${this.escapeHtml(I18n.__('retentionPlanFailed'))}</p>`;
+            }
+        }
+        if (button) {
+            button.disabled = false;
+            button.textContent = I18n.__('retentionCheck');
+        }
+    },
+
+    /**
+     * The dry run's answer, as the plan it is.
+     *
+     * Two fields of that report are deliberately *not* quoted here. ``deleted_total`` and
+     * ``bytes_total`` are what a sweep **removed**, and in a check nothing is removed: the totals
+     * are zero by construction (see ``retention._blank``). What the reader asked is what ``matched``
+     * and ``bytes`` add up to - rows and files the cutoffs selected, and the space they hold -
+     * so the sentence is built from those, and the panel says out loud that nothing went.
+     */
+    retentionPlanHtml(report) {
+        const targets = (report && report.targets) || {};
+        const names = Object.keys(targets);
+        const count = (name) => Number((targets[name] || {}).matched) || 0;
+        const size = (name) => Number((targets[name] || {}).bytes) || 0;
+        // Only what there is something to say about: a target with nothing past its window and
+        // no failure is the normal case, and ten rows of zeroes is how a reader stops reading.
+        const selected = names.filter((name) => count(name) > 0 || (targets[name] || {}).error);
+        const untouched = `<p class="ui-section-note" data-retention-untouched="true">${this.escapeHtml(I18n.__('retentionPlanUntouched'))}</p>`;
+        if (selected.length === 0) {
+            return `<p class="ui-note is-body" data-retention-plan-none="true">${this.escapeHtml(I18n.__('retentionPlanNone'))}</p>${untouched}`;
+        }
+        const rows = selected.map((name) => {
+            const target = targets[name] || {};
+            const label = this.escapeHtml(I18n.__(this.RETENTION_TARGET_KEYS[name] || name));
+            const space = target.error
+                ? `<span class="ui-badge is-warn" title="${this.escapeHtml(String(target.error))}" data-retention-target-failed="${this.escapeHtml(name)}">${this.escapeHtml(I18n.__('retentionTargetFailed'))}</span>`
+                : this.escapeHtml(size(name) > 0 ? this.devBytes(size(name)) : '\u2014');
+            return `
+                        <tr data-retention-target="${this.escapeHtml(name)}">
+                            <td>${label}</td>
+                            <td class="roster-numeric">${this.escapeHtml(String(count(name)))}</td>
+                            <td>${space}</td>
+                        </tr>`;
+        }).join('');
+        const items = selected.reduce((total, name) => total + count(name), 0);
+        const bytes = selected.reduce((total, name) => total + size(name), 0);
+        const sentence = I18n.__('retentionPlan')
+            .replace('{count}', String(items))
+            .replace('{bytes}', this.devBytes(bytes));
+        return `
+                <div class="ui-table-wrap" style="margin-top:16px">
+                    <table class="ui-table" data-retention-plan-table="true">
+                        <thead>
+                            <tr>
+                                <th scope="col">${this.escapeHtml(I18n.__('retentionData'))}</th>
+                                <th scope="col">${this.escapeHtml(I18n.__('retentionWouldGo'))}</th>
+                                <th scope="col">${this.escapeHtml(I18n.__('retentionSpace'))}</th>
+                            </tr>
+                        </thead>
+                        <tbody>${rows}</tbody>
+                    </table>
+                </div>
+                <p class="ui-note is-body" data-retention-plan-total="true">${this.escapeHtml(sentence)}</p>
+                ${untouched}`;
     },
 
     /**
@@ -9197,6 +9963,15 @@ const UI_MODULES = {
     //: asked for - one number, in two places, held together by the frontend suite.
     DASHBOARD_PERIOD_DAYS: 7,
 
+    //: The two *watch* windows, as the server counts them: an account with no punch in
+    //: ``dashboard.DORMANT_DAYS`` is dormant, and one created inside ``dashboard.NEW_ACCOUNT_DAYS``
+    //: that has never clocked in is onboarding. They are fallbacks and not the definition - the
+    //: payload carries both windows beside the figures (``people.dormant_days``), so the label
+    //: under a figure says the window the *server* counted over. A server that answered without
+    //: them would still draw a sentence rather than a dangling ``{days}``.
+    DASHBOARD_DORMANT_DAYS: 30,
+    DASHBOARD_ONBOARDING_DAYS: 7,
+
     /**
      * The period panel's window as the query parameter takes it: a day count, or ``month``.
      *
@@ -9518,6 +10293,15 @@ const UI_MODULES = {
                 String(button.getAttribute('data-dashboard-preset') || '')
             ));
         });
+        // The window as a file. The one control here that leaves the app, so it is the one
+        // control that can fail without the screen changing: a refusal is a toast, never a
+        // half-drawn tab.
+        content.querySelectorAll('[data-dashboard-export]').forEach((button) => {
+            if (typeof button.addEventListener !== 'function') return;
+            button.addEventListener('click', () => UI_MODULES.dashboardExportPeriod(
+                button.getAttribute('data-dashboard-export')
+            ));
+        });
         // One person's own attendance, over the period the figure beside them came from. The
         // window travels in the markup rather than being read back off the payload, so the link
         // cannot describe a different period than the number it sits under.
@@ -9584,6 +10368,184 @@ const UI_MODULES = {
         // tab would break the scroll keys on the panel underneath.
         if (typeof event.preventDefault === 'function') event.preventDefault();
         return this.dashboardSetMetric(views[index].id);
+    },
+
+    /**
+     * One tap on one of the window's three artifacts: the sheet, the spreadsheet, or a file.
+     *
+     * A dispatcher rather than three handlers, so the hook that names the artifact is the only
+     * thing the markup has to carry - and so an unknown value from a stale page lands on the
+     * *narrowest* format rather than whichever branch happens to be last. ``shiftsExportFormat``
+     * makes the same choice for the same reason: a control that cannot tell what was asked for
+     * must not invent a print dialog.
+     */
+    dashboardExportPeriod(format) {
+        const token = String(format === null || format === undefined ? '' : format).trim();
+        if (token === 'print') return this.dashboardPrintPeriod();
+        return this.dashboardDownloadPeriod(token === 'xlsx' ? 'xlsx' : 'csv');
+    },
+
+    /**
+     * One window as a file: fetch the report for *this* window, in the format asked for, and
+     * save it.
+     *
+     * The window is read off the snapshot the card was drawn from rather than from the control,
+     * which is the same rule the extreme links follow - a file named for one period and holding
+     * another is worse than no file, because it gets forwarded as the period's record. The request
+     * is made here rather than through ``API.request`` because the answer is a file and not JSON,
+     * and it is made with this session's own token because the route is ``admin_only``: a plain
+     * link would download a 401 as a file called ``attendance_....csv``.
+     *
+     * CSV and XLSX differ in exactly two places, and both are about bytes rather than about
+     * content: the one the server sends is text this page hands to ``saveFile``, and the one it
+     * builds itself is a ZIP that only ``saveBlob`` can put on disk intact.
+     */
+    async dashboardDownloadPeriod(format) {
+        const period = this._dashboard ? this._dashboard.period : null;
+        const start = period ? String(period.start || '') : '';
+        const end = period ? String(period.end || '') : '';
+        if (!start || !end) {
+            // No snapshot, or one with no window in it: there is no honest file to write, and a
+            // file of the wrong days is the one output this control must not produce.
+            Toast.error(I18n.__('dashboardPeriodExportFailed'));
+            return undefined;
+        }
+        const xlsx = String(format) === 'xlsx';
+        const headers = {};
+        if (State.token) headers.Authorization = `Bearer ${State.token}`;
+        const url = `${API.baseURL}/admin/reports/export?kind=attendance&format=${xlsx ? 'xlsx' : 'csv'}`
+            + `&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`;
+        try {
+            const response = await fetch(url, { headers });
+            if (!response.ok) {
+                // The refusal is read rather than replaced, because the one this route really
+                // produces is a 501 explaining that Excel needs an optional package - an operator
+                // can act on that sentence, and cannot act on "could not be downloaded".
+                let detail = null;
+                try { detail = await response.json(); } catch (err) { detail = null; }
+                throw new Error(API.describeError(detail, response) || I18n.__('dashboardPeriodExportFailed'));
+            }
+            if (xlsx) API.saveBlob(this.dashboardExportName(start, end, 'xlsx'), await response.blob());
+            else API.saveFile(this.dashboardExportName(start, end), await response.text());
+        } catch (err) {
+            Toast.error((err && err.message) || I18n.__('dashboardPeriodExportFailed'));
+        }
+        return undefined;
+    },
+
+    /**
+     * The file's name: ``attendance_YYYYMMDD-YYYYMMDD``, which is what the route writes for its
+     * own downloads - so a file saved from here and one saved from the API are recognisably the
+     * same report of the same window rather than two documents somebody has to reconcile.
+     */
+    dashboardExportName(start, end, extension = 'csv') {
+        const stamp = (value) => String(value || '').replace(/-/g, '');
+        // No extension at all for the sheet: the print dialog names the file after the *document
+        // title* and appends its own, so a title that ended in ".csv" would save as "....csv.pdf".
+        // ``shiftsExportName`` carries the same rule for the same reason.
+        const suffix = extension ? `.${extension}` : '';
+        return `attendance_${stamp(start)}-${stamp(end)}${suffix}`;
+    },
+
+    /**
+     * The window on paper - the third artifact, and the one that needs no server.
+     *
+     * Printed by the browser rather than generated anywhere, for the reason the timesheet next
+     * door is: the PDF *is* the print dialog's job here (no PDF library is pinned, and a sheet the
+     * browser draws already has the reader's own fonts and direction). What goes on the sheet is
+     * the card's own content, in three blocks: the figures, the window day by day, and the two
+     * people worth opening.
+     *
+     * WHAT IT DELIBERATELY IS NOT. It is not the attendance report - that is the CSV and the
+     * spreadsheet, one row per worker, which the server can build and this card cannot: the card
+     * holds aggregates, and aggregates cannot be turned back into rows. So the sheet is the summary
+     * the reader is looking at, and the note at its foot says which figures count.
+     */
+    dashboardPrintPeriod() {
+        const period = this._dashboard ? this._dashboard.period : null;
+        if (!period || !period.start || !period.end) {
+            // Nothing on screen for this window, so there is no honest sheet to print - and an
+            // empty sheet on letterhead is worse than no sheet. The print refusal has its own
+            // sentence: "could not be downloaded" about a sheet that never leaves the browser
+            // sends the reader looking for a network problem that does not exist.
+            Toast.error(I18n.__('dashboardPeriodPrintFailed'));
+            return undefined;
+        }
+        PrintReport.sheet(
+            this.dashboardPeriodPrintHtml(period),
+            this.dashboardExportName(period.start, period.end, '')
+        );
+        return undefined;
+    },
+
+    /**
+     * The sheet's content: the figures the card draws, the window day by day, both extremes.
+     *
+     * The rows come from ``dashboardPeriodFacts`` - the same list the facts grid is drawn from -
+     * so the paper and the screen cannot show two different sets of figures for one window. The
+     * frame around them (title, period line, table, the head of the company that owns it) is
+     * ``PrintReport.sheetHtml``'s, shared with the timesheets: how paper is taken out of the page,
+     * named in the dialog and put back is that helper's, and two copies of those three rules is how
+     * one screen ends up leaving its sheet behind.
+     *
+     * Cells are HTML by the helper's contract, so every value off the wire is escaped here - a
+     * worker's name is text somebody typed, and a sheet is the last place a stray tag would be
+     * noticed.
+     */
+    dashboardPeriodPrintHtml(period) {
+        const rows = this.dashboardPeriodFacts()
+            .filter(([field]) => period[field] !== undefined && period[field] !== null)
+            .map(([field, labelKey]) => [
+                this.escapeHtml(I18n.__(labelKey)),
+                this.escapeHtml(String(period[field]))
+            ]);
+        // A section row is a bold label with an empty cell beside it: the sheet's table is the
+        // frame's, so a row cannot carry a ``colspan`` - and the dates underneath say what the
+        // block is anyway.
+        const heading = (text) => `<b>${this.escapeHtml(text)}</b>`;
+
+        const days = Array.isArray(period.by_day) ? period.by_day : [];
+        if (days.length > 0) {
+            rows.push([heading(I18n.__('dashboardPeriodPrintEachDay')), '']);
+            days.forEach((entry) => rows.push([
+                this.escapeHtml(String(entry.day || '')),
+                this.escapeHtml(I18n.__('dashboardPeriodPrintDay')
+                    .replace('{present}', String(Number(entry.present) || 0))
+                    .replace('{late}', String(Number(entry.late) || 0)))
+            ]));
+        }
+
+        const expected = String(Number(period.expected_days) || 0);
+        [
+            ['quietest', 'dashboardPeriodQuietest'],
+            ['most_late', 'dashboardPeriodMostLate']
+        ].forEach(([group, labelKey]) => {
+            const list = Array.isArray(period[group]) ? period[group] : [];
+            if (list.length === 0) return;
+            rows.push([heading(I18n.__(labelKey)), '']);
+            list.forEach((row) => rows.push([
+                // The name if the account still has one, the id if it does not - the same rule the
+                // linkage on screen follows.
+                this.escapeHtml(row.worker_name ? String(row.worker_name) : String(row.worker_id || '')),
+                this.escapeHtml(I18n.__('dashboardPeriodExtremeSub')
+                    .replace('{days}', String(Number(row.present_days) || 0))
+                    .replace('{expected}', expected)
+                    .replace('{late}', String(Number(row.late) || 0)))
+            ]));
+        });
+
+        return PrintReport.sheetHtml({
+            title: I18n.__('dashboardPeriodPrintTitle'),
+            // The window, described by the helper rather than here - and the stamp with it, because
+            // a printed summary is a snapshot and the one thing paper cannot do is refresh itself.
+            meta: [PrintReport.periodLine(period, String((this._dashboard && this._dashboard.as_of) || ''))],
+            columns: [I18n.__('dashboardPeriodPrintFigure'), I18n.__('dashboardPeriodPrintValue')],
+            rows: rows,
+            // What the window adds up to: the readiness sentence, in the same words the card uses.
+            totals: this.escapeHtml(this.dashboardPayrollSentence(period)),
+            empty: I18n.__('dashboardPeriodNone'),
+            note: I18n.__('dashboardPeriodPrintNote')
+        });
     },
 
     /** One tap on a period window: remember it, then re-count the tab for it. */
@@ -9721,6 +10683,23 @@ const UI_MODULES = {
      * still leaves the count of what it removed on the wire - and a count is an enumeration.
      */
     dashboardPeopleBodyHtml(people) {
+        // The two figures that are not a state but a *watch*: an account that worked here and
+        // stopped, and one that joined and never started. Both need the window they were counted
+        // over to mean anything, so each label carries it - from the payload rather than from a
+        // constant here, because a label that says thirty days over a query that counted
+        // forty-five is a figure nobody can check. They are drawn in the queue shape rather than
+        // in the facts grid below, because unlike a headcount they are things to go and do.
+        const watch = [
+            ['dormant', 'dashboardDormant', people.dormant_days ?? this.DASHBOARD_DORMANT_DAYS],
+            ['onboarding', 'dashboardOnboarding', people.onboarding_days ?? this.DASHBOARD_ONBOARDING_DAYS]
+        ]
+            .filter(([field]) => people[field] !== undefined && people[field] !== null)
+            .map(([field, labelKey, days]) => `
+            <div class="dashboard-queue" data-dashboard-watch="${field}">
+                <span class="dashboard-queue-value" data-dashboard-fact="${field}">${this.escapeHtml(String(people[field]))}</span>
+                <span class="dashboard-queue-label">${this.escapeHtml(I18n.__(labelKey).replace('{days}', String(Number(days) || 0)))}</span>
+            </div>`)
+            .join('');
         // A fixed order rather than the payload's own: worker first, then the two lead
         // roles, then the administrative ones - the order an administrator reads a roster
         // in, and the one the Credentials form offers roles in. A role with no accounts is
@@ -9749,6 +10728,10 @@ const UI_MODULES = {
                 ['new_this_week', 'dashboardNewThisWeek'],
                 ['never_clocked_in', 'dashboardNeverClockedIn']
             ], people)}
+            ${watch
+                ? `<p class="ui-section-note dashboard-sub">${this.escapeHtml(I18n.__('dashboardWatch'))}</p>
+            <div class="dashboard-queues" data-dashboard-watch-list="true">${watch}</div>`
+                : ''}
             ${roles ? `<p class="ui-section-note dashboard-sub">${this.escapeHtml(I18n.__('dashboardByRole'))}</p>
             <div class="ui-facts dashboard-facts" data-dashboard-roles="true">${roles}</div>` : ''}
             ${this.dashboardLinkHtml('Credentials', 'dashboardPeopleLink')}`;
@@ -9798,20 +10781,115 @@ const UI_MODULES = {
     dashboardPeriodBodyHtml(period) {
         return `
             ${this.dashboardPeriodRangeHtml(period)}
-            ${this.dashboardFactsHtml([
-                ['workers', 'dashboardPeriodWorkers'],
-                ['present_days', 'dashboardPeriodPresentDays'],
-                ['expected_days', 'dashboardPeriodExpectedDays'],
-                ['late_arrivals', 'dashboardPeriodLate'],
-                ['average_attendance_rate', 'dashboardPeriodRate'],
-                ['approved_hours', 'dashboardPeriodApprovedHours'],
-                // Beside the approved figure and named for what it is: the part of those hours
-                // that needed somebody's decision, never hours worked twice.
-                ['overtime_hours', 'dashboardPeriodOvertimeHours'],
-                ['awaiting_approval_hours', 'dashboardPeriodAwaitingHours']
-            ], period)}
+            ${this.dashboardFactsHtml(this.dashboardPeriodFacts(), period)}
+            ${this.dashboardPayrollHtml(period)}
+            ${this.dashboardExportHtml()}
             ${this.dashboardDaysHtml(period)}
             ${this.dashboardExtremesHtml(period)}`;
+    },
+
+    /**
+     * The period's own fields, in the order the card draws them.
+     *
+     * One list rather than two, because there are two readers of it now: the facts grid on
+     * screen and the printed sheet. A sheet that showed a different set of figures from the
+     * card it was printed from - or the same figures under different words - is the paper
+     * disagreeing with the screen about one window.
+     */
+    dashboardPeriodFacts() {
+        return [
+            ['workers', 'dashboardPeriodWorkers'],
+            ['present_days', 'dashboardPeriodPresentDays'],
+            ['expected_days', 'dashboardPeriodExpectedDays'],
+            ['late_arrivals', 'dashboardPeriodLate'],
+            ['average_attendance_rate', 'dashboardPeriodRate'],
+            ['approved_hours', 'dashboardPeriodApprovedHours'],
+            // Beside the approved figure and named for what it is: the part of those hours that
+            // needed somebody's decision, never hours worked twice.
+            ['overtime_hours', 'dashboardPeriodOvertimeHours'],
+            ['awaiting_approval_hours', 'dashboardPeriodAwaitingHours'],
+            // The *count* behind that figure, and the reason it is on the screen: "12 hours are
+            // waiting" does not say whether that is one shift or six, and six decisions is a
+            // different afternoon's work from one.
+            ['awaiting_approval_shifts', 'dashboardPeriodAwaitingShifts']
+        ];
+    },
+
+    /**
+     * "Is this window ready to be paid" - the question this whole application exists to answer.
+     *
+     * Two states and no third, both drawn from the same two server fields the facts grid above
+     * carries (so the sentence and the figures beside it cannot disagree): everything signed off,
+     * or *this many shifts* still unsigned with the hours they are holding. The un-ready state says
+     * what it means for the reader rather than only what is true - a pay run now would leave those
+     * hours out - because "3 shifts awaiting approval" reads as admin housekeeping until somebody
+     * says it is money. The link goes to the queue that clears it, which is the only screen that
+     * can turn this figure down.
+     *
+     * Drawn only when the count is on the wire: a summary from a server that does not send it says
+     * nothing about readiness rather than claiming the window is ready.
+     */
+    dashboardPayrollHtml(period) {
+        const sentence = this.dashboardPayrollSentence(period);
+        // No sentence means the server did not answer the count, and a card cannot say "ready"
+        // about a question nobody answered - see the guard below.
+        if (!sentence) return '';
+        const ready = Number(period.awaiting_approval_shifts) <= 0;
+        return `
+            <p class="ui-note${ready ? '' : ' is-warn'}" data-dashboard-payroll="${ready ? 'ready' : 'waiting'}"
+               data-dashboard-payroll-shifts="${this.escapeHtml(String(period.awaiting_approval_shifts))}">${ready ? this.OPS_ICONS.check : this.OPS_ICONS.alert}<span>${this.escapeHtml(sentence)}</span></p>
+            ${ready ? '' : this.dashboardLinkHtml('Approvals', 'dashboardPayrollLink')}`;
+    },
+
+    /**
+     * The readiness sentence, in whichever of the two states the window is in - or ``''``.
+     *
+     * One wording for the card and for the printed sheet, because the two are read by the same
+     * person about the same window: paper that said "payroll is ready" while the screen said
+     * three shifts were unsigned would be one of them lying.
+     */
+    dashboardPayrollSentence(period) {
+        const raw = period.awaiting_approval_shifts;
+        // ``null`` and ``undefined`` both mean "this server did not answer that", and they are
+        // checked *before* the coercion on purpose: ``Number(null)`` is 0, and 0 here is the
+        // ready state - so a panel that answered nothing would be drawn as a window somebody may
+        // safely pay. That is this screen's one unforgivable output, so the check is spelled out.
+        if (raw === null || raw === undefined) return '';
+        const shifts = Number(raw);
+        if (!Number.isFinite(shifts)) return '';
+        const hours = String(Number(period.awaiting_approval_hours) || 0);
+        const approved = String(Number(period.approved_hours) || 0);
+        return shifts <= 0
+            ? I18n.__('dashboardPayrollReady').replace('{hours}', approved)
+            : I18n.__('dashboardPayrollWaiting')
+                .replace('{shifts}', String(shifts))
+                .replace('{hours}', hours);
+    },
+
+    /**
+     * The window as a file: the one control on this screen that leaves the app.
+     *
+     * It hands over to ``/admin/reports/export`` - the route the Reports tab's own downloads
+     * use - rather than building a CSV here, because what an administrator wants out of a period
+     * summary is the artifact: the attendance sheet for exactly these days, per worker, the same
+     * file the API would hand a script. The figures on this card are aggregates and cannot be
+     * turned back into rows, which is the other reason a file assembled here would be a
+     * *different* report wearing the same window.
+     */
+    dashboardExportHtml() {
+        // One button per artifact, and the button says what it hands over rather than what it
+        // does: "Download CSV" is a reader's own sentence, where "Export" needs a second thought.
+        // The three are the three things genuinely on offer - the route's two formats and the
+        // browser's own printer - and nothing here fetches anything a reader has not asked for.
+        const formats = [
+            ['csv', 'dashboardPeriodExportCsv'],
+            ['xlsx', 'dashboardPeriodExportExcel'],
+            ['print', 'dashboardPeriodPrint']
+        ];
+        const buttons = formats.map(([format, labelKey]) => `
+                <button type="button" class="ui-btn ui-btn-sm" data-dashboard-export="${format}">${this.escapeHtml(I18n.__(labelKey))}</button>`).join('');
+        return `
+            <div class="ui-row dashboard-export" data-dashboard-export-row="true">${buttons}</div>`;
     },
 
     /**

@@ -1809,6 +1809,154 @@ html.dark .ui-btn-warn:hover:not(:disabled) { color: #0f172a; }
 .ui-chip.is-active { background: var(--ops-primary); border-color: var(--ops-primary); color: #fff; }
 .ui-chip svg { width: 14px; height: 14px; flex: none; }
 
+/* ---------- The roster (Credentials) ------------------------------------- */
+
+/* Who can sign in, read as a list rather than as a spreadsheet.
+
+   What was here was a nine-column table, and nine columns do not fit the laptop an
+   administrator actually uses: the roster slid sideways under a scrollbar, and the facts
+   somebody opens this tab for - no face template, no password ever set - were the ones
+   parked off the right edge. One row per account now, on a three-column grid: who they
+   are, how their access stands, what may be done about it. The same markup stacks on a
+   phone, so there is one layout to keep in step rather than two.
+
+   Nothing here animates on its own, and the one transition is a background wash that
+   only distinguishes the row under the pointer or the caret - see the reduced-motion
+   block, which switches it off along with every other press effect in the console. */
+
+.roster-filters {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--ui-2);
+    margin-top: var(--ui-4);
+}
+/* The count rides inside the chip, so the chip is one control and not two: "Moallem",
+   then how many of them this filter would hand over. Monospace and tabular, like every
+   other figure in the console, so the row of chips does not jitter as counts change. */
+.roster-chip-count {
+    font-family: var(--ops-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 12px;
+    opacity: 0.65;
+}
+.ui-chip[aria-pressed='true'] .roster-chip-count { opacity: 0.9; }
+
+.roster {
+    list-style: none;
+    margin: var(--ui-4) 0 0;
+    padding: 0;
+    border: 1px solid var(--ops-border);
+    border-radius: var(--ui-radius);
+    background: var(--ops-surface);
+    overflow: hidden;
+}
+.roster-row {
+    display: grid;
+    grid-template-columns: minmax(200px, 1.25fr) minmax(0, 1.6fr) auto;
+    align-items: center;
+    gap: var(--ui-4);
+    padding: var(--ui-3) var(--ui-4);
+    transition: background-color var(--ui-press) ease;
+}
+.roster-row + .roster-row { border-top: 1px solid var(--ops-border); }
+.roster-row:hover,
+.roster-row:focus-within { background: var(--ops-surface-2); }
+.roster-who { display: flex; align-items: center; gap: var(--ui-3); min-width: 0; }
+.roster-id { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.roster-meta { display: flex; align-items: center; gap: 6px; }
+/* One name column per row, and the truncation belongs to it: a long name is ellipsised
+   rather than allowed to push the facts and the buttons off the row - which is why the name
+   carries a ``title``, so the one that is cut off is still readable on hover.
+
+   A size below the console's body text on purpose: this is the one string on the row that is
+   read *down* a list rather than looked at - ten of them at a time - and at the body's own
+   16px the longest names on a real roster ellipsised in a column that had the room for them. */
+.roster-name { max-width: 100%; font-size: 14px; }
+.roster-numeric {
+    font-family: var(--ops-mono);
+    font-variant-numeric: tabular-nums;
+}
+.roster-access {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--ui-2) var(--ui-4);
+    min-width: 0;
+}
+/* Label beside value rather than above it: four stacked labels make a row twice as tall,
+   and these four read as a sentence - "Face Enrolled · Password Set · Sessions 3". */
+.roster-fact { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.roster-fact-label {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--ops-muted);
+}
+.roster-sessions {
+    font-family: var(--ops-mono);
+    font-variant-numeric: tabular-nums;
+    /* The same optical weight as the badge beside it: at the body's own 16px this figure was
+       the loudest thing on a row, and it is one number in a line of four facts. */
+    font-size: 13px;
+    font-weight: 700;
+}
+.roster-actions { display: flex; justify-content: flex-end; }
+
+.roster-foot {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--ui-3);
+    margin-top: var(--ui-3);
+}
+.roster-count {
+    margin: 0;
+    color: var(--ops-muted);
+    font-family: var(--ops-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 12px;
+}
+
+/* Below the two-column widths the three blocks stack: the name, then the facts, then the
+   buttons - which is also the order they are read in. */
+@media (max-width: 900px) {
+    .roster-row {
+        grid-template-columns: minmax(0, 1fr);
+        align-items: start;
+        gap: var(--ui-3);
+    }
+    /* The facts keep columns once the row is stacked: ragged wrapping left the second line
+       holding whatever happened to fit, and one cell taller than its neighbours (a password
+       with the date it changed) pushed the line below it out of step. */
+    .roster-access { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
+    .roster-actions { justify-content: flex-start; }
+}
+
+/* ---------- The retention panel: what is on disk ------------------------
+   The two tables sit side by side where there is room. The stores table needs
+   its four columns; the windows table is two short ones, and stacked under the
+   first it left most of a 900px row empty - the shape of a table that has
+   stopped being read and started being skimmed.
+
+   Wrapping flex rather than a grid with a breakpoint, and that is the load-
+   bearing choice: the widths here are the *container's*, not the window's. A
+   column that cannot fit its table beside its neighbour drops to its own line
+   instead of being squeezed to 82px, so this is right at 900px, at 300px, and
+   in a pane that is narrower than the window it sits in - which a viewport
+   media query gets wrong in exactly the case nobody tests. */
+.retention-split {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--ui-4);
+    align-items: flex-start;
+    margin-top: var(--ui-4);
+}
+.retention-split > .ui-table-wrap:first-child { flex: 2 1 320px; min-width: 0; }
+.retention-split > .ui-table-wrap:last-child { flex: 1 1 220px; min-width: 0; }
+
 /* ---------- Tables ------------------------------------------------------- */
 
 .ui-table-wrap { overflow-x: auto; }
@@ -2044,6 +2192,11 @@ html.dark .ui-btn-warn:hover:not(:disabled) { color: #0f172a; }
 .dashboard-switch-btn:focus-visible { outline: 2px solid var(--ops-primary); outline-offset: -2px; }
 .dashboard-sub { margin: var(--ui-4) 0 var(--ui-2); }
 .dashboard-link { margin-top: var(--ui-4); }
+/* The period's three artifacts. ``ui-row`` already wraps, which is what a phone needs from
+   three buttons on one line; this only gives the row the spacing every other dashboard
+   block gets, and the buttons a floor big enough for a gloved thumb. */
+.dashboard-export { margin-top: var(--ui-3); }
+.dashboard-export .ui-btn { min-height: 36px; }
 /* The period panel's window control: two preset chips and the dates they resolved to. The
    chip that is in effect needs no rule of its own - ``aria-pressed`` is already the console's
    "this one is selected" treatment (see ``.ui-chip[aria-pressed='true']``) - so this block
@@ -2214,7 +2367,8 @@ html.dark .ui-btn-warn:hover:not(:disabled) { color: #0f172a; }
 
 @media (prefers-reduced-motion: reduce) {
     .ui-skeleton-bar { animation: none; opacity: 1; }
-    .ui-btn, .ui-chip, .admin-nav-btn, .admin-tabs button { transition: none; }
+    .ui-btn, .ui-chip, .admin-nav-btn, .admin-tabs button,
+    .dashboard-vital, .dashboard-switch-btn, .roster-row { transition: none; }
     .ui-btn:active:not(:disabled) { transform: none; }
 }
 

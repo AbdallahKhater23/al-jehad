@@ -98,6 +98,7 @@ import sqlite3
 import threading
 from datetime import datetime, timedelta
 
+import live_ops
 import migrations
 import notifications
 import push
@@ -1276,6 +1277,9 @@ def scan_auto_close(*, now: datetime | None = None) -> dict:
                 conn.execute(
                     "DELETE FROM active_sessions WHERE worker_id = ?", (session["worker_id"],)
                 )
+                # The day's end is a clock-out nobody tapped, and the board is the screen the
+                # gate is watched on: a shift that auto-closed has to leave it.
+                live_ops.board_changed()
                 log_id = _insert_auto_close_log(
                     conn,
                     worker_id=session["worker_id"],

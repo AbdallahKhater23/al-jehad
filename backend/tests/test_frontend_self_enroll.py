@@ -145,7 +145,7 @@ function usersRequests(env) {
  *  words. Read off the markup, because that is what the person sees. */
 function rowsWithButton(env) {
     const markup = render(env);
-    const rows = markup.match(/<tr data-user="[^"]*"[\s\S]*?<\/tr>/g) || [];
+    const rows = markup.match(/<li class="roster-row"[^>]*>[\s\S]*?<\/li>/g) || [];
     return rows.map((row) => ({
         id: (/data-user="([^"]*)"/.exec(row) || [])[1],
         enrolled: (/data-face="([^"]*)"/.exec(row) || [])[1] === 'enrolled',
@@ -158,7 +158,7 @@ function rowsWithButton(env) {
 /** The label as a translation, not as markup: a button whose text is a key is a bug. */
 function buttonLabel(env, userId) {
     const markup = render(env);
-    const row = (markup.match(/<tr data-user="[^"]*"[\s\S]*?<\/tr>/g) || [])
+    const row = (markup.match(/<li class="roster-row"[^>]*>[\s\S]*?<\/li>/g) || [])
         .filter((r) => r.indexOf('data-user="' + userId + '"') >= 0)[0] || '';
     return {
         marked: row.indexOf('data-enroll-self="' + userId + '"') >= 0,
