@@ -2710,6 +2710,12 @@ html.dark .ui-btn-warn:hover:not(:disabled) { color: #0f172a; }
 }
 .hand-dot.is-off { background: var(--ops-track); box-shadow: none; animation: none; }
 
+/* The clock panel's own column. The host it paints into is a plain div inside the flex
+   parent, so the parent's gap never reaches these blocks: the shift card, the button and the
+   facts used to sit flush against each other and read as one undifferentiated slab. Deliberately
+   not called ``.hand-stack`` - that name is the message thread's. */
+.hand-panel { display: flex; flex-direction: column; gap: var(--ui-4); min-width: 0; }
+
 /* The state as a sentence at 20px, not a 24px shout: the biggest thing on this card is
    the clock, and a headline that competes with it makes two heroes and no hierarchy. */
 .hand-hero-word {
@@ -2720,6 +2726,49 @@ html.dark .ui-btn-warn:hover:not(:disabled) { color: #0f172a; }
     letter-spacing: -0.015em;
 }
 .hand-hero.is-live .hand-hero-word { color: var(--ops-live-ink); }
+
+/* The figure, and beside it the dial that says how much of the paid day it is. Both
+   readings of one fact: the 40px digit is what a worker checks, and the ring is the answer
+   to the question they actually walked over with - how much of the day is left. */
+.hand-figure { display: flex; align-items: center; gap: var(--ui-3); margin-top: 10px; }
+.hand-figure-main { flex: 1 1 auto; min-width: 0; }
+.hand-ring { flex: 0 0 auto; width: 56px; height: 56px; transform: rotate(-90deg); }
+.hand-ring-track { fill: none; stroke: var(--ops-track); stroke-width: 5; }
+/* ``pathLength="100"`` on the circle makes the dash array percentages rather than an arc
+   length, so the tick writes the same figure it writes into the line below. */
+.hand-ring-fill {
+    fill: none;
+    stroke: var(--ops-live);
+    stroke-width: 5;
+    stroke-linecap: round;
+    stroke-dasharray: 0 100;
+    transition: stroke-dasharray 600ms ease, stroke 200ms ease;
+}
+.hand-ring-fill.is-over { stroke: var(--ops-warn); }
+@media (prefers-reduced-motion: reduce) {
+    .hand-ring-fill { transition: none; }
+}
+
+/* What is left of the paid day, in words: the same figure as the ring, for the reader who
+   wants a duration rather than a proportion. */
+.hand-day-line { margin: 8px 0 0; font-size: 13px; font-weight: 600; color: var(--ops-muted); }
+.hand-day-line.is-done { color: var(--ops-warn); }
+
+/* The month so far, as a footer under a running shift's own facts. The off-shift card
+   carries the same figure in the policy row, where there is no clock-in stamp to take the
+   third cell. */
+.hand-hero-foot {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--ui-2);
+    margin: var(--ui-3) 0 0;
+    padding-top: var(--ui-3);
+    border-top: 1px solid var(--ops-border);
+    font-size: 12px;
+    color: var(--ops-muted);
+}
+.hand-hero-foot b { color: var(--ops-text); font-size: 13px; }
 
 /* The figure the whole screen is about. 40px is read at arm's length and still fits a
    360px handset beside its own label; 54px was a scoreboard, and it wrapped. */
@@ -2735,6 +2784,9 @@ html.dark .ui-btn-warn:hover:not(:disabled) { color: #0f172a; }
     color: var(--ops-primary-ink);
 }
 .hand-timer.is-over { color: var(--ops-warn); }
+/* The time of day, when there is no shift to count: plain text, not the primary blue - the
+   blue is the colour of a number that is moving. */
+.hand-timer.is-now { color: var(--ops-text); }
 .hand-timer-label {
     display: block;
     margin-top: 4px;
@@ -2770,6 +2822,9 @@ html.dark .ui-btn-warn:hover:not(:disabled) { color: #0f172a; }
     border-top: 1px solid var(--ops-border);
 }
 .hand-policy-cell { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+/* The recorded stamp, on its own row: a 19-character time does not fit a third of a 342px
+   card, and wrapped to two lines it made the row of figures beside it look misaligned. */
+.hand-policy-cell.is-wide { grid-column: 1 / -1; }
 .hand-policy-label {
     font-size: 11px;
     font-weight: 700;
@@ -2812,51 +2867,23 @@ html.dark .ui-btn-warn:hover:not(:disabled) { color: #0f172a; }
 .hand-clock.compact { min-height: 48px; font-size: 15px; }
 .hand-clock svg { width: 18px; height: 18px; flex: none; }
 
-/* ---------- Facts, cards, rows ----------------------------------------- */
-
-/* Two tiles, not two panels: they carry the month's paid hours and whether the phone
-   can record a punch at all, so they are read in one glance under the button. The
-   hairline card (no shadow) is what keeps them from competing with the shift card
-   above, which is the only thing on this screen allowed to look raised. */
-.hand-facts {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: var(--ui-2);
-}
-.hand-fact {
-    padding: 10px var(--ui-3);
-    border: 1px solid var(--ops-border);
-    border-radius: var(--ui-radius-sm);
-    background: var(--ops-surface);
-    min-width: 0;
-}
-.hand-fact-label {
+/* What a punch needs from this phone, as a footnote to the button rather than a card beside
+   the shift: the two tiles that used to carry it were the same size as the shift itself,
+   which made a readiness check look like a second job. */
+.hand-action-line {
+    display: flex;
+    align-items: center;
+    gap: 6px;
     margin: 0;
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
+    font-size: 12px;
+    font-weight: 600;
     color: var(--ops-muted);
-    /* "Hours this month" is the longest label either language has and it does not fit
-       a 320px handset's tile on one line; balanced wrapping breaks it between words
-       rather than leaving "Hours this mo..." as the tile's only readable text. */
-    text-wrap: balance;
-    line-height: 1.25;
 }
-.hand-fact-value {
-    margin: 2px 0 0;
-    font-size: 17px;
-    font-weight: 700;
-    color: var(--ops-text);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-/* Only the figures are monospaced: "Ready" is a word, and a word set in a terminal
-   face is the shape people read as a serial number. */
-.hand-fact-value.is-mono { font-family: var(--ops-mono); font-variant-numeric: tabular-nums; }
-.hand-fact-value.is-ok { color: var(--ops-live-ink); }
-.hand-fact-value.is-warn { color: var(--ops-warn); }
+.hand-ready-dot { width: 7px; height: 7px; flex: none; border-radius: 999px; background: var(--ops-track); }
+.hand-ready-dot.is-ok { background: var(--ops-live); }
+.hand-ready-dot.is-warn { background: var(--ops-warn); }
+
+/* ---------- Facts, cards, rows ----------------------------------------- */
 
 .hand-card {
     padding: var(--ui-4);
@@ -3692,6 +3719,192 @@ th[aria-sort='descending'] .shifts-sort::after { content: '\2193'; opacity: 1; c
     .sites-search { flex-basis: 100%; }
     .sites-search input[type='search'] { flex: 1 1 120px; }
     .sites-row { padding: 10px var(--ui-3); }
+}
+
+/* ---------- Notes ---------------------------------------------------------
+   Both note screens were a *record* of a conversation rather than one. The
+   administrator's inbox was a six-column table whose subject cell held the worker's
+   original message and nothing since, so the one line that says whether a thread is
+   finished was the one line it never showed; opening a note replaced the whole inbox,
+   which threw away the filter, the search and the reader's place. The worker's list
+   showed their own first words for the same reason, under a full timestamp.
+
+   These are the same objects read as what they are: a queue of conversations. The
+   administrator gets the list and the open note side by side on a wide screen (and
+   stacked, with a back button, on a handset); a row previews the *last* message and who
+   wrote it; the time is words; and the unread state is a spine plus a word rather than
+   a colour alone.
+
+   Alignment and colour stay on the console's own tokens - the tab is Swiss and flat like
+   the rest of it, so nothing here names a hex value. */
+.notes-head { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: var(--ui-2); }
+.notes-head .ui-section-note { max-width: 64ch; }
+
+/* The band: whose turn it is first, because that is the question a queue is opened to
+   answer, then the two narrower questions under it. Everything wraps rather than
+   squeezing: a filter that has to shorten its own word to fit is unreadable on the one
+   screen where it is tapped. */
+.notes-bar {
+    display: flex; flex-wrap: wrap; align-items: center; gap: var(--ui-2);
+    margin: var(--ui-3) 0 var(--ui-4);
+}
+.notes-turns {
+    display: inline-flex; flex-wrap: wrap; flex: 1 1 auto; min-width: 0;
+    border: 1px solid var(--ops-border); border-radius: 999px;
+    background: var(--ops-surface-2); padding: 3px; gap: 3px;
+}
+.notes-turn {
+    display: inline-flex; flex: 0 0 auto; align-items: center; gap: 6px;
+    min-height: 36px; padding: 6px 14px; border: 0; border-radius: 999px;
+    background: transparent; color: var(--ops-muted);
+    font: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+}
+.notes-turn:hover { color: var(--ops-text); }
+.notes-turn:focus-visible { outline: 2px solid var(--ops-primary); outline-offset: 1px; }
+.notes-turn.is-active { background: var(--ops-surface); color: var(--ops-text); box-shadow: var(--ops-shadow); }
+.notes-turn-count { color: var(--ops-muted); font-weight: 600; font-variant-numeric: tabular-nums; }
+.notes-turn.is-active .notes-turn-count { color: var(--ops-text); }
+.notes-search { display: flex; flex: 1 1 260px; align-items: center; gap: var(--ui-2); min-width: 0; }
+.notes-status { flex: 0 1 190px; min-width: 0; }
+
+/* The two panes. One scrollable list and one scrollable thread, each keeping its own
+   place - which is the whole reason the tab is a split instead of a page swap. */
+.notes-shell {
+    display: grid; grid-template-columns: minmax(260px, 340px) minmax(0, 1fr);
+    height: min(70vh, 780px); min-height: 420px;
+    border: 1px solid var(--ops-border); border-radius: 14px;
+    background: var(--ops-surface); overflow: hidden;
+}
+.notes-pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: auto; }
+.notes-pane-list { border-inline-end: 1px solid var(--ops-border); }
+/* The thread scrolls *inside* itself rather than as a whole: the head stays put and the
+   composer stays reachable at the bottom, which is what makes a long conversation
+   answerable without hunting for the box. The list keeps the pane's own scrolling. */
+.notes-pane-thread { overflow: hidden; }
+.notes-pane-thread > * { flex: 0 0 auto; }
+.notes-threads { list-style: none; margin: 0; padding: 0; }
+.notes-filter-note { margin: var(--ui-2) var(--ui-3); }
+
+/* A conversation in the list. The whole row is the target (44px tall, thumb-sized) and
+   the row that is open is marked, so a reader who switched tabs and came back can see
+   where they were. */
+.notes-thread-item { border-bottom: 1px solid var(--ops-border); }
+.notes-thread-item:last-child { border-bottom: 0; }
+.notes-thread-item.is-unread { border-inline-start: 3px solid var(--ops-primary); }
+.notes-thread-item.is-open { background: var(--ops-primary-wash); }
+.notes-thread-btn {
+    display: flex; gap: 10px; width: 100%; min-height: 44px;
+    padding: 11px var(--ui-3); border: 0; background: transparent;
+    color: inherit; text-align: start; font: inherit; cursor: pointer;
+}
+.notes-thread-btn:hover { background: var(--ops-surface-2); }
+.notes-thread-btn:focus-visible { outline: 2px solid var(--ops-primary); outline-offset: -2px; }
+.notes-thread-main { display: flex; flex-direction: column; gap: 2px; flex: 1 1 auto; min-width: 0; }
+.notes-thread-top { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.notes-thread-name { font-size: 13.5px; color: var(--ops-text); }
+.notes-thread-time { flex: 0 0 auto; font-size: 11.5px; color: var(--ops-muted); white-space: nowrap; }
+.notes-thread-subject { font-size: 13px; color: var(--ops-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.notes-preview { display: block; font-size: 12.5px; color: var(--ops-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.notes-preview-who { color: var(--ops-text); }
+.notes-thread-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 3px; }
+.notes-turn-pill { font-size: 11px; font-weight: 700; color: var(--ops-muted); }
+.notes-turn-pill.is-you { color: var(--ops-warn); }
+.notes-turn-pill.is-them { color: var(--ops-muted); }
+.notes-turn-pill.is-done { color: var(--ops-muted); }
+.notes-unread {
+    align-self: flex-start; margin-top: 4px; padding: 2px 8px; border-radius: 999px;
+    background: var(--ops-primary-wash); color: var(--ops-primary-ink);
+    font-size: 11px; font-weight: 700;
+}
+/* The initials a conversation list draws instead of a photograph. */
+.notes-face {
+    display: grid; place-items: center; flex: 0 0 auto;
+    width: 34px; height: 34px; border-radius: 50%;
+    background: var(--ops-primary-wash); color: var(--ops-primary-ink);
+    font-size: 12.5px; font-weight: 700; text-transform: uppercase;
+}
+.notes-face.is-done { background: var(--ops-surface-2); color: var(--ops-muted); }
+
+/* The thread. The head stays put while the messages scroll under it; the composer stays
+   put at the bottom, which is where a reply is written from. */
+.notes-thread-head {
+    display: flex; flex-wrap: wrap; align-items: flex-start; gap: 10px;
+    padding: var(--ui-3); border-bottom: 1px solid var(--ops-border);
+}
+.notes-thread-who { display: flex; align-items: center; gap: 10px; flex: 1 1 auto; min-width: 0; }
+.notes-thread-who .ui-note { font-size: 12px; }
+.notes-thread-flags { flex: 0 0 auto; align-items: center; gap: 6px; }
+/* Scoped to the thread pane: the queue's rows carry the same class, and a rule written
+   for the conversation's title was indenting and enlarging every row in the list. */
+.notes-pane-thread .notes-thread-subject { padding: var(--ui-3) var(--ui-3) 0; font-size: 15px; font-weight: 700; color: var(--ops-text); }
+.notes-thread-opened { padding: 2px var(--ui-3) 0; font-size: 12px; }
+.notes-messages {
+    display: flex; flex-direction: column; gap: 8px; padding: var(--ui-3);
+    flex: 1 1 auto; min-height: 0; overflow-y: auto;
+}
+.notes-composer {
+    display: flex; flex-direction: column; gap: 8px; flex: 0 0 auto;
+    padding: var(--ui-3); border-top: 1px solid var(--ops-border);
+    background: var(--ops-surface);
+}
+.notes-composer-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.notes-composer-row #noteReplyStatus { flex: 0 1 200px; }
+.notes-bubble-tag { margin-inline-start: 6px; }
+/* An internal message is not merely stored differently - it is *marked*, because the value
+   of writing one is knowing you are writing one. Dashed, so it reads as "not sent" even
+   in a screenshot with no colours. */
+.hand-bubble-row.is-internal .hand-bubble { border-style: dashed; border-color: var(--ops-warn); }
+.notes-empty, .notes-thread-blank {
+    display: grid; place-items: center; gap: 6px; height: 100%;
+    padding: var(--ui-5) var(--ui-4); text-align: center;
+}
+.notes-thread-blank .ui-note { max-width: 40ch; }
+.notes-back { display: none; }
+
+/* A conversation of five messages across three days is unreadable as five timestamps:
+   the day is marked instead of computed, on both sides of the conversation. */
+.notes-day, .hand-day {
+    display: flex; align-items: center; gap: 8px; margin: 4px 0;
+    font-size: 11px; font-weight: 600; color: var(--ops-muted);
+    text-transform: uppercase; letter-spacing: 0.05em;
+}
+.notes-day::before, .notes-day::after,
+.hand-day::before, .hand-day::after { content: ''; flex: 1 1 auto; height: 1px; background: var(--ops-border); }
+
+/* The worker's side of the same conversation: the thread scrolls, the reply box sits under
+   it, and the last message is what the list previews. */
+.hand-thread { display: flex; flex-direction: column; gap: 8px; margin: 12px 0 16px; }
+.hand-day { margin: 2px 0; }
+.hand-note-who { color: var(--ops-text); }
+.hand-note-tags .hand-note-stamp { margin: 0 0 0 auto; }
+.hand-card.is-note.is-unread { border-inline-start: 3px solid var(--ops-primary); }
+.hand-card.is-flat { background: var(--ops-surface-2); box-shadow: none; }
+
+/* Under a tablet width the split becomes one pane at a time: the list is the screen, and
+   opening a conversation is a move into it with a way back - which is what the back button
+   in the thread head is for. The thread pane is not rendered at all until then, so the
+   composer cannot take a phone's first screen from the list. */
+@media (max-width: 900px) {
+    .notes-shell { grid-template-columns: minmax(0, 1fr); height: auto; min-height: 0; }
+    .notes-pane { overflow: visible; }
+    .notes-pane-list { border-inline-end: 0; }
+    .notes-shell:not(.is-open) .notes-pane-thread { display: none; }
+    .notes-shell.is-open .notes-pane-list { display: none; }
+    .notes-back { display: inline-flex; }
+    .notes-thread-head { position: static; }
+}
+
+/* A phone: the band gives up its basis reservations and the turns scroll rather than
+   stacking four lines of chrome above the queue they filter. */
+@media (max-width: 560px) {
+    .notes-bar { gap: var(--ui-2); }
+    .notes-turns { flex: 1 1 100%; flex-wrap: nowrap; overflow-x: auto; }
+    .notes-turn { padding: 6px 11px; font-size: 12.5px; }
+    .notes-search { flex: 1 1 100%; }
+    .notes-search input[type='search'] { flex: 1 1 120px; }
+    .notes-status { flex: 1 1 100%; }
+    .notes-thread-btn { padding: 10px var(--ui-2); }
+    .notes-composer-row #noteReplyStatus { flex: 1 1 100%; }
 }
 
 

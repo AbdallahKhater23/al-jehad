@@ -16,6 +16,9 @@ const WORKER_MODULES = {
     /** Live-timer handle; one at a time, torn down on every re-render. */
     _elapsedTimer: null,
 
+    /** The wall clock's own interval, for the card a worker opens with no shift to count. */
+    _clockTicker: null,
+
     /**
      * Current shift + month total for the logged-in worker.
      *
@@ -127,16 +130,56 @@ const WORKER_MODULES = {
 
     elapsedLabel(clockInTime) {
         const seconds = this.elapsedSeconds(clockInTime);
-        if (seconds === null) return null;
-        const minutes = Math.floor(seconds / 60);
-        const hours = Math.floor(minutes / 60);
-        return hours > 0 ? `${hours}h ${minutes % 60}m` : `${minutes}m`;
+        return seconds === null ? null : this.durationLabel(seconds);
     },
 
     /** "8.1" for 8.1, "8" for 8.0 -- mirrors Python's ``:g`` in the server's flags. */
     hoursLabel(value) {
         const number = Number(value);
         return Number.isFinite(number) ? String(Number(number.toFixed(2))) : String(value);
+    },
+
+    /** "4h 46m" for 17160 seconds - a duration a worker says out loud, for prose to use. */
+    durationLabel(seconds) {
+        const total = Math.max(0, Math.floor(Number(seconds) || 0));
+        const minutes = Math.floor(total / 60);
+        const hours = Math.floor(minutes / 60);
+        if (hours <= 0) return `${minutes}m`;
+        return minutes % 60 === 0 ? `${hours}h` : `${hours}h ${minutes % 60}m`;
+    },
+
+    /**
+     * The time of day on this phone, as "14:32".
+     *
+     * A time clock that never shows the time is the first thing that reads as cheap about
+     * this card - and the phone's own clock is one browser chrome away from being covered.
+     * It is the card's *figure* only when there is no shift to measure: with a shift running,
+     * the elapsed timer is the number a worker is looking for.
+     */
+    wallClock(at) {
+        const when = at instanceof Date ? at : new Date();
+        return `${String(when.getHours()).padStart(2, '0')}:${String(when.getMinutes()).padStart(2, '0')}`;
+    },
+
+    /**
+     * The day, in the reader's own language: "Tue 30 Sep" / "الثلاثاء، ٣٠ سبتمبر".
+     *
+     * The console prints its dates as zone-less stamps because a record has to be exact; a
+     * heading on a worker's own phone is the one place the same fact is allowed to be
+     * *readable* instead. Where the engine has no locale data for the chosen language it
+     * falls back to the ISO day, because a date in the wrong shape beats an empty one.
+     */
+    localDay(at) {
+        const when = at instanceof Date ? at : new Date();
+        const locale = { ar: 'ar', hi: 'hi-IN', ur: 'ur-PK' }[I18n.lang] || 'en-GB';
+        try {
+            return new Intl.DateTimeFormat(locale, {
+                weekday: 'short', day: 'numeric', month: 'short'
+            }).format(when);
+        } catch (err) {
+            const pad = (value) => String(value).padStart(2, '0');
+            return `${when.getFullYear()}-${pad(when.getMonth() + 1)}-${pad(when.getDate())}`;
+        }
     },
 
     /** "30m" / "1h 15m" - a break is minutes, not a decimal of an hour, on a phone. */
@@ -224,6 +267,31 @@ const WORKER_MODULES = {
             // same moment instead of a second apart on the same shift.
             const past = paid >= threshold * 3600;
             const dayReached = paidDay !== null && paid >= paidDay * 3600;
+            // The ring and the line under the figure are the same figure as the digit above
+            // them, at the scale a worker actually asks the question at ("how much of the day
+            // is left"): one tick, one truth, three readings of it. ``data-day-progress`` is
+            // the same percentage in the markup, because a progress *dial* is otherwise
+            // invisible to everything that reads the page without a stylesheet.
+            const share = paidDay === null ? null
+                : Math.max(0, Math.min(100, (paid / (paidDay * 3600)) * 100));
+            if (share !== null) {
+                const ring = document.getElementById('shiftRing');
+                if (ring) {
+                    if (ring.style) ring.style.strokeDasharray = `${share.toFixed(1)} 100`;
+                    if (ring.dataset) ring.dataset.dayProgress = share.toFixed(1);
+                    // Full: the dial changes hue with the same figure the note below states in
+                    // words, so colour is never the only thing that moved.
+                    if (ring.classList) ring.classList.toggle('is-over', share >= 100);
+                }
+                const left = document.getElementById('shiftRemaining');
+                if (left) {
+                    left.classList.toggle('is-done', dayReached);
+                    left.textContent = dayReached
+                        ? I18n.__('shiftEndsNow')
+                        : I18n.__('handPaidRemaining').replace(
+                            '{left}', this.durationLabel(paidDay * 3600 - paid));
+                }
+            }
             // One class rather than four palette utilities: the figure is the primary
             // blue while the paid day is still running, and switches to the same warning
             // colour as the note beneath it when it passes the line. The colour is never
@@ -263,6 +331,40 @@ const WORKER_MODULES = {
         if (this._elapsedTimer === null) return;
         clearInterval(this._elapsedTimer);
         this._elapsedTimer = null;
+    },
+
+    /**
+     * The wall clock on the card that has no shift to count.
+     *
+     * Every five seconds rather than every second, and it writes only when the minute has
+     * actually turned: a clock that ticks is the difference between a screen that knows what
+     * time it is and a screenshot of one, but a text write a second for a figure that changes
+     * once a minute is a wake-up the phone pays for and nobody can see.
+     *
+     * It tears itself down the moment the card is gone - a tab switch, a re-render, a shift
+     * that started in the meantime all replace the element this looks for.
+     */
+    startClockTicker() {
+        this.stopClockTicker();
+        const paint = () => {
+            const now = document.getElementById('clockNow');
+            if (!now) { this.stopClockTicker(); return; }
+            const clock = this.wallClock();
+            if (now.textContent !== clock) now.textContent = clock;
+            const day = document.getElementById('clockToday');
+            if (day) {
+                const label = this.localDay();
+                if (day.textContent !== label) day.textContent = label;
+            }
+        };
+        paint();
+        this._clockTicker = setInterval(paint, 5000);
+    },
+
+    stopClockTicker() {
+        if (this._clockTicker === null) return;
+        clearInterval(this._clockTicker);
+        this._clockTicker = null;
     },
 
     // ==========================================================================
@@ -397,6 +499,7 @@ const WORKER_MODULES = {
         // Whatever the previous render started (tab switch now, stale fetch later)
         // must not keep ticking against a card that no longer exists.
         this.stopElapsedTimer();
+        this.stopClockTicker();
         container.innerHTML = UI.loadingHtml();
 
         // Started here rather than after the card is drawn so the two requests overlap: a
@@ -418,8 +521,10 @@ const WORKER_MODULES = {
             // does not depend on the request that just failed - it came in with the sign-in
             // answer - and a brand-new worker whose first screen says an error is exactly the
             // reader who cannot afford to lose the number they were hired under.
-            container.innerHTML = `<div id="workerWelcome"></div>
-                <p class="ui-note is-body is-danger">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`;
+            container.innerHTML = `<div class="hand-panel">
+                <div id="workerWelcome"></div>
+                <p class="ui-note is-body is-danger">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>
+            </div>`;
             this.paintWelcome();
             return;
         }
@@ -438,8 +543,19 @@ const WORKER_MODULES = {
         // Only a known clock-in time can be counted from; an offline cache without
         // one still shows the shift, just without a timer and without a false alarm.
         const clockInTime = active && active.clock_in_time ? active.clock_in_time : null;
+        // Whether a punch can be recorded here at all. Not a nicety: the camera and the fix
+        // are what a punch is, and an insecure origin (a plain-http tunnel, a mis-typed
+        // address) silently removes both.
+        const ready = Location.isSecure;
+        // The paid day in seconds, when the server sent one: the ring and the "time left"
+        // line are only honest with a denominator.
+        const daySeconds = Number(status.paidDayHours) > 0 ? Number(status.paidDayHours) * 3600 : null;
 
+        // One column with a real gap: the host this paints into is a plain div - the gap on
+        // ``.hand-main`` above it never reaches these blocks - so without this the card, the
+        // button and the facts below it sit flush against each other and read as one slab.
         container.innerHTML = `
+            <div class="hand-panel">
             ${/* The welcome, above everything: before the shift, before the review alert and
                  before the inbox band, because it is the only thing on this card that is about
                  the account rather than about today's shift - and because a worker who has just
@@ -460,32 +576,66 @@ const WORKER_MODULES = {
                         : ''}
                 </div>
                 <p class="hand-hero-word">${this.escapeHtml(active ? I18n.__('onShift') : I18n.__('currentlyClockedOut'))}</p>
-                ${active ? `
-                    ${clockInTime ? `
-                        <span id="shiftElapsed" class="hand-timer">0:00:00</span>
-                        <span class="hand-timer-label">${this.escapeHtml(I18n.__('handTimeOnShift'))}</span>` : ''}
-                    ${/* The two numbers a worker is paid by, said out loud: the paid day, the
-                         unpaid break, and the shift length they add up to. Without them the
-                         timer above reads as the thing that gets paid, and 8:30:00 on a
-                         30-minute break day looks like an hour of missing money - and the
-                         clock-in the server actually recorded, so the timer can be checked
-                         against something a worker can point at. */ ''}
-                    ${clockInTime ? `<div class="hand-policy" data-day-policy="${status.paidDayHours || 'default'}">
-                        <span class="hand-policy-cell">
-                            <span class="hand-policy-label">${this.escapeHtml(I18n.__('clockedInAt'))}</span>
-                            <span class="hand-policy-value is-mono">${this.escapeHtml(active.clock_in_time)}</span>
-                        </span>
-                        <span class="hand-policy-cell">
-                            <span class="hand-policy-label">${this.escapeHtml(I18n.__('shiftPaidDay'))}</span>
-                            <span class="hand-policy-value"><b>${status.paidDayHours ? this.hoursLabel(status.paidDayHours) : '8'} h</b></span>
-                        </span>
-                        <span class="hand-policy-cell">
-                            <span class="hand-policy-label">${this.escapeHtml(I18n.__('shiftUnpaidBreak'))}</span>
-                            <span class="hand-policy-value"><b>${this.minutesLabel(status.breakMinutes)}</b></span>
-                        </span>
-                    </div>` : ''}
-                    ${clockInTime ? `<div id="shiftOvertimeNote" class="hand-note hidden"></div>` : ''}
-                ` : ''}
+                ${/* The figure. With a shift open it is the elapsed timer, and the ring beside
+                     it is how much of the paid day that is - the one question a worker on site
+                     actually has. With no shift there is nothing to count, so the figure is the
+                     time of day and its caption is the date: the same block, doing the two jobs
+                     this card has. */ ''}
+                ${active && clockInTime ? `
+                    <div class="hand-figure">
+                        <div class="hand-figure-main">
+                            <span id="shiftElapsed" class="hand-timer">0:00:00</span>
+                            <span class="hand-timer-label">${this.escapeHtml(I18n.__('handTimeOnShift'))}</span>
+                        </div>
+                        ${daySeconds ? `<svg class="hand-ring" viewBox="0 0 48 48" aria-hidden="true">
+                            <circle class="hand-ring-track" cx="24" cy="24" r="20"></circle>
+                            <circle id="shiftRing" class="hand-ring-fill" cx="24" cy="24" r="20"
+                                    pathLength="100" data-day-progress="0"></circle>
+                        </svg>` : ''}
+                    </div>
+                    ${daySeconds ? `<p class="hand-day-line" id="shiftRemaining"></p>` : ''}
+                ` : `
+                    <div class="hand-figure">
+                        <div class="hand-figure-main">
+                            <span id="clockNow" class="hand-timer is-now">${this.escapeHtml(this.wallClock())}</span>
+                            <span class="hand-timer-label" id="clockToday">${this.escapeHtml(this.localDay())}</span>
+                        </div>
+                    </div>
+                `}
+                ${/* The two numbers a worker is paid by, said out loud: the paid day, the
+                     unpaid break, and the shift length they add up to. Without them the
+                     timer above reads as the thing that gets paid, and 8:30:00 on a
+                     30-minute break day looks like an hour of missing money - and the
+                     clock-in the server actually recorded, so the timer can be checked
+                     against something a worker can point at. Off shift, the clock-in row
+                     becomes the month so far: there is no stamp yet, and the worker about
+                     to start a day still wants to know what a day is. */ ''}
+                <div class="hand-policy" data-day-policy="${status.paidDayHours || 'default'}">
+                    ${/* The recorded stamp gets the whole row to itself: it is a receipt line,
+                         not a figure to compare, and at 13px mono it did not fit a third of a
+                         342px card - it wrapped to two lines and left the row ragged. The two
+                         numbers a day is actually judged by sit under it, side by side. */ ''}
+                    ${active && clockInTime ? `<span class="hand-policy-cell is-wide">
+                        <span class="hand-policy-label">${this.escapeHtml(I18n.__('clockedInAt'))}</span>
+                        <span class="hand-policy-value is-mono">${this.escapeHtml(active.clock_in_time)}</span>
+                    </span>` : ''}
+                    <span class="hand-policy-cell">
+                        <span class="hand-policy-label">${this.escapeHtml(I18n.__('shiftPaidDay'))}</span>
+                        <span class="hand-policy-value"><b>${status.paidDayHours ? this.hoursLabel(status.paidDayHours) : '8'} h</b></span>
+                    </span>
+                    <span class="hand-policy-cell">
+                        <span class="hand-policy-label">${this.escapeHtml(I18n.__('shiftUnpaidBreak'))}</span>
+                        <span class="hand-policy-value"><b>${this.minutesLabel(status.breakMinutes)}</b></span>
+                    </span>
+                </div>
+                ${active && clockInTime ? `<div id="shiftOvertimeNote" class="hand-note hidden"></div>` : ''}
+                ${/* The month, on its own line in both states: as a policy cell it was the one
+                     label in the row too long for a 106px column, and it has nothing to do
+                     with today's shift policy anyway - it is the worker's own tally. */ ''}
+                <p class="hand-hero-foot">
+                    <span>${this.escapeHtml(I18n.__('hoursThisMonth'))}</span>
+                    <b class="is-mono">${this.escapeHtml(status.monthHours)} h</b>
+                </p>
                 ${status.stale ? `<p class="hand-hero-meta is-warn">${this.escapeHtml(I18n.__('lastKnownStatus'))}</p>` : ''}
             </div>
 
@@ -543,23 +693,23 @@ const WORKER_MODULES = {
 
             ${this.offlinePanelHtml(status)}
 
-            <div class="hand-facts">
-                <div class="hand-fact">
-                    <p class="hand-fact-label">${this.escapeHtml(I18n.__('hoursThisMonth'))}</p>
-                    <p class="hand-fact-value is-mono">${this.escapeHtml(status.monthHours)} h</p>
-                </div>
-                <div class="hand-fact">
-                    <p class="hand-fact-label">${this.escapeHtml(I18n.__('location'))}</p>
-                    <p class="hand-fact-value ${Location.isSecure ? 'is-ok' : 'is-warn'}">
-                        ${this.escapeHtml(Location.isSecure ? I18n.__('handReady') : I18n.__('handNotReady'))}
-                    </p>
-                </div>
+            ${/* Under the action, not above it: whether this phone can record the punch at all
+                 is a footnote to the button, and the tile it used to sit in was the same size
+                 as the shift itself. */ ''}
+            <p class="hand-action-line" data-punch-ready="${ready ? 1 : 0}">
+                <span class="hand-ready-dot ${ready ? 'is-ok' : 'is-warn'}" aria-hidden="true"></span>
+                ${this.escapeHtml(I18n.__('location'))} · ${this.escapeHtml(ready ? I18n.__('handReady') : I18n.__('handNotReady'))}
+            </p>
             </div>
         `;
 
         // The welcome and the banner are in the document now, so both can be drawn into them.
         this.paintWelcome();
         this.paintAlertBadges();
+        // ... and the wall clock, if this card was painted without a shift to count. Bails
+        // immediately when there is no clock on the card, so the on-shift panel runs no
+        // second interval at all.
+        this.startClockTicker();
 
         // ... and the way out of an unconfirmed shift, which exists only on this card. One
         // delegated listener per host, marked on the element exactly as the alerts band is:
@@ -1380,25 +1530,38 @@ const WORKER_MODULES = {
                 : `<div class="hand-stack">${notes.map((note) => this.noteCardHtml(note)).join('')}</div>`}`;
     },
 
+    /**
+     * One conversation in the list: the title, what was said last, and how long ago.
+     *
+     * The card used to lead with the subject and then the worker's *own original* words, so a
+     * thread the administrator had answered twice read exactly like one nobody had touched -
+     * and the only stamp on it was a full timestamp above a label that said "Last activity".
+     * The last message is the point of a list of conversations, and it says who wrote it, so
+     * "the answer is here" needs no badge to be believed. The stamp is still words rather
+     * than a column of identical strings, so "2 h ago" and "yesterday" can be told apart.
+     */
     noteCardHtml(note) {
         const unread = Number(note.worker_unread) || 0;
-        const preview = note.last_message ? note.last_message.body : '';
+        const last = note.last_message || null;
+        const preview = last ? last.body : note.body;
+        const stamp = note.last_reply_at || note.created_at || '';
+        const who = last ? (last.from_admin ? I18n.__('noteFromAdmin') : I18n.__('noteFromYou')) : '';
         return `
             <button type="button" data-note="${note.id}" onclick="WORKER_MODULES.openNote(${note.id})"
-                    class="hand-card is-note">
+                    class="hand-card is-note${unread > 0 ? ' is-unread' : ''}">
                 <div class="ui-spread">
                     <p class="hand-note-subject">${this.escapeHtml(note.subject)}</p>
                     ${unread > 0
                         ? `<span data-unread="${unread}" class="ui-badge is-ok">${this.escapeHtml(I18n.__('noteWaitingReply'))}</span>`
                         : ''}
                 </div>
+                ${preview ? `<p class="hand-note-preview">${who ? `<b class="hand-note-who">${this.escapeHtml(who)}:</b> ` : ''}${this.escapeHtml(preview)}</p>` : ''}
                 <p class="hand-note-tags">
                     ${this.noteCategoryChip(note.category)}
                     ${this.noteStatusChip(note.status)}
                     ${note.priority === 'high' ? `<span data-urgent="1" class="ui-badge is-danger">${this.escapeHtml(I18n.__('notePriorityHigh'))}</span>` : ''}
+                    <time class="hand-note-stamp" datetime="${this.escapeHtml(stamp)}" title="${this.escapeHtml(stamp)}">${this.escapeHtml(UI.timeAgo(stamp))}</time>
                 </p>
-                ${preview ? `<p class="hand-note-preview">${this.escapeHtml(preview)}</p>` : ''}
-                <p class="hand-note-stamp">${this.escapeHtml(I18n.__('noteLastActivity'))}: ${this.escapeHtml(note.last_reply_at || note.created_at || '')}</p>
             </button>`;
     },
 
@@ -1512,6 +1675,9 @@ const WORKER_MODULES = {
         this._noteThread = note;
         this._composingNote = false;
         this._notesHost.innerHTML = this.noteThreadHtml(note);
+        // A conversation is read from the bottom, so it opens there: the answer the worker is
+        // looking for is the last line, not the first.
+        UI.scrollToLatest('handNotesScroll');
     },
 
     noteThreadHtml(note) {
@@ -1531,7 +1697,9 @@ const WORKER_MODULES = {
                 <div class="ui-stack is-tight">
                     <h3 class="hand-section-title">${this.escapeHtml(note.subject)}</h3>
                     <p class="hand-section-note">
-                        ${this.escapeHtml(I18n.__('noteOpened'))}: ${this.escapeHtml(note.created_at || '')}
+                        ${this.escapeHtml(I18n.__('noteOpened'))} ·
+                        <time datetime="${this.escapeHtml(note.created_at || '')}"
+                              title="${this.escapeHtml(note.created_at || '')}">${this.escapeHtml(UI.timeAgo(note.created_at || ''))}</time>
                     </p>
                 </div>
                 <span class="ui-row" style="gap:6px">
@@ -1540,10 +1708,10 @@ const WORKER_MODULES = {
                 </span>
             </div>
             ${hint ? `<p class="hand-alert" data-thread-hint>${HAND_ICONS.info}<span>${this.escapeHtml(hint)}</span></p>` : ''}
-            <div class="hand-stack" style="margin:12px 0 16px">
-                ${messages.map((message) => this.noteMessageHtml(message)).join('')}
+            <div class="hand-thread" id="handNotesScroll">
+                ${this.notesMessagesHtml(messages)}
             </div>
-            <div class="hand-card" style="background:var(--ops-surface-2);box-shadow:none">
+            <div class="hand-card is-flat" data-reply-composer>
                 <textarea id="noteReplyBody" rows="3" maxlength="2000"
                           placeholder="${this.escapeHtml(I18n.__('noteReplyPlaceholder'))}" class="ui-field"></textarea>
                 <div class="ui-row" style="margin-top:8px">
@@ -1562,13 +1730,34 @@ const WORKER_MODULES = {
     noteMessageHtml(message) {
         const mine = !message.from_admin;
         const who = mine ? I18n.__('noteFromYou') : I18n.__('noteFromAdmin');
+        const stamp = message.created_at || '';
         return `
             <div class="hand-bubble-row ${mine ? 'is-mine' : ''}" data-message="${message.id}">
                 <div class="hand-bubble ${mine ? 'is-mine' : ''}">
-                    <p class="hand-bubble-who">${this.escapeHtml(who)} · ${this.escapeHtml(message.created_at || '')}</p>
+                    <p class="hand-bubble-who">${this.escapeHtml(who)} · <time datetime="${this.escapeHtml(stamp)}" title="${this.escapeHtml(stamp)}">${this.escapeHtml(UI.timeAgo(stamp))}</time></p>
                     <p class="hand-bubble-body">${this.escapeHtml(message.body)}</p>
                 </div>
             </div>`;
+    },
+
+    /**
+     * The thread, oldest first, with a day marker whenever the day changes.
+     *
+     * A note can run across days - a request on Thursday, answered on Sunday - and three
+     * stamps in a row make the reader do the arithmetic. The same marker is drawn on the
+     * administrator's copy of this thread, from ``UI.dayLabel``, so neither side of the
+     * conversation starts describing a day its own way.
+     */
+    notesMessagesHtml(messages) {
+        let day = '';
+        return (messages || []).map((message) => {
+            const stamp = UI.dayOf(message.created_at);
+            const marker = stamp && stamp !== day
+                ? `<p class="hand-day"><span>${this.escapeHtml(UI.dayLabel(stamp))}</span></p>`
+                : '';
+            day = stamp || day;
+            return `${marker}${this.noteMessageHtml(message)}`;
+        }).join('');
     },
 
     async sendNoteReply(noteId, button) {

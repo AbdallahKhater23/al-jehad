@@ -10139,6 +10139,22 @@ ${sessionsFact}${statusFact}
     /** A password just generated for a note's author: shown once, then forgotten. */
     _noteRevealed: null,
 
+    /** A reply being typed, kept across a repaint; emptied when another note is opened. */
+    _noteReplyDraft: '',
+
+    /** Whether the reply being typed was marked internal. */
+    _noteInternalDraft: false,
+
+    /**
+     * Whether the reset form is unfolded under the thread's head.
+     *
+     * It starts folded, and that is the point: a conversation is read and answered far
+     * more often than a password is issued, and a credential form parked above the
+     * messages made the tab read as a form with a thread under it. The tool is one press
+     * away in the head, where the other facts about this worker already are.
+     */
+    _notePasswordOpen: false,
+
     /** A password the admin typed for a note's author; blank means "generate one". */
     _notePasswordDraft: '',
 
@@ -10148,6 +10164,86 @@ ${sessionsFact}${statusFact}
     /** "" means every status, which is what the tab opens on. */
     notesStatus() { return State.notesStatus || ''; },
     notesQuery() { return State.notesQuery || ''; },
+    /** "" means every turn: the queue opens on the whole of it, like the status filter. */
+    notesTurn() { return State.notesTurn || ''; },
+
+    /**
+     * Whose turn a note is on - the one question a queue of conversations answers.
+     *
+     * ``you``  - the worker wrote last, or nobody has answered yet, so the next word is
+     *            the administrator's; ``them`` - the administrator answered and the worker
+     *            has not written since; ``done`` - resolved or closed, which is a state and
+     *            not a turn at all. The payload carries both the status and the last
+     *            message, and the author of that message is the only thing that separates
+     *            the first two: the status alone cannot, because an open note the admin
+     *            just answered is still open.
+     */
+    notesTurnOf(note) {
+        if (!note) return 'you';
+        if (note.status === 'resolved' || note.status === 'closed') return 'done';
+        if (Number(note.admin_unread) > 0) return 'you';
+        return note.last_message && note.last_message.from_admin ? 'them' : 'you';
+    },
+
+    notesTurnLabel(turn) {
+        if (turn === 'you') return I18n.__('notesWaitingOnYou');
+        if (turn === 'them') return I18n.__('notesWaitingOnThem');
+        if (turn === 'done') return I18n.__('notesDone');
+        return I18n.__('notesFilterAll');
+    },
+
+    /**
+     * How many notes are waiting on each side, counted over the whole queue.
+     *
+     * Counted from the payload rather than from what the search left on screen, for the same
+     * reason the status counts come from the server: a segment reading "2" because that is
+     * how many rows a word matched would be answering a question nobody asked.
+     */
+    notesTurnCounts(notes) {
+        const counts = { all: 0, you: 0, them: 0, done: 0 };
+        (notes || []).forEach((note) => {
+            counts.all += 1;
+            counts[this.notesTurnOf(note)] += 1;
+        });
+        return counts;
+    },
+
+    /** The initials a conversation list draws instead of a photograph. */
+    notesInitials(note) {
+        const name = String((note && (note.worker_name || note.worker_id)) || '').trim();
+        const words = name.split(/\s+/).filter(Boolean).slice(0, 2);
+        const letters = words.map((word) => word.slice(0, 1)).join('').toUpperCase();
+        return this.escapeHtml(letters || '?');
+    },
+
+    /**
+     * What a row previews: the last thing said, and who said it.
+     *
+     * A queue of six columns shows the worker's *original* subject and nothing since, so the
+     * one line that tells an administrator whether a thread is finished is the one line it
+     * never showed. When the server sent no last message (a note whose first message is
+     * still in flight) the body stands in for it - which is what the body is.
+     */
+    notesPreviewHtml(note) {
+        const last = note.last_message || null;
+        const body = last ? last.body : note.body;
+        const who = last
+            ? (last.from_admin ? I18n.__('noteFromYou') : this.notesFirstName(note))
+            : '';
+        const name = who ? `<b class="notes-preview-who">${this.escapeHtml(who)}:</b> ` : '';
+        return `<span class="notes-preview">${name}${this.escapeHtml(body || '')}</span>`;
+    },
+
+    /**
+     * The first name of the person on the other end, for the preview prefix.
+     *
+     * A thread preview of a worker's own message reads better with their name than with the
+     * word "Worker", and it is the same string the row already prints one line above.
+     */
+    notesFirstName(note) {
+        const name = String((note && (note.worker_name || note.worker_id)) || '').trim();
+        return name.split(/\s+/)[0] || '';
+    },
 
     noteStatusLabel(status) { return codeLabel('noteStatus', status); },
     noteCategoryLabel(category) { return codeLabel('noteCat', category); },
@@ -10178,10 +10274,18 @@ ${sessionsFact}${statusFact}
         // repaint and an error line: the two are separate questions and the second must not
         // be able to take the first off the screen.
         const inbox = this.notesRegion() || content;
-        // Toolbar first: the list can be slow from site, and an admin should see the
-        // filter they are about to use rather than a blank tab.
-        this.paintNotes(inbox, this.notesToolbarHtml() + UI.loadingHtml());
+        // A reader coming back to this tab lands in the conversation they left: a thread
+        // stays open across a tab switch, because that is what a conversation does. It is
+        // re-read rather than remembered - the queue payload carries only each note's last
+        // message - so a queue read now is never left sitting beside a thread read an hour
+        // ago.
+        const reopened = this._noteThread ? this._noteThread.id : null;
+        // The frame first: the list can be slow from site, and an administrator should see
+        // the filters they are about to use - and the place an answer will appear - rather
+        // than a blank tab.
+        this.paintNotes(inbox, this.notesScreenHtml(null));
         await this.loadNotes(inbox);
+        if (reopened !== null) await this.loadNote(reopened);
     },
 
     /** The host the administrator's own notes paint into, above the mailbox. */
@@ -10219,7 +10323,8 @@ ${sessionsFact}${statusFact}
         try {
             const data = await API.request('/admin/notes');
             this._notes = data;
-            this.paintNotes(content, this.notesToolbarHtml() + this.notesListHtml(data));
+            this.paintNotes(content, this.notesScreenHtml(data));
+            this.scrollNotesToLatest();
         } catch (err) {
             this._notes = null;
             this.paintNotes(content, this.notesToolbarHtml() +
@@ -10227,8 +10332,19 @@ ${sessionsFact}${statusFact}
         }
     },
 
-    /** Repaints the tab and binds the search box. */
+    /**
+     * Repaints the queue and re-binds everything in it.
+     *
+     * One delegated listener on the region rather than a handler per row: the CSP's inline
+     * attribute allowance may only fall, and a conversation list is mostly rows. Everything
+     * the router answers is a ``data-`` hook, so this is also where "which control does
+     * what" is readable in one place.
+     */
     paintNotes(content, html) {
+        // The half-written reply is remembered before the markup it lives in is thrown
+        // away: filtering the queue, or opening the note you were already reading, is not
+        // an instruction to discard it.
+        this.rememberNotesDraft();
         content.innerHTML = html;
         const form = document.getElementById('notesSearchForm');
         if (form) {
@@ -10237,6 +10353,94 @@ ${sessionsFact}${statusFact}
                 return this.applyNotesSearch();
             };
         }
+        const status = document.getElementById('notesStatus');
+        if (status) {
+            status.onchange = () => this.filterNotesByStatus(status.value);
+        }
+        content.onclick = (event) => this.onNotesClick(event);
+    },
+
+    /** Keeps the reply being typed across a repaint. Nothing else on the tab is stateful. */
+    rememberNotesDraft() {
+        const body = document.getElementById('noteReplyBody');
+        if (body) this._noteReplyDraft = String(body.value || '');
+        const internal = document.getElementById('noteInternal');
+        if (internal) this._noteInternalDraft = !!internal.checked;
+    },
+
+    /**
+     * The whole screen: the band, then the two panes.
+     *
+     * ``data`` is the queue as last read, so opening a note repaints the list beside it
+     * rather than fetching it again - which is the point of the split. Until the first read
+     * lands, the list pane carries the loading line and the thread pane the invitation to
+     * pick one; neither is ever absent, so scrolling, focus and the shape of the page do not
+     * jump when the data arrives.
+     */
+    notesScreenHtml(data, threadHtml, keepOpen) {
+        const list = data ? this.notesListHtml(data) : UI.loadingHtml();
+        const thread = threadHtml !== undefined
+            ? threadHtml
+            : (this._noteThread ? this.noteThreadHtml(this._noteThread) : this.notesEmptyThreadHtml());
+        // ``keepOpen`` is for the one pane that has something to say while there is no
+        // thread to say it in - a failed read - so the message is not hidden behind the
+        // list on a phone the moment the selection is dropped.
+        const open = !!this._noteThread || !!keepOpen;
+        return `${this.notesToolbarHtml()}
+            <div class="notes-shell${open ? ' is-open' : ''}">
+                <section class="notes-pane notes-pane-list" data-notes-list
+                         aria-label="${this.escapeHtml(I18n.__('notesInbox'))}">
+                    ${list}
+                </section>
+                <section class="notes-pane notes-pane-thread" data-notes-thread
+                         aria-label="${this.escapeHtml(I18n.__('noteReplyToWorker'))}">
+                    ${thread}
+                </section>
+            </div>`;
+    },
+
+    /** The thread pane before anything is opened - an invitation, not an empty column. */
+    notesEmptyThreadHtml() {
+        return `
+            <div class="notes-thread-blank">
+                <p class="ui-empty-title">${this.escapeHtml(I18n.__('notesThreadEmpty'))}</p>
+                <p class="ui-note is-body">${this.escapeHtml(I18n.__('notesThreadEmptyHint'))}</p>
+            </div>`;
+    },
+
+    /**
+     * One listener for the whole tab.
+     *
+     * The order matters: the controls that sit *inside* a row are matched before the row
+     * itself, or pressing "open" on a row would run the row's own action twice.
+     */
+    onNotesClick(event) {
+        const target = event && event.target;
+        const closest = (selector) => (target && target.closest ? target.closest(selector) : null);
+        const route = [
+            ['[data-notes-back]', () => this.backToNotes()],
+            ['[data-send-reply]', (el) => this.replyToNote(this._noteThread ? this._noteThread.id : null, el)],
+            ['[data-show-password]', () => this.showNotePasswordPanel()],
+            ['[data-reset-password]', () => this.resetPasswordFromNote()],
+            ['[data-copy-password]', () => this.copyNotePassword()],
+            ['[data-dismiss-password]', () => this.dismissNotePassword()],
+            ['[data-clear-search]', () => this.clearNotesSearch()],
+            ['[data-turn]', (el) => this.filterNotesByTurn((el.dataset || {}).turn || '')],
+            ['[data-open-note]', () => {
+                const row = closest('[data-note]');
+                return row ? this.openNote(Number(row.dataset.note)) : null;
+            }]
+        ];
+        for (const [selector, run] of route) {
+            const el = closest(selector);
+            if (el) return run(el);
+        }
+        return null;
+    },
+
+    /** The newest message is the one a thread opens on; see ``UI.scrollToLatest``. */
+    scrollNotesToLatest() {
+        return UI.scrollToLatest('notesScroll');
     },
 
     repaintNotesFromCache() {
@@ -10244,7 +10448,8 @@ ${sessionsFact}${statusFact}
         // with it, and the reader who is searching the mailbox is not done with their own.
         const content = this.notesRegion();
         if (!content || !this._notes) return UI.renderAdminTab('Notes');
-        this.paintNotes(content, this.notesToolbarHtml() + this.notesListHtml(this._notes));
+        this.paintNotes(content, this.notesScreenHtml(this._notes));
+        this.scrollNotesToLatest();
         return Promise.resolve();
     },
 
@@ -10265,42 +10470,73 @@ ${sessionsFact}${statusFact}
     },
 
     /**
-     * The status chips, each carrying how many notes are in that state.
+     * Narrows the queue to one side of the conversation. Tapping the active one clears it,
+     * so the segment a reader just pressed is also the way back out of it.
+     */
+    async filterNotesByTurn(turn) {
+        // "all" is the first segment's own name for "no narrowing", and tapping it is the
+        // same act as tapping the active one: the queue opens back out.
+        const next = turn === 'all' ? '' : (turn || '');
+        State.notesTurn = this.notesTurn() === next ? '' : next;
+        return this.repaintNotesFromCache();
+    },
+
+    /**
+     * The band: whose turn it is, then the two narrower questions under it.
      *
-     * The counts come from the server and cover every note, not the filtered list: a
-     * chip that says "3" because that is what is on screen would be answering a
+     * The segments are the question an administrator working a queue actually has - "who is
+     * waiting on me" - and each carries how many notes are in that state, counted here over
+     * the whole payload rather than over what a search matched. The status select is the
+     * quieter literal one, kept because "everything still open" and "everything closed" are
+     * real errands that a turn cannot express; the server's own counts ride on its options,
+     * for the same reason they always did: a number that means "on screen" answers a
      * question nobody asked.
      */
     notesToolbarHtml() {
-        const counts = (this._notes && this._notes.counts) || {};
-        const active = this.notesStatus();
-        const total = Object.keys(counts).reduce((sum, key) => sum + (Number(counts[key]) || 0), 0);
+        const data = this._notes || null;
+        const counts = (data && data.counts) || {};
+        const turns = this.notesTurnCounts((data && data.notes) || []);
+        const active = this.notesTurn();
+        const status = this.notesStatus();
         const query = this.notesQuery();
-        const chips = [['', 'notesFilterAll', total]].concat(
-            ['open', 'in_progress', 'resolved', 'closed'].map((status) => [status, null, counts[status] || 0])
-        );
+        const segments = ['all', 'you', 'them', 'done'];
+        const key = (turn) => (turn === 'all' ? '' : turn);
+        const count = (turn) => (turn === 'all' ? turns.all : turns[turn] || 0);
         return `
-            <div class="ui-section-head">
-                <h3 class="ui-section-title">${this.escapeHtml(I18n.__('notesInbox'))}</h3>
-                <p class="ui-section-note" data-notes-hint style="max-width:64ch">${this.escapeHtml(I18n.__('notesInboxHint'))}</p>
+            <div class="notes-head">
+                <div class="ui-stack is-tight">
+                    <h3 class="ui-section-title">${this.escapeHtml(I18n.__('notesInbox'))}</h3>
+                    <p class="ui-section-note" data-notes-hint>${this.escapeHtml(I18n.__('notesInboxHint'))}</p>
+                </div>
             </div>
-            <div class="ui-row" style="margin-top:12px">
-                <!-- The data-status and data-active attributes are adjacent on purpose: the
-                     product suite reads the filter state off that pair, and one of them
-                     moving to another element would make the counts untestable without
-                     touching CSS. -->
-                ${chips.map(([status, labelKey, count]) => `
-                    <button type="button" data-status="${status || 'all'}" data-active="${status === active}"
-                            onclick="UI_MODULES.filterNotesByStatus('${status}')"
-                            class="ui-chip"${status === active ? ' aria-pressed="true"' : ''}>${this.escapeHtml(labelKey ? I18n.__(labelKey) : this.noteStatusLabel(status))} (${count})</button>`).join('')}
-            </div>
-            <form id="notesSearchForm" class="ui-row" style="margin-top:12px;margin-bottom:16px">
-                <label class="sr-only" for="notesQuery">${this.escapeHtml(I18n.__('notesSearchPlaceholder'))}</label>
-                <input type="search" id="notesQuery" class="ui-field is-flex" value="${this.escapeHtml(query)}"
-                       placeholder="${this.escapeHtml(I18n.__('notesSearchPlaceholder'))}">
-                <button type="submit" class="ui-btn">${this.OPS_ICONS.search}${this.escapeHtml(I18n.__('search'))}</button>
-                ${query ? `<button type="button" onclick="UI_MODULES.clearNotesSearch()" class="ui-btn ui-btn-quiet">${this.OPS_ICONS.close}${this.escapeHtml(I18n.__('clear'))}</button>` : ''}
-            </form>`;
+            <div class="notes-bar">
+                <!-- The data-turn and data-active attributes are adjacent on purpose: the
+                     notes suite reads the filter state off that pair, and one of them moving
+                     to another element would make the counts untestable without touching the
+                     stylesheet. -->
+                <div class="notes-turns" role="group" aria-label="${this.escapeHtml(I18n.__('notesInbox'))}">
+                    ${segments.map((turn) => `
+                        <button type="button" data-turn="${turn}" data-active="${key(turn) === active}"
+                                class="notes-turn${key(turn) === active ? ' is-active' : ''}"
+                                ${key(turn) === active ? 'aria-pressed="true"' : ''}>
+                            ${this.escapeHtml(this.notesTurnLabel(turn))}
+                            <span class="notes-turn-count">(${count(turn)})</span>
+                        </button>`).join('')}
+                </div>
+                <form id="notesSearchForm" class="notes-search">
+                    <label class="sr-only" for="notesQuery">${this.escapeHtml(I18n.__('notesSearchPlaceholder'))}</label>
+                    <input type="search" id="notesQuery" class="ui-field is-flex" value="${this.escapeHtml(query)}"
+                           placeholder="${this.escapeHtml(I18n.__('notesSearchPlaceholder'))}">
+                    <button type="submit" class="ui-btn">${this.OPS_ICONS.search}${this.escapeHtml(I18n.__('search'))}</button>
+                    ${query ? `<button type="button" data-clear-search class="ui-btn ui-btn-quiet">${this.OPS_ICONS.close}${this.escapeHtml(I18n.__('clear'))}</button>` : ''}
+                </form>
+                <label class="sr-only" for="notesStatus">${this.escapeHtml(I18n.__('status'))}</label>
+                <select id="notesStatus" class="ui-field notes-status">
+                    <option value=""${status === '' ? ' selected' : ''}>${this.escapeHtml(I18n.__('notesStatusAny'))}</option>
+                    ${['open', 'in_progress', 'resolved', 'closed'].map((value) => `
+                        <option value="${value}"${value === status ? ' selected' : ''}>${this.escapeHtml(this.noteStatusLabel(value))} (${Number(counts[value]) || 0})</option>`).join('')}
+                </select>
+            </div>`;
     },
 
     /**
@@ -10325,11 +10561,23 @@ ${sessionsFact}${statusFact}
 
     notesVisible(data) {
         const notes = (data && data.notes) || [];
+        const turn = this.notesTurn();
         const status = this.notesStatus();
-        const byStatus = status ? notes.filter((note) => note.status === status) : notes;
-        return this.notesMatches(byStatus, this.notesQuery());
+        let shown = notes;
+        if (turn) shown = shown.filter((note) => this.notesTurnOf(note) === turn);
+        if (status) shown = shown.filter((note) => note.status === status);
+        return this.notesMatches(shown, this.notesQuery());
     },
 
+    /**
+     * The queue: one row per conversation.
+     *
+     * A row is a conversation, not a record - what was last said and how long ago are the
+     * two facts that decide whether to open it - and the subject sits above the preview
+     * because it is the name a reader recognises the thread by. One markup for every
+     * screen: a conversation list is the same object on a phone and on a laptop, so there
+     * is no second rendering that can disagree with this one.
+     */
     notesListHtml(data) {
         const notes = (data && data.notes) || [];
         const shown = this.notesVisible(data);
@@ -10338,78 +10586,64 @@ ${sessionsFact}${statusFact}
             return `<p class="ui-empty" data-no-matches>${I18n.__('notesNone')}</p>`;
         }
         const filterNote = query ? `
-            <p class="ui-note" data-filter-note>
+            <p class="ui-note notes-filter-note" data-filter-note>
                 ${I18n.__('notesFiltered')}: “${this.escapeHtml(query)}” · ${shown.length} / ${notes.length}
             </p>` : '';
-        return `${filterNote}${Device.isMobile ? this.notesCardsHtml(shown) : this.notesTableHtml(shown)}`;
+        return `${filterNote}
+            <ul class="notes-threads">
+                ${shown.map((note) => this.notesRowHtml(note)).join('')}
+            </ul>`;
     },
 
-    notesTableHtml(notes) {
-        // ``ui-table`` on the element: the frame brings the hairlines, the uppercase column
-        // labels and the row hover, and no cell below has to name a padding value.
-        return `
-            <div class="ui-table-wrap">
-                <table class="ui-table" data-notes-table="true">
-                    <caption class="sr-only">${this.escapeHtml(I18n.__('notesInbox'))}</caption>
-                    <thead>
-                        <tr>
-                            <th>${I18n.__('name')}</th>
-                            <th>${I18n.__('noteCategory')}</th>
-                            <th>${I18n.__('noteSubject')}</th>
-                            <th>${I18n.__('status')}</th>
-                            <th>${I18n.__('noteLastActivity')}</th>
-                            <th></th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        ${notes.map((note) => `<tr data-note="${note.id}">
-                            <td>
-                                <p class="ui-card-title">${this.escapeHtml(note.worker_name || note.worker_id)}</p>
-                                <p class="ui-note">${this.escapeHtml(note.worker_id)} · ${this.escapeHtml(this.roleLabel(note.worker_role || ''))}</p>
-                            </td>
-                            <td>${this.escapeHtml(this.noteCategoryLabel(note.category))}</td>
-                            <td class="is-clip">
-                                <p class="ui-strong ui-truncate">${this.escapeHtml(note.subject)}</p>
-                                <p class="ui-note ui-truncate">${this.escapeHtml(note.body)}</p>
-                            </td>
-                            <td>${this.noteStatusChip(note.status)}</td>
-                            <td class="ui-tone-muted">${this.escapeHtml(note.last_reply_at || note.created_at || '')}</td>
-                            <td class="is-end">${this.noteOpenButtonHtml(note)}</td>
-                        </tr>`).join('')}
-                    </tbody>
-                </table>
-            </div>`;
-    },
-
-    notesCardsHtml(notes) {
-        return `<div class="ui-stack">${notes.map((note) => `
-            <div class="ui-card is-stacked" data-note="${note.id}">
-                <div class="ui-spread">
-                    <p class="ui-strong ui-truncate">${this.escapeHtml(note.subject)}</p>
-                    ${this.noteUnreadBadge(note)}
-                </div>
-                <p class="ui-note">
-                    ${this.escapeHtml(note.worker_name || note.worker_id)} · ${this.escapeHtml(note.worker_id)}
-                </p>
-                <p class="ui-note">${this.escapeHtml(this.noteCategoryLabel(note.category))} · ${this.noteStatusChip(note.status)}</p>
-                <p class="ui-note is-body">${this.escapeHtml(note.body)}</p>
-                <p class="ui-note ui-tone-faint">${this.escapeHtml(note.last_reply_at || note.created_at || '')}</p>
-                <div class="ui-row">${this.noteOpenButtonHtml(note)}</div>
-            </div>`).join('')}</div>`;
-    },
-
-    noteUnreadBadge(note) {
+    notesRowHtml(note) {
+        const turn = this.notesTurnOf(note);
         const unread = Number(note.admin_unread) || 0;
-        if (unread <= 0) return '';
-        return `<span class="ui-badge is-solid" data-admin-unread>${I18n.__('noteWaitingReply')}</span>`;
+        const stamp = note.last_reply_at || note.created_at || '';
+        const urgent = note.priority === 'high';
+        const open = !!this._noteThread && String(this._noteThread.id) === String(note.id);
+        return `
+            <li class="notes-thread-item${unread > 0 ? ' is-unread' : ''}${open ? ' is-open' : ''}"
+                data-note="${note.id}">
+                <button type="button" data-open-note class="notes-thread-btn">
+                    <span class="notes-face${turn === 'done' ? ' is-done' : ''}" aria-hidden="true">${this.notesInitials(note)}</span>
+                    <span class="notes-thread-main">
+                        <span class="notes-thread-top">
+                            <b class="notes-thread-name">${this.escapeHtml(note.worker_name || note.worker_id)}</b>
+                            <time class="notes-thread-time" datetime="${this.escapeHtml(stamp)}"
+                                  title="${this.escapeHtml(stamp)}">${this.escapeHtml(UI.timeAgo(stamp))}</time>
+                        </span>
+                        <span class="notes-thread-subject">${this.escapeHtml(note.subject)}</span>
+                        ${this.notesPreviewHtml(note)}
+                        <span class="notes-thread-tags">
+                            ${this.noteStatusChip(note.status)}
+                            <span class="ui-badge is-quiet">${this.escapeHtml(this.noteCategoryLabel(note.category))}</span>
+                            ${urgent ? `<span data-urgent="1" class="ui-badge is-danger">${this.escapeHtml(I18n.__('notePriorityHigh'))}</span>` : ''}
+                            <span class="notes-turn-pill is-${turn}">${this.escapeHtml(this.notesTurnLabel(turn))}</span>
+                        </span>
+                        ${unread > 0 ? `<span class="notes-unread" data-admin-unread>${this.escapeHtml(I18n.__('noteWaitingReply'))}</span>` : ''}
+                    </span>
+                </button>
+            </li>`;
     },
 
-    noteOpenButtonHtml(note) {
-        return `
-            ${note.priority === 'high' ? `<span data-urgent="1" class="ui-badge is-danger ui-spaced-end">${I18n.__('notePriorityHigh')}</span>` : ''}
-            ${this.noteUnreadBadge(note)}
-            <button type="button" data-open-note onclick="UI_MODULES.openNote(${note.id})"
-                    class="ui-btn ui-btn-primary ui-btn-sm ui-spaced-start">${I18n.__('open')}</button>`;
+    /**
+     * The thread, oldest first, with a day marker whenever the day changes.
+     *
+     * Five messages across three days read as five stamped rows is a wall of timestamps; a
+     * reader scrolling for "what did I say on Tuesday" needs the days marked rather than
+     * computed. The marker goes in before the first message of each day, which is where a
+     * reader looking for a boundary looks.
+     */
+    notesMessagesHtml(messages) {
+        let day = '';
+        return (messages || []).map((message) => {
+            const stamp = UI.dayOf(message.created_at);
+            const marker = stamp && stamp !== day
+                ? `<p class="notes-day"><span>${this.escapeHtml(UI.dayLabel(stamp))}</span></p>`
+                : '';
+            day = stamp || day;
+            return `${marker}${this.noteMessageHtml(message)}`;
+        }).join('');
     },
 
     /**
@@ -10423,7 +10657,16 @@ ${sessionsFact}${statusFact}
      */
     async openNote(noteId) {
         this._noteRevealed = null;
+        this._notePasswordDraft = '';
+        this._notePasswordOpen = false;
         this._noteStatusDraft = '';
+        // A reply half-written for one worker must not be waiting in the next one's
+        // composer. State *and* field: the field is what ``rememberNotesDraft`` reads on
+        // the paint that is about to happen.
+        this._noteReplyDraft = '';
+        this._noteInternalDraft = false;
+        const body = document.getElementById('noteReplyBody');
+        if (body) body.value = '';
         return this.loadNote(noteId);
     },
 
@@ -10433,16 +10676,33 @@ ${sessionsFact}${statusFact}
         // their own has not finished with the card above.
         const content = this.notesRegion();
         if (!content) return;
-        content.innerHTML = UI.loadingHtml();
+        // The queue stays on screen and only the thread pane says it is reading: the reason
+        // the two panes exist is so that opening a conversation does not cost the reader
+        // their place in the list.
+        this.paintNotes(content, this.notesScreenHtml(this._notes, UI.loadingHtml()));
         let note;
         try {
             note = await API.request(`/admin/notes/${noteId}`);
         } catch (err) {
-            content.innerHTML = `<p class="ui-note is-body is-danger">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`;
+            // The note went away under the reader - a colleague closed it, or the id is
+            // gone. The queue beside it is still the truth, so the selection is dropped
+            // with the error rather than left marking a row that may no longer exist.
+            this._noteThread = null;
+            this.paintNotes(content, this.notesScreenHtml(this._notes,
+                `<p class="ui-note is-body is-danger">${I18n.__('error')}: ${this.escapeHtml(err.message)}</p>`, true));
             return;
         }
         this._noteThread = note;
-        this.paintNotes(content, this.noteThreadHtml(note));
+        this.paintNotes(content, this.notesScreenHtml(this._notes));
+        this.scrollNotesToLatest();
+        this.focusNoteReply();
+    },
+
+    /** Puts the cursor where the work is - the reply box of the note just opened. */
+    focusNoteReply() {
+        if (Device.isMobile) return;
+        const box = document.getElementById('noteReplyBody');
+        if (box && typeof box.focus === 'function') box.focus();
     },
 
     noteThreadHtml(note) {
@@ -10450,40 +10710,61 @@ ${sessionsFact}${statusFact}
         const field = 'ui-field';
         const quiet = 'ui-btn ui-btn-quiet';
         return `
-            <button type="button" onclick="UI_MODULES.backToNotes()"
-                    class="ui-btn is-link" data-notes-back>
-                ← ${I18n.__('noteBackAdmin')}
-            </button>
-            <div class="ui-spread is-top">
-                <div class="ui-stack is-tight">
-                    <p class="ui-title">${this.escapeHtml(note.subject)}</p>
-                    <p class="ui-note">
-                        ${this.escapeHtml(note.worker_name || note.worker_id)} (${this.escapeHtml(note.worker_id)})
-                        · ${this.escapeHtml(this.roleLabel(note.worker_role || ''))}
-                        · ${this.escapeHtml(this.noteCategoryLabel(note.category))}
-                        · ${I18n.__('noteOpened')}: ${this.escapeHtml(note.created_at || '')}
-                    </p>
+            <div class="notes-thread-head">
+                <button type="button" class="${quiet} notes-back" data-notes-back>
+                    ← ${I18n.__('noteBackAdmin')}
+                </button>
+                <div class="notes-thread-who">
+                    <span class="notes-face" aria-hidden="true">${this.notesInitials(note)}</span>
+                    <span class="ui-stack is-tight">
+                        <b class="notes-thread-name">${this.escapeHtml(note.worker_name || note.worker_id)}</b>
+                        <span class="ui-note">
+                            ${this.escapeHtml(note.worker_id)} · ${this.escapeHtml(this.roleLabel(note.worker_role || ''))}
+                            · ${this.escapeHtml(this.noteCategoryLabel(note.category))}
+                        </span>
+                    </span>
                 </div>
-                <div class="ui-row">${this.noteStatusChip(note.status)}
+                <div class="ui-row notes-thread-flags">
+                    ${this.noteStatusChip(note.status)}
                     ${note.priority === 'high' ? `<span data-urgent="1" class="ui-badge is-danger">${I18n.__('notePriorityHigh')}</span>` : ''}
+                    <!-- The reset lives behind this one button rather than above the
+                         messages: it is the thing an admin occasionally needs from a
+                         thread, and a form parked there made every thread open on one. A
+                         worker whose account a standard admin may not touch gets no
+                         button at all, because a control that always answers 403 is a
+                         trap. -->
+                    ${note.can_reset_password === false ? '' : `
+                        <button type="button" data-show-password class="${quiet}" aria-expanded="${this._notePasswordOpen ? 'true' : 'false'}">
+                            ${this.OPS_ICONS.key}${this.escapeHtml(I18n.__('noteSetPassword'))}
+                        </button>`}
                 </div>
             </div>
+            <p class="notes-thread-subject">${this.escapeHtml(note.subject)}</p>
+            <p class="ui-note notes-thread-opened">${this.escapeHtml(I18n.__('noteOpened'))} ·
+                <time datetime="${this.escapeHtml(note.created_at || '')}"
+                      title="${this.escapeHtml(note.created_at || '')}">${this.escapeHtml(UI.timeAgo(note.created_at || ''))}</time>
+            </p>
             ${this.notePasswordPanelHtml(note, field, quiet)}
-            <div class="ui-stack is-tight">${messages.map((message) => this.noteMessageHtml(message)).join('')}</div>
-            <div class="ui-card is-tight is-stacked is-flat" data-note-composer>
+            <div class="notes-messages" id="notesScroll">
+                ${this.notesMessagesHtml(messages)}
+            </div>
+            <div class="notes-composer" data-note-composer>
+                <label class="sr-only" for="noteReplyBody">${this.escapeHtml(I18n.__('noteReplyToWorker'))}</label>
                 <textarea id="noteReplyBody" rows="3" maxlength="2000"
-                          placeholder="${I18n.__('noteReplyToWorker')}" class="${field}"></textarea>
-                <div class="ui-row">
+                          placeholder="${this.escapeHtml(I18n.__('noteReplyToWorker'))}"
+                          class="${field}">${this.escapeHtml(this._noteReplyDraft || '')}</textarea>
+                <div class="notes-composer-row">
+                    <button type="button" data-send-reply
+                            class="ui-btn ui-btn-primary">${this.escapeHtml(I18n.__('noteReply'))}</button>
+                    <label class="ui-check">
+                        <input type="checkbox" id="noteInternal"${this._noteInternalDraft ? ' checked' : ''}>
+                        <span>${this.escapeHtml(I18n.__('noteInternal'))}</span>
+                    </label>
+                    <label class="sr-only" for="noteReplyStatus">${this.escapeHtml(I18n.__('status'))}</label>
                     <select id="noteReplyStatus" class="ui-field">
                         ${[['', 'noteKeepStatus'], ['in_progress', 'noteMarkInProgress'], ['resolved', 'noteMarkResolved'], ['open', 'noteMarkOpen']]
                             .map(([value, key]) => `<option value="${value}" ${this._noteStatusDraft === value ? 'selected' : ''}>${I18n.__(key)}</option>`).join('')}
                     </select>
-                    <label class="ui-check">
-                        <input type="checkbox" id="noteInternal">
-                        <span>${I18n.__('noteInternal')}</span>
-                    </label>
-                    <button type="button" data-send-reply onclick="UI_MODULES.replyToNote(${note.id}, this)"
-                            class="ui-btn ui-btn-primary ui-push">${I18n.__('noteReply')}</button>
                 </div>
             </div>`;
     },
@@ -10495,22 +10776,32 @@ ${sessionsFact}${statusFact}
     noteMessageHtml(message) {
         const mine = !!message.from_admin;
         const who = mine ? I18n.__('noteFromAdmin') : I18n.__('noteFromWorker');
+        const stamp = message.created_at || '';
         const tag = message.internal
-            ? `<span class="ui-badge is-warn ui-spaced-start">${I18n.__('noteInternalTag')}</span>`
+            ? `<span class="ui-badge is-warn notes-bubble-tag">${I18n.__('noteInternalTag')}</span>`
             : '';
         return `
-            <div class="hand-bubble-row${mine ? ' is-mine' : ''}" data-message="${message.id}" data-internal="${message.internal ? 1 : 0}">
+            <div class="hand-bubble-row${mine ? ' is-mine' : ''}${message.internal ? ' is-internal' : ''}" data-message="${message.id}" data-internal="${message.internal ? 1 : 0}">
                 <div class="hand-bubble${mine ? ' is-mine' : ''}">
-                    <p class="hand-bubble-who">${who} · ${this.escapeHtml(message.created_at || '')}${tag}</p>
+                    <p class="hand-bubble-who">${who} · <time datetime="${this.escapeHtml(stamp)}" title="${this.escapeHtml(stamp)}">${this.escapeHtml(UI.timeAgo(stamp))}</time>${tag}</p>
                     <p class="hand-bubble-body">${this.escapeHtml(message.body)}</p>
                 </div>
             </div>`;
     },
 
+    /**
+     * Back to the queue: on a phone this is the way out of a thread, and on a wide screen it
+     * only clears the selection. No request - the queue is already in hand, which is what
+     * makes coming back instant instead of a wait.
+     */
     backToNotes() {
         this._noteThread = null;
         this._noteRevealed = null;
-        return UI.renderAdminTab('Notes');
+        this._noteReplyDraft = '';
+        this._noteInternalDraft = false;
+        const body = document.getElementById('noteReplyBody');
+        if (body) body.value = '';
+        return this.repaintNotesFromCache();
     },
 
     async replyToNote(noteId, button) {
@@ -10539,6 +10830,12 @@ ${sessionsFact}${statusFact}
             return;
         }
         Toast.success(I18n.__('noteReplySent'));
+        // The box is emptied with the send - state and field: ``rememberNotesDraft`` reads the
+        // field on the repaint about to happen, and would otherwise put the sentence just
+        // sent back into the composer.
+        this._noteReplyDraft = '';
+        const sent = document.getElementById('noteReplyBody');
+        if (sent) sent.value = '';
         // Re-read so the thread shows the message that was just sent - and so the password
         // panel, if one is on screen, survives the repaint.
         await this.loadNote(noteId);
@@ -10571,18 +10868,22 @@ ${sessionsFact}${statusFact}
     notePasswordPanelHtml(note, field, quiet) {
         const revealed = this._noteRevealed;
         if (revealed) {
+            // A password on screen outranks the fold: it is readable once, and hiding it
+            // behind a button would make "copy it now" a race with the reader's own
+            // forgetfulness.
             return `
                 <div class="ui-alert is-ok is-stacked" data-note-password-reveal="${this.escapeHtml(revealed.worker_id)}">
                     <p class="ui-card-title">${I18n.__('notePasswordSetFor')} ${this.escapeHtml(note.worker_name || revealed.worker_id)}</p>
                     <p class="ui-note is-body">${I18n.__('credentialsRevealNote')}</p>
                     <div class="ui-row">
                         <input id="noteRevealedPassword" readonly value="${this.escapeHtml(revealed.password)}" class="ui-field ui-mono is-flex">
-                        <button type="button" onclick="UI_MODULES.copyNotePassword()" class="${quiet}">${I18n.__('credentialsCopyPassword')}</button>
-                        <button type="button" onclick="UI_MODULES.dismissNotePassword()" class="${quiet}">${I18n.__('close')}</button>
+                        <button type="button" data-copy-password class="${quiet}">${I18n.__('credentialsCopyPassword')}</button>
+                        <button type="button" data-dismiss-password class="${quiet}">${I18n.__('close')}</button>
                     </div>
                     <p class="ui-note">${I18n.__('noteSetPasswordHint')}</p>
                 </div>`;
         }
+        if (!this._notePasswordOpen) return '';
         const protectedTarget = note.can_reset_password === false;
         return `
             <div class="ui-card is-tight is-stacked" data-note-password-panel>
@@ -10591,9 +10892,10 @@ ${sessionsFact}${statusFact}
                            oninput="UI_MODULES.setNotePasswordDraft(this.value)" autocomplete="new-password"
                            ${protectedTarget ? 'disabled' : ''}
                            placeholder="${this.escapeHtml(I18n.__('credentialsPasswordPlaceholder'))}" class="${field} ui-mono is-flex">
-                    <button type="button" data-reset-password onclick="UI_MODULES.resetPasswordFromNote()"
+                    <button type="button" data-reset-password
                             ${protectedTarget ? 'disabled' : ''}
                             class="ui-btn ui-btn-warn">${I18n.__('noteSetPassword')}</button>
+                    <button type="button" data-dismiss-password class="${quiet}">${I18n.__('close')}</button>
                     <p class="ui-note">${protectedTarget ? I18n.__('notePasswordProtected') : I18n.__('noteSetPasswordHint')}</p>
                 </div>
             </div>`;
@@ -10662,15 +10964,22 @@ ${sessionsFact}${statusFact}
         }
     },
 
-    /** Forgetting the password here is the whole of the cleanup - it is stored nowhere. */
+    /**
+     * Forgetting the password here is the whole of the cleanup - it is stored nowhere.
+     *
+     * It folds the form as well as the reveal, which is what one Close means to a reader
+     * who pressed one button to get here.
+     */
     async dismissNotePassword() {
         this._noteRevealed = null;
-        const content = this.notesRegion();
-        if (!content || !this._noteThread) {
-            return UI.renderAdminTab('Notes');
-        }
-        this.paintNotes(content, this.noteThreadHtml(this._noteThread));
-        return Promise.resolve();
+        this._notePasswordOpen = false;
+        return this.repaintNotesFromCache();
+    },
+
+    /** Unfolds the reset form under the thread's head. No request: the note is in hand. */
+    async showNotePasswordPanel() {
+        this._notePasswordOpen = true;
+        return this.repaintNotesFromCache();
     },
 
     // =====================================================================
