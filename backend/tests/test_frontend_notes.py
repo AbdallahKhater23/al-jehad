@@ -8,8 +8,9 @@ parts an API test cannot see:
 
 1. the worker's queue is *wired* - the tab is on the bar, the list says what is waiting
    for an answer, and a reply goes to that note's endpoint rather than to a general one;
-2. the admin's inbox shows the person, the type and the state before anything is opened,
-   and the filters narrow what is on screen without a request;
+2. the admin's queue shows the person, what was said *last* and whose turn it is before
+   anything is opened, and the filters narrow what is on screen without a request;
+   opening a note keeps the queue beside it and leaves it exactly as it was;
 3. an internal message is *marked* as internal on the admin's screen, because the value
    of writing one is knowing you are writing one;
 4. what a worker or a moallem typed is text, not markup: a note about a site called
@@ -36,7 +37,7 @@ HARNESS = r"""
 
 // Three notes, one per interesting state: waiting for an answer, being handled, and
 // resolved. The subject of the second one is markup, because a note is free text a
-// worker typed and the inbox renders it inside a table.
+// worker typed and the queue renders it as text.
 const NOTES = [
     {
         id: 11, worker_id: '601', worker_name: 'Bilal Khan', worker_role: 'worker',
@@ -215,9 +216,17 @@ function inputValue(markup, id) {
     return match ? match[1] : null;
 }
 
-/** Every note row on the desktop layout, read the way an admin sees it. */
+/**
+ * Every conversation in the queue, read the way an admin sees it.
+ *
+ * The rows are list items now rather than table rows - the queue is a list of
+ * conversations, not a record of notes - but the three things each row is asked about are
+ * the three it was asked about before: which note it is, whether it is waiting for an
+ * answer, and whether the worker marked it urgent. That is the point of reading the row
+ * through this one function instead of pattern-matching the markup in each assertion.
+ */
 function rowsOf(markup) {
-    const rows = markup.match(/<tr data-note="[^"]*"[\s\S]*?<\/tr>/g) || [];
+    const rows = markup.match(/<li class="notes-thread-item[^"]*"[\s\S]*?data-note="[^"]*"[\s\S]*?<\/li>/g) || [];
     return rows.map((row) => ({
         id: (/data-note="([^"]*)"/.exec(row) || [])[1],
         unread: row.indexOf('data-admin-unread') >= 0,
@@ -226,10 +235,11 @@ function rowsOf(markup) {
     }));
 }
 
-function chipsOf(markup) {
-    const chips = markup.match(/<button type="button" data-status="[^"]*"[\s\S]*?<\/button>/g) || [];
+/** The turn segments down the top of the queue, with the state each one is in. */
+function turnsOf(markup) {
+    const chips = markup.match(/<button type="button" data-turn="[^"]*"[\s\S]*?<\/button>/g) || [];
     return chips.map((chip) => ({
-        status: (/data-status="([^"]*)"/.exec(chip) || [])[1],
+        turn: (/data-turn="([^"]*)"/.exec(chip) || [])[1],
         active: /data-active="true"/.test(chip),
         text: textOf(chip)
     }));
@@ -299,11 +309,125 @@ const results = {};
     const markup = render(env);
     results.inbox = {
         rows: rowsOf(markup),
-        chips: chipsOf(markup),
+        turns: turnsOf(markup),
         has_search_box: markup.indexOf('id="notesQuery"') >= 0,
         title_shown: textOf(markup).indexOf('Worker notes') >= 0,
-        requests: env.requests.filter((r) => r.url.indexOf('/admin/notes') >= 0).length
+        requests: env.requests.filter((r) => r.url.indexOf('/admin/notes') >= 0).length,
+        // The row that is waiting carries the last thing said in words, not the worker's
+        // own first message under a full timestamp.
+        waiting_row: rowsOf(markup).filter((row) => row.id === '11')[0].text,
+        // Two panes, and the thread pane is an invitation until something is opened.
+        has_list_pane: markup.indexOf('data-notes-list') >= 0,
+        has_thread_pane: markup.indexOf('data-notes-thread') >= 0,
+        blank_thread: markup.indexOf(env.evaluate("I18n.__('notesThreadEmpty')")) >= 0
     };
+}
+
+// 1b. whose turn a conversation is on, and the way back out of a segment
+{
+    const env = inboxEnv();
+    await env.evaluate("UI.renderAdminTab('Notes')");
+    const before = env.requests.length;
+    const ids = () => rowsOf(render(env)).map((row) => row.id);
+    await env.evaluate("UI_MODULES.filterNotesByTurn('you')");
+    const you = ids();
+    await env.evaluate("UI_MODULES.filterNotesByTurn('them')");
+    const them = ids();
+    await env.evaluate("UI_MODULES.filterNotesByTurn('done')");
+    const done = ids();
+    // Pressing the segment that is already on is the way back out of it, which is the only
+    // thing a reader can do with a filter they no longer want.
+    await env.evaluate("UI_MODULES.filterNotesByTurn('done')");
+    const backOut = ids();
+    await env.evaluate("UI_MODULES.filterNotesByTurn('all')");
+    const all = ids();
+    // The status select is the narrower, literal question, and it answers the same way.
+    await env.evaluate("document.getElementById('notesStatus').value = 'resolved'");
+    await env.evaluate("document.getElementById('notesStatus').onchange()");
+    const resolved = ids();
+    results.turns = {
+        you: you,
+        them: them,
+        done: done,
+        back_out: backOut,
+        all: all,
+        resolved: resolved,
+        requests_added: env.requests.length - before
+    };
+}
+
+// 1c. the queue's controls are one delegated listener, not a handler per row
+//
+// The CSP's allowance for inline handlers may only fall, and a list of conversations is
+// mostly rows; every control on the tab is a data hook answered in one place. What the
+// stub can prove is that the hooks are the ones the markup carries and that pressing them
+// reaches the right note - the open control reads its note from the row it sits in, and
+// the reply button answers the thread that is on screen.
+{
+    const env = inboxEnv();
+    await env.evaluate("UI.renderAdminTab('Notes')");
+    const press = (selector, note) => env.evaluate(
+        "document.getElementById('notesInbox').onclick({ target: { closest: (s) => {" +
+        " if (s === " + JSON.stringify(selector) + ") return { dataset: " + JSON.stringify(note || {}) + " };" +
+        (note && note.note ? " if (s === '[data-note]') return { dataset: " + JSON.stringify(note) + " };" : '') +
+        " return null; } } })"
+    );
+    await press('[data-turn]', { turn: 'you' });
+    const afterTurn = rowsOf(render(env)).map((row) => row.id);
+    await press('[data-open-note]', { note: '12' });
+    const opened = render(env);
+    env.evaluate("document.getElementById('noteReplyBody').value = 'On its way.'");
+    await press('[data-send-reply]');
+    results.routing = {
+        after_turn: afterTurn,
+        opened_the_row_pressed: opened.indexOf('Ana Torres') >= 0,
+        // The send carries the note the thread is showing, not the row that was clicked.
+        sent: replies.slice(),
+        back_hook: render(env).indexOf('data-notes-back') >= 0
+    };
+    // The queue is still narrowed by the turn segment that was pressed, which is the point of
+    // reading beside the list rather than instead of it.
+    results.routing.threads_before_back = rowsOf(render(env)).map((row) => row.id);
+    await press('[data-notes-back]');
+    results.routing.threads_after_back = rowsOf(render(env)).map((row) => row.id);
+    results.routing.blank_after_back = render(env).indexOf('data-notes-thread') >= 0
+        && render(env).indexOf(env.evaluate("I18n.__('notesThreadEmpty')")) >= 0;
+}
+
+// 1d. what the tab does with the thread when the reader comes back to it
+//
+// Leaving the tab is not a decision about the conversation, so the two ways of leaving get
+// two answers: back says "done with this one" and the tab then opens on the queue, while a
+// thread left open is where the reader lands. Either way the conversation is *re-read*
+// rather than remembered - the queue's payload carries only each note's last message, so a
+// thread held in memory would be a conversation frozen at the hour it was last read,
+// sitting beside a queue read a minute ago.
+{
+    const env = inboxEnv();
+    const reads = () => env.requests.filter((r) => /\/admin\/notes\/11$/.test(r.url)).length;
+    const blank = env.evaluate("I18n.__('notesThreadEmpty')");
+    await env.evaluate("UI.renderAdminTab('Notes')");
+    await env.evaluate("UI_MODULES.openNote(11)");
+    await env.evaluate("UI_MODULES.backToNotes()");
+    const afterBack = render(env);
+    const beforeFirst = reads();
+    await env.evaluate("UI.renderAdminTab('Notes')");
+    const reentered = render(env);
+    results.reentry = {
+        blank_after_back: afterBack.indexOf(blank) >= 0,
+        list_after_reentry: reentered.indexOf(blank) >= 0,
+        open_row_after_reentry: reentered.indexOf('is-open') >= 0,
+        read_again: reads() - beforeFirst
+    };
+    // The other way of leaving: the thread was never put down, so it is still there - and
+    // re-read, so what it shows is this minute's conversation and not last hour's.
+    await env.evaluate("UI_MODULES.openNote(11)");
+    const beforeSecond = reads();
+    await env.evaluate("UI.renderAdminTab('Notes')");
+    const reopened = render(env);
+    results.reentry.reopened_thread = reopened.indexOf('data-notes-back') >= 0
+        && reopened.indexOf('id="noteReplyBody"') >= 0;
+    results.reentry.reopened_read_again = reads() - beforeSecond;
 }
 
 // 2. the status chips and the search narrow the list without another request
@@ -346,25 +470,39 @@ const results = {};
     const env = inboxEnv();
     await env.evaluate("UI.renderAdminTab('Notes')");
     await env.evaluate("UI_MODULES.openNote(11)");
-    const markup = render(env);
+    const folded = render(env);
     // A message is identified by the two data attributes, and "which side is it on" by the
     // bubble's own variant class - the same class the stylesheet uses to put it there, so a
     // message that stopped being the admin's would fail here as well as on screen.
-    const messages = (markup.match(/<div class="hand-bubble-row[^"]*" data-message="\d+" data-internal="[01]"/g) || [])
+    const messages = (folded.match(/<div class="hand-bubble-row[^"]*" data-message="\d+" data-internal="[01]"/g) || [])
         .map((tag) => ({
             id: (/data-message="(\d+)"/.exec(tag) || [])[1],
             internal: /data-internal="1"/.test(tag),
             mine: tag.indexOf('is-mine') >= 0
         }));
+    // The reset form is folded away until it is asked for: a conversation is read far more
+    // often than a password is issued, and a credential form parked above the messages made
+    // every thread open on one. Both states are read here, so a form that appeared unasked
+    // for and a button that opened onto nothing are each their own failure.
+    await env.evaluate("UI_MODULES.showNotePasswordPanel()");
+    const markup = render(env);
     results.thread = {
         messages: messages,
-        internal_text_visible: markup.indexOf('internal: the old import') >= 0,
-        internal_tagged: markup.indexOf('data-internal="1"') >= 0,
-        has_reply_box: markup.indexOf('id="noteReplyBody"') >= 0,
-        has_back: markup.indexOf('data-notes-back') >= 0,
-        worker_named: textOf(markup).indexOf('Bilal Khan') >= 0,
+        internal_text_visible: folded.indexOf('internal: the old import') >= 0,
+        internal_tagged: folded.indexOf('data-internal="1"') >= 0,
+        has_reply_box: folded.indexOf('id="noteReplyBody"') >= 0,
+        has_back: folded.indexOf('data-notes-back') >= 0,
+        worker_named: textOf(folded).indexOf('Bilal Khan') >= 0,
+        folded_panel_hidden: folded.indexOf('data-note-password-panel') < 0,
+        reset_toggle_offered: folded.indexOf('data-show-password') >= 0,
         has_password_panel: markup.indexOf('data-note-password-panel') >= 0,
-        can_reset_offered: markup.indexOf('resetPasswordFromNote') >= 0
+        // The reset is offered as a data hook rather than an inline handler: this assertion
+        // used to name the handler, which meant it could only fail in the browser after the
+        // handler had already been removed from the markup.
+        can_reset_offered: markup.indexOf('data-reset-password') >= 0,
+        // Opening a note keeps the queue beside it, and the thread is the note.
+        queue_still_there: rowsOf(markup).map((row) => row.id),
+        day_marker: folded.indexOf('notes-day') >= 0
     };
 }
 
@@ -440,7 +578,10 @@ const results = {};
     results.reset.after_dismiss = {
         html_has_password: closed.indexOf(shownInMarkup) >= 0,
         reveal: closed.indexOf('data-note-password-reveal') >= 0,
-        panel_back: closed.indexOf('data-note-password-panel') >= 0
+        // One Close puts both away - the password that was on screen and the form that
+        // produced it - because that is what the button in front of the reader says.
+        panel_back: closed.indexOf('data-note-password-panel') >= 0,
+        toggle_back: closed.indexOf('data-show-password') >= 0
     };
 }
 
@@ -449,6 +590,8 @@ const results = {};
     const env = inboxEnv();
     await env.evaluate("UI.renderAdminTab('Notes')");
     await env.evaluate("UI_MODULES.openNote(11)");
+    // The form has to be asked for first: it is folded behind the thread head's button.
+    await env.evaluate("UI_MODULES.showNotePasswordPanel()");
     const panel = render(env);
     const typed = 'Remember-This-One-2026';
     await env.evaluate("UI_MODULES.setNotePasswordDraft(" + JSON.stringify(typed) + ")");
@@ -646,15 +789,95 @@ def test_the_console_has_a_notes_tab_that_opens_on_the_queue(results):
     assert ["Notes", "notes"] in results["tabs"], "the tab is on the console"
     inbox = results["inbox"]
     assert [row["id"] for row in inbox["rows"]] == ["11", "12", "13"], "one row per note"
-    assert [chip["status"] for chip in inbox["chips"]] == ["all", "open", "in_progress", "resolved", "closed"]
-    assert inbox["chips"][0]["active"] is True, "the tab opens on everything, not on a filter"
-    assert "(1)" in inbox["chips"][1]["text"], "each chip carries how many notes are in that state"
+    assert [chip["turn"] for chip in inbox["turns"]] == ["all", "you", "them", "done"], (
+        "the queue is filtered by whose turn it is; the five status chips answered a "
+        "question the administrator did not have"
+    )
+    assert inbox["turns"][0]["active"] is True, "the tab opens on everything, not on a filter"
+    assert "(1)" in inbox["turns"][1]["text"], "each segment carries how many notes are in that state"
     waiting = next(row for row in inbox["rows"] if row["id"] == "11")
     assert waiting["unread"] is True, "a note nobody has opened is flagged"
     assert waiting["urgent"] is True, "so is one the worker marked urgent"
     assert "Bilal Khan" in waiting["text"] and "Password" in waiting["text"]
     assert inbox["has_search_box"] is True
     assert inbox["requests"] == 1
+    # A row is a conversation: it says which side owes an answer. The table had no column
+    # that could say it, because the status alone cannot - an open note the administrator
+    # just answered is still open.
+    assert "Waiting on you" in inbox["waiting_row"], inbox["waiting_row"]
+    # And the tab is two panes: the queue, and the note that opens beside it.
+    assert inbox["has_list_pane"] and inbox["has_thread_pane"], (
+        "opening a note must not replace the queue - that is what lost the filter, the "
+        "search and the reader's place in it"
+    )
+    assert inbox["blank_thread"], "the thread pane says what to do before anything is opened"
+
+
+def test_the_queue_narrows_by_whose_turn_it_is_without_asking_again(results):
+    turns = results["turns"]
+    assert turns["you"] == ["11"], "a note the worker wrote last is waiting on the administrator"
+    assert turns["them"] == ["12"], "one the administrator answered is waiting on the worker"
+    assert turns["done"] == ["13"], "resolved and closed are a state, not a turn"
+    assert turns["back_out"] == ["11", "12", "13"], "pressing the active segment clears it"
+    assert turns["all"] == ["11", "12", "13"], "and the first segment means every turn"
+    assert turns["resolved"] == ["13"], (
+        "the literal status filter is still there - \"show me everything closed\" is a real "
+        "errand that a turn cannot express"
+    )
+    assert turns["requests_added"] == 0, "all of it repaints from the rows already in hand"
+
+
+def test_the_queue_is_one_delegated_listener_over_data_hooks(results):
+    """Every control on the tab is a ``data-`` hook, answered in one place.
+
+    The CSP's inline-handler allowance may only fall, and a list of conversations is mostly
+    rows - seven handlers left this tab for one listener. What is worth asserting is that
+    the hooks are the ones the markup actually carries and that a press reaches the right
+    note: the open control reads its note from the row it sits in, and the reply button
+    answers the thread on screen rather than the row that was clicked.
+    """
+    routing = results["routing"]
+    assert routing["after_turn"] == ["11"], "the turn segment answered the press"
+    assert routing["opened_the_row_pressed"], "the open control opened the note in its own row"
+    assert len(routing["sent"]) == 1, "one press, one reply"
+    assert routing["sent"][0]["url"] == "/admin/notes/12/replies", (
+        "the reply must go to the thread on screen, not to the row that was clicked"
+    )
+    assert routing["sent"][0]["body"]["body"] == "On its way."
+    assert routing["back_hook"], "there is a way back out of a thread"
+    assert routing["threads_after_back"] == routing["threads_before_back"], (
+        "back leaves the queue exactly as it was - no request, nothing lost"
+    )
+    assert routing["threads_after_back"] == ["11"], (
+        "including the filter the reader had set: coming back out of a thread must not widen "
+        "the queue they were working through"
+    )
+    assert routing["blank_after_back"], "back empties the thread pane rather than leaving it"
+
+
+def test_a_tab_switch_lands_in_the_conversation_that_was_left_open(results):
+    """What the tab does with the thread when the reader comes back to it.
+
+    Two answers, and they differ by how the reader left. Back is how someone says they are
+    done with a conversation, so a tab switch after that opens on the queue; a thread that
+    was simply left open is where they land - because that is what a conversation does, and
+    losing your place is the cost of the old page-swap inbox.
+    """
+    reentry = results["reentry"]
+    assert reentry["blank_after_back"] is True, "back empties the thread pane"
+    assert reentry["list_after_reentry"] is True, (
+        "and the tab opened after that is the queue, not a conversation that was put down"
+    )
+    assert reentry["open_row_after_reentry"] is False, "with no row left marked open"
+    assert reentry["read_again"] == 0, "the queue already in hand is not re-read on the way in"
+    assert reentry["reopened_thread"] is True, (
+        "a conversation left open is where the reader lands"
+    )
+    assert reentry["reopened_read_again"] >= 1, (
+        "re-read rather than remembered: the queue payload carries only each note's last "
+        "message, so a thread held in memory would be a conversation frozen at the hour it "
+        "was last read, sitting beside a queue read a minute ago"
+    )
 
 
 def test_the_filters_narrow_what_is_on_screen_without_asking_again(results):
@@ -682,7 +905,19 @@ def test_a_note_opens_as_a_thread_with_the_workers_own_words(results):
     assert thread["internal_tagged"] is True, "and can tell it is one"
     assert thread["worker_named"] is True
     assert thread["has_reply_box"] is True and thread["has_back"] is True
-    assert thread["has_password_panel"] is True and thread["can_reset_offered"] is True
+    assert thread["folded_panel_hidden"] is True, (
+        "the reset form does not open with the thread - the conversation does"
+    )
+    assert thread["reset_toggle_offered"] is True, (
+        "but the way to it is in the head, where the reader already is"
+    )
+    assert thread["has_password_panel"] is True and thread["can_reset_offered"] is True, (
+        "and asking for it produces the form, not an empty card"
+    )
+    assert thread["queue_still_there"] == ["11", "12", "13"], (
+        "the queue stays on screen - reading a note is not a page swap"
+    )
+    assert thread["day_marker"], "the thread marks the day instead of leaving it to be computed"
 
 
 def test_answering_goes_to_that_note_with_the_text_the_flag_and_the_status(results):
@@ -727,7 +962,12 @@ def test_the_password_reset_reveals_once_and_never_lands_in_the_note(results):
     assert reset["copied"] == password, "the copy button hands over the password that was set"
     assert reset["after_dismiss"]["html_has_password"] is False, "it is stored nowhere"
     assert reset["after_dismiss"]["reveal"] is False
-    assert reset["after_dismiss"]["panel_back"] is True, "the reset offer is still there"
+    assert reset["after_dismiss"]["panel_back"] is False, (
+        "closing the reveal closes the form with it - one Close, one meaning"
+    )
+    assert reset["after_dismiss"]["toggle_back"] is True, (
+        "while the offer itself stays in the thread head"
+    )
 
 
 def test_a_password_for_a_note_can_be_typed_or_generated(results):

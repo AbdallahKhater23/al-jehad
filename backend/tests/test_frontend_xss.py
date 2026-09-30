@@ -252,7 +252,15 @@ INLINE_HANDLER_BUDGET = {
     # beside: it was the last handler on that tab, and the one attribute in the console with a
     # *site name* in it - so the count coming down is not tidiness, it is one fewer place a
     # name from the database is written into executable text.
-    "admin_modules.js": 57,
+    #
+    # 49 since the Notes tab's queue became a list of conversations: opening a note, replying,
+    # going back, clearing the search and the three password controls were seven handlers
+    # between them, and one of them put a *note id* and a whole thread's worth of rows on the
+    # page. The tab now answers all of them in ``onNotesClick``, and the one handler left in
+    # that region is the manual-password box's ``oninput`` - which the suite asserts by name
+    # (``test_a_password_for_a_note_can_be_typed_or_generated``) because the box has to record
+    # every keystroke without a repaint that would wipe the reply beside it.
+    "admin_modules.js": 49,
     "frontendjavascript.js": 19,
     "worker_modules.js": 10,
 }

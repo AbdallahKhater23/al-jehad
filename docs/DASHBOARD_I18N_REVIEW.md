@@ -256,6 +256,54 @@ sentence now names what was typed: *No site matches "{query}"*, with `sitesNoMat
 | ST-4 | `sitesCategoriesEmpty` | Watch - terse by design | *No categories yet.* The fold it sits in already carries `sitesCategoriesHint`, so this is a full stop rather than a second explanation; the Arabic `لا توجد فئات بعد.` and the Urdu `ابھی کوئی زمرہ نہیں۔` mirror that. Not wrong, but it is the shortest sentence in the group and the one whose *tone* a native reader would settle. |
 | ST-5 | `sitesSearchPlaceholder` | Checked against the code, not by a reader | *Name or category* (Arabic `الاسم أو الفئة`), which is what `sitesMatches` actually filters on - a name or a category, never an id. Recorded because a placeholder that promises more than the filter delivers is the commonest lie a search box tells. |
 
+## Added after this review: the Notes tab
+
+Twelve strings, written with that tab's redesign - the queue read as a conversation. Six are
+the screen's own labels (whose turn it is, the empty thread, the *Any status* option) and six
+are a small time vocabulary the whole console can now use. Two are **watch** items rather
+than faults, and one is a number-agreement problem the English cannot see.
+
+The tab's other words were deliberately **not** written. The subject, the preview, the day
+marker's date, the status labels, `noteOpened`, `noteReplyToWorker` and the internal-message
+badge all reuse the strings the tab already had; the queue's whole rewrite is a change of
+*shape* (a row is a person and what was said last, with the turn pill naming the state) rather
+than a rename of what a note is. The one new *concept* is whose turn it is, and that is where
+the three languages disagree with each other.
+
+| # | Key | Class | Note |
+|---|---|---|---|
+| NM-1 | `notesWaitingOnYou`, `notesWaitingOnThem` | Watch - the same idea in three shapes | English names the *turn* (*Waiting on you* / *Waiting on them*); Hindi and Urdu kept the turn (आपकी प्रतीक्षा में / ان کی باری) while Arabic named the *wait* (بانتظارك - "in your waiting"). The pill sits on every row of the queue and is the one thing the tab adds to a note, so it is read more than anything else here. Idiomatically both parenthesese are fine Arabic; the asymmetry with the other two languages is the thing to confirm rather than the phrase itself. |
+| NM-2 | `notesDone` | Drift - a third word for one state | *Done* (منتهية / पूरा / مکمل) joins `noteStatusClosed` (*Closed*) and the resolved wording already in the tables as a way of saying a note is finished. On the segment it means "neither side owes the other anything" - resolved *or* closed - so it cannot simply reuse `noteStatusClosed`, but the reader who has just seen a **Closed** chip on the same row is being told the same fact in two words. Worth deciding whether the segment should read *Finished* in all four. |
+| NM-3 | `timeMinutesAgo`, `timeHoursAgo`, `timeDaysAgo` | Watch - number agreement, in all three languages | Nothing in the tables pluralises: the keys are `{count} min ago`, `{count} h ago`, `{count} d ago`. Arabic `قبل {count} دقيقة` is the singular and is wrong from 3 to 10 ("before 3 minute"), which is the range most rows fall in; Hindi and Urdu carry the same risk less sharply. SM-1 worked around this in the Shifts tab by phrasing around the count; these three cannot, because a relative time is the count. The real fix is a plural rule in `I18n` - the note here is that this redesign spread the problem from one tab's coverage strip to every timestamp in the console. |
+| NM-4 | `timeYesterday` | Noted - a word that means two things in Hindi and Urdu | कल and کل are both "yesterday" *and* "tomorrow". The English key only ever means the past, and the marker is only drawn for past days, so the copy is correct today - but a future note (a shift that has not happened) would be labelled with the same word, and a reader who sees it as "tomorrow" is not wrong about the word. Recorded for whoever adds the first future-facing timestamp. |
+| NM-5 | `notesThreadEmptyHint` | Checked against the code, not by a reader | *Choose one from the list, or search for a name, an ID or a word from the message.* The three things promised are the three things `notesMatches` actually searches (worker name, worker id, subject/body/last-message text), so the sentence is true - the same check ST-5 records on the Sites tab. Arabic uses a comma inside the list and repeats `أو` twice, which is ordinary prose; the Hindi and Urdu use the same two-`or` shape. |
+| NM-6 | `notesStatusAny` | Drift - a second *Any* | The Credentials roster already has a role filter with its own "any" phrasing. Two filters, two tabs, one word - the same shape as ST-2. Nothing here is wrong; it is the sort of pair that drifts apart one string at a time. |
+
+Two keys were deliberately **not** written, and the choice is worth recording: the worker's
+side of the same conversation reuses `noteFromYou` / `noteFromAdmin` and `noteOpened` rather
+than gaining its own narrator, because the two screens are one conversation and a worker reading
+"الآن" where the administrator read "الآن" is the point of writing the time keys once in the
+shared namespace rather than in the note's.
+
+## Added after this review: the clock card
+
+One string, and one place where the console stops using strings for a date at all, both with
+the worker's clock card redesign - the timer's ring and the line under it.
+
+| # | Key | Class | Note |
+|---|---|---|---|
+| CC-1 | `handPaidRemaining` | Checked against the fix, not by a reader | *{left} left of the paid day* renders `{left}` as a duration the app formats (`4h 46m`, `15m`), never a bare count - so the phrase agrees with nothing and is grammatical for every value, which is the workaround SM-1 needed and NM-3 could not use. Arabic `باقي {left} من يوم العمل`, Hindi `भुगतान दिवस में {left} शेष`, Urdu `{left} باقی معاوضہ دن`. The English word order ("4h 46m left") does not survive translation in any of the three, which is expected and correct: the placeholder is a token, not a number. |
+
+**The date on the same card is not a table entry.** `#clockToday` is the caption under the
+time of day, and it is the first date in this application formatted for a *reader* rather than
+for a record: `Intl.DateTimeFormat` with the language's own locale (`en-GB`, `ar`, `hi-IN`,
+`ur-PK`) gives "Wed 30 Sept" / "الأربعاء، ٣٠ سبتمبر", digits and all. Everywhere else the
+console prints the server's zone-less `YYYY-MM-DD HH:MM:SS` because a timesheet row has to be
+exact and unambiguous; a heading on a worker's own phone is the one place the same fact is
+allowed to be *readable*. Where an engine has no locale data for the chosen language it falls
+back to the ISO day rather than to nothing, so the caption can read as English-ISO on a phone
+with a stripped ICU - visible, wrong, and better than empty.
+
 ## What this review cannot conclude
 
 Register and idiom for a *native* reader: whether `متوقف`, `सुप्त` or `غیر حاضر` is the word a

@@ -160,6 +160,11 @@ const State = {
     // should not lose the filter every time they open a note and come back.
     notesQuery: '',
     notesStatus: '',
+    // Whose turn the queue is narrowed to: '' for all of it, or the side that owes an
+    // answer. Held beside the status filter for the same reason - the two panes repaint
+    // from a string, and a selection that lived only in the markup would be lost on the
+    // next repaint.
+    notesTurn: '',
     // And for the shift board: the board repaints itself every 45 seconds, and an
     // admin halfway through typing a name must not have it wiped under them.
     liveOpsQuery: '',
@@ -1433,6 +1438,92 @@ const SHIFT_CLOCK = {
 
 const UI = {
     get appContainer() { return document.getElementById('app'); },
+
+    /**
+     * A timestamp as a person reads it: "Just now", "12 min ago", "3 h ago", "Yesterday".
+     *
+     * A note screen is a conversation, and a conversation is dated in words rather than in
+     * a column of identical stamps: "2026-09-14 07:10:00" twice in a list answers nothing,
+     * while "3 h ago" against "Yesterday" says which of the two is still warm. Past a week
+     * the words stop being an improvement and stop: the day itself is shown, because "23 d
+     * ago" is a subtraction, not a date. The full stamp stays on the ``title`` of the
+     * element that carries this, so the exact time is still one hover away.
+     *
+     * The server writes SQLite timestamps (``2026-09-14 07:10:00``). The space is turned into
+     * a ``T`` before parsing: the space form is not in the spec's date grammar, so Safari has
+     * historically refused it, and a bare date-time is read as local time - which is what
+     * the rest of this console assumes every server stamp already is.
+     */
+    timeAgo(value) {
+        const raw = String(value === null || value === undefined ? '' : value).trim();
+        if (!raw) return '';
+        const at = new Date(raw.replace(' ', 'T'));
+        const stamp = at.getTime();
+        if (!stamp || isNaN(stamp)) return raw;
+        const seconds = Math.round((Date.now() - stamp) / 1000);
+        // A clock a minute or two ahead of the server's is normal, and "-1 min ago" is
+        // worse than "just now"; anything further in the future is shown as its own date.
+        if (seconds < 0) return seconds > -300 ? I18n.__('timeJustNow') : raw.slice(0, 10);
+        if (seconds < 90) return I18n.__('timeJustNow');
+        const minutes = Math.round(seconds / 60);
+        if (minutes < 60) return I18n.__('timeMinutesAgo').replace('{count}', minutes);
+        const hours = Math.round(minutes / 60);
+        if (hours < 24) return I18n.__('timeHoursAgo').replace('{count}', hours);
+        const days = Math.round(hours / 24);
+        if (days <= 1) return I18n.__('timeYesterday');
+        if (days < 7) return I18n.__('timeDaysAgo').replace('{count}', days);
+        return raw.slice(0, 10);
+    },
+
+    /** The day part of a timestamp - ``2026-09-14 07:10:00`` in, ``2026-09-14`` out. */
+    dayOf(value) {
+        return String(value === null || value === undefined ? '' : value).trim().slice(0, 10);
+    },
+
+    /**
+     * The day a thread's marker names: "Today" and "Yesterday" are read faster than a date,
+     * and anything older is the date itself.
+     *
+     * Both note threads draw this marker - the administrator's and the worker's - from here,
+     * so one of them cannot start saying something the other does not.
+     */
+    dayLabel(stamp) {
+        const pad = (value) => String(value).padStart(2, '0');
+        const name = (date) => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+        const today = new Date();
+        if (stamp === name(today)) return I18n.__('notesToday');
+        if (stamp === name(new Date(today.getTime() - 86400000))) return I18n.__('timeYesterday');
+        return stamp;
+    },
+
+    /**
+     * Puts the newest message in view.
+     *
+     * A conversation is read from the bottom, and a thread that opens at its first message
+     * makes every reader scroll before they reach the answer the screen exists to show.
+     * Every step is guarded: a stub DOM has no layout at all.
+     */
+    /**
+     * Opens a conversation at its newest message rather than its oldest.
+     *
+     * The scroller is not always the box named here: the messages have their own scroll
+     * area only on a laptop, while the handset's whole view and the phone's page scroll
+     * instead. Walking up from the newest message and pushing down every ancestor that can
+     * scroll is what makes "you land on what was just said" true on all of them without
+     * each caller knowing which one it is.
+     */
+    scrollToLatest(id) {
+        const pane = document.getElementById(id);
+        if (!pane || typeof pane.scrollHeight !== 'number') return;
+        pane.scrollTop = pane.scrollHeight;
+        let node = pane.parentElement;
+        while (node) {
+            if (typeof node.scrollHeight === 'number' && node.scrollHeight > node.clientHeight) {
+                node.scrollTop = node.scrollHeight;
+            }
+            node = node.parentElement;
+        }
+    },
 
     async init() {
         // Before anything is drawn: the chosen language may be a file this tab has not

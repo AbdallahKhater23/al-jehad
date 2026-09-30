@@ -179,6 +179,32 @@ def test_the_clock_button_is_a_thumb_and_not_a_poster():
     assert _length(compact, "min-height") <= 80
 
 
+def _token_px(name: str) -> int:
+    """A spacing token's value in pixels, so a rule using one is still checked in real px."""
+    match = re.search(rf"{re.escape(name)}\s*:\s*(\d+)px", STYLE)
+    assert match, f"the {name} token is gone from the scale"
+    return int(match.group(1))
+
+
+def test_the_clock_panel_is_a_stack_of_blocks_and_not_one_slab():
+    """The card, the button and the readiness line need a gap between them.
+
+    The panel paints into a plain div - not into the flex parent itself - so the gap on
+    ``.hand-main`` never reached the blocks. Measured in a browser before this rule existed:
+    the shift card's last pixel and the button's first pixel were the same pixel, and the same
+    again between the button and the facts below it, which is most of why the screen read as
+    one undifferentiated slab rather than as a card with an action under it.
+    """
+    rule = _rule(STYLE, ".hand-panel")
+    assert rule, "the clock panel's own column is gone - its blocks are flush again"
+    assert "flex-direction: column" in rule
+    gap = re.search(r"gap\s*:\s*var\((--[\w-]+)\)", rule)
+    assert gap, f"the column has no gap: {rule!r}"
+    assert _token_px(gap.group(1)) >= 12, (
+        f"{gap.group(1)} is under 12px, which reads as a rendering artefact rather than a gap"
+    )
+
+
 def test_the_solid_action_fills_carry_white_text_in_both_themes():
     """A fill is a contrast promise, and the promise is white text on it.
 

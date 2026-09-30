@@ -2330,6 +2330,21 @@ A note is a **thread**, not a form. The administrator answers, or asks a questio
 the worker answers back - which is the difference between a request that gets handled
 and a form somebody submits into silence.
 
+**Both screens read as that thread, not as a record of forms.** The administrator's queue
+is a list of people: the subject, then what was said **last** with who said it, then how
+long ago in words, and over it a segment bar that answers the only question a queue is
+opened to ask - *whose turn is this* - as **All / Waiting on you / Waiting on them /
+Done**, each carrying its count. The narrower, literal *status* select sits beside it,
+because "everything still open" is a real errand a turn cannot express. Opening a note
+paints the conversation **beside** the queue rather than over it - under 900px it stacks
+and the thread head grows the button back to the list - so a reader working through a
+queue never loses their place in it, and the reply box takes the cursor. The worker's side
+is the same reading: the last message previewed under the author's name, a *day* marker
+whenever a thread crosses midnight, times as "27 min ago" rather than a raw stamp, and a
+thread that opens on its newest message. Nothing on either screen asks the server for
+anything on a timer: what makes the tab feel alive is the preview, the relative time and
+the unread marker, not a poll.
+
 ```
 POST /api/v1/worker/notes                    open one (any signed-in user, incl. a moallem or off-office worker)
 GET  /api/v1/worker/notes                    your own, plus the open/unread counts
@@ -2363,9 +2378,12 @@ The rules that are not obvious from the endpoints:
   a whole site behind one tunnel shares an address, and one worker's backlog must not
   silence their colleagues. Resolving one makes room again.
 
-**Password help is answered, not stored.** For a note whose author's password may be
-reset, the dashboard offers a password box beside *Set a new password*: type one, or leave
-it empty and the button generates one. Either way it calls the same
+**Password help is answered, not stored.** A thread whose author's password may be reset
+carries a *Set a new password* button in its head - folded, because a conversation is read
+far more often than a password is issued, and a credential form parked above the messages
+made every thread open on one. Unfolded, it offers a password box beside *Set a new
+password*: type one, or leave it empty and the button generates one; one *Close* puts both
+the box and the revealed password away. Either way it calls the same
 `/admin/users/edit_password` the **Credentials** tab calls - so the same
 `token_version` bump signs the account out everywhere - reveals the password
 once, and prefills a reply. The password is deliberately **not** written into the note:
@@ -2463,6 +2481,35 @@ The app ships two dedicated layouts and switches automatically:
 
 Force a mode for testing with `localStorage.layoutOverride = 'mobile' | 'desktop'`,
 and point the front-end at another backend with `localStorage.apiBaseURL`.
+
+### The worker's clock card
+
+The card at the top of the **Clock** tab is the one screen a worker opens standing at a gate,
+and it is built around the two questions they arrive with: *what time is it*, and *how much of
+my day is left*. On shift the figure is the live elapsed timer with a ring beside it showing
+how much of the paid day that is, and a line under it counting the rest down in words ("5h 45m
+left of the paid day"). Past the paid day the ring changes hue, the line states the verdict and
+the overtime note appears - all three written by the same tick from the same figure, so the
+colour is never the only thing that moved.
+
+With no shift running the figure is the phone's own time with the date under it. A time clock
+that never shows the time is the first thing that reads as cheap about this screen; the row
+underneath still carries the paid day and the unpaid break, so what a day is worth is visible
+*before* the punch that starts it rather than only after it.
+
+Three smaller decisions came with the same redesign. The panel is a column with a real gap
+(`.hand-panel`), because it paints into a plain div inside the flex parent and the parent's gap
+never reached its blocks - the card, the button and the line under it were flush against each
+other and read as one slab. Whether this phone can record a punch at all - location and camera,
+the two things a punch is made of - is a one-line footnote under the button with a state dot,
+where it was a tile the same size as the shift card. And the clock-in stamp stays printed
+exactly as the server recorded it, on a line of its own: nineteen characters do not fit a third
+of a 342px card, and wrapped to two lines it made the figures on that row look misaligned.
+
+The day's figures come from the server's own policy (`paid_day_hours`, `break_minutes`,
+`break_after_hours`) and the countdown applies the same rule the payroll arithmetic does: the
+break is only deducted once the shift is long enough to have contained one, so the ring and the
+line agree with the overtime alert rather than with a hardcoded eight hours.
 
 ### The phone console's sticky band
 

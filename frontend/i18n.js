@@ -297,6 +297,18 @@ const TRANSLATIONS = {
         "notesSearchPlaceholder": "Name, ID, title or text",
         "notesFiltered": "Filtered",
         "notesWaiting": "Waiting",
+        "notesWaitingOnYou": "Waiting on you",
+        "notesWaitingOnThem": "Waiting on them",
+        "notesDone": "Done",
+        "notesStatusAny": "Any status",
+        "notesThreadEmpty": "Pick a note to read",
+        "notesThreadEmptyHint": "Choose one from the list, or search for a name, an ID or a word from the message.",
+        "notesToday": "Today",
+        "timeJustNow": "Just now",
+        "timeMinutesAgo": "{count} min ago",
+        "timeHoursAgo": "{count} h ago",
+        "timeYesterday": "Yesterday",
+        "timeDaysAgo": "{count} d ago",
         "noteSetPassword": "Set a new password",
         "noteSetPasswordHint": "Creates a password, shows it once, and signs the account out on every device. It is never written into the note.",
         "notePasswordProtected": "Only a head administrator can change an administrator's password.",
@@ -584,6 +596,10 @@ const TRANSLATIONS = {
         "timesheetHistory": "Timesheet History",
         "noHistory": "No attendance records yet.",
         "handTimeOnShift": "Time on shift",
+        //: The line under the timer: how much of the paid day is still ahead. The count is a
+        //: rendered duration ("4h 46m"), not a bare number, so no language has to agree with
+        //: it in number or case - which is the same ground ``shiftsCoverageDays`` stood on.
+        "handPaidRemaining": "{left} left of the paid day",
         "handNoHistoryHint": "Every clock-in and clock-out you make appears here, newest first.",
         // Handset access for an account that also runs the console, and the timesheet of
         // its own that account can read and download.
