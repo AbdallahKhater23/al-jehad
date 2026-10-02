@@ -1294,10 +1294,10 @@ async def upload_sync_photo(
 
     try:
         scored = await score_queued_selfie(current.id, blob)
-    except face_engine.FaceEngineBusy as exc:
+    except (face_engine.FaceEngineBusy, face_engine.FaceEngineUnavailable) as exc:
         # Nothing has been written and nothing is recorded as scored, so the retry is a first
         # attempt rather than a second one.
-        raise face_engine.busy_http_exception(exc) from None
+        raise face_engine.http_exception_for(exc) from None
 
     attention = _selfie_attention(scored)
     now_str = datetime.now().strftime(_TS)

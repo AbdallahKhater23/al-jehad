@@ -90,8 +90,22 @@ ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
 #                               and it is a measurement tool, not something the site needs to
 #                               clock in. ``python -m coverage_report --once`` is the
 #                               cron-shaped way to keep the report current off-box.
+#   FACE_ENGINE_PROCESS=1     - the models leave this process. The FaceNet graph (87 MB on disk)
+#                               and the detector's arena are a one-time floor the API process can
+#                               never give back, and an ONNX allocation failure or a corrupt model
+#                               kills whichever process they are in. In a child interpreter (see
+#                               ``backend/face_process.py``) the *critical* process stops carrying
+#                               them, and a crash ends one punch - the next call respawns the
+#                               child. Measured with ``tools/face_process_memory.py``: the API
+#                               process's floor goes from +211.9 MiB to +3.8 MiB while the child
+#                               holds 279.0 MiB, so the host total grows and the process serving the
+#                               gate, the console and every non-face endpoint shrinks. Its failure
+#                               modes are already answered: a child that dies or stops answering is
+#                               a coded ``503 + Retry-After`` (``face_check_unavailable``), never an
+#                               unhandled 500.
 ENV FACE_INFERENCE_QUEUE=8 \
-    STANDING_SWEEP_ENABLED=0
+    STANDING_SWEEP_ENABLED=0 \
+    FACE_ENGINE_PROCESS=1
 
 # Dependencies first, so an application-only change does not re-download the wheels.
 #

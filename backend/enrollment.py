@@ -674,8 +674,8 @@ async def submit_enrollment(
         decision, embedding = await face_engine.ENGINE.run_async(
             embed_reference, image, stage="self_service"
         )
-    except face_engine.FaceEngineBusy as exc:
-        raise face_engine.busy_http_exception(exc) from None
+    except (face_engine.FaceEngineBusy, face_engine.FaceEngineUnavailable) as exc:
+        raise face_engine.http_exception_for(exc) from None
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except HTTPException:
@@ -981,9 +981,19 @@ def _process_item(job_id: int, item: sqlite3.Row, *, archive, photos: dict[str, 
     # it. Collapsing them into one call would report both as one or the other.
     try:
         decision = face_engine.ENGINE.run(_require_liveness, image, stage="bulk_import")
-    except face_engine.FaceEngineBusy as exc:
+    except (face_engine.FaceEngineBusy, face_engine.FaceEngineUnavailable) as exc:
+        # An item-level failure either way - a batch of photographs must not answer with a
+        # server fault, and the two codes stay apart because "the queue was full" and "the
+        # models could not be reached" are different things for an operator to see.
         with db(write=True) as conn:
-            finish(conn, ITEM_FAILED, "engine_busy", str(exc))
+            finish(
+                conn,
+                ITEM_FAILED,
+                "engine_busy"
+                if isinstance(exc, face_engine.FaceEngineBusy)
+                else "engine_unavailable",
+                str(exc),
+            )
         return "failed"
     except HTTPException as exc:
         reason = exc.detail.get("error_code") if isinstance(exc.detail, dict) else str(exc.detail)
@@ -998,9 +1008,19 @@ def _process_item(job_id: int, item: sqlite3.Row, *, archive, photos: dict[str, 
 
     try:
         embedding = face_engine.ENGINE.run(_embed_image, image)
-    except face_engine.FaceEngineBusy as exc:
+    except (face_engine.FaceEngineBusy, face_engine.FaceEngineUnavailable) as exc:
+        # An item-level failure either way - a batch of photographs must not answer with a
+        # server fault, and the two codes stay apart because "the queue was full" and "the
+        # models could not be reached" are different things for an operator to see.
         with db(write=True) as conn:
-            finish(conn, ITEM_FAILED, "engine_busy", str(exc))
+            finish(
+                conn,
+                ITEM_FAILED,
+                "engine_busy"
+                if isinstance(exc, face_engine.FaceEngineBusy)
+                else "engine_unavailable",
+                str(exc),
+            )
         return "failed"
     except ValueError as exc:
         with db(write=True) as conn:

@@ -989,11 +989,11 @@ async def submit_registration(
             decision, embedding = await face_engine.ENGINE.run_async(
                 enrollment.embed_reference, image, stage="registration_intake"
             )
-        except face_engine.FaceEngineBusy as exc:
+        except (face_engine.FaceEngineBusy, face_engine.FaceEngineUnavailable) as exc:
             # The pool is the gate's own. Answering "busy" rather than queueing a stranger ahead
             # of a worker at a gate is the honest order of priorities, and this form can be sent
             # again.
-            raise face_engine.busy_http_exception(exc) from None
+            raise face_engine.http_exception_for(exc) from None
 
         password_hash = hash_password(password)
         stamp = _now()
