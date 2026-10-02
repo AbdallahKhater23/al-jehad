@@ -548,6 +548,24 @@ class FakeFaceNetEngine:
         return _unit(vector)
 
 
+#: The fixture-driven suite stubs the models **in this process** (``FAKE_ENGINE`` below, and
+#: ``face_detector.detect_and_align`` further down), so it always runs the in-process engine -
+#: whatever the host's environment says. ``FACE_ENGINE_PROCESS=1`` in a developer's shell (or a
+#: CI job handed the deployment's own variables) would otherwise send every stubbed punch
+#: through a real child process: the child imports the *real* models, answers the fixtures'
+#: synthetic frames with "no face detected", and the punch, liveness and metrics suites fail
+#: for a reason that has nothing to do with the code under test (measured: 24 failures in
+#: ``test_metrics`` and ``test_phase02_liveness_and_shifts`` alone).
+#:
+#: The child mode is not thereby untested, it is tested where it belongs: ``test_face_process``
+#: (the transport against a stub worker that speaks the real protocol, plus the engine, liveness
+#: and preload wiring) and ``tools/face_process_memory.py`` for the real models. A test that
+#: wants the child asks for it explicitly - see that suite's ``remote`` fixture. Pinning it here
+#: is what keeps the rest of the suite a test of the application rather than of this machine.
+import config as _config
+
+_config.settings.face_engine_process = False
+
 FAKE_ENGINE = FakeFaceNetEngine()
 #: The seam is ``face_onnx``'s shared engine, replaced through its own setter rather than by
 #: monkeypatching ``get_engine`` - so every path that embeds (the punch, the four enrollment

@@ -337,13 +337,17 @@ class Settings(BaseModel):
     #: burst instead of shedding it.
     face_inference_wait_seconds: float = 20.0
     #  ``face_engine_process`` moves the model calls into a child process (see
-    #  ``face_process`` and ``face_worker``). **Off by default, and it is a prototype.**
+    #  ``face_process`` and ``face_worker``). **Off by default here, on in the deployment image**
+    #  (``Dockerfile``: ``FACE_ENGINE_PROCESS=1``). The library default is what the test suite
+    #  and the tools run - a suite whose models are stubbed in-process must not spawn real ones -
+    #  and the image is where the trade below is actually wanted.
     #
     #  What it buys: the API process stops importing the 87 MiB FaceNet graph, stops
     #  building an ONNX session and stops running a detector, so an ONNX Runtime allocation
     #  failure, a corrupt model or the kernel's OOM killer ends the *child* - which the next
     #  punch restarts - instead of ending the process that serves the gate, the console and
-    #  every other endpoint. What it costs: a second interpreter, every frame copied over a
+    #  every other endpoint. Measured with ``tools/face_process_memory.py``: the API process's
+    #  floor falls from +211.9 MiB to +3.8 MiB while the child holds 279.0 MiB. What it costs: a second interpreter, every frame copied over a
     #  pipe, one inference at a time (see ``face_process``) and a slightly *larger* host
     #  total, because the models now live in a process of their own. This is a decision about
     #  survivability, not about the size of the machine, which is why it is a flag.

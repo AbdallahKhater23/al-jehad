@@ -773,8 +773,8 @@ async def submit_quick_punch(
 
     try:
         liveness_decision = await face_engine.ENGINE.run_async(liveness.inspect, rgb_array)
-    except face_engine.FaceEngineBusy as exc:
-        raise face_engine.busy_http_exception(exc) from None
+    except (face_engine.FaceEngineBusy, face_engine.FaceEngineUnavailable) as exc:
+        raise face_engine.http_exception_for(exc) from None
     liveness_class, liveness_score = liveness_decision.log_fields()
     if not liveness_decision.allowed:
         with db(write=True) as conn:
@@ -816,8 +816,8 @@ async def submit_quick_punch(
         # One pool slot for the whole detection, so a burst of taps cannot spawn forty
         # simultaneous TensorFlow calls - and it is awaited, not run on the event loop.
         faces = await face_engine.ENGINE.run_async(detect_faces_sync, img_array)
-    except face_engine.FaceEngineBusy as exc:
-        raise face_engine.busy_http_exception(exc) from None
+    except (face_engine.FaceEngineBusy, face_engine.FaceEngineUnavailable) as exc:
+        raise face_engine.http_exception_for(exc) from None
     subjects = _subject_report(faces)
     if subjects.merged or subjects.specks:
         log.info("face detection on a clock-link selfie: %s", subjects.summary())

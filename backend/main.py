@@ -2284,8 +2284,8 @@ async def enroll_my_face(
         decision, embedding = await face_engine.ENGINE.run_async(
             enrollment.embed_reference, image, stage="console_self_enroll"
         )
-    except face_engine.FaceEngineBusy as exc:
-        raise face_engine.busy_http_exception(exc) from None
+    except (face_engine.FaceEngineBusy, face_engine.FaceEngineUnavailable) as exc:
+        raise face_engine.http_exception_for(exc) from None
     except HTTPException:
         # A liveness refusal is a 422 written for the person in front of the camera; it is
         # not ours to rewrite into something vaguer.
@@ -2828,8 +2828,8 @@ async def verify_worker(
         liveness_decision, face_data, image = await face_engine.ENGINE.run_async(
             judge_punch_frame, reference_filepath if has_reference else None, photo.path
         )
-    except face_engine.FaceEngineBusy as exc:
-        raise face_engine.busy_http_exception(exc) from None
+    except (face_engine.FaceEngineBusy, face_engine.FaceEngineUnavailable) as exc:
+        raise face_engine.http_exception_for(exc) from None
     finally:
         # The upload has done its job: the frame the models judged is in memory now, and nothing
         # below reads the file again. Removed on *every* path - a full queue, a photo that would
@@ -3705,8 +3705,8 @@ async def create_user(
             decision, embedding = await face_engine.ENGINE.run_async(
                 enrollment.embed_reference, image, stage="console_create"
             )
-        except face_engine.FaceEngineBusy as exc:
-            raise face_engine.busy_http_exception(exc) from None
+        except (face_engine.FaceEngineBusy, face_engine.FaceEngineUnavailable) as exc:
+            raise face_engine.http_exception_for(exc) from None
 
     now = datetime.now()
     with db(write=True) as conn:
@@ -5981,8 +5981,8 @@ async def enroll_worker(
                 request=request,
             )
         return {"status": "success", "message": f"Facial data for worker {worker_id} successfully enrolled."}
-    except face_engine.FaceEngineBusy as exc:
-        raise face_engine.busy_http_exception(exc) from None
+    except (face_engine.FaceEngineBusy, face_engine.FaceEngineUnavailable) as exc:
+        raise face_engine.http_exception_for(exc) from None
     except HTTPException:
         raise
     except ValueError:

@@ -121,10 +121,14 @@ class FaceEngineNested(FaceEngineError):
 
 
 class FaceEngineUnavailable(FaceEngineError):
-    """The pool could not be brought up at all (no capacity, a worker that will not start).
+    """The engine could not answer at all: no pool, no usable model, a model process that died.
 
-    Distinct from ``FaceEngineBusy``: busy means "try again shortly", this means the engine
-    itself is not there - a 500 rather than a 503.
+    Distinct from ``FaceEngineBusy`` in what it says about the *work*, not in what it asks the
+    caller to do: busy means "the queue stayed full", this means "the models could not be
+    reached" - a child that exited, was killed at its deadline (see ``face_process``), or a host
+    with no usable graph. Both are the server being unable to answer rather than an answer, so
+    both are answered with 503 + ``Retry-After`` and neither may blame the photograph (see
+    ``http_exception_for``).
     """
 
 
@@ -656,6 +660,46 @@ def busy_http_exception(exc: FaceEngineError | None = None):
         },
         headers={"Retry-After": "5"},
     )
+
+
+def unavailable_http_exception(exc: FaceEngineError | None = None):
+    """The 503 a *model* failure answers with: nothing was judged, so nothing is the caller's.
+
+    The same contract as ``busy_http_exception`` - the photo and the account are fine, the server
+    could not do the work, try again in a few seconds - and it is a separate sentence because the
+    two are different facts about the server: a full queue is a busy moment, an unreachable model
+    process is the models being down. It travels as its own ``error_code`` for the same reason the
+    busy one does: an operator reading a support ticket, or a client deciding whether to retry now
+    or to send the worker to re-enroll, has to be able to tell them apart.
+    """
+    from fastapi import HTTPException
+
+    return HTTPException(
+        status_code=503,
+        detail={
+            "error_code": "face_check_unavailable",
+            "message": (
+                "The server could not check the photo right now. Nothing is wrong with your "
+                "photo or your account - please try again in a few seconds."
+            ),
+            "retry_after_seconds": 5,
+            **({"reason": str(exc)} if exc is not None else {}),
+        },
+        headers={"Retry-After": "5"},
+    )
+
+
+def http_exception_for(exc: FaceEngineError):
+    """The HTTP answer for an engine failure, decided in one place.
+
+    Every endpoint that submits to this engine goes through here, so a failure mode cannot be a
+    coded 503 at one endpoint and an unhandled 500 at another - which is exactly what an
+    unreachable model process used to be: a dead or killed child raised ``FaceEngineUnavailable``
+    straight out of the punch, where only ``FaceEngineBusy`` was caught.
+    """
+    if isinstance(exc, FaceEngineUnavailable):
+        return unavailable_http_exception(exc)
+    return busy_http_exception(exc)
 
 
 def describe_failure(exc: BaseException) -> str:

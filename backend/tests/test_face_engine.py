@@ -160,6 +160,63 @@ def test_a_refusal_does_not_leave_a_half_recorded_punch(client, monkeypatch):
             holder.result(timeout=5)
 
 
+def test_a_dead_model_process_answers_the_punch_with_503_not_a_crash(client, monkeypatch):
+    """The child-process failure, at the gate: a coded 503, never a bare 500.
+
+    ``FaceEngineUnavailable`` is what a model process that exited, was killed at its deadline or
+    could not be started raises (see ``face_process``). The punch used to catch only
+    ``FaceEngineBusy``, so a dead child left the endpoint as an unhandled exception: the worker
+    got a 500 that told them nothing, the server logged a traceback, and no client could tell a
+    retryable moment from a broken deployment.
+    """
+
+    async def _dead(*args, **kwargs):
+        raise face_engine.FaceEngineUnavailable("the face model process exited (code 1)")
+
+    monkeypatch.setattr(face_engine.ENGINE, "run_async", _dead)
+    before = harness.db_scalar("SELECT COUNT(*) FROM attendance_logs")
+    response = harness.clock_in(client, MOALLEM, headers=bearer(MOALLEM), image=jpeg_bytes())
+    assert response.status_code == 503, response.text[:300]
+    assert response.headers.get("Retry-After") == "5"
+    detail = response.json()["detail"]
+    assert detail["error_code"] == "face_check_unavailable"
+    assert "try again" in detail["message"].lower()
+    assert "wrong" not in detail["message"].split("Nothing is wrong")[0].lower(), (
+        "an unreachable model process must not be reported as a problem with the photo"
+    )
+    # Nothing was judged, so nothing was recorded - the same rule the busy refusal follows.
+    assert harness.db_scalar("SELECT COUNT(*) FROM attendance_logs") == before
+    assert (
+        harness.db_scalar("SELECT COUNT(*) FROM active_sessions WHERE worker_id = ?", (MOALLEM,)) == 0
+    )
+
+
+def test_the_two_engine_failures_have_two_codes_and_one_answer():
+    """One mapping for every endpoint: a full queue and an unreachable model both answer 503.
+
+    They stay distinguishable - ``face_check_busy`` is a busy moment, ``face_check_unavailable``
+    is the models being down - because an operator reading a ticket, or a client deciding whether
+    to retry or to send the worker somewhere, has to be able to tell them apart. What must not
+    differ is the *shape*: both retryable, neither blaming the photograph, and neither reaching a
+    caller as an unhandled 500.
+    """
+    busy = face_engine.http_exception_for(face_engine.FaceEngineBusy("the queue stayed full"))
+    gone = face_engine.http_exception_for(
+        face_engine.FaceEngineUnavailable("the child did not answer in 60s")
+    )
+    assert (busy.status_code, gone.status_code) == (503, 503)
+    assert busy.detail["error_code"] == "face_check_busy"
+    assert gone.detail["error_code"] == "face_check_unavailable"
+    assert busy.headers["Retry-After"] == gone.headers["Retry-After"] == "5"
+    assert busy.detail["retry_after_seconds"] == gone.detail["retry_after_seconds"] == 5
+    for answer in (busy, gone):
+        message = answer.detail["message"].lower()
+        assert "try again" in message
+        assert "enroll" not in message and "re-enrol" not in message
+    # The reason travels for an operator, and only there: it is the server's own sentence.
+    assert gone.detail["reason"] == "the child did not answer in 60s"
+
+
 # ---------------------------------------------------------------------------
 # 3. failures
 # ---------------------------------------------------------------------------

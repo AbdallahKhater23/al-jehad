@@ -551,7 +551,10 @@ Key settings (all optional except `SECRET_KEY`, full list in `backend/config.py`
 | `FACE_INFERENCE_CONCURRENCY` | `2` | how many face verifications may run at once - see below before raising it |
 | `FACE_INFERENCE_QUEUE` | `64` | how many may wait for a slot before the server answers `503` + `Retry-After` |
 | `FACE_INFERENCE_WAIT_SECONDS` | `20` | how long a caller waits for room before that `503` |
-| `FACE_MODEL_PRELOAD` | `1` | load VGG-Face at startup instead of on the first punch |
+| `FACE_MODEL_PRELOAD` | `1` | load the face models at startup instead of on the first punch |
+| `FACE_ENGINE_PROCESS` | `0` | run the model calls in a child process (`backend/face_process.py`) instead of in the API process. The deployment image sets `1`; see *Where the models run* below |
+| `FACE_ENGINE_PROCESS_TIMEOUT_SECONDS` | `60` | how long one model call may take before the child is killed as hung - replies are matched by id, so a late one would be applied to the wrong photograph |
+| `FACE_ENGINE_PROCESS_START_SECONDS` | `120` | how long the child's first answer may take; the cold graph load and the detector warm are inside it |
 | `RETENTION_ENABLED` | `1` | run the in-process retention sweeper (see below) |
 | `RETENTION_PUNCH_PHOTO_DAYS` | `30` | how long a quick-link punch selfie is kept. `0` = forever |
 | `RETENTION_BIOMETRIC_DAYS` | `7` | how long biometric **residue** is kept (a face whose account is gone). `0` = forever |
@@ -622,14 +625,28 @@ counters - `memory.current` and `memory.stat anon`, `memory.peak`, `memory.event
 (`oom_kill`), and `cpu.stat` throttling - with a pass/fail table and an exit code. Run that
 one before a release; it needs docker and a few minutes of real inference.
 
-**What this does *not* isolate.** The models still run inside the API process: a crash
-inside native TensorFlow (an out-of-memory kill, a corrupt image reaching a half-loaded
-model) takes the API process with it, and a saturated pool still competes for the same
-CPU. Real isolation means a separate model server - Triton, TorchServe - behind a network
-call. `FaceEngine` is the seam for that, so it becomes a second implementation rather
-than a rewrite; until then this bounds the damage. `GET /api/v1/readiness` reports the
-load (capacity, queued, in-flight, refusals, slowest) as an advisory check, so an operator
-can see a saturated engine without it failing the startup gate.
+**Where the models run, and what they still share.** The library default is `FACE_ENGINE_PROCESS=0`
+- in-process, which is what the test suite and the tools run - and the *deployment* image turns it
+on. With `FACE_ENGINE_PROCESS=1` the four model calls (`represent`, `detect`, the liveness check and
+the preload) cross a pipe into a child interpreter (`backend/face_process.py`,
+`backend/face_worker.py`) and nothing else follows them: the queue, the capacity policy, the
+one-subject rule, the cosine, the thresholds and every refusal sentence stay in the API process,
+which is what makes this an isolation of models rather than a second copy of the application.
+Measured with `tools/face_process_memory.py`: the API process's model floor drops from **+211.9 MiB
+to +3.8 MiB** while the child holds **279.0 MiB**. The *host* total therefore grows - this buys a
+smaller critical process and a shared-fate fix, not a smaller machine - and an ONNX allocation
+failure or a corrupt model now ends a child the next punch respawns instead of ending the service.
+A child that dies or stops answering is answered as `503 + Retry-After` with
+`error_code: face_check_unavailable` (never an unhandled 500), because "we could not check right
+now" is a different sentence from "your photo is wrong" - and the only one a worker at a gate can
+act on. What it does *not* isolate: the CPU (the child competes for the same cores, and it runs one
+inference at a time where the queue admits two), the child's own memory (nothing bounds it but a
+cgroup, which is what `tools/capacity_test.py` measures), and the host total. Real isolation is
+still a separate model server - Triton, TorchServe - behind a network call, and `FaceEngine`
+remains the seam that makes it a second implementation rather than a rewrite.
+`GET /api/v1/readiness` reports the load (capacity, queued, in-flight, refusals, slowest) plus the
+model process's own state, as an advisory check, so an operator can see a saturated engine without
+it failing the startup gate.
 
 ## Keeping the detector comparison current
 
