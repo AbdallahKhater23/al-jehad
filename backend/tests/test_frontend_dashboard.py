@@ -13,6 +13,9 @@ browser* is exactly what this file exercises:
    the intention;
 3. **it does not poll.** The stamp is drawn and the screen says so in words, because an operator
    who assumes these figures are live is an operator acting on a figure from five minutes ago;
+   the strip beside it then ages honestly - each figure carries the read time it shares with the
+   one read, and past the window the strip is marked stale rather than printing an old number as
+   though it were current - and the tick that does that repaints the age without fetching anything;
 4. **a panel the server could not read is ``null``, and is drawn as such** - never as a zero
    standing in for it, which reads as good news on the one screen somebody checks to decide
    whether anything is wrong;
@@ -75,6 +78,10 @@ function panel(overrides) {
     return Object.assign({
         status: 'success',
         as_of: '2026-09-28 14:03:11',
+        // The server's own freshness windows, sent with the read. Deliberately present and
+        // deliberately *not* the console's fallback pair, so a strip that aged from a constant
+        // instead of the payload fails here rather than in somebody's trust of a number.
+        freshness: { aging_seconds: 90, stale_seconds: 300 },
         day: DAY,
         people: {
             accounts: 41, active: 38, pending_approval: 2, deactivated: 3,
@@ -283,7 +290,13 @@ async function eachView(who, overrides) {
                 .map((id) => (new RegExp('data-dashboard-vital-fact="' + id + '">([^<]*)<').exec(markup) || [])[1] ?? null),
             linked: (markup.match(/data-dashboard-vital="[^"]*"[^>]*data-dashboard-go="/g) || []).length,
             present_note: (/data-dashboard-vital="present_days"[\s\S]*?dashboard-vital-note">([^<]*)</.exec(markup) || [])[1] ?? null,
-            warned: markup.indexOf('class="dashboard-vital is-warn" data-dashboard-vital="awaiting_approval_hours"') >= 0
+            warned: markup.indexOf('class="dashboard-vital is-warn" data-dashboard-vital="awaiting_approval_hours"') >= 0,
+            // Where a tile goes is no longer a line of grey text under it, so the one thing that
+            // has to survive the shortening is the tile *saying* it: the button's accessible name.
+            // Read off each tile's own opening tag, because the queue rows below carry one too.
+            spoken: (markup.match(/<button[^>]*data-dashboard-vital="[^"]*"[^>]*>/g) || [])
+                .map((tag) => (/aria-label="([^"]*)"/.exec(tag) || [])[1] ?? '')
+                .filter((label) => /Shifts to review|On shift now/.test(label))
         },
         requests: env.requests.map((r) => r.url),
         waiting: {
@@ -298,6 +311,63 @@ async function eachView(who, overrides) {
         stamp: (/data-dashboard-asof="true">([\s\S]*?)<\/p>/.exec(markup) || [])[1],
         text: textOf(markup),
         links: (markup.match(/data-dashboard-go="([^"]*)"/g) || []).map((m) => /"([^"]*)"/.exec(m.slice(18))[1])
+    };
+}
+
+// 2a. freshness: one read's age, and that an old read says so rather than printing a number
+{
+    const env = consoleEnv();
+    await env.evaluate("UI.renderAdminTab('Dashboard')");
+    const freshMarkup = render(env);
+    const readsAtPaint = reads;
+    // Age the *read*, not the figures: this is the clock moving over one snapshot, so the redraw
+    // must rebuild the markup from the payload already in hand and cost no request at all.
+    const aged = await env.evaluate(`(() => {
+        UI_MODULES._dashboardReadAt = Date.now() - 400000;
+        UI_MODULES.dashboardSetMetric('now');
+        return document.getElementById('adminContent').innerHTML;
+    })()`);
+    // The chip is repainted in place from the clock, which is the tick's whole job.
+    const chip = await env.evaluate(`(() => {
+        UI_MODULES.paintDashboardFreshness();
+        const node = document.getElementById('dashboardFreshness');
+        return { text: node.textContent, className: node.className };
+    })()`);
+    // The boundaries are the server's, not this module's. Hold the read's age still (400 s) and
+    // move only the window on the wire: a longer aging window must say "fresh" where the
+    // console's own constant would already say "stale", a wider stale window must make the
+    // middle word reachable, and a payload that omits the block - or sends a zero or a negative
+    // - must fall back to the console's constants rather than reading every figure as stale.
+    const windowsMoved = await env.evaluate(`(() => {
+        UI_MODULES._dashboardReadAt = Date.now() - 400000;
+        const verdict = (freshness) => UI_MODULES.dashboardFresh(
+            freshness === undefined ? {} : { freshness: freshness }
+        );
+        return {
+            from_long_aging: verdict({ aging_seconds: 600, stale_seconds: 900 }),
+            from_wide_stale: verdict({ aging_seconds: 300, stale_seconds: 900 }),
+            from_omitted: verdict(undefined),
+            from_junk: verdict({ aging_seconds: 0, stale_seconds: -5 })
+        };
+    })()`);
+    const chipOf = (markup) => {
+        const found = /<span class="ops-fresh dashboard-fresh is-([a-z]+)" id="dashboardFreshness"[^>]*>([^<]*)</.exec(markup);
+        return found ? [found[1], found[2]] : null;
+    };
+    const tileTitleOf = (markup) => (/data-dashboard-vital="reviews"[^>]*title="([^"]*)"/.exec(markup) || [])[1] ?? null;
+    const tileAriaOf = (markup) => (/<button[^>]*data-dashboard-vital="reviews"[^>]*aria-label="([^"]*)"/.exec(markup) || [])[1] ?? null;
+    results.freshness = {
+        fresh_chip: chipOf(freshMarkup),
+        fresh_read_at: (/data-dashboard-read-at="([^"]*)"/.exec(freshMarkup) || [])[1] ?? null,
+        fresh_title: tileTitleOf(freshMarkup),
+        fresh_aria: tileAriaOf(freshMarkup),
+        reads: reads - readsAtPaint,
+        aged_chip: chipOf(aged),
+        aged_tiles: (aged.match(/class="dashboard-vital [^"]*is-stale"/g) || []).length,
+        aged_tile_read_at: tileTitleOf(aged),
+        aged_tile_aria: tileAriaOf(aged),
+        painted_chip: chip,
+        window_moved: windowsMoved
     };
 }
 
@@ -428,8 +498,11 @@ async function eachView(who, overrides) {
     // The figures that are a *queue* link from the view that lists them; the two that are the
     // whole point of a view ("open the roster", "see the full list") are links from anywhere on
     // the screen, so they are asked of all five.
+    // A row is a ``<button>`` where there is a queue to open and a plain ``<div>`` where there is
+    // not, so the read stops at whichever tag actually closes it - otherwise a row with no owner
+    // would inherit the next row's link and read as one that has one.
     const linkFor = (markup, field) => {
-        const block = new RegExp('data-dashboard-queue="' + field + '"[\\s\\S]*?</div>').exec(markup);
+        const block = new RegExp('data-dashboard-queue="' + field + '"[\\s\\S]*?</(?:button|div)>').exec(markup);
         return block ? (/data-dashboard-go="([^"]*)"/.exec(block[0]) || [])[1] : null;
     };
     // The now view's rows carry their own hook, and the same question: which tab owns this
@@ -437,7 +510,7 @@ async function eachView(who, overrides) {
     // in this console lists - so it must come back empty rather than pointing at a tab that does
     // not show the rows.
     const nowLinkFor = (field) => {
-        const block = new RegExp('data-dashboard-now="' + field + '"[\\s\\S]*?</div>').exec(views.now);
+        const block = new RegExp('data-dashboard-now="' + field + '"[\\s\\S]*?</(?:button|div)>').exec(views.now);
         // ``?? null`` rather than an undefined falling out of the array: a property the JSON
         // bridge drops is a *missing* key on this side, which reads as "not asserted" in a test
         // instead of as "no link", and those are different claims.
@@ -450,6 +523,13 @@ async function eachView(who, overrides) {
         alerts_row: views.waiting.indexOf('data-dashboard-queue="alerts"') >= 0,
         credentials: (/data-dashboard-go="Credentials"/).test(views.all),
         sites: (/data-dashboard-go="Sites"/).test(views.all),
+        // The row itself is the button rather than a button sitting inside it, and the destination
+        // it opens is in the row's accessible name - the same shortening the vital tiles got.
+        row: (views.waiting.match(/<button[^>]*data-dashboard-queue="[^"]*"[^>]*>/g) || []).length,
+        row_spoken: (/<button[^>]*data-dashboard-queue="reviews"[^>]*aria-label="([^"]*)"/.exec(views.waiting) || [])[1] ?? null,
+        // ...and no queue row carries a smaller button inside it any more - which is what the
+        // "Open Approvals" row under every figure was.
+        inner_buttons: (views.waiting.match(/ui-btn-sm/g) || []).length,
         // ...and switching is not a read: five views, one request.
         reads: views.reads_after_switching
     };
@@ -969,6 +1049,11 @@ def test_the_vital_strip_draws_the_five_figures_somebody_checks_first(results):
     # The tone is a state: a queue with something in it is marked, and the hours nobody has
     # signed for yet are one of those queues.
     assert vitals["warned"] is True, vitals
+    # ...and each tile still says where it goes, in the one place the shortening moved it to.
+    assert vitals["spoken"] == [
+        "4 — Shifts to review — Approvals",
+        "12 — On shift now — Active Shifts"
+    ], vitals
 
 
 def test_every_count_is_drawn_from_the_payload(results):
@@ -1037,12 +1122,52 @@ def test_the_now_view_draws_the_boards_figure_and_the_three_kinds_of_waiting(res
 def test_the_stamp_says_what_it_is_and_that_it_does_not_tick(results):
     """Not live, and why - written on the panel, or an operator acts on a stale figure."""
     paint = results["paint"]
-    assert paint["stamp"] == "Counted at 2026-09-28 14:03:11. This screen refreshes when you ask it to, not on a timer.", (
+    assert paint["stamp"] == "Counted at 2026-09-28 14:03:11. A snapshot, not a live board.", (
         paint["stamp"]
     )
     # The one panel that answers "has anything been sitting here too long", in words.
     assert paint["waiting"]["oldest"] == "8100", paint["waiting"]
     assert "waited" in paint["text"] or "waiting" in paint["text"], paint["text"]
+
+
+def test_a_figure_says_when_it_was_read_and_an_old_read_is_marked_stale(results):
+    """One read, one age: each figure carries its read time, and past the window it says so.
+
+    The dashboard does not poll, so there is no second read to compare against: the only honest
+    freshness is how long ago the one read landed, and every figure shares it. A figure printed
+    as current after that window is exactly the false confidence this screen exists to prevent -
+    so the read is stamped, and once it is old the strip says so *without fetching a thing*.
+    """
+    fresh = results["freshness"]
+    # The read time is on the strip and in every tile: one read, so no figure has a time of its own.
+    assert fresh["fresh_read_at"] == "2026-09-28 14:03:11", fresh
+    assert fresh["fresh_title"] == "Read at 2026-09-28 14:03:11", fresh
+    assert fresh["fresh_chip"] == ["fresh", "Read just now"], fresh
+    assert "out of date" not in fresh["fresh_aria"].lower(), fresh
+    # Aging the read is the clock moving over one snapshot: nothing may be re-read for it.
+    assert fresh["reads"] == 0, (
+        "aging the read cost a request: freshness is a property of the clock, not a refresh: "
+        + str(fresh)
+    )
+    # Past the stale window, the figures are still shown - they are the last thing counted - but
+    # marked, and their accessible names say old rather than letting a number read as current.
+    assert fresh["aged_chip"] == ["stale", "Out of date. Refresh to re-count."], fresh
+    assert fresh["aged_tiles"] == 5, fresh
+    assert fresh["aged_tile_read_at"] == "Read at 2026-09-28 14:03:11", fresh
+    assert "out of date" in fresh["aged_tile_aria"].lower(), fresh
+    # And the chip repaints in place from the clock, which is the tick's whole job.
+    assert fresh["painted_chip"]["className"].endswith("is-stale"), fresh
+    assert fresh["painted_chip"]["text"] == fresh["aged_chip"][1], fresh
+    # The boundaries are the server's, not this module's. With the read held at 400 s, a longer
+    # aging window on the wire says "fresh", a wider stale window makes "aging" reachable, and a
+    # payload that omits the block - or sends a zero or a negative - falls back to the console's
+    # constants rather than reading every figure as stale. This is what stops the strip's
+    # definition of "current" drifting from the deployment's.
+    moved = fresh["window_moved"]
+    assert moved["from_long_aging"] == "fresh", moved
+    assert moved["from_wide_stale"] == "aging", moved
+    assert moved["from_omitted"] == "stale", moved
+    assert moved["from_junk"] == "stale", moved
 
 
 def test_each_count_links_to_the_tab_that_owns_that_queue(results):
@@ -1055,6 +1180,10 @@ def test_each_count_links_to_the_tab_that_owns_that_queue(results):
     assert owners["sites"] is True, owners
     # The alert queue is the root tier's, and this is an administrator's session: no row.
     assert owners["alerts_row"] is False, owners
+    # Three queues a person has to work, and each one *is* the tap into the tab that works it.
+    assert owners["row"] == 3, owners
+    assert owners["row_spoken"] == "4 Shifts to review — Approvals", owners
+    assert owners["inner_buttons"] == 0, owners
 
     # The now panel's three rows, and the one that must not have an owner: the punch queue is
     # triaged at a route no tab in this console lists.

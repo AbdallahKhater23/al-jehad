@@ -321,7 +321,7 @@ names the landing tab once, as a module constant.
   for a ten-account roster and a two-hundred-and-ten-account one.
 * `backend/tests/test_frontend_dashboard.py` (13, Node VM). The tab is first and a console lands
   on it; **one** request on paint and it is the aggregate endpoint; every figure drawn from the
-  server's own field; the stamp and the "not on a timer" sentence; each count linking to the tab
+  server's own field; the stamp and the sentence saying it does not tick; each count linking to the tab
   that owns its queue; the alert row drawn for the root tier and not for an administrator; a
   `null` panel drawn as unread while the other two paint; a failed *read* still leaving the
   refresh control on screen; the empty deployment; a `<img onerror>` site name staying text; the
@@ -716,3 +716,168 @@ head the helper draws. ``test_frontend_payload.py`` counts the new keys across t
 ``test_frontend_xss.py`` holds the handler budget where it was, and ``test_frontend_print_sheet.py``
 (6) keeps the frame, the stylesheet and the page-restore rules in one place - which is what makes the
 dashboard's sheet inherit them instead of copying them.
+
+---
+
+## 16. The front door compacted, as built (2026-10-01)
+
+§14 was right about the *shape* - a strip that never switches away over one view at a time - and wrong
+about how much furniture that shape needed. Measured on the phone this console was written for
+(439 × 715 CSS px, the width the reader wears gloves at), the waiting view was **1793 px tall**: a
+title, a four-line paragraph, a two-line stamp sentence, five tiles wrapping into *three* rows, a
+five-tab switcher, and then the panel's own title and paragraph. Two and a half screens to answer "is
+anything wrong", and three of those blocks were the screen saying the same thing twice.
+
+Nothing below the chrome changed. All five views survived; so did every figure, every tone, every link
+and every `data-` hook the suite reads.
+
+### What was cut, and why each cut was free
+
+1. **The fragment's own `<header>`.** `dashboardShellHtml` drew an `h1` "Dashboard" and a paragraph of
+   `hintDashboard`, and the frame it is painted into had *already* drawn both: the console header prints
+   the active tab's `key` as `adminTitle` and its `hint` as `adminSubtitle`. The duplication was worth
+   85 px and a heading-level inversion (`h2` in the frame, then an `h1` inside it). The panel below keeps
+   its own `h2`, which is the one title the screen needs.
+2. **`hintDashboard` shortened**, 152 characters to 57. It was the longest hint in the console - the next
+   is 134, the median is around 60 - because it was carrying the *plan's* reasoning ("counted rather than
+   downloaded") into a place where a reader wants to know what the screen is for. The honesty it was
+   carrying moved to the sentence beside the figures, which is where it is read anyway.
+3. **`dashboardAsOf` shortened**, from a two-clause sentence to "Counted at {stamp}. A snapshot, not a
+   live board." §7 requires the screen to say it does not tick, not to say it at length - and the stamp is
+   now the first line of the fragment rather than the third thing down it. It also stopped being
+   ellipsised: `ops-sub` is a `nowrap` one-liner everywhere else in the console, and the dashboard's stamp
+   overrides it to `normal`, because a sentence cut off mid-word is worse than one that wraps.
+4. **The vital strip halved, 334 px to 160.** The grid floor falls from 150 px to 108, the tile from 96 px
+   tall to 62, the figure from 30 px to 24 and the label from 13 to 12 - which is what turns five tiles
+   from three rows into two on a phone. The floor is still a floor and not a fixed column, for §14's
+   reason: the five figures are five different widths in four different scripts.
+5. **The destination came off every tile and every queue row.** "Approvals" under a tile, and an "Open
+   Approvals" button under every queue figure, both spent a line saying what the control already is. The
+   vital tile and the queue row are one component shape now - the whole card is the `<button>`, as the
+   tile already was - and the tab it opens moved into that button's `aria-label`. A queue with no tab to
+   open stays a plain `div` rather than a button that only ever answers "not you".
+
+### What moved
+
+`dashboardQueueHtml` is new and is the only structural addition: it draws one row from
+`(hook, field, labelKey, value, tab)`, where `hook` is the row's own `data-` name - so the waiting
+view's `data-dashboard-queue` and the now view's `data-dashboard-now` are one shape drawn twice and read
+apart by that name. `button.dashboard-queue` picks up the resets and the press feedback `.dashboard-vital`
+already carried, and `.dashboard-queue .ui-btn` is gone with the buttons it styled.
+
+No inline handler was added: every hook is the `data-` attribute it always was, and
+`test_frontend_xss.py`'s budget for `admin_modules.js` is unchanged.
+
+### The measurement
+
+The same fixture, the same 439 px viewport, one paint:
+
+| | before | after |
+| --- | --- | --- |
+| whole view | 1793 px | 1309 px |
+| vital strip | 334 px (3 rows) | 160 px (2 rows) |
+| one queue row | 126 px | 78 px |
+| titles reading "Dashboard" | 2 | 1 |
+
+27% off the screen, and - the part that matters - the five figures, the switcher and the first queue now
+all sit above the fold, where the fold used to land in the middle of the tiles.
+
+### Tests
+
+`test_frontend_dashboard.py` gains two assertions and changes one. The stamp assertion pins the new
+sentence; the strip's test reads each tile's `aria-label` off its own opening tag (the queue rows carry
+one too, so a bare scan of the markup finds six) and asserts a tile still says where it goes after the
+visible line was removed; the owners test asserts a queue row *is* the button, that its accessible name
+carries the destination, and that no row carries a smaller button inside it. The two link helpers stop at
+`</button>|</div>` rather than at `</div>`, which is what keeps "`offline_waiting` has no owner" a
+statement about a row rather than about its neighbour.
+
+The two strings this section shortened changed in all four tables at once, so the parity suite's key
+counts and placeholder checks are untouched by it.
+
+## 17. The strip's figures age, as built (2026-10-02)
+
+§7 says the front door does not poll, and §16 says so on the screen. Both are right, and both left one
+hole: a screen that admits it is a snapshot still *prints* its figures the same way an hour later as it
+did the second they were read. A reader who leaves the tab open - and the front door is the tab a
+console lands on - sees five numbers presented as current when they are history. The fix is not to make
+it poll; it is to let the figures show their age.
+
+### One read, one age
+
+Every figure on the strip is one field of the *same* counted read, so there is no per-figure read time
+to discover: they all share one instant. The anchor is `_dashboardReadAt`, set by `renderDashboard` when
+the answer lands (the browser's clock, not the payload's `as_of`, because the age that decides whether
+to trust a figure is the age of the copy on the screen). `dashboardFresh(data)` returns the board's own
+three words for that age - **fresh** under a minute, **aging** under five, **stale** past it - or
+`unknown` when nothing has been read, which is drawn as nothing at all rather than as a verdict.
+
+### What the reader sees
+
+- **The read time, once and per figure.** §16's stamp already prints "Counted at {stamp}", so the
+  strip-level read time is on the screen. The per-figure half is carried by each tile: a `title` of
+  "Read at {stamp}" (`dashboardReadAt`, four tables) and a `data-dashboard-read-at` on the strip. One
+  read means one timestamp, and inventing five would be worse honesty, not better.
+- **A freshness chip** (`dashboardFreshnessHtml`) beside the stamp, borrowing the board's `ops-fresh`
+  vocabulary - same dot, same hues, same three states - because "how old is this?" should be answered
+the same way in both places. `dashboardFreshFresh` / `Aging` / `Stale` are its words; the title names
+  the instant it was read.
+- **A stale mark on every figure.** Past the window, each tile takes `is-stale`: the figure is dimmed to
+  the muted ink, its edge goes dashed, and its *accessible name* gains the stale sentence, so a number
+  is never read as current even by somebody who never looks at the chip. The figure itself stays - it is
+  the last thing anybody counted, and hiding it would be its own kind of lie.
+
+### The tick that is not a poll
+
+A verdict that is only computed at paint would never appear, because this screen does not repaint. So
+`tickDashboard` runs every `DASHBOARD_TICK_MS` (30 s) and calls `paintDashboardFreshness`, which
+rewrites the chip's text and class and toggles `is-stale` on the tiles. It **reads nothing** - the screen
+still makes exactly one request per paint - and it retires itself the moment `State.adminTab` is no
+longer `Dashboard`, the same way the live board's tick does. Aging the read in the suite costs zero
+requests, and that is asserted.
+
+### Tests
+
+The dashboard suite gains `test_a_figure_says_when_it_was_read_and_an_old_read_is_marked_stale`: the
+fresh strip carries `14:03:11` in the stamp, in a tile's `title` and on the strip's `data-` hook; aging
+`_dashboardReadAt` and redrawing from the same snapshot marks all five tiles `is-stale`, puts the stale
+sentence in a tile's accessible name, and costs no read; and `paintDashboardFreshness` repaints the chip
+in place. Two regexes had to name the tile and not the strip (`dashboard-vital ` with a trailing space)
+because the strip's own class is a prefix of the tile's. The four new keys landed in all four tables at
+once, so the parity suite's key counts and placeholder checks stay level.
+
+## 18. The freshness windows come from the server, as built (2026-10-02)
+
+§17 gave the strip a verdict but left its boundaries in the browser. `DASHBOARD_AGING_MS` and
+`DASHBOARD_STALE_MS` were console constants, and the words beside them - "Read just now", "Out of
+date" - are claims about *this deployment's* idea of current. A second copy of a definition is exactly
+what the rest of the backend refuses (`dormant_days`, `period.start/end`), and a window the browser keeps
+to itself is one the server cannot correct. So the two boundaries now travel with the read they
+describe.
+
+### The payload
+
+`build_dashboard` gains a top-level `freshness` block beside `as_of` - `aging_seconds` and
+`stale_seconds`, from two new constants in `dashboard.py` (`FRESHNESS_AGING_SECONDS`,
+`FRESHNESS_STALE_SECONDS`). Seconds, like `waiting.oldest_seconds`, so every window on this payload
+speaks one unit. It is top-level rather than inside a panel because freshness is a property of the
+*whole* snapshot: one read, one age, one pair of boundaries.
+
+### The console
+
+`dashboardFresh(data)` no longer reads the constants directly; it asks `dashboardFreshWindows(data)`,
+which prefers `freshness.aging_seconds` / `freshness.stale_seconds` (× 1000) and falls back to
+`DASHBOARD_AGING_MS` / `DASHBOARD_STALE_MS` only for a payload that omits the block - an older backend,
+a rollback, a cached bundle. A zero, a negative or a non-number falls back too, so a malformed window
+ages the strip rather than reading every figure as stale. The constants are kept and re-documented as
+fallbacks; the tick, the chip, the stale mark and the `unknown` verdict are unchanged.
+
+### Tests
+
+`test_the_freshness_windows_travel_with_the_read` (backend) pins the block's two keys and the invariant
+that aging ends before stale begins. The dashboard suite's `panel()` fixture now carries the server's
+windows (90 s / 300 s), and scenario 2a holds the read's age still at 400 s while moving only the window
+on the wire: a longer aging window says *fresh* where the fixture's own window said *stale*, a wider
+stale window reaches the middle word *aging*, and an omitted or junk window falls back to the console's
+constants. `test_the_panel_names_are_the_ones_the_console_draws` gains `freshness` to the pinned
+top-level set.

@@ -56,6 +56,47 @@ const UI_MODULES = {
     //: while they were reading row five, which is worse than never opening at all.
     _liveOpsExpanded: false,
 
+    //: Whether the "needs me now" chip is narrowing the board to the shifts that have crossed
+    //: a line. A *filter*, like the search and the site picker - which is why the three figures
+    //: above the board do not move when it is on: those are the read, not the narrowing.
+    _liveOpsAttention: false,
+
+    //: Whether the operator has paused the board. A paused board is a deliberate static
+    //: snapshot: the clock and the stream stop, the rows stay exactly where they are, and the
+    //: header says so rather than breathing a live dot over numbers that are no longer moving.
+    _liveOpsPaused: false,
+
+    //: Which of the two readings of the board is on screen: the list of who is here *now*,
+    //: or the day's own timeline of arrivals and departures. Per visit rather than a stored
+    //: preference, like the fold and the pause - ``stopLiveOps`` puts it back to the board,
+    //: so returning to the tab always opens on the moment it is for.
+    _liveOpsView: 'board',
+
+    //: Where the scrubber is standing, in minutes past local midnight, or ``null`` for "now".
+    //: Held here so a repaint of the board (the poll, Refresh, the tick) cannot drop the
+    //: moment an operator is reading, and so the read is a value a suite can assert on.
+    _liveOpsMoment: null,
+
+    //: Today's closed shifts, read once when the timeline is first opened: one row per shift
+    //: with its arrival and its clock-out (``GET /admin/reports/shifts``). ``null`` until it
+    //: is asked for - which is the point: the board never pays for the day's history to draw
+    //: the moment it is already showing.
+    _liveOpsTimeline: null,
+    _liveOpsTimelineLoading: false,
+    _liveOpsTimelineFailed: false,
+
+    //: Which gate's day the timeline is drawing, by site name, or ``''`` for the whole
+    //: deployment. Its own field rather than the board's ``_liveOpsSite``, because that one
+    //: holds a *category* while the board is grouped by category and a category name is not a
+    //: site: sharing them would leave the timeline filtered to a gate that does not exist.
+    _liveOpsTimelineSite: '',
+
+    //: The minute of the day the timeline was last drawn for. The axis ends at "now", and
+    //: "now" moves whether or not the board has, so the one-second tick redraws the timeline
+    //: when - and only when - the minute under it has changed. That keeps the open lanes
+    //: reaching the right edge on a quiet morning without rebuilding forty rows once a second.
+    _liveOpsTimelineMinute: null,
+
     //: How often the board asks whether anything has moved *when it has to ask at all*.
     //:
     //: This used to be the whole mechanism: one counted read every 45 seconds, and the rows
@@ -86,6 +127,35 @@ const UI_MODULES = {
     //: and because two is also the number that fits above the fold on the phone this console is
     //: usually opened on. The rest are one tap away, and the control says how many.
     LIVE_OPS_FOLD: 2,
+
+    //: How far one step of the timeline's scrubber moves, in minutes. Five, because a shift is
+    //: read in quarter-hours and the whole day is then 288 steps - fine enough that nothing is
+    //: hidden between two positions, coarse enough that a thumb can land on one.
+    LIVE_OPS_SCRUB_STEP: 5,
+
+    //: How old the last read may be before the board stops claiming to be live. Under a
+    //: minute it is fresh; past a minute it is aging; past five minutes - or with no way to
+    //: learn anything new at all (the stream gave up and no poll is running beside it) - it is
+    //: stale, and the dot stops breathing rather than animating over a number it cannot stand
+    //: behind.
+    LIVE_OPS_AGING_MS: 60000,
+    LIVE_OPS_STALE_MS: 300000,
+
+    //: FALLBACK boundaries for how old the front door's one read may be before the strip stops
+    //: printing its figures as current. The server owns these windows and sends them with the
+    //: read (``freshness.aging_seconds`` / ``freshness.stale_seconds``); they are preferred, for
+    //: the reason every other window comes from the payload - "Read just now" is a claim about
+    //: this snapshot's age, and the definition of current belongs in one place. These constants
+    //: are only the answer for a payload that omits them (an older backend, a rollback, a cached
+    //: bundle), so a console talking to the previous build still ages rather than guessing.
+    DASHBOARD_AGING_MS: 60000,
+    DASHBOARD_STALE_MS: 300000,
+
+    //: How often that verdict is re-evaluated. Half a minute is well inside the aging window, so
+    //: the strip turns stale within seconds of the boundary rather than a window late, and it is
+    //: coarse enough that an idle screen is not doing work every second for a word that changes
+    //: twice in five minutes.
+    DASHBOARD_TICK_MS: 30000,
 
     /**
      * Inline SVG, never an emoji: an emoji is font-dependent, renders
@@ -120,6 +190,8 @@ const UI_MODULES = {
         camera: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8h3l1.5-2h7L17 8h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1Z"></path><circle cx="12" cy="13.5" r="3.5"></circle></svg>',
         pencil: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20h4L20 8l-4-4L4 16v4Z"></path><path d="m14 6 4 4"></path></svg>',
         power: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 4v8"></path><path d="M7.5 7.5a6.5 6.5 0 1 0 9 0"></path></svg>',
+        pause: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M9 5v14M15 5v14"></path></svg>',
+        play: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 5v14l11-7L8 5Z"></path></svg>',
         table: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="M3 10h18M9 10v9"></path></svg>',
         printer: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 8V4h10v4"></path><rect x="4" y="8" width="16" height="7" rx="2"></rect><path d="M7 15h10v5H7z"></path></svg>',
         eye: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-6.5 10-6.5S22 12 22 12s-3.5 6.5-10 6.5S2 12 2 12Z"></path><circle cx="12" cy="12" r="2.5"></circle></svg>'
@@ -173,6 +245,27 @@ const UI_MODULES = {
         return I18n.__('liveOpsHoursShort')
             .replace('{hours}', String(hours))
             .replace('{minutes}', String(minutes % 60));
+    },
+
+    /**
+     * How long something has waited, in the unit a reader thinks in.
+     *
+     * ``liveOpsDuration`` is the board's own short duration and stops at hours - which is right for
+     * a shift that started this morning, and wrong for an application that has been sitting for a
+     * week, where "162h 11m" is a figure a reader has to divide before it means anything. Above a
+     * day this switches to days plus the hours left over. It is the rule the dashboard's
+     * oldest-queue figure already followed; that one calls this now, so the two cannot disagree
+     * about what "a day and a bit" reads like.
+     */
+    waitingLabel(seconds) {
+        const total = Math.max(0, Number(seconds) || 0);
+        const days = Math.floor(total / 86400);
+        if (days >= 1) {
+            return I18n.__('dashboardDaysShort')
+                .replace('{days}', String(days))
+                .replace('{hours}', String(Math.floor((total % 86400) / 3600)));
+        }
+        return this.liveOpsDuration(total);
     },
 
     /** Just the HH:MM of a server timestamp, which is all a row needs to show. */
@@ -354,6 +447,250 @@ const UI_MODULES = {
         return map.get(String((session && session.site_name) || '')) || '';
     },
 
+    // =======================================================================
+    //  The day's timeline: arrivals and departures, and where the scrubber is
+    // =======================================================================
+    //
+    // The board answers "who is here now". The timeline answers the question under
+    // it - *how did we get here* - by drawing every shift that touched today as one
+    // bar from its clock-in to its clock-out, and letting a scrubber stand anywhere
+    // in the day. It is the same two reads the board already makes (the open shifts)
+    // plus one it does not need until somebody asks for it: today's *closed* shifts,
+    // from ``/admin/reports/shifts``, which is the only place a clock-out lives.
+    //
+    // Everything below is arithmetic on minutes past local midnight, deliberately, so
+    // the drawing code never parses a stamp twice and the headcount at any moment is a
+    // function a suite can call without a DOM.
+
+    /** Which reading of the board is on screen: ``'board'`` (the default) or ``'timeline'``. */
+    liveOpsView() {
+        return this._liveOpsView === 'timeline' ? 'timeline' : 'board';
+    },
+
+    /**
+     * Minutes past *today's* local midnight for one stored wall clock, or ``null``.
+     *
+     * The subtraction is against today's midnight, not against the stamp's own
+     * time-of-day, so a shift that began yesterday evening comes back **negative** and an
+     * overnight arrival is drawn on the left of one axis rather than at 22:00 on the wrong
+     * side of noon. The zone-less wall clock the server writes is read in the reader's own
+     * zone, exactly as ``liveOpsClockTime`` and ``SHIFT_CLOCK`` read it everywhere else - the
+     * one assumption this console has always made (see ``SHIFT_CLOCK.recordedAt``).
+     */
+    liveOpsMinuteOfDay(timestamp) {
+        const at = SHIFT_CLOCK.recordedAt(timestamp);
+        if (at === null) return null;
+        const when = new Date(at);
+        const today = new Date();
+        const midnight = (value) => new Date(value.getFullYear(), value.getMonth(), value.getDate()).getTime();
+        const days = Math.round((midnight(when) - midnight(today)) / 86400000);
+        return days * 1440 + when.getHours() * 60 + when.getMinutes() + when.getSeconds() / 60;
+    },
+
+    /** Minutes past local midnight now. */
+    liveOpsNowMinute() {
+        const now = new Date();
+        return now.getHours() * 60 + now.getMinutes() + now.getSeconds() / 60;
+    },
+
+    /** ``HH:MM`` from minutes past midnight, wrapped into the day. */
+    liveOpsTimeLabel(minute) {
+        const total = ((Math.round(Number(minute) || 0) % 1440) + 1440) % 1440;
+        const pad = (value) => String(value).padStart(2, '0');
+        return `${pad(Math.floor(total / 60))}:${pad(total % 60)}`;
+    },
+
+    /**
+     * One lane per shift that touched today: today's closed shifts, then the open ones.
+     *
+     * The two reads are merged here rather than server-side because they are two different
+     * questions asked of two different tables - ``attendance_logs`` for what has finished, the
+     * open-session table for what has not - and a lane only needs to know when it started and
+     * when it stopped. An open shift has ``end: null``, which is not "no answer": it is "not
+     * yet", and the drawing code turns that into a bar that reaches the right edge.
+     *
+     * A row whose Clock In was never written (a force-clock-out, an auto-close whose arrival
+     * predates the pairing) still gets a lane: it is drawn as a point at its clock-out rather
+     * than dropped, because a person who worked today and cannot be seen is the one thing a
+     * timeline must not do.
+     */
+    liveOpsTimelineAllEntries(data) {
+        const entries = [];
+        const rows = (this._liveOpsTimeline && Array.isArray(this._liveOpsTimeline.rows))
+            ? this._liveOpsTimeline.rows : [];
+        for (const row of rows) {
+            const arrival = this.liveOpsMinuteOfDay(row && row.arrival_time);
+            const departure = this.liveOpsMinuteOfDay(row && row.timestamp);
+            if (arrival === null && departure === null) continue;
+            const start = arrival === null ? departure : arrival;
+            const end = departure === null ? start : departure;
+            entries.push({
+                worker_id: String((row && row.worker_id) || ''),
+                name: String((row && (row.worker_name || row.worker_id)) || ''),
+                site_name: String((row && row.site_name) || ''),
+                start,
+                end: Math.max(start, end),
+                open: false,
+                late: false
+            });
+        }
+        for (const session of ((data && data.sessions) || [])) {
+            const start = this.liveOpsMinuteOfDay(session && session.clock_in_time);
+            if (start === null) continue;
+            entries.push({
+                worker_id: String((session && session.worker_id) || ''),
+                name: String((session && (session.name || session.worker_id)) || ''),
+                site_name: String((session && session.site_name) || ''),
+                start,
+                end: null,
+                open: true,
+                late: this.liveOpsIsLate(session)
+            });
+        }
+        return entries;
+    },
+
+    /**
+     * One gate's day, or the whole deployment's.
+     *
+     * The narrowing is applied *here* rather than at each caller because every part of the
+     * drawing - the window, the curve, the count at a minute, the lanes, the note - is derived
+     * from this one list, so a site chosen for the chart is a site chosen for all of it. The
+     * choice lives in ``_liveOpsTimelineSite``, set from the picker in the timeline's own
+     * header: an operator scrubbing one gate's day is asking the same question the board's site
+     * filter asks of the list, and gets one field for it rather than a second, quieter meaning
+     * for the board's.
+     */
+    liveOpsTimelineEntries(data) {
+        const site = this._liveOpsTimelineSite || '';
+        const entries = this.liveOpsTimelineAllEntries(data);
+        return site ? entries.filter((entry) => entry.site_name === site) : entries;
+    },
+
+    /**
+     * Every gate the timeline could be read for: the deployment's list of sites, plus any name
+     * a stored shift carries that the registry no longer does (a site removed since it was
+     * worked). Sorted, so the picker does not reorder itself as the day fills up.
+     */
+    liveOpsTimelineSiteNames(data) {
+        const names = new Set();
+        for (const site of ((data && data.sites) || [])) {
+            const name = String((site && site.site_name) || '').trim();
+            if (name) names.add(name);
+        }
+        for (const entry of this.liveOpsTimelineAllEntries(data)) {
+            if (entry.site_name) names.add(entry.site_name);
+        }
+        return Array.from(names).sort((a, b) => a.localeCompare(b));
+    },
+
+    /**
+     * The timeline's scope picker: one gate, or every gate.
+     *
+     * Offered in the timeline's own header rather than the board's toolbar, whose list-only
+     * controls hide while the timeline is up (a search box that narrows a list nobody is looking
+     * at is a control that looks broken - but a site picker narrows the *chart*). The counts are
+     * shifts that touched today, not people on site now, because that is what the chart is made
+     * of; and the options come from the site registry as well as the day, so an operator can ask
+     * "what happened at this gate" before anything has happened there.
+     */
+    liveOpsTimelineSiteSelectHtml(data) {
+        const names = this.liveOpsTimelineSiteNames(data);
+        if (!names.length) return '';
+        const all = this.liveOpsTimelineAllEntries(data);
+        const counts = new Map();
+        for (const entry of all) {
+            if (!entry.site_name) continue;
+            counts.set(entry.site_name, (counts.get(entry.site_name) || 0) + 1);
+        }
+        const selected = this._liveOpsTimelineSite || '';
+        const option = (value, label) => `<option value="${this.escapeHtml(value)}"${selected === value ? ' selected' : ''}>${this.escapeHtml(label)}</option>`;
+        const everySite = I18n.__('liveOpsAllSites');
+        return `<label class="sr-only" for="liveOpsTimelineSite">${this.escapeHtml(I18n.__('liveOpsSiteFilter'))}</label>
+            <select class="ops-select" id="liveOpsTimelineSite" data-live-ops-timeline-site>${option('', `${everySite} (${all.length})`)}${names.map((name) => option(name, `${name} (${counts.get(name) || 0})`)).join('')}</select>`;
+    },
+
+    /**
+     * The slice of the day the timeline draws: an hour before the first arrival, to now.
+     *
+     * Anchored to the first *arrival* rather than to midnight because at 09:00 a window from
+     * 00:00 spends three quarters of its width proving that nothing happened - the opposite of
+     * what the timeline is for. The hour of lead-in is what makes the first bar read as an
+     * arrival instead of as the edge of the chart; nothing may start before midnight, and the
+     * window never runs past now, because a clock-out in the future does not exist.
+     */
+    liveOpsTimelineWindow(entries, nowMinute) {
+        let first = null;
+        for (const entry of (entries || [])) {
+            if (entry.start === null) continue;
+            if (first === null || entry.start < first) first = entry.start;
+        }
+        const now = Number.isFinite(nowMinute) ? nowMinute : this.liveOpsNowMinute();
+        const from = first === null ? 0 : Math.max(0, Math.floor(first / 60) * 60 - 60);
+        const to = Math.min(1440, Math.max(now, from + 60));
+        return { from, to: to <= from ? Math.min(1440, from + 60) : to };
+    },
+
+    /** Where the scrubber stands: the chosen moment clamped into the window, or its end. */
+    liveOpsScrubMinute(window) {
+        const to = window && Number.isFinite(window.to) ? window.to : this.liveOpsNowMinute();
+        const from = window && Number.isFinite(window.from) ? window.from : 0;
+        const raw = this._liveOpsMoment;
+        if (raw === null || raw === undefined) return to;
+        const minute = Number(raw);
+        if (!Number.isFinite(minute)) return to;
+        return Math.min(to, Math.max(from, minute));
+    },
+
+    /** Whether the scrubber is standing somewhere other than now. */
+    liveOpsScrubbing() {
+        return this._liveOpsMoment !== null && this._liveOpsMoment !== undefined;
+    },
+
+    /** How many shifts were open at one minute of the day. */
+    liveOpsTimelineCount(entries, minute) {
+        const at = Number(minute);
+        if (!Number.isFinite(at)) return 0;
+        return (entries || []).filter((entry) => entry.start !== null
+            && entry.start <= at && (entry.end === null || entry.end > at)).length;
+    },
+
+    /**
+     * The headcount across the window, sampled finely enough to be a shape.
+     *
+     * A step function sampled on a fixed grid rather than "one point per punch": the curve
+     * has to be a polyline, and reading it off the arrivals alone would miss the minutes where
+     * a departure was the only thing that changed. At most ~96 samples, so the markup stays a
+     * paragraph of numbers rather than a payload.
+     */
+    liveOpsTimelineSeries(entries, window) {
+        const from = window.from;
+        const to = window.to;
+        const span = Math.max(1, to - from);
+        const step = Math.max(this.LIVE_OPS_SCRUB_STEP, Math.ceil(span / 96));
+        const samples = [];
+        for (let minute = from; minute <= to; minute += step) {
+            samples.push({ minute, count: this.liveOpsTimelineCount(entries, minute) });
+        }
+        if (!samples.length || samples[samples.length - 1].minute !== to) {
+            samples.push({ minute: to, count: this.liveOpsTimelineCount(entries, to) });
+        }
+        return samples;
+    },
+
+    /** How far across the window a minute sits, as a percentage. */
+    liveOpsTimelinePercent(minute, window) {
+        const span = Math.max(1, window.to - window.from);
+        const position = ((Number(minute) - window.from) / span) * 100;
+        return Math.max(0, Math.min(100, Number.isFinite(position) ? position : 0));
+    },
+
+    /** Today, as the two ``YYYY-MM-DD`` values ``/admin/reports/shifts`` takes. */
+    liveOpsTimelineDay() {
+        const today = this.isoDate(new Date());
+        return { start: today, end: today };
+    },
+
     liveOpsRows(data) {
         const query = String(this._liveOpsQuery || '').trim().toLowerCase();
         const site = this._liveOpsSite || '';
@@ -364,7 +701,10 @@ const UI_MODULES = {
             session,
             category: this.liveOpsCategoryOf(categories, session),
             facts: this.liveOpsFacts(session, data && data.rules)
-        })).filter(({ session, category }) => {
+        })).filter(({ session, category, facts }) => {
+            // The "needs me now" chip is a filter, not a fourth figure: it narrows the list
+            // under the tiles and never moves the tiles themselves.
+            if (this._liveOpsAttention && facts.state !== 'closing' && facts.state !== 'over') return false;
             // One field narrows the board either way: it holds a site in Site view and a
             // category in Category view, so the chip row is still the one control.
             if (site) {
@@ -517,6 +857,188 @@ const UI_MODULES = {
     },
 
     /**
+     * How trustworthy the stamp beside the figures is: fresh, aging or stale.
+     *
+     * A board that keeps breathing a live dot over numbers it read ten minutes ago is worse
+     * than one that says nothing, because it asks the operator to believe something the console
+     * cannot back up. The age is the whole test, plus one case the age alone cannot see: a board
+     * whose stream has given up *and* which is running no poll has no way to learn anything new,
+     * whatever its stamp says, so past the freshness window it is stale rather than merely aging.
+     *
+     * A paused board is its own state, not a stale one: stopping the clock is exactly what the
+     * operator asked for, and calling that "out of date" would be the console arguing with them.
+     */
+    liveOpsFresh(data) {
+        if (this._liveOpsPaused) return 'paused';
+        const at = Number(data && data.at);
+        const age = isFinite(at) && at > 0 ? Date.now() - at : Infinity;
+        if (age < this.LIVE_OPS_AGING_MS) return 'fresh';
+        const blind = !this._liveOpsStreaming && this._liveOpsPoll === null;
+        if (age < this.LIVE_OPS_STALE_MS && !blind) return 'aging';
+        return 'stale';
+    },
+
+    liveOpsFreshnessLabel(data) {
+        const state = this.liveOpsFresh(data);
+        if (state === 'paused') return I18n.__('liveOpsFreshnessPaused');
+        if (state === 'stale') return I18n.__('liveOpsFreshnessStale');
+        if (state === 'aging') return I18n.__('liveOpsFreshnessAging');
+        return I18n.__('liveOpsFreshnessFresh');
+    },
+
+    /**
+     * The freshness chip, beside the stamp and *outside* the live region.
+     *
+     * Two reasons it is a sibling of ``liveOpsStatusTime`` and not part of the announcement:
+     * a status word that changed on its own every minute would be noise read aloud, and the
+     * freshness is about the machinery, not about who is on site. It is drawn in words as well
+     * as colour, like every other state on this screen.
+     */
+    liveOpsFreshnessHtml(data) {
+        const state = this.liveOpsFresh(data);
+        const title = state === 'paused'
+            ? I18n.__('liveOpsPausedNote')
+            : state === 'stale' ? I18n.__('liveOpsFreshnessStale')
+                : state === 'aging' ? I18n.__('liveOpsFreshnessAging') : '';
+        const hint = title ? ` title="${this.escapeHtml(title)}"` : '';
+        return `<span class="ops-fresh is-${state}" id="liveOpsFreshness"${hint}>${this.escapeHtml(this.liveOpsFreshnessLabel(data))}</span>`;
+    },
+
+    /**
+     * Repaint the live dot and the freshness chip in place.
+     *
+     * Called by the paint, the tick and the pause control alike: the freshness is a function of
+     * the clock, so anything that moves the clock has to move it too, or the board would sit on
+     * "Live" through an outage and then flip to "out of date" on the next unrelated repaint.
+     */
+    paintLiveOpsFreshness(data) {
+        const state = this.liveOpsFresh(this._liveOps || data);
+        const label = this.liveOpsFreshnessLabel(this._liveOps || data);
+        const span = document.getElementById('liveOpsFreshness');
+        if (span) {
+            span.textContent = label;
+            span.className = `ops-fresh is-${state}`;
+        }
+        const dot = document.getElementById('liveOpsLiveDot');
+        if (dot) dot.className = `ops-live-dot is-${state}`;
+    },
+
+    /**
+     * Who is on site, per site - the strip above the board in Site view.
+     *
+     * Built from the counted read's own ``sites`` when there is one (the server already worked
+     * out the spread in SQL), and from the rows in hand otherwise. Either way it is the *figures*
+     * the tiles above already lead with, drawn as the shape of the day: one proportional bar per
+     * site, so an operator sees "one site is carrying everyone" before they read a single name.
+     * Hidden in Category view, where the board is already grouped by the same idea - and in the
+     * timeline, which is the one reading where a figure about *now* over a chart of the whole
+     * day would be the wrong tense on the screen.
+     */
+    liveOpsOccupancyRows(data) {
+        const count = data && this.liveOpsCountedRead(data.count) ? data.count : null;
+        if (count && Array.isArray(count.sites)) {
+            return count.sites
+                .map((site) => ({ name: String((site && site.site_name) || ''), workers: Number((site && site.workers) || 0) }))
+                .filter((site) => site.name)
+                .sort((a, b) => b.workers - a.workers || a.name.localeCompare(b.name));
+        }
+        const buckets = new Map();
+        for (const session of ((data && data.sessions) || [])) {
+            const name = String((session && session.site_name) || '');
+            if (!name) continue;
+            buckets.set(name, (buckets.get(name) || 0) + 1);
+        }
+        return Array.from(buckets, ([name, workers]) => ({ name, workers }))
+            .sort((a, b) => b.workers - a.workers || a.name.localeCompare(b.name));
+    },
+
+    liveOpsOccupancyHtml(data) {
+        // The three tiles above are the board's own figures and they stay put in every
+        // reading - they are what an operator came for. This strip is a breakdown of *those*
+        // figures, so it is the one part of the pane that has to leave when the rest of the
+        // pane is answering "how did the day go" instead of "where is everybody": a "2 here, 1
+        // there" above a chart standing at 04:30 would be read as the answer for 04:30.
+        if (this.liveOpsView() === 'timeline' || this.liveOpsGroup() !== 'site') return '';
+        const sites = this.liveOpsOccupancyRows(data);
+        if (!sites.length) return '';
+        const max = sites.reduce((peak, site) => Math.max(peak, site.workers), 1);
+        const items = sites.map((site) => `
+            <li class="ops-occupancy-item">
+                <span class="ops-occupancy-name" title="${this.escapeHtml(site.name)}">${this.escapeHtml(site.name)}</span>
+                <span class="ops-occupancy-bar" aria-hidden="true"><span style="width:${Math.round((site.workers / max) * 100)}%"></span></span>
+                <span class="ops-occupancy-count">${this.escapeHtml(String(site.workers))}</span>
+            </li>`).join('');
+        return `
+            <section class="ops-occupancy" data-live-ops-occupancy aria-label="${this.escapeHtml(I18n.__('liveOpsOccupancyTitle'))}">
+                <h2 class="ops-occupancy-title">${this.escapeHtml(I18n.__('liveOpsOccupancyTitle'))}</h2>
+                <ul class="ops-occupancy-list">${items}</ul>
+            </section>`;
+    },
+
+    /**
+     * The one chip that narrows the board to the shifts that need a person.
+     *
+     * A *filter*, deliberately, and not a fourth tile: the three figures above are what the
+     * operator came for and they must not move when this is tapped - the chip narrows the list
+     * under them, beside the search and the site picker it belongs with. It is a ``data-`` hook
+     * through ``onLiveOpsClick``, like every other control this file gained.
+     */
+    liveOpsAttentionHtml() {
+        const on = !!this._liveOpsAttention;
+        return `<button type="button" class="ops-chip ops-chip-attention" id="liveOpsAttention" data-live-ops-attention aria-pressed="${on ? 'true' : 'false'}" title="${this.escapeHtml(I18n.__('liveOpsAttentionHint'))}">${this.OPS_ICONS.alert}<span>${this.escapeHtml(I18n.__('liveOpsNeedsMe'))}</span></button>`;
+    },
+
+    toggleLiveOpsAttention() {
+        this._liveOpsAttention = !this._liveOpsAttention;
+        State.liveOpsAttention = this._liveOpsAttention;
+        const chip = document.getElementById('liveOpsAttention');
+        if (chip) chip.setAttribute('aria-pressed', this._liveOpsAttention ? 'true' : 'false');
+        if (this._liveOps) {
+            const board = document.getElementById('liveOpsBoard');
+            if (board) board.innerHTML = this.liveOpsBoardHtml(this._liveOps);
+            const note = document.getElementById('liveOpsFilterNote');
+            if (note) note.textContent = this.liveOpsFilterNoteHtml(this._liveOps);
+        }
+        return this._liveOpsAttention;
+    },
+
+    /** The pause control: it stops the upkeep, or starts it again. */
+    liveOpsPauseHtml() {
+        const paused = !!this._liveOpsPaused;
+        return `<button type="button" class="ops-btn" id="liveOpsPause" data-live-ops-pause aria-pressed="${paused ? 'true' : 'false'}">${paused ? this.OPS_ICONS.play : this.OPS_ICONS.pause}<span>${this.escapeHtml(I18n.__(paused ? 'liveOpsResume' : 'liveOpsPause'))}</span></button>`;
+    },
+
+    /**
+     * Freeze the board, or unfreeze it.
+     *
+     * Pausing stops the one-second tick, the stream and the poll - everything that would have
+     * changed a number - and leaves the rows where they are. It deliberately does *not* go
+     * through ``stopLiveOps``: that is the method for leaving the tab, and it folds the list
+     * shut, which is the last thing an operator who pressed Pause mid-read wants. The header
+     * says the board is paused, and ``liveOpsFresh`` reports it as its own state rather than as
+     * staleness: the operator stopped it on purpose.
+     */
+    toggleLiveOpsPause() {
+        this._liveOpsPaused = !this._liveOpsPaused;
+        if (this._liveOpsPaused) {
+            if (this._liveOpsTick !== null) { clearInterval(this._liveOpsTick); this._liveOpsTick = null; }
+            if (this._liveOpsPoll !== null) { clearInterval(this._liveOpsPoll); this._liveOpsPoll = null; }
+            this.stopLiveOpsStream();
+        } else if (this._liveOps && State.adminTab === 'Live Ops') {
+            if (this._liveOpsTick === null) this._liveOpsTick = setInterval(() => this.tickLiveOps(), 1000);
+            this.startLiveOpsStream();
+        }
+        const button = document.getElementById('liveOpsPause');
+        if (button) {
+            const paused = this._liveOpsPaused;
+            button.setAttribute('aria-pressed', paused ? 'true' : 'false');
+            button.innerHTML = `${paused ? this.OPS_ICONS.play : this.OPS_ICONS.pause}<span>${this.escapeHtml(I18n.__(paused ? 'liveOpsResume' : 'liveOpsPause'))}</span>`;
+        }
+        this.paintLiveOpsFreshness(this._liveOps);
+        return this._liveOpsPaused;
+    },
+
+    /**
      * The site (or category) picker: one list of everything that can be chosen.
      *
      * A row of chips was the wrong instrument for this. Chips were built from the shifts that
@@ -555,15 +1077,41 @@ const UI_MODULES = {
     onLiveOpsChange(event) {
         const target = event && event.target;
         if (!target || typeof target.getAttribute !== 'function') return undefined;
-        if (target.getAttribute('data-live-ops-filter') === null) return undefined;
-        return this.setLiveOpsSite(target.value);
+        // One listener answers both events this pane fires with a value: the picker's ``change``
+        // and the search box's ``input``. A control is identified by its own ``data-`` hook, so
+        // there is no second place for the two to disagree about which one moved.
+        if (target.getAttribute('data-live-ops-filter') !== null) return this.setLiveOpsSite(target.value);
+        if (target.getAttribute('data-live-ops-timeline-site') !== null) return this.setLiveOpsTimelineSite(target.value);
+        if (target.getAttribute('data-sort-select') !== null) return this.setLiveOpsSort(target.value);
+        if (target.getAttribute('data-search') !== null) return this.setLiveOpsQuery(target.value);
+        // The scrubber fires ``input`` once per step, which is the one delegated control whose
+        // event is *not* the end of an interaction: the value has to be read as it moves, and
+        // the timeline's body - never the input - is what gets redrawn (see
+        // ``setLiveOpsMoment``).
+        if (target.getAttribute('data-live-ops-scrub') !== null) return this.setLiveOpsMoment(target.value);
+        return undefined;
+    },
+
+    /**
+     * The force-in disclosure opening or closing.
+     *
+     * ``toggle`` does not bubble, so this is a capture listener on the pane rather than a
+     * bubbling one: the same reason the click listener is delegated - the markup is a string
+     * rebuilt on every repaint, and a listener written into it is the inline allowance this
+     * file is trying to retire.
+     */
+    onLiveOpsToggle(event) {
+        const target = event && event.target;
+        if (!target || typeof target.getAttribute !== 'function') return undefined;
+        if (target.getAttribute('data-live-ops-panel') === null) return undefined;
+        return this.liveOpsPanelToggled(target);
     },
 
     liveOpsSortSelectHtml() {
         const sort = this._liveOpsSort || 'longest';
         const option = (value, key) => `<option value="${value}"${sort === value ? ' selected' : ''}>${this.escapeHtml(I18n.__(key))}</option>`;
         return `<label class="sr-only" for="liveOpsSort">${this.escapeHtml(I18n.__('liveOpsSort'))}</label>
-            <select class="ops-sort" id="liveOpsSort" data-sort-select onchange="UI_MODULES.setLiveOpsSort(this.value)">
+            <select class="ops-sort" id="liveOpsSort" data-sort-select>
                 ${option('longest', 'liveOpsSortLongest')}${option('newest', 'liveOpsSortNewest')}${option('name', 'liveOpsSortName')}
             </select>`;
     },
@@ -589,7 +1137,7 @@ const UI_MODULES = {
         const sort = this._liveOpsSort || 'longest';
         const active = (key === 'name' && sort === 'name') || (key === 'elapsed' && sort !== 'name');
         const arrow = active ? (sort === 'newest' ? this.OPS_ICONS.chevronUp : this.OPS_ICONS.chevronDown) : '';
-        return `<button type="button" class="ops-sort-btn" data-sort-btn="${key}" onclick="UI_MODULES.setLiveOpsSort('${key}')">${this.escapeHtml(label)}${arrow}</button>`;
+        return `<button type="button" class="ops-sort-btn" data-sort-btn="${key}">${this.escapeHtml(label)}${arrow}</button>`;
     },
 
     /**
@@ -639,11 +1187,14 @@ const UI_MODULES = {
         return this.escapeHtml(parts.filter(Boolean).join(' \u00b7 '));
     },
 
-    liveOpsRowHtml(session, facts) {
+    liveOpsRowHtml(session, facts, index) {
         const elapsed = facts.seconds === null ? '\u2014' : this.liveOpsDuration(facts.seconds);
         const start = this.escapeHtml(String(session.clock_in_time || ''));
+        // ``--i`` is the stagger step, shared with the Links board; it is clamped so a long
+        // board does not make the last row wait a second and a half to fade in.
+        const step = Math.min(Number(index) || 0, 8);
         return `
-            <tr class="ops-row ${this.liveOpsStateClass(facts.state)}"
+            <tr class="ops-row ${this.liveOpsStateClass(facts.state)}" style="--i:${step}"
                 data-session="${this.escapeHtml(session.worker_id)}">
                 <td>
                     <div class="ops-row-main">
@@ -666,10 +1217,11 @@ const UI_MODULES = {
             </tr>`;
     },
 
-    liveOpsCardHtml(session, facts) {
+    liveOpsCardHtml(session, facts, index) {
         const elapsed = facts.seconds === null ? '\u2014' : this.liveOpsDuration(facts.seconds);
+        const step = Math.min(Number(index) || 0, 8);
         return `
-            <article class="ops-card ${this.liveOpsStateClass(facts.state)}" data-session="${this.escapeHtml(session.worker_id)}">
+            <article class="ops-card ${this.liveOpsStateClass(facts.state)}" style="--i:${step}" data-session="${this.escapeHtml(session.worker_id)}">
                 <div class="ops-card-top">
                     ${this.liveOpsAvatarHtml(session)}
                     <div class="ops-who">
@@ -702,8 +1254,13 @@ const UI_MODULES = {
      * layouts differ in everything but this, and a second copy is where they would drift.
      */
     forceOutButtonHtml(session) {
+        // Three ``data-`` attributes read back by the board's one delegated click listener,
+        // rather than three values written into an inline call. The worker's id, name and
+        // clock-in are operator-entered and server-sent text; an attribute is exactly where a
+        // value is *not* executable, which is the point of converting this button.
         return `<button type="button" class="ops-btn ops-btn-danger" data-force-out="${this.escapeHtml(session.worker_id)}"
-                            onclick="UI.forceOutModal('${this.liveOpsInlineString(session.worker_id)}', '${this.liveOpsInlineString(session.worker_name || session.worker_id)}', '${this.liveOpsInlineString(session.clock_in_time || '')}')">${this.escapeHtml(I18n.__('forceOut'))}</button>`;
+                            data-name="${this.escapeHtml(session.worker_name || session.name || session.worker_id)}"
+                            data-clock-in="${this.escapeHtml(session.clock_in_time || '')}">${this.escapeHtml(I18n.__('forceOut'))}</button>`;
     },
 
     liveOpsTableHtml(rows) {
@@ -723,27 +1280,39 @@ const UI_MODULES = {
                             <th scope="col"><span class="sr-only">${this.escapeHtml(I18n.__('liveOpsAction'))}</span></th>
                         </tr>
                     </thead>
-                    <tbody>${rows.map(({ session, facts }) => this.liveOpsRowHtml(session, facts)).join('')}</tbody>
+                    <tbody>${rows.map(({ session, facts }, index) => this.liveOpsRowHtml(session, facts, index)).join('')}</tbody>
                 </table>
             </div>`;
     },
 
     liveOpsCardsHtml(rows) {
-        return `<div class="ops-cards">${rows.map(({ session, facts }) => this.liveOpsCardHtml(session, facts)).join('')}</div>`;
+        return `<div class="ops-cards">${rows.map(({ session, facts }, index) => this.liveOpsCardHtml(session, facts, index)).join('')}</div>`;
     },
 
     liveOpsEmptyHtml(total) {
         const filtered = total > 0;
+        const attention = !!this._liveOpsAttention;
+        // The empty state knows *which* filter emptied it. "No shift matches these filters"
+        // under a "needs me now" chip that quietly narrowed the list to nothing would leave an
+        // operator hunting a search box they never touched.
+        const title = filtered
+            ? (attention ? I18n.__('liveOpsNeedsMe') : I18n.__('liveOpsNoMatches'))
+            : I18n.__('noActiveShifts');
+        const body = filtered
+            ? (attention
+                ? I18n.__('liveOpsNeedsMeEmpty')
+                : I18n.__(this.liveOpsGroup() === 'category' ? 'liveOpsNoMatchesHintCategory' : 'liveOpsNoMatchesHint'))
+            : I18n.__('liveOpsNobodyHint');
+        // Both buttons are delegated: the clear-filters hook, and the force-in hook, are read by
+        // the board's one click listener rather than written into an attribute as a call.
         const action = filtered
-            ? `<button type="button" class="ops-btn" data-clear-filters onclick="UI_MODULES.clearLiveOpsFilters()">${this.escapeHtml(I18n.__('liveOpsClearFilters'))}</button>`
-            : `<button type="button" class="ops-btn ops-btn-primary" data-force-in-cta onclick="UI_MODULES.openForceIn()">${this.OPS_ICONS.person}${this.escapeHtml(I18n.__('liveOpsForceCta'))}</button>`;
+            ? `<button type="button" class="ops-btn" data-clear-filters>${this.escapeHtml(I18n.__('liveOpsClearFilters'))}</button>`
+            : `<button type="button" class="ops-btn ops-btn-primary" data-force-in-cta>${this.OPS_ICONS.person}${this.escapeHtml(I18n.__('liveOpsForceCta'))}</button>`;
         return `
             <div class="ops-empty" data-empty="${filtered ? 'filtered' : 'nobody'}">
                 <span class="ops-empty-icon">${filtered ? this.OPS_ICONS.search : this.OPS_ICONS.person}</span>
-                <p class="ops-empty-title">${this.escapeHtml(filtered ? I18n.__('liveOpsNoMatches') : I18n.__('noActiveShifts'))}</p>
-                <p class="ops-empty-body">${this.escapeHtml(filtered
-                    ? I18n.__(this.liveOpsGroup() === 'category' ? 'liveOpsNoMatchesHintCategory' : 'liveOpsNoMatchesHint')
-                    : I18n.__('liveOpsNobodyHint'))}</p>
+                <p class="ops-empty-title">${this.escapeHtml(title)}</p>
+                <p class="ops-empty-body">${this.escapeHtml(body)}</p>
                 ${action}
             </div>`;
     },
@@ -774,7 +1343,214 @@ const UI_MODULES = {
         });
     },
 
+    /**
+     * The Board / Timeline switch.
+     *
+     * A second segmented pair rather than a third button on the Site / Category one: those
+     * two answer "how is this list grouped", and the timeline is not a grouping - it is a
+     * different question about the same day. Both pairs are read off the same
+     * ``data-`` hook and ``aria-pressed`` adjacency the first one is, so the two switches
+     * behave identically for a keyboard and for a screen reader.
+     */
+    liveOpsViewToggleHtml() {
+        const view = this.liveOpsView();
+        const option = (value, key, id) => `<button type="button" class="ops-seg-btn" id="${id}" data-live-ops-view="${value}" aria-pressed="${view === value ? 'true' : 'false'}">${this.escapeHtml(I18n.__(key))}</button>`;
+        return `<div class="ops-seg ops-seg-view" role="group" aria-label="${this.escapeHtml(I18n.__('liveOpsViewLabel'))}">${option('board', 'liveOpsViewBoard', 'liveOpsViewBoard')}${option('timeline', 'liveOpsViewTimeline', 'liveOpsViewTimeline')}</div>`;
+    },
+
+    /** The sentence above the timeline: the scrubbed moment, and the headcount at it. */
+    liveOpsTimelineAtLabel(data) {
+        const entries = this.liveOpsTimelineEntries(data);
+        const window = this.liveOpsTimelineWindow(entries, this.liveOpsNowMinute());
+        const moment = this.liveOpsScrubMinute(window);
+        return I18n.__(this.liveOpsScrubbing() ? 'liveOpsTimelineAtLine' : 'liveOpsTimelineNowLine')
+            .replace('{time}', this.liveOpsTimeLabel(moment))
+            .replace('{count}', String(this.liveOpsTimelineCount(entries, moment)));
+    },
+
+    /**
+     * The timeline: the day's own shape, and every shift that made it.
+     *
+     * Three parts, in the order an operator reads them. A **headline** that says which moment
+     * the scrubber is standing on and how many people were on site then - the sentence the
+     * whole view exists to produce. A **scrubber**, which is an ordinary range input so it
+     * answers the arrow keys and a screen reader the way every other range input does. And a
+     * **body** that is redrawn on its own when the scrubber moves, so the slider keeps the
+     * thumb the user is dragging instead of being replaced under it.
+     */
+    liveOpsTimelineHtml(data) {
+        if (this._liveOpsTimelineLoading) return this.liveOpsTimelineLoadingHtml();
+        if (this._liveOpsTimelineFailed) return this.liveOpsTimelineErrorHtml();
+        const entries = this.liveOpsTimelineEntries(data);
+        if (!entries.length) {
+            // A gate with nothing today is still a gate somebody chose: the way out of an empty
+            // *filtered* day is the picker that filtered it, not "back to the board".
+            return (this._liveOpsTimelineSite || '')
+                ? this.liveOpsTimelineSiteEmptyHtml(data)
+                : this.liveOpsTimelineEmptyHtml();
+        }
+        const window = this.liveOpsTimelineWindow(entries, this.liveOpsNowMinute());
+        const moment = this.liveOpsScrubMinute(window);
+        const scrubbing = this.liveOpsScrubbing();
+        const label = this.liveOpsTimelineAtLabel(data);
+        return `
+            <section class="ops-timeline" data-live-ops-timeline aria-label="${this.escapeHtml(I18n.__('liveOpsTimelineTitle'))}">
+                <header class="ops-timeline-head">
+                    <div class="ops-timeline-scope">${this.liveOpsTimelineSiteSelectHtml(data)}</div>
+                    <div class="ops-timeline-readout">
+                        <p class="ops-timeline-at" id="liveOpsTimelineAt" role="status" aria-atomic="true">${this.escapeHtml(label)}</p>
+                        <button type="button" class="ops-btn" id="liveOpsNow" data-live-ops-now${scrubbing ? '' : ' hidden'}>${this.escapeHtml(I18n.__('liveOpsTimelineNow'))}</button>
+                    </div>
+                </header>
+                <label class="ops-scrub">
+                    <span class="sr-only">${this.escapeHtml(I18n.__('liveOpsTimelineScrubLabel'))}</span>
+                    <input type="range" id="liveOpsScrub" data-live-ops-scrub min="${Math.round(window.from)}" max="${Math.round(window.to)}" step="${this.LIVE_OPS_SCRUB_STEP}" value="${Math.round(moment)}" aria-valuetext="${this.escapeHtml(label)}" />
+                </label>
+                ${this.liveOpsTimelineAxisHtml(window)}
+                <div id="liveOpsTimelineBody">${this.liveOpsTimelineBodyHtml(data)}</div>
+            </section>`;
+    },
+
+    /** The hour marks under the track, as many as the window can carry legibly. */
+    liveOpsTimelineAxisHtml(window) {
+        const span = Math.max(1, window.to - window.from);
+        const everyHours = span > 8 * 60 ? 2 : 1;
+        const ticks = [];
+        for (let minute = Math.ceil(window.from / 60) * 60; minute <= window.to; minute += everyHours * 60) {
+            ticks.push(`<span class="ops-tick" style="left:${this.liveOpsTimelinePercent(minute, window).toFixed(2)}%">${this.escapeHtml(this.liveOpsTimeLabel(minute))}</span>`);
+        }
+        return `<div class="ops-timeline-axis" aria-hidden="true" data-live-ops-axis>${ticks.join('')}</div>`;
+    },
+
+    /**
+     * The shape of the day, and the lanes under it.
+     *
+     * The curve is drawn as an SVG on a 100x100 grid with ``preserveAspectRatio="none"``, so it
+     * is a percentage of the box it is given rather than a pixel canvas that has to be measured
+     * and redrawn on resize - and ``vector-effect="non-scaling-stroke"`` keeps the line one
+     * pixel wide however the box is stretched. It is ``aria-hidden``: it is the same fact as the
+     * headline above it, drawn rather than said, and a screen reader has the sentence.
+     *
+     * Part of drawing, not decoration: the *curve* is what answers "how did the site fill up".
+     */
+    liveOpsTimelineBodyHtml(data) {
+        const entries = this.liveOpsTimelineEntries(data);
+        const window = this.liveOpsTimelineWindow(entries, this.liveOpsNowMinute());
+        const moment = this.liveOpsScrubMinute(window);
+        const series = this.liveOpsTimelineSeries(entries, window);
+        const peak = Math.max(1, series.reduce((high, sample) => Math.max(high, sample.count), 0));
+        const points = series.map((sample) => `${this.liveOpsTimelinePercent(sample.minute, window).toFixed(2)},${(100 - (sample.count / peak) * 100).toFixed(2)}`).join(' ');
+        const marker = this.liveOpsTimelinePercent(moment, window).toFixed(2);
+        // Whoever was there at the scrubbed moment sorts first: the lanes answer "who is this",
+        // and the answer is a set that changes as the day moves, so the set has to be at the top.
+        const present = (entry) => entry.start !== null && entry.start <= moment
+            && (entry.end === null || entry.end > moment);
+        const lanes = entries.slice().sort((a, b) => (present(a) ? 0 : 1) - (present(b) ? 0 : 1)
+            || a.start - b.start || a.name.localeCompare(b.name));
+        return `
+            <div class="ops-curve-wrap">
+                <svg class="ops-curve" data-live-ops-curve viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true" focusable="false">
+                    <polygon class="ops-curve-area" points="0,100 ${points} 100,100" />
+                    <polyline class="ops-curve-line" vector-effect="non-scaling-stroke" points="${points}" />
+                </svg>
+                <span class="ops-marker" data-live-ops-marker style="left:${marker}%"></span>
+            </div>
+            <ol class="ops-lanes" data-live-ops-lanes>${lanes.map((entry, index) => this.liveOpsLaneHtml(entry, window, moment, index)).join('')}</ol>`;
+    },
+
+    /** One shift's lane: who, where, when they arrived, and the bar between the two. */
+    liveOpsLaneHtml(entry, window, moment, index) {
+        const start = Math.max(window.from, entry.start);
+        const end = entry.end === null ? window.to : Math.min(window.to, Math.max(start, entry.end));
+        const left = this.liveOpsTimelinePercent(start, window);
+        // A force-clock-out with no readable arrival is a point, not a span: one and a half
+        // percent is the width that keeps it visible without inventing time it did not have.
+        const width = Math.max(1.5, this.liveOpsTimelinePercent(end, window) - left);
+        const present = entry.start <= moment && (entry.end === null || entry.end > moment);
+        const step = Math.min(Number(index) || 0, 8);
+        const times = `${this.liveOpsTimeLabel(entry.start)} \u2192 ${entry.open ? I18n.__('liveOpsTimelineStillHere') : this.liveOpsTimeLabel(entry.end)}`;
+        return `
+            <li class="ops-lane ${present ? 'is-present' : 'is-absent'}${entry.open ? ' is-open' : ''}"
+                data-lane="${this.escapeHtml(entry.worker_id)}" data-start="${Math.round(entry.start)}"
+                data-end="${entry.end === null ? '' : Math.round(entry.end)}"${entry.open ? ' data-open="true"' : ''}
+                style="--i:${step}">
+                <span class="ops-lane-who">
+                    ${this.liveOpsAvatarHtml({ name: entry.name, worker_id: entry.worker_id })}
+                    <span class="ops-lane-name">${this.escapeHtml(entry.name)}</span>
+                    <span class="ops-lane-site">${this.escapeHtml(entry.site_name)}</span>
+                </span>
+                <span class="ops-lane-track">
+                    <span class="ops-lane-bar" style="left:${left.toFixed(2)}%;width:${width.toFixed(2)}%"></span>
+                </span>
+                <span class="ops-lane-times">${this.escapeHtml(times)}</span>
+                <span class="sr-only">${this.escapeHtml(present ? I18n.__('liveOpsTimelinePresent') : I18n.__('liveOpsTimelineAbsent'))}</span>
+            </li>`;
+    },
+
+    liveOpsTimelineLoadingHtml() {
+        return `
+            <div class="ops-empty" data-empty="timeline-loading" role="status">
+                <span class="ops-skeleton-bar" style="width:100%"></span>
+                <p class="ops-empty-body">${this.escapeHtml(I18n.__('liveOpsTimelineLoading'))}</p>
+            </div>`;
+    },
+
+    /** Today held nothing: no closed shift and nobody clocked in. An honest, named emptiness. */
+    liveOpsTimelineEmptyHtml() {
+        return `
+            <div class="ops-empty" data-empty="timeline">
+                <span class="ops-empty-icon">${this.OPS_ICONS.clock}</span>
+                <p class="ops-empty-title">${this.escapeHtml(I18n.__('liveOpsTimelineEmptyTitle'))}</p>
+                <p class="ops-empty-body">${this.escapeHtml(I18n.__('liveOpsTimelineEmpty'))}</p>
+                <button type="button" class="ops-btn" data-live-ops-view="board">${this.escapeHtml(I18n.__('liveOpsTimelineBack'))}</button>
+            </div>`;
+    },
+
+    /**
+     * The chosen gate had no shift today.
+     *
+     * Distinct from the empty day above, and deliberately so: "nothing to draw" over the whole
+     * deployment is a fact about the day, while an empty chart with a site chosen in the picker
+     * is a fact about *that gate* - and a reader who cannot tell the two apart concludes the
+     * deployment is empty when they are only looking at one place. The picker stays in the
+     * empty state, so "then show me somewhere else" is answered where the question was asked.
+     */
+    liveOpsTimelineSiteEmptyHtml(data) {
+        const site = this._liveOpsTimelineSite || '';
+        return `
+            <section class="ops-timeline" data-live-ops-timeline aria-label="${this.escapeHtml(I18n.__('liveOpsTimelineTitle'))}">
+                <header class="ops-timeline-head">
+                    <div class="ops-timeline-scope">${this.liveOpsTimelineSiteSelectHtml(data)}</div>
+                </header>
+                <div class="ops-empty" data-empty="timeline-site">
+                    <span class="ops-empty-icon">${this.OPS_ICONS.clock}</span>
+                    <p class="ops-empty-title">${this.escapeHtml(I18n.__('liveOpsTimelineSiteEmptyTitle').replace('{site}', site))}</p>
+                    <p class="ops-empty-body">${this.escapeHtml(I18n.__('liveOpsTimelineSiteEmpty').replace('{site}', site))}</p>
+                    <button type="button" class="ops-btn" data-live-ops-timeline-all>${this.escapeHtml(I18n.__('liveOpsAllSites'))}</button>
+                </div>
+            </section>`;
+    },
+
+    /**
+     * Today's closed shifts could not be read.
+     *
+     * The retry is its own hook rather than the tab's generic one: re-rendering the tab would
+     * land the reader back on the board, which is not the screen they asked to retry.
+     */
+    liveOpsTimelineErrorHtml() {
+        return `
+            <div class="ops-error" data-empty="timeline-failed" role="alert">
+                <span>${this.escapeHtml(I18n.__('liveOpsTimelineError'))}</span>
+                <button type="button" class="ops-btn" data-live-ops-timeline-retry="true">${this.OPS_ICONS.refresh}<span>${this.escapeHtml(I18n.__('liveOpsRetry'))}</span></button>
+            </div>`;
+    },
+
     liveOpsBoardHtml(data) {
+        // The one place the two readings meet: everything below draws the list, and the
+        // timeline is the same region showing a different shape. Keeping them the same element
+        // (``#liveOpsBoard``) is what lets the poll, Refresh and the fold all keep working on
+        // whichever one is on screen without knowing which it is.
+        if (this.liveOpsView() === 'timeline') return this.liveOpsTimelineHtml(data);
         const rows = this.liveOpsRows(data);
         const total = ((data && data.sessions) || []).length;
         if (rows.length === 0) return this.liveOpsEmptyHtml(total);
@@ -881,15 +1657,51 @@ const UI_MODULES = {
         if (target.closest('[data-live-ops-toggle]')) return this.toggleLiveOpsExpanded();
         const group = target.closest('[data-live-ops-group]');
         if (group) return this.setLiveOpsGroup((group.dataset || {}).liveOpsGroup);
+        const view = target.closest('[data-live-ops-view]');
+        if (view) return this.setLiveOpsView((view.dataset || {}).liveOpsView);
+        if (target.closest('[data-live-ops-now]')) return this.setLiveOpsMoment(null);
+        if (target.closest('[data-live-ops-timeline-retry]')) return this.retryLiveOpsTimeline();
+        if (target.closest('[data-live-ops-timeline-all]')) return this.setLiveOpsTimelineSite('');
+        if (target.closest('[data-live-ops-attention]')) return this.toggleLiveOpsAttention();
+        if (target.closest('[data-live-ops-pause]')) return this.toggleLiveOpsPause();
+        if (target.closest('[data-live-ops-retry]')) return UI.renderAdminTab('Live Ops');
+        if (target.closest('[data-clear-filters]')) return this.clearLiveOpsFilters();
+        if (target.closest('[data-force-in-cta]')) return this.openForceIn();
+        if (target.closest('[data-refresh]')) return this.refreshLiveOps();
+        const sort = target.closest('[data-sort-btn]');
+        if (sort) return this.setLiveOpsSort((sort.dataset || {}).sortBtn);
+        const forceOut = target.closest('[data-force-out]');
+        if (forceOut) {
+            const data = forceOut.dataset || {};
+            return UI.forceOutModal(data.forceOut, data.name, data.clockIn);
+        }
         return undefined;
     },
 
     liveOpsFilterNoteHtml(data) {
+        // The timeline is not the list, so it does not get the list's sentence: "6 open shifts"
+        // under a chart of the whole day would describe the only part of it that is *not* the
+        // subject. Its own note says what the day contained instead.
+        if (this.liveOpsView() === 'timeline') return this.liveOpsTimelineNoteHtml(data);
         const total = ((data && data.sessions) || []).length;
         const shown = this.liveOpsRows(data).length;
         return shown === total
             ? I18n.__('liveOpsOpenCount').replace('{total}', String(total))
             : I18n.__('liveOpsShowing').replace('{shown}', String(shown)).replace('{total}', String(total));
+    },
+
+    /** What the day held: how many shifts it closed, and how many are still open. */
+    liveOpsTimelineNoteHtml(data) {
+        const entries = this.liveOpsTimelineEntries(data);
+        const open = entries.filter((entry) => entry.open).length;
+        const site = this._liveOpsTimelineSite || '';
+        // The same two numbers over a subset of the deployment, named by the gate they are
+        // about: "1 still on site" under a chart of one site is that site's answer, not the
+        // company's, and the note is where a reader who scrolled past the picker finds out.
+        return I18n.__(site ? 'liveOpsTimelineSiteNote' : 'liveOpsTimelineNote')
+            .replace('{site}', site)
+            .replace('{closed}', String(entries.length - open))
+            .replace('{open}', String(open));
     },
 
     liveOpsHtml(data) {
@@ -904,27 +1716,40 @@ const UI_MODULES = {
                 <header class="ops-head">
                     <div>
                         <div class="ops-status">
-                            <span class="ops-live-dot" aria-hidden="true"></span>
+                            <span class="ops-live-dot" id="liveOpsLiveDot" aria-hidden="true"></span>
                             <span id="liveOpsStatus" role="status" aria-atomic="true">${this.escapeHtml(this.liveOpsStatusSentence(data))}</span>
                             <span class="ops-status-time" id="liveOpsStatusTime">${this.escapeHtml(this.liveOpsStatusTime(data))}</span>
+                            ${this.liveOpsFreshnessHtml(data)}
                         </div>
                     </div>
-                    <button type="button" class="ops-btn" data-refresh onclick="UI_MODULES.refreshLiveOps()">${this.OPS_ICONS.refresh}<span>${this.escapeHtml(I18n.__('liveOpsRefresh'))}</span></button>
+                    <div class="ops-head-actions">
+                        ${this.liveOpsPauseHtml()}
+                        <button type="button" class="ops-btn" data-refresh>${this.OPS_ICONS.refresh}<span>${this.escapeHtml(I18n.__('liveOpsRefresh'))}</span></button>
+                    </div>
                 </header>
                 <div class="ops-stats" id="liveOpsStats">${this.liveOpsStatsHtml(data)}</div>
+                <div id="liveOpsOccupancy">${this.liveOpsOccupancyHtml(data)}</div>
                 <div class="ops-toolbar">
-                    <label class="ops-search">
-                        <span class="sr-only">${this.escapeHtml(I18n.__('liveOpsSearchLabel'))}</span>
-                        ${this.OPS_ICONS.search}
-                        <input type="search" id="liveOpsQuery" data-search value="${this.escapeHtml(this._liveOpsQuery || '')}"
-                               placeholder="${this.escapeHtml(I18n.__('liveOpsSearchPlaceholder'))}"
-                               oninput="UI_MODULES.setLiveOpsQuery(this.value)" />
-                    </label>
-                    ${this.liveOpsFilterSelectHtml(data)}
-                    ${Device.isMobile ? this.liveOpsSortSelectHtml() : ''}
-                    ${this.liveOpsGroupToggleHtml()}
+                    <!-- The list's own controls, hidden while the timeline is up: a search box
+                         that narrows a list nobody is looking at is a control that looks
+                         broken. The wrapper's id is what setLiveOpsView toggles, and it is
+                         display: contents so hiding it changes nothing about the row it sits
+                         in. -->
+                    <div class="ops-toolbar-board" id="liveOpsBoardTools"${this.liveOpsView() === 'timeline' ? ' hidden' : ''}>
+                        <label class="ops-search">
+                            <span class="sr-only">${this.escapeHtml(I18n.__('liveOpsSearchLabel'))}</span>
+                            ${this.OPS_ICONS.search}
+                            <input type="search" id="liveOpsQuery" data-search value="${this.escapeHtml(this._liveOpsQuery || '')}"
+                                   placeholder="${this.escapeHtml(I18n.__('liveOpsSearchPlaceholder'))}" />
+                        </label>
+                        ${this.liveOpsAttentionHtml()}
+                        ${this.liveOpsFilterSelectHtml(data)}
+                        ${Device.isMobile ? this.liveOpsSortSelectHtml() : ''}
+                        ${this.liveOpsGroupToggleHtml()}
+                    </div>
+                    ${this.liveOpsViewToggleHtml()}
                 </div>
-                <details class="ops-panel" id="liveOpsForceIn"${this._forceInOpen ? ' open' : ''} ontoggle="UI_MODULES.liveOpsPanelToggled(this)">
+                <details class="ops-panel" id="liveOpsForceIn" data-live-ops-panel${this._forceInOpen ? ' open' : ''}>
                     <summary>${this.OPS_ICONS.person}<span>${this.escapeHtml(I18n.__('forceInTitle'))}</span></summary>
                     <div id="liveOpsForceInBody">${this.liveOpsForceInBodyHtml(data)}</div>
                 </details>
@@ -953,7 +1778,7 @@ const UI_MODULES = {
             <div class="ops-error" role="alert">
                 <span>${this.escapeHtml(I18n.__('liveOpsError'))}</span>
                 <span class="ops-sub">${this.escapeHtml((err && err.message) || '')}</span>
-                <button type="button" class="ops-btn" onclick="UI.renderAdminTab('Live Ops')">${this.OPS_ICONS.refresh}<span>${this.escapeHtml(I18n.__('liveOpsRetry'))}</span></button>
+                <button type="button" class="ops-btn" data-live-ops-retry="UI.renderAdminTab('Live Ops')">${this.OPS_ICONS.refresh}<span>${this.escapeHtml(I18n.__('liveOpsRetry'))}</span></button>
             </div>`;
     },
 
@@ -1016,6 +1841,10 @@ const UI_MODULES = {
         } catch (err) {
             if (this.liveOpsRenderIsStale(run)) return;   // a newer render owns the screen
             content.innerHTML = this.liveOpsErrorHtml(err);
+            // The error block's retry is a ``data-`` hook too, so the listener has to be here:
+            // this is the one path that paints the pane and returns without reaching the
+            // assignment below, and a hook with no listener under it is a dead button.
+            content.onclick = (event) => this.onLiveOpsClick(event);
             return;
         }
         if (this.liveOpsRenderIsStale(run)) return;
@@ -1026,10 +1855,19 @@ const UI_MODULES = {
         // rather than added, like the Shifts tab's, so a repaint cannot leave the previous
         // paint's listener behind on the same element.
         content.onclick = (event) => this.onLiveOpsClick(event);
-        // The picker fires on ``change``, not ``click``: one delegated listener beside the
-        // click one, assigned rather than added for the same reason - a repaint must not leave
-        // the previous paint's listener behind on the same element.
+        // The picker fires on ``change`` and the search box on ``input``: the same delegated
+        // listener answers both, assigned rather than added for the same reason - a repaint must
+        // not leave the previous paint's listener behind on the same element.
         content.onchange = (event) => this.onLiveOpsChange(event);
+        content.oninput = (event) => this.onLiveOpsChange(event);
+        // The force-in disclosure is the one control that fires neither: ``toggle`` does not
+        // bubble, so it is a capture listener - attached once to the pane, which outlives every
+        // repaint of its markup, and reused rather than re-added (there is no ``removeEventListener``
+        // call here for the same reason: adding is idempotent under this guard).
+        if (!content.__liveOpsToggle) {
+            content.__liveOpsToggle = (event) => this.onLiveOpsToggle(event);
+            content.addEventListener('toggle', content.__liveOpsToggle, true);
+        }
         this.startLiveOps();
         // A panel that was open when the tab was left is open again, and its roster is the one
         // thing this render did not fetch: a disclosure already open fires no ``toggle``, so
@@ -1175,11 +2013,23 @@ const UI_MODULES = {
         // reader leaves the tab, and a board that is no longer on screen has no business holding
         // a connection open - nor the next tab's render inheriting one.
         this.stopLiveOpsStream();
-        // A board somebody has left starts folded again. This is the only place the state is
-        // cleared (``startLiveOps`` calls this method), and it is deliberately *not* the poll
-        // or the tick: those repaint the board the operator is already reading, and the one
-        // thing that must not happen there is the list closing by itself.
+        // A board somebody has left starts folded again, and unpaused: the pause was about the
+        // read they were in the middle of, not a setting to carry to the next visit.
         this._liveOpsExpanded = false;
+        this._liveOpsPaused = false;
+        // ...and on the list, not the timeline, standing at now rather than wherever the
+        // scrubber was left. Everything the timeline holds is today's and is re-read when it is
+        // opened again - the day a visitor comes back to is the one they are returning to, not
+        // a snapshot from the visit before.
+        this._liveOpsView = 'board';
+        this._liveOpsMoment = null;
+        this._liveOpsTimeline = null;
+        this._liveOpsTimelineFailed = false;
+        this._liveOpsTimelineLoading = false;
+        this._liveOpsTimelineMinute = null;
+        // ...and at every gate rather than the one last looked at, for the same reason: the
+        // filter is about the visit, and the next visitor is owed the whole deployment.
+        this._liveOpsTimelineSite = '';
     },
 
     /**
@@ -1190,6 +2040,21 @@ const UI_MODULES = {
     tickLiveOps() {
         const data = this._liveOps;
         if (!data) return;
+        // The timeline's axis ends at "now", and "now" moves whether or not the board has: once
+        // a minute, and only while nobody is scrubbing, the shape is redrawn so the open lanes
+        // keep reaching the right edge. Once a minute rather than once a second because the
+        // lanes are forty rows - and because a scrubber mid-drag must not have the subtree it is
+        // reading rebuilt under it (that is what ``setLiveOpsMoment`` was written to avoid).
+        if (this.liveOpsView() === 'timeline' && !this.liveOpsScrubbing()) {
+            const minute = Math.floor(this.liveOpsNowMinute());
+            if (minute !== this._liveOpsTimelineMinute) {
+                this._liveOpsTimelineMinute = minute;
+                const body = document.getElementById('liveOpsTimelineBody');
+                if (body) body.innerHTML = this.liveOpsTimelineBodyHtml(data);
+                const at = document.getElementById('liveOpsTimelineAt');
+                if (at) at.textContent = this.liveOpsTimelineAtLabel(data);
+            }
+        }
         const rules = data.rules;
         const stateClasses = ['is-on', 'is-over', 'is-closing', 'is-unknown'];
         document.querySelectorAll('[data-fact]').forEach((el) => {
@@ -1229,6 +2094,9 @@ const UI_MODULES = {
         const stats = this.liveOpsStats(data);
         const longest = document.getElementById('liveOpsStatLongest');
         if (longest) longest.textContent = stats.longest ? this.liveOpsDuration(stats.longest.facts.seconds) : '\u2014';
+        // The freshness moves with the clock too: a board whose read is aging while nothing is
+        // happening is exactly the case a live dot has to stop claiming.
+        this.paintLiveOpsFreshness(data);
     },
 
     /**
@@ -1332,12 +2200,15 @@ const UI_MODULES = {
         if (board) board.innerHTML = this.liveOpsBoardHtml(data);
         const stats = document.getElementById('liveOpsStats');
         if (stats) stats.innerHTML = this.liveOpsStatsHtml(data);
+        const occupancy = document.getElementById('liveOpsOccupancy');
+        if (occupancy) occupancy.innerHTML = this.liveOpsOccupancyHtml(data);
         const status = document.getElementById('liveOpsStatus');
         if (status) status.textContent = this.liveOpsStatusSentence(data);
         const stamp = document.getElementById('liveOpsStatusTime');
         if (stamp) stamp.textContent = this.liveOpsStatusTime(data);
         const note = document.getElementById('liveOpsFilterNote');
         if (note) note.textContent = this.liveOpsFilterNoteHtml(data);
+        this.paintLiveOpsFreshness(data);
     },
 
     /** Repaint the force-in panel's body in place, if the panel is on the page at all. */
@@ -1354,6 +2225,16 @@ const UI_MODULES = {
             // Refresh must carry it across rather than empty the panel somebody is looking at.
             const users = this._liveOps && this._liveOps.users;
             this._liveOps = users ? { ...fresh, users } : fresh;
+            // Refresh means the screen in front of the reader, not just its list half: with the
+            // timeline up, the day's closed shifts are re-read too, or the one control whose
+            // whole job is to re-read would leave the chart it is looking at untouched.
+            if (this.liveOpsView() === 'timeline') {
+                // Re-read from scratch rather than keeping the last answer, so a Refresh is also
+                // how a failed timeline read is retried without leaving the view.
+                this._liveOpsTimeline = null;
+                this._liveOpsTimelineFailed = false;
+                await this.loadLiveOpsTimeline();
+            }
             this.paintLiveOps(this._liveOps);
             // Never redraw a panel somebody is part-way through filling in.
             if (!this._forceInOpen) this.paintForceInBody(this._liveOps);
@@ -1388,6 +2269,27 @@ const UI_MODULES = {
     },
 
     /**
+     * Narrow the timeline to one gate, or put every gate back.
+     *
+     * A whole-region repaint rather than a patch of the lanes, because the choice moves the
+     * window as well as the rows: a gate whose first arrival is 08:00 draws a different axis
+     * from the deployment's 06:00, and the scrubber's own ``min``/``max`` are part of that
+     * markup. Repainting on ``change`` is safe here - unlike the scrubber, a select is not
+     * mid-drag. The moment is *kept* rather than reset: an operator who scrubbed to 09:00 and
+     * then asked "what about this gate" is asking about 09:00 at that gate, and
+     * ``liveOpsScrubMinute``'s clamp is what keeps a moment outside the new window on its edge.
+     */
+    setLiveOpsTimelineSite(site) {
+        this._liveOpsTimelineSite = String(site || '');
+        if (!this._liveOps) return;
+        const board = document.getElementById('liveOpsBoard');
+        if (board) board.innerHTML = this.liveOpsBoardHtml(this._liveOps);
+        const note = document.getElementById('liveOpsFilterNote');
+        if (note) note.textContent = this.liveOpsFilterNoteHtml(this._liveOps);
+        return this._liveOpsTimelineSite;
+    },
+
+    /**
      * Flip the board between sites and site categories.
      *
      * A full re-render rather than a patch of the board: the view changes the filter chips'
@@ -1407,6 +2309,119 @@ const UI_MODULES = {
         // The render is returned so a caller - and the suite that drives this file - can wait
         // for the board it asked for, exactly like ``renderAdminTab`` itself.
         return UI.renderAdminTab('Live Ops');
+    },
+
+    /**
+     * Switch the board between the list of who is here and the day's timeline.
+     *
+     * A patch rather than the whole-tab re-render ``setLiveOpsGroup`` does, and for the reason
+     * that switch exists: here nothing outside the pane's own region changes meaning. The
+     * toolbar's list-only controls hide, the note becomes the day's, and ``#liveOpsBoard`` is
+     * redrawn as the timeline. Going *to* the timeline is also the only moment today's closed
+     * shifts are ever read, once - which is the whole reason the board does not pay for the
+     * day's history to draw the moment it is already showing.
+     */
+    async setLiveOpsView(value) {
+        const view = value === 'timeline' ? 'timeline' : 'board';
+        if (view === this.liveOpsView() && !(view === 'timeline' && this._liveOpsTimelineFailed)) {
+            return view;
+        }
+        this._liveOpsView = view;
+        // Back to now on every switch: a moment that was about one reading of the day is not a
+        // position in the other, and a scrubber left at 07:00 explains nothing about the list.
+        this._liveOpsMoment = null;
+        this._liveOpsTimelineMinute = null;
+        this.paintLiveOpsView();
+        if (!this._liveOps) return view;
+        if (view === 'timeline' && !this._liveOpsTimeline) {
+            // The loading state is painted before the read is awaited, so the region never sits
+            // on the previous reading's markup while the answer is on its way.
+            const board = document.getElementById('liveOpsBoard');
+            if (board) board.innerHTML = this.liveOpsTimelineLoadingHtml();
+            await this.loadLiveOpsTimeline();
+        }
+        this.paintLiveOps(this._liveOps);
+        return view;
+    },
+
+    /**
+     * The parts of the pane the view owns: the list-only toolbar, and which half of the switch
+     * is pressed. Named and id'd rather than queried, so this works on the same element the
+     * markup named and costs no selector engine on a pane that repaints every minute.
+     */
+    paintLiveOpsView() {
+        const view = this.liveOpsView();
+        const tools = document.getElementById('liveOpsBoardTools');
+        if (tools) tools.hidden = view === 'timeline';
+        const board = document.getElementById('liveOpsViewBoard');
+        if (board) board.setAttribute('aria-pressed', view === 'board' ? 'true' : 'false');
+        const timeline = document.getElementById('liveOpsViewTimeline');
+        if (timeline) timeline.setAttribute('aria-pressed', view === 'timeline' ? 'true' : 'false');
+    },
+
+    /**
+     * Today's closed shifts: the one read the board has never needed until now.
+     *
+     * The whole day in one request (``start=end=today``), which is the shape the Shifts tab
+     * already uses, so the two screens cannot disagree about what "today" contains. A failure is
+     * remembered rather than thrown: the timeline has an error state with its own retry, and the
+     * board behind it must keep working - one read that could not be answered is not a broken tab.
+     */
+    async loadLiveOpsTimeline() {
+        const day = this.liveOpsTimelineDay();
+        this._liveOpsTimelineLoading = true;
+        this._liveOpsTimelineFailed = false;
+        try {
+            const report = await API.request(`/admin/reports/shifts?start=${day.start}&end=${day.end}`);
+            this._liveOpsTimeline = {
+                rows: (report && Array.isArray(report.rows)) ? report.rows : [],
+                at: Date.now()
+            };
+        } catch (err) {
+            this._liveOpsTimeline = null;
+            this._liveOpsTimelineFailed = true;
+        } finally {
+            this._liveOpsTimelineLoading = false;
+        }
+        return this._liveOpsTimeline;
+    },
+
+    /** The timeline's own retry: re-read the day, not the whole tab (which would leave it). */
+    async retryLiveOpsTimeline() {
+        this._liveOpsTimeline = null;
+        this._liveOpsTimelineFailed = false;
+        await this.loadLiveOpsTimeline();
+        if (this._liveOps && this.liveOpsView() === 'timeline') this.paintLiveOps(this._liveOps);
+        return this._liveOpsTimeline;
+    },
+
+    /**
+     * Move the scrubber, and redraw only what the moment decides.
+     *
+     * The *body* - the curve, the marker and the lanes - is replaced; the input itself never is,
+     * because a range input that is rewritten under a thumb mid-drag loses the drag. That is the
+     * one place this file repaints a subtree it was handed an event from, and it is deliberate:
+     * the alternative is a scrubber that can only be moved one step at a time.
+     */
+    setLiveOpsMoment(value) {
+        if (value === null || value === undefined || value === '') {
+            this._liveOpsMoment = null;
+        } else {
+            const minute = Number(value);
+            this._liveOpsMoment = Number.isFinite(minute) ? minute : null;
+        }
+        const data = this._liveOps;
+        if (data && this.liveOpsView() === 'timeline') {
+            const body = document.getElementById('liveOpsTimelineBody');
+            if (body) body.innerHTML = this.liveOpsTimelineBodyHtml(data);
+            const at = document.getElementById('liveOpsTimelineAt');
+            if (at) at.textContent = this.liveOpsTimelineAtLabel(data);
+            const scrub = document.getElementById('liveOpsScrub');
+            if (scrub) scrub.setAttribute('aria-valuetext', this.liveOpsTimelineAtLabel(data));
+            const now = document.getElementById('liveOpsNow');
+            if (now) now.hidden = !this.liveOpsScrubbing();
+        }
+        return this._liveOpsMoment;
     },
 
     setLiveOpsSort(key) {
@@ -1430,13 +2445,20 @@ const UI_MODULES = {
     clearLiveOpsFilters() {
         this._liveOpsQuery = '';
         this._liveOpsSite = '';
+        // The "needs me now" chip is a filter, so clearing them clears it: an empty board with
+        // rows behind three different narrowings and only two of them visible is how an
+        // operator concludes the deployment is empty.
+        this._liveOpsAttention = false;
         State.liveOpsQuery = '';
         State.liveOpsSite = '';
+        State.liveOpsAttention = false;
         if (!this._liveOps) return;
         const search = document.getElementById('liveOpsQuery');
         if (search) search.value = '';
         const select = document.getElementById('liveOpsFilter');
         if (select) select.value = '';
+        const chip = document.getElementById('liveOpsAttention');
+        if (chip) chip.setAttribute('aria-pressed', 'false');
         const board = document.getElementById('liveOpsBoard');
         if (board) board.innerHTML = this.liveOpsBoardHtml(this._liveOps);
         const note = document.getElementById('liveOpsFilterNote');
@@ -3287,6 +4309,19 @@ const UI_MODULES = {
     _registrations: null,
     _registrationsLast: null,
 
+    //: The element the last paint was drawn into, so opening an application redraws in place
+    //: without reaching for the document - the same contract the dashboard's shell keeps.
+    _registrationsHost: null,
+
+    //: The application whose review is open, by id, or ``null`` for the queue alone. A move
+    //: within the queue rather than a read: opening one makes no request.
+    _registrationsOpen: null,
+
+    //: The application whose photograph has already been fetched for the open review. Held so a
+    //: repaint - the intake switch, a language change - does not re-download the same face or
+    //: repeat a 404 toast beside it.
+    _registrationsPhotoFor: null,
+
     /** The intake switch as the last read answered it, or null before that read. */
     _registrationsIntake: null,
 
@@ -3372,9 +4407,9 @@ const UI_MODULES = {
      * administrator or a head administrator moves this switch either way. It used to be a
      * ceiling, and the console drew no button at all when the flag was what held the link shut
      * - which left the applicant's own sentence ("ask your site administrator to open it") with
-     * nobody who could act on it. The reason is still said, because "nobody has opened this yet"
-     * and "somebody closed it this morning" are one state and two different things to do about
-     * it.
+     * nobody who could act on it. The reason is still said - but only when the link is *shut*,
+     * because "nobody has opened this yet" and "somebody closed it this morning" are one state and
+     * two different things to do about it, and an open link needs no explanation at all.
      *
      * The reason codes are mapped to keys rather than interpolated into one: the table is the
      * vocabulary, and a key built by concatenation is a string no parity check can see.
@@ -3391,38 +4426,87 @@ const UI_MODULES = {
         const accepting = intake.accepting === true;
         // No state left where this would answer nothing: the console owns the switch, so the
         // only question is which way it is pointing.
-        const button = `<button type="button" class="ui-btn ${accepting ? 'ui-btn-danger' : 'ui-btn-primary'}" data-registration-intake="${accepting ? 'close' : 'open'}">${this.escapeHtml(I18n.__(accepting ? 'registrationsIntakeClose' : 'registrationsIntakeOpen'))}</button>`;
+        const button = `<button type="button" class="ui-btn ui-btn-sm ${accepting ? 'ui-btn-danger' : 'ui-btn-primary'}" data-registration-intake="${accepting ? 'close' : 'open'}">${this.escapeHtml(I18n.__(accepting ? 'registrationsIntakeClose' : 'registrationsIntakeOpen'))}</button>`;
         return `
-            <div class="ui-card" data-registrations-intake="${this.escapeHtml(intake.reason)}">
+            <div class="ui-card registrations-intake" data-registrations-intake="${this.escapeHtml(intake.reason)}">
                 <div class="ui-spread">
-                    <div class="ops-row-main">
+                    <span class="registrations-intake-state">
                         <span class="ops-stat-label">${this.escapeHtml(I18n.__('registrationsIntakeTitle'))}</span>
-                        <span class="ui-fact-value" data-registrations-intake-state="${this.escapeHtml(intake.reason)}">${this.escapeHtml(I18n.__(accepting ? 'registrationsIntakeAccepting' : 'registrationsIntakeRefusing'))}</span>
-                    </div>
+                        <span class="registrations-intake-value" data-registrations-intake-state="${this.escapeHtml(intake.reason)}">${this.escapeHtml(I18n.__(accepting ? 'registrationsIntakeAccepting' : 'registrationsIntakeRefusing'))}</span>
+                    </span>
                     ${button}
                 </div>
-                <p class="ui-note">${this.escapeHtml(I18n.__(why))}</p>
+                ${accepting ? '' : `<p class="ui-note" data-registrations-intake-why>${this.escapeHtml(I18n.__(why))}</p>`}
             </div>`;
     },
 
     /**
-     * One application, in the order a reviewer reads it: who is asking, how long they have
-     * waited, what they said about themselves, the face the form captured, and the two
-     * answers with the note that is recorded either way.
+     * When an application arrived, said the way a reader says a date.
      *
-     * An application past a day is drawn as a danger rather than as a warning. A day is where
-     * "we are working through the queue" turns into "this person has been waiting on us for a
-     * shift and a night", and the colour is never the only signal - the waiting figure beside
-     * it is the fact, and the card is announced by its own text.
+     * The queue used to print the server's raw ``2026-09-25 06:40:00``, which is a value to
+     * compare rather than a sentence to read. The day goes through the same marker the note threads
+     * use - "Today", "Yesterday", then the date - with the clock beside it, because *how long has
+     * this been sitting here* is the question this screen is opened with.
      */
-    registrationsCardHtml(request) {
+    registrationsAppliedLabel(stamp) {
+        const text = String(stamp || '');
+        if (!text) return '\u2014';
+        const day = UI.dayLabel(text.slice(0, 10));
+        const clock = this.liveOpsClockTime(text);
+        return clock && clock !== '\u2014' ? `${day} ${clock}` : day;
+    },
+
+    /**
+     * One application in the queue: who is asking, and how long they have waited.
+     *
+     * THE ROW IS THE BUTTON, and it is a *row* rather than a form. The queue used to draw every
+     * application as a complete card - a facts grid, a photograph box, a note field, a hint and two
+     * answers - so six applications were six open forms, nineteen buttons and nearly four thousand
+     * pixels of screen before a reviewer had decided anything. What a reviewer actually does is scan
+     * for the one that matters and read *that* one, so the queue is a list of one-line rows and the
+     * reading, the note and the two answers live in the review pane one tap away
+     * (``registrationsReviewHtml``).
+     *
+     * An application past a day is marked as a danger rather than as a warning, and the mark is
+     * never colour alone: the waiting figure is printed in the row, and above a day it is printed in
+     * days (see ``waitingLabel``), because "162h 11m" is a figure a reader has to divide first.
+     */
+    registrationsRowHtml(request, open) {
         const id = this.escapeHtml(request.id);
         const seconds = this.registrationsWaitingSeconds(request);
         const danger = seconds !== null && seconds >= 86400;
-        const waiting = seconds === null ? '\u2014' : this.liveOpsDuration(seconds);
+        const waiting = seconds === null ? '\u2014' : this.waitingLabel(seconds);
+        return `
+            <li class="registrations-item${open ? ' is-open' : ''}" data-registration="${id}">
+                <button type="button" class="registrations-row" data-registration-open="${id}"
+                        aria-expanded="${open ? 'true' : 'false'}" aria-controls="registrationReview-${id}">
+                    ${this.liveOpsAvatarHtml({ name: request.full_name, worker_id: request.id })}
+                    <span class="registrations-row-main">
+                        <span class="registrations-row-top">
+                            <span class="registrations-row-name">${this.escapeHtml(request.full_name || '')}</span>
+                            <span class="registrations-row-wait${danger ? ' is-danger' : ''}">${this.escapeHtml(`${I18n.__('registrationsWaiting')} ${waiting}`)}</span>
+                        </span>
+                        <span class="registrations-row-sub" data-registration-fact>${this.escapeHtml(`${this.roleLabel(request.requested_role)} \u00b7 #${request.id}`)}</span>
+                    </span>
+                </button>
+            </li>`;
+    },
+
+    /**
+     * One application, open for a decision: the face, what they said, the note, the two answers.
+     *
+     * Rendered for one application at a time - the one the reviewer opened - which is what makes the
+     * note field *the* note field rather than the sixth of six, and the photograph a single fetch by
+     * the act of opening rather than a screenful of empty boxes waiting behind a button.
+     */
+    registrationsReviewHtml(request) {
+        const id = this.escapeHtml(request.id);
+        const seconds = this.registrationsWaitingSeconds(request);
+        const danger = seconds !== null && seconds >= 86400;
+        const waiting = seconds === null ? '\u2014' : this.waitingLabel(seconds);
         const facts = [
             { label: I18n.__('registrationsRole'), text: this.roleLabel(request.requested_role) },
-            { label: I18n.__('registrationsApplied'), text: String(request.created_at || '\u2014') },
+            { label: I18n.__('registrationsApplied'), text: this.registrationsAppliedLabel(request.created_at) },
             {
                 label: I18n.__('registrationsContact'),
                 text: [request.phone, request.email].filter(Boolean).join(' \u00b7 ') || '\u2014'
@@ -3432,24 +4516,24 @@ const UI_MODULES = {
             facts.push({ label: I18n.__('registrationsDetails'), text: String(request.work_details) });
         }
         return `
-            <article class="ui-card${danger ? ' is-danger' : ' is-warn'}" data-registration="${id}">
-                <div class="ui-spread">
-                    <div class="ops-row-main">
-                        <div class="ops-who">
-                            <span class="ops-name">${this.escapeHtml(request.full_name || '')}</span>
-                            <span class="ops-sub">${this.escapeHtml(this.roleLabel(request.requested_role))} \u00b7 #${id}</span>
-                        </div>
-                    </div>
+            <article class="ui-card registrations-review${danger ? ' is-danger' : ' is-warn'}"
+                     data-registration-review="${id}" id="registrationReview-${id}">
+                <div class="registrations-review-head">
+                    <button type="button" class="ui-btn ui-btn-sm registrations-back" data-registration-close="true">${this.escapeHtml(I18n.__('registrationsBack'))}</button>
+                    <span class="ops-who">
+                        <span class="ops-name">${this.escapeHtml(request.full_name || '')}</span>
+                        <span class="ops-sub">${this.escapeHtml(this.roleLabel(request.requested_role))} \u00b7 #${id}</span>
+                    </span>
                     <span class="ui-badge${danger ? ' is-danger' : ' is-warn'}">${this.OPS_ICONS.alert}${this.escapeHtml(`${I18n.__('registrationsWaiting')} ${waiting}`)}</span>
                 </div>
-                <div class="ui-facts" style="margin-top:14px">
+                <div class="ui-facts registrations-facts">
                     ${facts.map((fact) => `
                         <div class="ui-fact">
                             <span class="ops-stat-label">${this.escapeHtml(fact.label)}</span>
                             <span class="ui-fact-value" data-registration-fact>${this.escapeHtml(fact.text)}</span>
                         </div>`).join('')}
                 </div>
-                <div class="ui-evidence-row" style="margin-top:14px">
+                <div class="ui-evidence-row">
                     <div class="ui-evidence-media">
                         <img id="registrationPhoto${id}" class="hidden ui-photo" alt="${this.escapeHtml(I18n.__('registrationsPhotoAlt'))}" />
                     </div>
@@ -3457,25 +4541,31 @@ const UI_MODULES = {
                         <button type="button" class="ui-btn ui-btn-sm" data-registration-photo="${id}">${this.OPS_ICONS.eye}${this.escapeHtml(I18n.__('registrationsShowPhoto'))}</button>
                     </div>
                 </div>
-                <label class="ui-label" for="registrationNote-${id}" style="margin-top:16px">${this.escapeHtml(I18n.__('registrationsNote'))}</label>
+                <label class="ui-label" for="registrationNote-${id}">${this.escapeHtml(I18n.__('registrationsNote'))}</label>
                 <textarea id="registrationNote-${id}" class="ui-field" rows="2"
                           placeholder="${this.escapeHtml(I18n.__('registrationsNotePlaceholder'))}"></textarea>
-                <p class="ui-section-note" style="margin-top:6px">${this.escapeHtml(I18n.__('registrationsNoteUsed'))}</p>
-                <div class="ui-row" style="margin-top:12px">
-                    <button type="button" class="ui-btn ui-btn-primary" data-registration-approve="${id}">${this.OPS_ICONS.check}${this.escapeHtml(I18n.__('registrationsApprove'))}</button>
-                    <button type="button" class="ui-btn ui-btn-danger" data-registration-reject="${id}">${this.OPS_ICONS.close}${this.escapeHtml(I18n.__('registrationsReject'))}</button>
+                <p class="ui-section-note">${this.escapeHtml(I18n.__('registrationsNoteUsed'))}</p>
+                <div class="ui-row registrations-answers">
+                    <button type="button" id="registrationApprove-${id}" class="ui-btn ui-btn-primary" data-registration-approve="${id}">${this.OPS_ICONS.check}${this.escapeHtml(I18n.__('registrationsApprove'))}</button>
+                    <button type="button" id="registrationReject-${id}" class="ui-btn ui-btn-danger" data-registration-reject="${id}">${this.OPS_ICONS.close}${this.escapeHtml(I18n.__('registrationsReject'))}</button>
                 </div>
             </article>`;
     },
 
     /**
-     * The queue itself: how many are waiting, then the cards oldest first.
+     * The queue itself: how many are waiting, then the rows oldest first and, when one is open,
+     * the review beside them.
      *
      * ``pending`` is the server's own total, counted apart from the page it sent. The two
      * agree until the page is truncated, and when they do not the screen says so instead of
      * ending at row two hundred as if the queue were empty behind it.
+     *
+     * The review is rendered *beside* the list rather than in place of it, so a decision can be
+     * made without losing the reader's place in the queue - which is the same reason the notes tab
+     * is a split. Under a tablet width the shell becomes one pane at a time and the list is the
+     * screen; the way back is the review's own head.
      */
-    registrationsHtml(requests, pending) {
+    registrationsHtml(requests, pending, openId) {
         if (requests.length === 0) {
             return `
                 <div class="ui-empty" data-registrations-empty="true">
@@ -3489,9 +4579,18 @@ const UI_MODULES = {
             ? ` ${I18n.__('liveOpsShowing').replace('{shown}', String(requests.length)).replace('{total}', String(total))}`
             : '';
         const count = I18n.__('registrationsCount').replace('{count}', String(total));
+        const open = requests.find((request) => String(request.id) === String(openId)) || null;
+        const rows = requests
+            .map((request) => this.registrationsRowHtml(request, open !== null && String(request.id) === String(openId)))
+            .join('');
         return `
             <p class="ui-section-note" data-registrations-count="${total}">${this.escapeHtml(count + showing)}</p>
-            <div class="ui-stack">${requests.map((request) => this.registrationsCardHtml(request)).join('')}</div>`;
+            <div class="registrations-shell${open ? ' is-open' : ''}">
+                <div class="registrations-pane registrations-pane-queue">
+                    <ol class="registrations-list" role="list">${rows}</ol>
+                </div>
+                ${open ? `<div class="registrations-pane registrations-pane-review">${this.registrationsReviewHtml(open)}</div>` : ''}
+            </div>`;
     },
 
     /**
@@ -3513,6 +4612,7 @@ const UI_MODULES = {
      */
     async renderRegistrations(content) {
         if (!content) return;
+        this._registrationsHost = content;
         content.innerHTML = UI.consoleSkeletonHtml(I18n.__('registrationsTitle'));
         let data;
         try {
@@ -3536,50 +4636,125 @@ const UI_MODULES = {
             this._registrationsIntake = null;
         }
         this._registrations = data;
-        const requests = Array.isArray(data && data.requests) ? data.requests : [];
         const pending = Math.max(0, Number(data && data.pending) || 0);
         State.registrationsWaiting = pending;
         if (typeof UI !== 'undefined' && UI.paintRegistrationsBadge) UI.paintRegistrationsBadge();
-        // The intake switch, stated on the queue rather than left to the public form to
-        // explain: the applicants already in here are still decisions to make, and a queue
-        // that silently stops growing is a queue somebody believes is broken.
-        const closed = data && data.enabled === false
+        await this.paintRegistrations();
+    },
+
+    /**
+     * Paint the queue and its one open review from the read already in hand, and bind it.
+     *
+     * Separate from ``renderRegistrations`` because opening an application is *not* a read: the
+     * queue is in memory, and a fold that asked the server again would put a round trip between a
+     * tap and the face it was tapped to see. It is also what keeps a queue somebody is halfway
+     * through working from being re-ordered under their hands.
+     *
+     * The photograph is fetched here rather than behind its button, because the face is the thing
+     * being judged - but only once per application, so a repaint (the intake switch, a language
+     * change) does not re-download the same face or repeat a 404 beside it.
+     */
+    async paintRegistrations() {
+        const host = this._registrationsHost;
+        const data = this._registrations;
+        if (!host || typeof host !== 'object' || !data) return undefined;
+        const requests = Array.isArray(data.requests) ? data.requests : [];
+        // An application that is no longer in the queue cannot stay open: the decision that took it
+        // out is the reason this is being painted again.
+        if (this._registrationsOpen !== null
+            && !requests.some((request) => String(request.id) === String(this._registrationsOpen))) {
+            this._registrationsOpen = null;
+            this._registrationsPhotoFor = null;
+        }
+        const pending = Math.max(0, Number(data.pending) || 0);
+        // The intake switch, stated on the queue rather than left to the public form to explain:
+        // the applicants already in here are still decisions to make, and a queue that silently
+        // stops growing is a queue somebody believes is broken.
+        const closed = data.enabled === false
             ? `<p class="ui-note is-warn" data-registrations-closed="true">${this.OPS_ICONS.alert}${this.escapeHtml(I18n.__('registrationsClosed'))}</p>`
             : '';
-        content.innerHTML = `<div class="ui-page" data-registrations="true">${this.registrationsIntakeHtml()}${this.registrationsNoticeHtml()}${closed}${this.registrationsHtml(requests, pending)}</div>`;
-        if (typeof content.querySelectorAll === 'function') {
-            const bindEach = (selector, handler) => {
-                let nodes = [];
-                try {
-                    nodes = Array.from(content.querySelectorAll(selector) || []);
-                } catch (err) {
-                    nodes = [];
-                }
-                nodes.forEach((node) => {
-                    if (node && typeof node.addEventListener === 'function') handler(node);
-                });
-            };
-            bindEach('[data-registration-intake]', (button) => {
-                button.addEventListener('click', () => {
-                    this.toggleRegistrationsIntake(button.getAttribute('data-registration-intake'));
-                });
-            });
-            bindEach('[data-registration-photo]', (button) => {
-                button.addEventListener('click', () => {
-                    this.showRegistrationPhoto(button.getAttribute('data-registration-photo'));
-                });
-            });
-            bindEach('[data-registration-approve]', (button) => {
-                button.addEventListener('click', () => {
-                    this.handleRegistration(button.getAttribute('data-registration-approve'), 'approve');
-                });
-            });
-            bindEach('[data-registration-reject]', (button) => {
-                button.addEventListener('click', () => {
-                    this.handleRegistration(button.getAttribute('data-registration-reject'), 'reject');
-                });
-            });
+        host.innerHTML = `<div class="ui-page" data-registrations="true">${this.registrationsIntakeHtml()}${this.registrationsNoticeHtml()}${closed}${this.registrationsHtml(requests, pending, this._registrationsOpen)}</div>`;
+        this.bindRegistrations(host);
+        if (this._registrationsOpen !== null && this._registrationsOpen !== this._registrationsPhotoFor) {
+            this._registrationsPhotoFor = this._registrationsOpen;
+            await this.showRegistrationPhoto(this._registrationsOpen);
         }
+        return undefined;
+    },
+
+    /**
+     * Open one application's review, or close it again - a move within the queue, not a read.
+     *
+     * ``openRegistration`` is the whole of the queue's navigation: the row that was tapped keeps
+     * its place in the list, and the pane beside it (or, on a handset, in place of it) holds the one
+     * application being decided.
+     */
+    async openRegistration(requestId) {
+        const id = String(requestId === null || requestId === undefined ? '' : requestId);
+        if (!id) return undefined;
+        this._registrationsOpen = id;
+        return this.paintRegistrations();
+    },
+
+    /** Back to the queue alone. The fetched face is forgotten with the pane that showed it. */
+    async closeRegistration() {
+        this._registrationsOpen = null;
+        this._registrationsPhotoFor = null;
+        return this.paintRegistrations();
+    },
+
+    /**
+     * Bind the queue's controls after it is painted.
+     *
+     * One pass over the ``data-`` hooks the markup carries, so no inline ``onclick`` joins the ones
+     * the document policy already tolerates, and a repaint between paint and tap cannot orphan a
+     * handler. That matters more here than anywhere else in the console, because opening an
+     * application *is* a repaint.
+     */
+    bindRegistrations(content) {
+        if (!content || typeof content.querySelectorAll !== 'function') return undefined;
+        const bindEach = (selector, handler) => {
+            let nodes = [];
+            try {
+                nodes = Array.from(content.querySelectorAll(selector) || []);
+            } catch (err) {
+                nodes = [];
+            }
+            nodes.forEach((node) => {
+                if (node && typeof node.addEventListener === 'function') handler(node);
+            });
+        };
+        bindEach('[data-registration-open]', (button) => {
+            button.addEventListener('click', () => {
+                this.openRegistration(button.getAttribute('data-registration-open'));
+            });
+        });
+        bindEach('[data-registration-close]', (button) => {
+            button.addEventListener('click', () => {
+                this.closeRegistration();
+            });
+        });
+        bindEach('[data-registration-intake]', (button) => {
+            button.addEventListener('click', () => {
+                this.toggleRegistrationsIntake(button.getAttribute('data-registration-intake'));
+            });
+        });
+        bindEach('[data-registration-photo]', (button) => {
+            button.addEventListener('click', () => {
+                this.showRegistrationPhoto(button.getAttribute('data-registration-photo'));
+            });
+        });
+        bindEach('[data-registration-approve]', (button) => {
+            button.addEventListener('click', () => {
+                this.handleRegistration(button.getAttribute('data-registration-approve'), 'approve');
+            });
+        });
+        bindEach('[data-registration-reject]', (button) => {
+            button.addEventListener('click', () => {
+                this.handleRegistration(button.getAttribute('data-registration-reject'), 'reject');
+            });
+        });
+        return undefined;
     },
 
     /**
@@ -3627,8 +4802,8 @@ const UI_MODULES = {
      * a reason before it sends: the server accepts a refusal without one, and ``audit_log`` is
      * where the answer to "why was I turned down" survives the deletion.
      *
-     * Both buttons go down while the request is in flight: this is a round trip on a phone
-     * tether, and a card that took a second answer would be a second account or a second
+     * Both answers go down while the request is in flight: this is a round trip on a phone
+     * tether, and a pane that took a second answer would be a second account or a second
      * refusal for one decision. A 409 means somebody else decided it first, and the queue is
      * re-read rather than left holding a button that can only fail again.
      */
@@ -3640,8 +4815,16 @@ const UI_MODULES = {
             Toast.error(I18n.__('registrationsRejectNeedsNote'));
             return;
         }
-        const card = typeof document.querySelector === 'function' ? document.querySelector(`[data-registration="${requestId}"]`) : null;
-        const buttons = card && card.querySelectorAll ? Array.from(card.querySelectorAll('button')) : [];
+        // The two answers are the buttons that must not take a second tap while the first is
+        // unanswered: a second approve is a second account and a second reject a second refusal
+        // for one decision. They are found by their own ids rather than by sweeping a container,
+        // and deliberately not scoped to ``[data-registration]`` - after the queue became a list
+        // that is the one-line row, which holds only its open button, so the sweep found nothing
+        // and the two answers stayed live for the whole round trip. The way back is left usable,
+        // so a hung request does not trap the reviewer in the pane.
+        const buttons = [`registrationApprove-${requestId}`, `registrationReject-${requestId}`]
+            .map((id) => (typeof document.getElementById === 'function' ? document.getElementById(id) : null))
+            .filter(Boolean);
         buttons.forEach((button) => { button.disabled = true; });
         let answer = null;
         try {
@@ -3892,11 +5075,50 @@ const UI_MODULES = {
     //  photograph can only be looked at, so this screen is built for looking: every tap is
     //  listed under its link with the selfie it was taken with, fetched with the session's
     //  token rather than by a URL that would work for anybody who has it.
+    //
+    //  This is a *dashboard*, not a form with a table under it. The questions an operator
+    //  arrives with - how many links are live, is anybody on shift through one, which one
+    //  is about to die - used to be answered by reading every row. They are answered above
+    //  the list now: one live line and four figures, then a search and a state filter so
+    //  that forty links are not forty rows to scan. Each row says the same things again in
+    //  place - a state accent, a tap meter, and an expiry that reads "under a day" rather
+    //  than making the reader subtract two dates.
+    //
+    //  Two rules hold the "alive" part honest:
+    //
+    //  * **It only moves when it has news.** A 30 s refresh runs while the tab is on screen
+    //    and stops the moment it is not - and makes no request at all in a hidden tab. It
+    //    repaints the figures and the list *in place*, so it cannot take a search box, an
+    //    open punch list, or a freshly issued link out from under the reader.
+    //  * **Colour is never the only signal.** Every state is a pill with a word in it as
+    //    well as a hairline on the row, the entrance stagger is a single one-shot the
+    //    reduced-motion query turns off entirely, and the one live region announces a
+    //    sentence rather than three bare numbers.
     // -----------------------------------------------------------------
+
+    /** The last good read of the links, and the handles that keep the pane live. */
+    _links: null,
+    _linksRoster: null,
+    _newLink: null,
+    /** The list's own two controls, held here so a repaint cannot lose them. */
+    _linksQuery: '',
+    _linksFilter: 'all',
+    /** The refresh interval, and when the read on screen was taken. */
+    _linksTick: null,
+    _linksAt: 0,
+    /** How often the figures and the list re-read themselves while the tab is open. */
+    LINKS_REFRESH_MS: 30000,
+    /** The stagger is clamped here: a hundred rows must not take four seconds to arrive. */
+    LINKS_STAGGER_MAX: 12,
+
     async renderLinks(content) {
         // Entering the tab forgets the last issued link: it cannot be shown again, and a
         // stale URL left on screen is a URL somebody would copy tomorrow and expect to work.
         this._newLink = null;
+        // And it starts from the whole list, not from whatever the last visit filtered to.
+        this._linksQuery = '';
+        this._linksFilter = 'all';
+        this.stopLinks();
         this.paintLinks(content, UI.loadingHtml());
         await this.loadLinks(content);
     },
@@ -3922,10 +5144,22 @@ const UI_MODULES = {
         }
         this._links = links;
         this._linksRoster = users;
-        this.paintLinks(content, this.linkCreateHtml(users) + this.linksHtml(links) +
+        this._linksAt = Date.now();
+        // The figures and the list first, the form under them: the screen opens on the
+        // answer, and issuing one is the action you take once you have seen it.
+        this.paintLinks(content, this.linksPanelHtml(links) + this.linkCreateHtml(users) +
             '<div id="linkUsesPanel"></div>');
     },
 
+    /**
+     * Paint the pane and bind it.
+     *
+     * The controls are delegated from the pane itself, never written into the markup: every
+     * link id, every use id and every worker name on this screen is a value from the
+     * database, and an inline handler is one more place a string has to survive being put
+     * inside executable text. ``onclick``/``oninput`` are *assigned* rather than added, like
+     * the Live Ops board's, so a repaint cannot leave the previous paint's listener behind.
+     */
     paintLinks(content, html) {
         content.innerHTML = html;
         const form = document.getElementById('linkCreateForm');
@@ -3935,6 +5169,254 @@ const UI_MODULES = {
                 return this.createLink();
             };
         }
+        if (content && typeof content.addEventListener === 'function') {
+            content.onclick = (event) => this.onLinksClick(event);
+            content.oninput = (event) => this.onLinksInput(event);
+            this.startLinks();
+        }
+    },
+
+    /** One click anywhere in the pane. Each control answers for its own ``data-`` hook. */
+    onLinksClick(event) {
+        const target = event && event.target;
+        if (!target || typeof target.closest !== 'function') return undefined;
+        const value = (name) => {
+            const node = target.closest(`[${name}]`);
+            return node ? node.getAttribute(name) : null;
+        };
+        const revoke = target.closest('[data-revoke-link]');
+        if (revoke) return this.revokeLink(revoke.getAttribute('data-revoke-link'));
+        const photo = value('data-show-photo');
+        if (photo !== null) return this.showLinkPhoto(photo);
+        const uses = value('data-open-uses');
+        if (uses !== null) return this.openLinkUses(uses);
+        if (target.closest('[data-copy-link]')) return this.copyLinkUrl();
+        if (target.closest('[data-close-uses]')) return this.closeLinkUses();
+        const filter = value('data-links-filter');
+        if (filter !== null) return this.setLinksFilter(filter);
+        if (target.closest('[data-links-refresh]')) return this.refreshLinks(true);
+        if (target.closest('[data-issue-link]')) return this.focusIssueForm();
+        return undefined;
+    },
+
+    onLinksInput(event) {
+        const target = event && event.target;
+        if (!target || typeof target.getAttribute !== 'function') return undefined;
+        if (target.getAttribute('data-links-search') === null) return undefined;
+        return this.setLinksQuery(target.value);
+    },
+
+    // -----------------------------------------------------------------
+    //  The dashboard above the list: a live line, four figures, a filter bar
+    // -----------------------------------------------------------------
+
+    /** The four figures, off the read that is already in hand. */
+    linksStats(links) {
+        const list = links || [];
+        const state = (link) => this.linkState(link);
+        return {
+            total: list.length,
+            working: list.filter((link) => state(link) === 'active' && link.worker_active !== false).length,
+            onShift: list.filter((link) => !!link.clocked_in).length,
+            taps: list.reduce((sum, link) => sum + (Number(link.uses) || 0), 0),
+            expiring: list.filter((link) => state(link) === 'active' && this.linksExpiringSoon(link)).length
+        };
+    },
+
+    /** Milliseconds until the link dies; ``null`` when it never had a usable expiry. */
+    linksMsUntil(link) {
+        const raw = String((link && link.expires_at) || '').trim();
+        if (!raw) return null;
+        const at = new Date(raw.replace(' ', 'T')).getTime();
+        if (!at || isNaN(at)) return null;
+        return at - Date.now();
+    },
+
+    linksExpiringSoon(link) {
+        const ms = this.linksMsUntil(link);
+        return ms !== null && ms > 0 && ms <= 24 * 60 * 60 * 1000;
+    },
+
+    /** What the live region announces: counts, never a bare number off on its own. */
+    linksStatusSentence(links) {
+        const stats = this.linksStats(links);
+        return I18n.__('linksStatusLine')
+            .replace('{working}', String(stats.working))
+            .replace('{onShift}', String(stats.onShift))
+            .replace('{total}', String(stats.total));
+    },
+
+    linksUpdatedLabel() {
+        const at = new Date(this._linksAt || Date.now());
+        const pad = (value) => String(value).padStart(2, '0');
+        return I18n.__('linksUpdated').replace('{time}', `${pad(at.getHours())}:${pad(at.getMinutes())}`);
+    },
+
+    linksStatsHtml(links) {
+        const stats = this.linksStats(links);
+        const tile = (key, value, hintKey, tone) => `
+            <div class="ops-stat${tone ? ' ' + tone : ''}">
+                <span class="ops-stat-label">${this.escapeHtml(I18n.__(key))}</span>
+                <span class="ops-stat-value" data-links-stat="${key}">${this.escapeHtml(String(value))}</span>
+                <span class="ops-stat-hint">${this.escapeHtml(I18n.__(hintKey).replace('{total}', String(stats.total)))}</span>
+            </div>`;
+        return tile('linksStatWorking', stats.working, 'linksStatWorkingHint', '')
+            + tile('linksStatOnShift', stats.onShift, 'linksStatOnShiftHint', '')
+            + tile('linksStatTaps', stats.taps, 'linksStatTapsHint', '')
+            + tile('linksStatExpiring', stats.expiring, 'linksStatExpiringHint', stats.expiring ? 'is-warn' : '');
+    },
+
+    linksFilterChipsHtml() {
+        const active = this._linksFilter || 'all';
+        const chip = (value, key) => `<button type="button" class="ops-chip" data-links-filter="${value}" aria-pressed="${active === value ? 'true' : 'false'}">${this.escapeHtml(I18n.__(key))}</button>`;
+        return `<div class="ops-chips" role="group" aria-label="${this.escapeHtml(I18n.__('linksFilterLabel'))}">
+            ${chip('all', 'linksFilterAll')}${chip('working', 'linksFilterWorking')}${chip('on_shift', 'linksFilterOnShift')}${chip('expiring', 'linksFilterExpiring')}${chip('dead', 'linksFilterDead')}
+        </div>`;
+    },
+
+    linksFilterNoteHtml(links) {
+        const all = (links || []).length;
+        if (all === 0) return '';
+        const shown = (links || []).filter((link) => this.linksMatches(link)).length;
+        return I18n.__('linksShowing').replace('{shown}', String(shown)).replace('{total}', String(all));
+    },
+
+    /**
+     * The whole pane: the live line, the figures, the two controls, then the list.
+     *
+     * The list is repainted on its own (``paintLinksList``), so a filter or a refresh never
+     * takes the search box's caret with it.
+     */
+    linksPanelHtml(links) {
+        const list = links || [];
+        return `
+            <section class="ops-board links-board" data-links="board" aria-label="${this.escapeHtml(I18n.__('quickLinks'))}">
+                <header class="ops-head">
+                    <div>
+                        <div class="ops-status">
+                            <span class="ops-live-dot" aria-hidden="true"></span>
+                            <span id="linksStatus" role="status" aria-atomic="true">${this.escapeHtml(this.linksStatusSentence(list))}</span>
+                            <span class="ops-status-time" id="linksStatusTime">${this.escapeHtml(this.linksUpdatedLabel())}</span>
+                        </div>
+                    </div>
+                    <div class="ui-row is-tight">
+                        <button type="button" class="ops-btn ops-btn-primary" data-issue-link>${this.OPS_ICONS.plus}<span>${this.escapeHtml(I18n.__('linksIssueAction'))}</span></button>
+                        <button type="button" class="ops-btn" data-links-refresh>${this.OPS_ICONS.refresh}<span>${this.escapeHtml(I18n.__('linksRefresh'))}</span></button>
+                    </div>
+                </header>
+                <div class="ops-stats" id="linksStats">${this.linksStatsHtml(list)}</div>
+                <div class="ops-toolbar">
+                    <label class="ops-search">
+                        <span class="sr-only">${this.escapeHtml(I18n.__('linksSearchLabel'))}</span>
+                        ${this.OPS_ICONS.search}
+                        <input type="search" id="linksQuery" data-links-search value="${this.escapeHtml(this._linksQuery || '')}"
+                               placeholder="${this.escapeHtml(I18n.__('linksSearchPlaceholder'))}" />
+                    </label>
+                    ${this.linksFilterChipsHtml()}
+                </div>
+                <p class="ops-note" id="linksFilterNote">${this.escapeHtml(this.linksFilterNoteHtml(list))}</p>
+                <div class="links-list" id="linkList">${this.linksHtml(list)}</div>
+            </section>`;
+    },
+
+    /** Repaint the figures and the list in place, and nothing else. */
+    paintLinksList() {
+        const list = this._links || [];
+        const stats = document.getElementById('linksStats');
+        if (stats) stats.innerHTML = this.linksStatsHtml(list);
+        const status = document.getElementById('linksStatus');
+        if (status) status.textContent = this.linksStatusSentence(list);
+        const stamp = document.getElementById('linksStatusTime');
+        if (stamp) stamp.textContent = this.linksUpdatedLabel();
+        const note = document.getElementById('linksFilterNote');
+        if (note) note.textContent = this.linksFilterNoteHtml(list);
+        const target = document.getElementById('linkList');
+        if (target) target.innerHTML = this.linksHtml(list);
+    },
+
+    setLinksQuery(value) {
+        this._linksQuery = String(value || '');
+        this.paintLinksList();
+    },
+
+    setLinksFilter(value) {
+        this._linksFilter = String(value || 'all');
+        this.paintLinksList();
+    },
+
+    /** Does one link answer the search and the state chip currently on screen? */
+    linksMatches(link) {
+        const terms = String(this._linksQuery || '').toLowerCase().split(/\s+/).filter(Boolean);
+        if (terms.length) {
+            const haystack = [link.worker_name, link.worker_id, link.note].join(' ').toLowerCase();
+            if (!terms.every((term) => haystack.indexOf(term) >= 0)) return false;
+        }
+        const filter = this._linksFilter || 'all';
+        if (filter === 'working') return this.linkState(link) === 'active' && link.worker_active !== false;
+        if (filter === 'on_shift') return !!link.clocked_in;
+        if (filter === 'expiring') return this.linkState(link) === 'active' && this.linksExpiringSoon(link);
+        if (filter === 'dead') return ['revoked', 'expired', 'used_up', 'account_inactive'].indexOf(this.linkState(link)) >= 0;
+        return true;
+    },
+
+    focusIssueForm() {
+        const field = document.getElementById('linkWorker') || document.getElementById('linkCreateForm');
+        if (field && typeof field.focus === 'function') field.focus();
+        return field ? true : false;
+    },
+
+    // -----------------------------------------------------------------
+    //  Keeping it alive: a refresh that stops when the tab is left
+    // -----------------------------------------------------------------
+
+    startLinks() {
+        this.stopLinks();
+        this._linksTick = setInterval(() => this.tickLinks(), this.LINKS_REFRESH_MS);
+    },
+
+    stopLinks() {
+        if (this._linksTick !== null) {
+            clearInterval(this._linksTick);
+            this._linksTick = null;
+        }
+    },
+
+    /**
+     * One beat of the refresh.
+     *
+     * It stops itself the moment the tab is not the one on screen, and it makes no request
+     * at all while the page is hidden - the same rule the Live Ops board holds to, and the
+     * reason a console left open in another tab is not a request every 30 seconds forever.
+     */
+    async tickLinks() {
+        if (State.adminTab !== 'Links') {
+            this.stopLinks();
+            return;
+        }
+        if (typeof document.visibilityState !== 'undefined' && document.visibilityState === 'hidden') return;
+        await this.refreshLinks(false);
+    },
+
+    /**
+     * Re-read the links and repaint the figures and the list.
+     *
+     * A full re-render would take the search box's caret, an open punch list and the single
+     * copy of a just-issued link with it, so this repaints the two regions the read actually
+     * changed. ``announce`` is the difference between a person pressing Refresh and a timer:
+     * only the person gets a toast.
+     */
+    async refreshLinks(announce) {
+        let links;
+        try {
+            links = await API.request('/admin/quick_links');
+        } catch (err) {
+            if (announce) Toast.error((err && err.message) || I18n.__('error'));
+            return;
+        }
+        this._links = links;
+        this._linksAt = Date.now();
+        this.paintLinksList();
+        if (announce) Toast.success(I18n.__('linksRefreshed'));
     },
 
     /** Accounts a link may be issued to: the ones whose hours a report pays out. */
@@ -4027,11 +5509,11 @@ const UI_MODULES = {
             ? `<img src="${this.escapeHtml(res.qr_png_data_uri)}" alt="${I18n.__('linksQr')}" class="ui-qr" />`
             : '';
         return `
-            <div class="ui-alert is-ok is-stacked" data-new-link="${this.escapeHtml(res.link_id)}">
+            <div class="ui-alert is-ok is-stacked links-issued" data-new-link="${this.escapeHtml(res.link_id)}">
                 <p class="ui-card-title">${I18n.__('linksFor')} ${this.escapeHtml(res.worker_name || res.worker_id)} (${this.escapeHtml(res.worker_id)})</p>
                 <input id="linkUrl" class="${field}" readonly value="${this.escapeHtml(res.url)}" />
                 <div class="ui-row">
-                    <button type="button" onclick="UI_MODULES.copyLinkUrl()" class="ui-btn ui-btn-primary">${I18n.__('linksCopy')}</button>
+                    <button type="button" data-copy-link class="ui-btn ui-btn-primary">${this.OPS_ICONS.copy}${I18n.__('linksCopy')}</button>
                 </div>
                 <p class="ui-note is-warn">${I18n.__('linksShownOnce')}</p>
                 ${qr}
@@ -4052,16 +5534,35 @@ const UI_MODULES = {
         }
     },
 
+    /** The list, minus whatever the search and the state chip have taken out of it. */
     linksHtml(links) {
-        if (!links || links.length === 0) {
-            return `<p class="ui-empty" data-no-links>${I18n.__('linksEmpty')}</p>`;
+        const all = links || [];
+        if (all.length === 0) return this.linksEmptyHtml();
+        const shown = all.filter((link) => this.linksMatches(link));
+        if (shown.length === 0) {
+            return `<p class="ui-empty" data-no-links data-links-filtered>${I18n.__('linksFilteredEmpty')}</p>`;
         }
-        return Device.isMobile ? this.linkCardsHtml(links) : this.linkTableHtml(links);
+        return Device.isMobile ? this.linkCardsHtml(shown) : this.linkTableHtml(shown);
+    },
+
+    /**
+     * The empty state, which is a call to action rather than a sentence: the one thing this
+     * screen can do from nothing is issue the first link, and the button goes to the field
+     * that does it instead of leaving the reader to find the form.
+     */
+    linksEmptyHtml() {
+        return `
+            <div class="ui-empty links-empty" data-no-links>
+                <span class="ui-empty-icon" aria-hidden="true">${this.OPS_ICONS.link}</span>
+                <p class="ui-empty-title">${I18n.__('linksEmptyTitle')}</p>
+                <p class="ui-empty-body">${I18n.__('linksEmptyBody')}</p>
+                <button type="button" class="ui-btn ui-btn-primary" data-issue-link>${this.OPS_ICONS.plus}${I18n.__('linksIssueAction')}</button>
+            </div>`;
     },
 
     linkTableHtml(links) {
         return `
-            <div class="ui-table-wrap">
+            <div class="ui-table-wrap links-table">
                 <table class="ui-table">
                     <thead class="ui-table-head">
                         <tr>
@@ -4075,36 +5576,87 @@ const UI_MODULES = {
                         </tr>
                     </thead>
                     <tbody>
-                        ${links.map((link) => `<tr data-link="${link.id}">
-                            <td><span class="ui-strong">${this.escapeHtml(link.worker_name || link.worker_id)}</span>
-                                <span class="ui-note">${this.escapeHtml(link.worker_id)}</span>
-                                ${link.note ? `<span class="ui-note">${this.escapeHtml(link.note)}</span>` : ''}</td>
-                            <td data-link-state="${this.linkState(link)}">${this.linkStateHtml(link)}</td>
-                            <td data-link-uses="${link.uses}">${this.linkUsesLabel(link)}</td>
-                            <td class="ui-nowrap">${this.escapeHtml(link.expires_at)}</td>
-                            <td class="ui-nowrap">${this.linkLastUse(link)}</td>
-                            <td class="ui-nowrap">${this.linkOpenShift(link)}</td>
-                            <td class="is-end">${this.linkActionHtml(link)}</td>
-                        </tr>`).join('')}
+                        ${links.map((link, index) => this.linkRowHtml(link, index)).join('')}
                     </tbody>
                 </table>
             </div>`;
     },
 
-    /** The phone layout: one card per link, the same facts as the table. */
+    /** One row, with the state as a class so the accent can be drawn by the stylesheet. */
+    linkRowHtml(link, index) {
+        const state = this.linkState(link);
+        const dead = state === 'revoked' || state === 'expired' || state === 'used_up' || state === 'account_inactive';
+        return `
+            <tr data-link="${link.id}" data-state="${state}" class="links-row${dead ? ' is-dead' : ''}" style="--i:${Math.min(index || 0, this.LINKS_STAGGER_MAX)}">
+                <td>${this.linkPersonHtml(link)}</td>
+                <td data-link-state="${state}">${this.linkStateHtml(link)}</td>
+                <td data-link-uses="${link.uses}">${this.linkUsesMeterHtml(link)}</td>
+                <td class="ui-nowrap">${this.linkExpiryHtml(link)}</td>
+                <td class="ui-nowrap">${this.linkLastUse(link)}</td>
+                <td class="ui-nowrap">${this.linkOpenShift(link)}</td>
+                <td class="is-end">${this.linkActionHtml(link)}</td>
+            </tr>`;
+    },
+
+    /** The phone layout: one card per link, the same facts as the table, stacked. */
     linkCardsHtml(links) {
-        return `<div class="ui-stack">${links.map((link) => `
-            <div class="ui-card is-stacked" data-link="${link.id}">
+        return `<div class="links-cards">${links.map((link, index) => {
+            const state = this.linkState(link);
+            const dead = state === 'revoked' || state === 'expired' || state === 'used_up' || state === 'account_inactive';
+            return `
+            <div class="ui-card is-stacked links-card${dead ? ' is-dead' : ''}" data-link="${link.id}" data-state="${state}" style="--i:${Math.min(index || 0, this.LINKS_STAGGER_MAX)}">
                 <div class="ui-spread">
-                    <p class="ui-strong ui-truncate">${this.escapeHtml(link.worker_name || link.worker_id)}</p>
-                    <p class="ui-note ui-nowrap">${this.escapeHtml(link.worker_id)}</p>
+                    ${this.linkPersonHtml(link)}
+                    ${this.linkStateHtml(link)}
                 </div>
-                <p class="ui-note" data-link-state="${this.linkState(link)}">${this.linkStateHtml(link)}</p>
-                <p class="ui-note">${this.linkUsesLabel(link)} · ${I18n.__('linksExpires')} ${this.escapeHtml(link.expires_at)}</p>
-                <p class="ui-note">${I18n.__('linksLastUse')}: ${this.linkLastUse(link)}</p>
-                <p class="ui-note">${this.linkOpenShift(link)}</p>
+                <div class="links-meta">
+                    <span data-link-uses="${link.uses}">${I18n.__('linksTaps')}: ${this.linkUsesMeterHtml(link)}</span>
+                    <span>${I18n.__('linksExpires')}: ${this.linkExpiryHtml(link)}</span>
+                    <span>${I18n.__('linksLastUse')}: ${this.linkLastUse(link)}</span>
+                    ${this.linkOpenShift(link)}
+                </div>
                 <div class="ui-row">${this.linkActionHtml(link)}</div>
-            </div>`).join('')}</div>`;
+            </div>`;
+        }).join('')}</div>`;
+    },
+
+    /** A worker as a chip and two lines: a column of names is a shape before it is a read. */
+    linkPersonHtml(link) {
+        const name = String(link.worker_name || link.worker_id || '');
+        const initial = name.trim().charAt(0);
+        return `
+            <span class="links-person">
+                <span class="links-avatar" aria-hidden="true">${this.escapeHtml(initial)}</span>
+                <span class="links-person-body">
+                    <span class="links-person-name ui-truncate">${this.escapeHtml(name)}</span>
+                    <span class="ui-note">${this.escapeHtml(link.worker_id)}${link.note ? ` \u00b7 ${this.escapeHtml(link.note)}` : ''}</span>
+                </span>
+            </span>`;
+    },
+
+    /**
+     * How many taps the link has taken, as a figure and - when it is capped - a bar.
+     *
+     * An uncapped link has no bar to draw, because there is no fraction to draw it from;
+     * the word beside the count is what says so.
+     */
+    linkUsesMeterHtml(link) {
+        const cap = Number(link.max_uses) || 0;
+        if (cap === 0) {
+            return `<span class="links-meter-label">${this.escapeHtml(String(link.uses))}</span> <span class="links-meter-note">${I18n.__('linksUnlimited')}</span>`;
+        }
+        const used = Number(link.uses) || 0;
+        const percent = Math.max(0, Math.min(100, Math.round((used / cap) * 100)));
+        return `<span class="links-meter-label">${this.escapeHtml(`${used} / ${cap}`)}</span>
+            <span class="ops-progress links-meter-bar${used >= cap ? ' is-closing' : ''}" aria-hidden="true"><span style="width:${percent}%"></span></span>`;
+    },
+
+    /** The expiry, with the one relative read that saves a subtraction: "under a day". */
+    linkExpiryHtml(link) {
+        const stamp = this.escapeHtml(link.expires_at);
+        if (!this.linksExpiringSoon(link)) return `<span title="${stamp}">${stamp}</span>`;
+        return `<span title="${stamp}">${stamp}</span>
+            <span class="ui-badge is-warn">${I18n.__('linksExpiringSoon')}</span>`;
     },
 
     /** One word for why the link is or is not usable, including the account it belongs to. */
@@ -4130,23 +5682,22 @@ const UI_MODULES = {
             used_up: 'is-warn',
             account_inactive: 'is-danger'
         };
-        return `<span class="ui-state ${tones[state] || ''}">${codeLabel('linksState', state)}</span>`;
-    },
-
-    linkUsesLabel(link) {
-        const cap = Number(link.max_uses) || 0;
-        if (cap === 0) return `${link.uses} · ${I18n.__('linksUnlimited')}`;
-        return `${link.uses} / ${cap}`;
+        return `<span class="ui-state ${tones[state] || ''}" data-link-state="${state}">${codeLabel('linksState', state)}</span>`;
     },
 
     linkLastUse(link) {
         if (!link.last_used_at) return `<span class="ui-tone-muted">${I18n.__('linksNever')}</span>`;
-        return `${this.escapeHtml(link.last_used_at)}${link.last_used_ip ? ` <span class="ui-tone-muted">${this.escapeHtml(link.last_used_ip)}</span>` : ''}`;
+        // The words are what a reader scans ("2 h ago"); the exact server stamp stays on the
+        // title, so the figure is still one hover away for anybody who needs it.
+        const ago = UI.timeAgo(link.last_used_at);
+        return `<span title="${this.escapeHtml(link.last_used_at)}">${this.escapeHtml(ago)}</span>${link.last_used_ip ? ` <span class="ui-tone-muted">${this.escapeHtml(link.last_used_ip)}</span>` : ''}`;
     },
 
     linkOpenShift(link) {
         if (!link.clocked_in) return '';
-        return `<span class="ui-tone-ok">${I18n.__('linksOnShift')}</span> ${this.escapeHtml(link.clock_in_time || '')} ${this.escapeHtml(link.open_shift_site || '')}`;
+        // A static dot, not the breathing one: this repeats down the list, and a hundred
+        // pulsing dots is a screen nobody can read. The header's live line is the animated one.
+        return `<span class="links-onshift"><span class="links-onshift-dot" aria-hidden="true"></span><span class="ui-tone-ok">${I18n.__('linksOnShift')}</span> ${this.escapeHtml(link.clock_in_time || '')} ${this.escapeHtml(link.open_shift_site || '')}</span>`;
     },
 
     /**
@@ -4160,11 +5711,11 @@ const UI_MODULES = {
         const id = this.escapeHtml(link.id);
         const state = this.linkState(link);
         const revoke = (state === 'active' || state === 'account_inactive')
-            ? `<button type="button" data-revoke-link="${id}" onclick="UI_MODULES.revokeLink(${link.id})"
+            ? `<button type="button" data-revoke-link="${id}"
                     class="ui-btn ui-btn-danger ui-btn-sm">${I18n.__('linksRevoke')}</button>`
             : '';
         return `${revoke}
-            <button type="button" data-link-uses="${id}" onclick="UI_MODULES.openLinkUses(${link.id})"
+            <button type="button" data-open-uses="${id}"
                     class="ui-btn ui-btn-sm">${I18n.__('linksUses')}</button>`;
     },
 
@@ -4209,7 +5760,7 @@ const UI_MODULES = {
                     </p>
                     ${use.flag_reason ? `<p class="ui-note is-warn">${this.escapeHtml(use.flag_reason)}</p>` : ''}
                     <div class="ui-row">
-                        <button type="button" data-show-photo="${use.id}" onclick="UI_MODULES.showLinkPhoto(${use.id})"
+                        <button type="button" data-show-photo="${use.id}"
                                 class="ui-btn ui-btn-sm">${I18n.__('linksShowPhoto')}</button>
                         <img id="linkPhoto${use.id}" class="hidden ui-photo" alt="${I18n.__('linksPhotoAlt')}" />
                     </div>
@@ -4218,7 +5769,7 @@ const UI_MODULES = {
             <div class="ui-card is-stacked" data-uses-for="${this.escapeHtml(data.link_id)}">
                 <div class="ui-spread">
                     <h3 class="ui-card-title">${I18n.__('linksUsesTitle')} · ${this.escapeHtml(data.worker_name || data.worker_id)}</h3>
-                    <button type="button" onclick="UI_MODULES.closeLinkUses()" class="ui-btn ui-btn-quiet ui-btn-sm is-icon">✕</button>
+                    <button type="button" data-close-uses class="ui-btn ui-btn-quiet ui-btn-sm is-icon" aria-label="${this.escapeHtml(I18n.__('close'))}" title="${this.escapeHtml(I18n.__('close'))}">${this.OPS_ICONS.close}</button>
                 </div>
                 <p class="ui-note">${I18n.__('linksUsesHint')}</p>
                 <div class="ui-stack">${rows}</div>
@@ -11019,6 +12570,15 @@ ${sessionsFact}${statusFact}
     //: only thing that ever paints this tab - so it is the same age as ``_dashboard`` above.
     _dashboardHost: null,
 
+    //: When the read behind ``_dashboard`` landed, in the browser's own clock. ``0`` is "nothing
+    //: read". This is the anchor for every freshness verdict on this screen: the payload's
+    //: ``as_of`` is when the *server* counted, and this is when the answer reached the reader -
+    //: and the age that decides whether to trust a figure is the age of the copy on the screen.
+    _dashboardReadAt: 0,
+
+    //: The freshness tick: a repaint of the *age* only, never a request. See ``tickDashboard``.
+    _dashboardTick: null,
+
     //: The days the period panel asks for when nothing has been chosen. It has to be the
     //: server's own default (``dashboard.DEFAULT_PERIOD_DAYS``), because the label on the
     //: button says "last 7 days" and the figures under it come from whatever the request
@@ -11049,7 +12609,9 @@ ${sessionsFact}${statusFact}
     /** The front door: one read, then the five panels. */
     async renderDashboard(content) {
         if (!content) return;
+        this.stopDashboardTick();
         this._dashboard = null;
+        this._dashboardReadAt = 0;
         this._dashboardHost = content;
         content.innerHTML = UI.consoleSkeletonHtml(I18n.__('dashboard'));
         let data = null;
@@ -11065,8 +12627,10 @@ ${sessionsFact}${statusFact}
             return;
         }
         this._dashboard = data;
+        this._dashboardReadAt = Date.now();
         content.innerHTML = this.dashboardShellHtml(data);
         this.bindDashboardControls(content);
+        this.startDashboardTick();
     },
 
     /**
@@ -11087,17 +12651,22 @@ ${sessionsFact}${statusFact}
      * prints one field, and a tab is a name. Where a figure *is* derived - "waiting on a person"
      * across four queues - the server already answered it (``waiting``), which is why the strip
      * carries the queues separately rather than adding them up here.
+     *
+     * NOTHING HERE REPEATS THE CONSOLE'S OWN HEADER. The frame this fragment is drawn into already
+     * prints the tab's name and its hint (``adminTitle``/``adminSubtitle``), and this screen used to
+     * print both a second time as its own ``ui-section-head`` - a title twice, and a four-line
+     * paragraph before the first figure on a phone. The panel below carries its own heading, which
+     * is the one title this screen actually needs.
      */
     dashboardShellHtml(data) {
         return `
             <div class="ui-page" data-dashboard="true">
-                <header class="ui-section-head">
-                    <h1 class="ui-section-title">${this.escapeHtml(I18n.__('dashboard'))}</h1>
-                    <p class="ui-section-note dashboard-lead">${this.escapeHtml(I18n.__('hintDashboard'))}</p>
-                </header>
                 <div class="ui-spread dashboard-stamp">
                     <p class="ops-sub" data-dashboard-asof="true">${this.escapeHtml(this.dashboardStampText(data))}</p>
-                    <button type="button" class="ui-btn" data-dashboard-refresh="true">${this.OPS_ICONS.refresh}<span>${this.escapeHtml(I18n.__('dashboardRefresh'))}</span></button>
+                    <div class="dashboard-fresh-row">
+                        ${this.dashboardFreshnessHtml(data)}
+                        <button type="button" class="ui-btn" data-dashboard-refresh="true">${this.OPS_ICONS.refresh}<span>${this.escapeHtml(I18n.__('dashboardRefresh'))}</span></button>
+                    </div>
                 </div>
                 ${this.dashboardVitalsHtml(data)}
                 ${this.dashboardSwitchHtml(data)}
@@ -11118,6 +12687,13 @@ ${sessionsFact}${statusFact}
         const waiting = data ? data.waiting : null;
         const moment = data ? data.now : null;
         const period = data ? data.period : null;
+        // Every figure on this strip is one field of one counted read, so they share one read time
+        // and one verdict on its age. The strip is stamped with the instant that read happened,
+        // and once it is old enough the strip - and each tile in it - says so rather than printing
+        // a figure that may no longer be true as if it still were.
+        const state = this.dashboardFresh(data);
+        const stale = state === 'stale';
+        const readAt = data && data.as_of ? String(data.as_of) : '';
         // ``null`` when the panel behind the figure could not be read. It is drawn as an em dash
         // and never as a zero: on this strip a zero is good news, and inventing good news is the
         // one output this page must not produce.
@@ -11135,7 +12711,9 @@ ${sessionsFact}${statusFact}
             },
             { id: 'awaiting_approval_hours', labelKey: 'dashboardPeriodAwaitingHours', tab: 'Approvals', tone: 'is-warn', value: field(period, 'awaiting_approval_hours') }
         ];
-        return `<section class="dashboard-vitals" data-dashboard-vitals="true">${tiles
+        tiles.forEach((tile) => { tile.stale = stale; tile.readAt = readAt; });
+        return `<section class="dashboard-vitals is-${this.escapeHtml(state)}" data-dashboard-vitals="true"`
+            + ` data-dashboard-read-at="${this.escapeHtml(readAt)}">${tiles
             .map((tile) => this.dashboardVitalHtml(tile))
             .join('')}</section>`;
     },
@@ -11144,9 +12722,10 @@ ${sessionsFact}${statusFact}
      * One vital: the figure, what it is, and where it is worked.
      *
      * The whole tile is the button, so the tap target is the tile and not a word inside it (a
-     * phone in gloves is the reader this console was written for). The tab's own name is printed
-     * under the label - "Approvals", "Registrations" - so a tile says where it goes without
-     * repeating a sentence five times, and the accessible name of the button is all of it.
+     * phone in gloves is the reader this console was written for). The tab's own name - the
+     * "Approvals" the tile opens - is in the button's *accessible name* rather than on a second
+     * line under the label: the tile still says where it goes, without five more words of grey type
+     * on a screen somebody opens to glance at a number.
      */
     dashboardVitalHtml(tile) {
         const unknown = tile.value === null || tile.value === undefined;
@@ -11157,14 +12736,28 @@ ${sessionsFact}${statusFact}
         const classes = ['dashboard-vital'];
         if (unknown) classes.push('is-unknown');
         else if (flagged && tile.tone) classes.push(tile.tone);
+        // A stale figure is still shown - it is the last thing anybody counted, and hiding it
+        // would be its own kind of lie - but it is marked, and its accessible name says it is old,
+        // so it is never read as current.
+        const stale = !!tile.stale && !unknown;
+        if (stale) classes.push('is-stale');
         const offered = this.dashboardTabOffered(tile.tab);
         const link = offered ? ` data-dashboard-go="${this.escapeHtml(tile.tab)}"` : '';
+        const label = I18n.__(tile.labelKey);
+        const readAt = this.dashboardReadAtText(tile.readAt ? { as_of: tile.readAt } : null);
+        const title = readAt ? ` title="${this.escapeHtml(readAt)}"` : '';
+        // Where the tile goes is *spoken*, not printed. The destination used to be a second line of
+        // grey text under every figure; the button's accessible name is where a screen reader reads
+        // it anyway, and this is one fewer line on each of five tiles.
+        const spoken = [figure, label, tile.note, stale ? I18n.__('dashboardFreshStale') : '', offered ? I18n.__(adminTabRecord(tile.tab).key) : '']
+            .filter((part) => !!part)
+            .join(' — ');
         return `
-            <button type="button" class="${classes.join(' ')}" data-dashboard-vital="${this.escapeHtml(tile.id)}"${link}>
+            <button type="button" class="${classes.join(' ')}" data-dashboard-vital="${this.escapeHtml(tile.id)}"${link}${title}
+                    aria-label="${this.escapeHtml(spoken)}">
                 <span class="dashboard-vital-value" data-dashboard-vital-fact="${this.escapeHtml(tile.id)}">${this.escapeHtml(figure)}</span>
-                <span class="dashboard-vital-label">${this.escapeHtml(I18n.__(tile.labelKey))}</span>
+                <span class="dashboard-vital-label">${this.escapeHtml(label)}</span>
                 ${tile.note ? `<span class="dashboard-vital-note">${this.escapeHtml(tile.note)}</span>` : ''}
-                ${offered ? `<span class="dashboard-vital-link">${this.escapeHtml(I18n.__(adminTabRecord(tile.tab).key))}</span>` : ''}
             </button>`;
     },
 
@@ -11254,6 +12847,123 @@ ${sessionsFact}${statusFact}
     },
 
     /**
+     * How old the one read on this screen is: fresh, aging, stale - or unknown with nothing read.
+     *
+     * The whole point of this screen is that it does *not* poll, so a figure's age is the age of
+     * the read that produced it: there is no second read to compare against, and every figure on
+     * the strip shares this one verdict. ``unknown`` is the failed read and the not-yet-read; it
+     * is drawn as nothing at all rather than as a state, because "could not be read" is already
+     * said once by the shell, and a second word about the same absence would be noise.
+     */
+    dashboardFresh(data) {
+        if (!data) return 'unknown';
+        const at = Number(this._dashboardReadAt);
+        if (!isFinite(at) || at <= 0) return 'unknown';
+        const windows = this.dashboardFreshWindows(data);
+        const age = Date.now() - at;
+        if (age < windows.agingMs) return 'fresh';
+        if (age < windows.staleMs) return 'aging';
+        return 'stale';
+    },
+
+    /**
+     * The two freshness boundaries this deployment defines, in milliseconds.
+     *
+     * The server owns them and sends them with the snapshot (``freshness.aging_seconds`` /
+     * ``freshness.stale_seconds``), because "Read just now" is a verdict about this read's age and
+     * the boundary it was tested against belongs beside the read it describes - the same rule that
+     * sends ``dormant_days`` with the dormant count. A window is taken only when it is a real
+     * positive number; a payload that omits it, or sends a zero or a non-number, falls back to
+     * this module's own constant rather than reading every figure as stale.
+     */
+    dashboardFreshWindows(data) {
+        const source = data && data.freshness ? data.freshness : null;
+        const asMs = (value, fallback) => {
+            const seconds = Number(value);
+            return isFinite(seconds) && seconds > 0 ? seconds * 1000 : fallback;
+        };
+        if (!source) {
+            return { agingMs: this.DASHBOARD_AGING_MS, staleMs: this.DASHBOARD_STALE_MS };
+        }
+        return {
+            agingMs: asMs(source.aging_seconds, this.DASHBOARD_AGING_MS),
+            staleMs: asMs(source.stale_seconds, this.DASHBOARD_STALE_MS)
+        };
+    },
+
+    dashboardFreshnessLabel(data) {
+        const state = this.dashboardFresh(data);
+        if (state === 'fresh') return I18n.__('dashboardFreshFresh');
+        if (state === 'aging') return I18n.__('dashboardFreshAging');
+        if (state === 'stale') return I18n.__('dashboardFreshStale');
+        return '';
+    },
+
+    /**
+     * The freshness chip on the stamp row, drawn beside the read time rather than in place of it.
+     *
+     * It borrows the board's own ``ops-fresh`` vocabulary - the same dot, the same hues, the same
+     * words in the reader's language - because "how old is this?" should be answered the same way
+     * in both places. The title names the instant the read landed, which is the per-figure read
+     * time: every figure on the strip came from the one read, so they all share it.
+     */
+    dashboardFreshnessHtml(data) {
+        const state = this.dashboardFresh(data);
+        if (state === 'unknown') return '';
+        const title = this.dashboardReadAtText(data);
+        const hint = title ? ` title="${this.escapeHtml(title)}"` : '';
+        return `<span class="ops-fresh dashboard-fresh is-${state}" id="dashboardFreshness"${hint}>`
+            + `${this.escapeHtml(this.dashboardFreshnessLabel(data))}</span>`;
+    },
+
+    /** "Read at 14:03:11" - when the figures on the screen reached it. Empty with no read. */
+    dashboardReadAtText(data) {
+        const stamp = data && data.as_of ? String(data.as_of) : '';
+        return stamp ? I18n.__('dashboardReadAt').replace('{stamp}', stamp) : '';
+    },
+
+    /** The clock moved and nothing else did: repaint the chip and the tiles' stale mark in place. */
+    paintDashboardFreshness() {
+        const state = this.dashboardFresh(this._dashboard);
+        const chip = document.getElementById('dashboardFreshness');
+        if (chip) {
+            chip.textContent = this.dashboardFreshnessLabel(this._dashboard);
+            chip.className = `ops-fresh dashboard-fresh is-${state}`;
+        }
+        const tiles = typeof document.querySelectorAll === 'function'
+            ? document.querySelectorAll('[data-dashboard-vital]')
+            : [];
+        tiles.forEach((tile) => {
+            if (tile && tile.classList && typeof tile.classList.toggle === 'function') {
+                tile.classList.toggle('is-stale', state === 'stale');
+            }
+        });
+    },
+
+    /**
+     * Re-evaluate the age every half-minute while the tab is on screen.
+     *
+     * This is not a poll: it reads nothing, and the screen still makes exactly one request per
+     * paint. It exists because a number that was true when it was read stops being true on its
+     * own, and a strip that kept printing it as current would be the false confidence this whole
+     * tab is designed against. The tick retires itself the moment the tab is no longer the one
+     * being looked at, the same way the live board's does.
+     */
+    tickDashboard() {
+        if (State.adminTab !== 'Dashboard') { this.stopDashboardTick(); return; }
+        this.paintDashboardFreshness();
+    },
+
+    startDashboardTick() {
+        this.stopDashboardTick();
+        this._dashboardTick = setInterval(() => this.tickDashboard(), this.DASHBOARD_TICK_MS);
+    },
+
+    stopDashboardTick() {
+        if (this._dashboardTick !== null) { clearInterval(this._dashboardTick); this._dashboardTick = null; }
+    },
+
+    /**
      * Whether this session is offered a tab, before a link to it is drawn.
      *
      * ``adminVisibleTabs`` is the nav's own answer to that question, so a panel cannot
@@ -11303,15 +13013,7 @@ ${sessionsFact}${statusFact}
      * "73h 12m" is a figure a reader has to divide before it means anything.
      */
     dashboardWaitLabel(seconds) {
-        const total = Math.max(0, Number(seconds) || 0);
-        const days = Math.floor(total / 86400);
-        if (days >= 1) {
-            const hours = Math.floor((total % 86400) / 3600);
-            return I18n.__('dashboardDaysShort')
-                .replace('{days}', String(days))
-                .replace('{hours}', String(hours));
-        }
-        return this.liveOpsDuration(total);
+        return this.waitingLabel(seconds);
     },
 
     /**
@@ -11639,6 +13341,40 @@ ${sessionsFact}${statusFact}
     },
 
     /**
+     * One queue row: the figure, what it is, and - where this reader is offered it - the tap that
+     * opens the tab which works it.
+     *
+     * THE ROW IS THE BUTTON. It used to end in an "Open Approvals" button under the number, which
+     * spent a third of the card saying what the card already said, on a screen whose whole point is
+     * that the figures are taken in at a glance. That is the rule the vital strip above already
+     * follows, applied to the panel; the destination is in the accessible name now, so the row still
+     * names where it goes to a screen reader and a sighted reader gets the number a line closer to
+     * the top.
+     *
+     * ``hook`` is the row's own attribute (``data-dashboard-queue`` on the waiting view,
+     * ``data-dashboard-now`` on the now view): the two views draw the same shape at different
+     * moments, and the suite reads them apart by that name. A row with no tab - the punch queue is
+     * triaged at a route no tab in this console lists - stays a plain ``div`` rather than a button
+     * that only ever answers "not you".
+     */
+    dashboardQueueHtml(hook, field, labelKey, value, tab) {
+        const offered = !!tab && this.dashboardTabOffered(tab);
+        const label = I18n.__(labelKey);
+        const figure = String(value ?? 0);
+        const spoken = offered
+            ? `${figure} ${label} — ${I18n.__(adminTabRecord(tab).key)}`
+            : `${figure} ${label}`;
+        const inner = `
+                <span class="dashboard-queue-value" data-dashboard-fact="${this.escapeHtml(field)}">${this.escapeHtml(figure)}</span>
+                <span class="dashboard-queue-label">${this.escapeHtml(label)}</span>`;
+        const name = this.escapeHtml(field);
+        return offered
+            ? `<button type="button" class="dashboard-queue" ${hook}="${name}"`
+                + ` data-dashboard-go="${this.escapeHtml(tab)}" aria-label="${this.escapeHtml(spoken)}">${inner}</button>`
+            : `<div class="dashboard-queue" ${hook}="${name}">${inner}</div>`;
+    },
+
+    /**
      * Waiting on a person - the first view, because it is the only one that changes behaviour.
      *
      * Each count is the predicate its own screen uses, so the dashboard and the queue it
@@ -11661,14 +13397,9 @@ ${sessionsFact}${statusFact}
         if (waiting.alerts !== null && waiting.alerts !== undefined && this.dashboardTabOffered('Alerts')) {
             queues.push(['alerts', 'dashboardAlerts', 'Alerts']);
         }
-        const rows = queues.map(([field, labelKey, tab]) => `
-            <div class="dashboard-queue" data-dashboard-queue="${field}">
-                <span class="dashboard-queue-value" data-dashboard-fact="${field}">${this.escapeHtml(String(waiting[field] ?? 0))}</span>
-                <span class="dashboard-queue-label">${this.escapeHtml(I18n.__(labelKey))}</span>
-                ${this.dashboardTabOffered(tab)
-                    ? `<button type="button" class="ui-btn ui-btn-sm" data-dashboard-go="${tab}">${this.escapeHtml(I18n.__('dashboardOpenTab').replace('{tab}', I18n.__(adminTabRecord(tab).key)))}</button>`
-                    : ''}
-            </div>`).join('');
+        const rows = queues
+            .map(([field, labelKey, tab]) => this.dashboardQueueHtml('data-dashboard-queue', field, labelKey, waiting[field], tab))
+            .join('');
         return `
             <div class="dashboard-queues">${rows}</div>
             ${this.dashboardOldestHtml(waiting)}`;
@@ -11715,14 +13446,7 @@ ${sessionsFact}${statusFact}
             ['overtime_open', 'dashboardOvertimeOpen', 'Approvals'],
             ['offline_waiting', 'dashboardOfflineWaiting', null],
             ['refused_24h', 'dashboardRefused24h', 'Developer']
-        ].map(([field, labelKey, tab]) => `
-            <div class="dashboard-queue" data-dashboard-now="${field}">
-                <span class="dashboard-queue-value" data-dashboard-fact="${field}">${this.escapeHtml(String(moment[field] ?? 0))}</span>
-                <span class="dashboard-queue-label">${this.escapeHtml(I18n.__(labelKey))}</span>
-                ${tab && this.dashboardTabOffered(tab)
-                    ? `<button type="button" class="ui-btn ui-btn-sm" data-dashboard-go="${tab}">${this.escapeHtml(I18n.__('dashboardOpenTab').replace('{tab}', I18n.__(adminTabRecord(tab).key)))}</button>`
-                    : ''}
-            </div>`).join('');
+        ].map(([field, labelKey, tab]) => this.dashboardQueueHtml('data-dashboard-now', field, labelKey, moment[field], tab)).join('');
         // Who, by site: the same rows the total counts, grouped by the server rather than here,
         // so the split and the total cannot disagree. A site name is text somebody typed, so it
         // is escaped like every other value off the wire.

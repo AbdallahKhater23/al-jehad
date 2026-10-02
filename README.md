@@ -187,9 +187,26 @@ it; `ngrok http 8000` works the same way if that is what you have.
   is the rule, not a fault. A transit worker (the per-account grant, Credentials → *Allow
   off-site shift start*) may open a shift away from every site; it opens **pending**, at "In
   Transit", and it counts: the worker is on the clock, the console lists them, and nothing is
-  payable yet. Arriving at a site confirms the shift - the placeholder becomes the site, the
-  travel time is credited from the departure, and the worker gets an "Arrival confirmed" notice
-  in their own inbox. A Clock Out taken away from every site is **refused** (409,
+  payable yet. On arrival the worker taps **I have arrived at a site** on their panel - a fix
+  and a geofence, no camera: the face was checked when the shift began, and the arrival's claim
+  is a place, not a person - and that confirms the shift: the
+  placeholder becomes the site, the travel time is credited from the departure, the card stops
+  saying it is on the road, and the worker gets an "Arrival confirmed" notice in their own
+  inbox. (A Clock Out taken inside a fence while still in transit confirms the trip and closes
+  the day in one tap, and leaves the same notice.)
+
+  An arrival taken outside every fence is **refused** (422 `arrival_outside_geofence`), and one
+  taken against a trip somebody has already confirmed is refused too (409
+  `arrival_already_confirmed`) - a double tap, or an administrator closing the shift first. In
+  both cases the shift is left exactly as it was: open, in transit, still counting. Both are
+  refusals about the *worker's own act* rather than about the deployment, so both carry an
+  `error_code` beside the server's English sentence and the handset keys on that code to say the
+  thing in the reader's own language - the same contract the liveness gate and the early
+  clock-out question keep. The server's sentence stays in the body, because a refusal read back
+  out of a log or a trace still has to be a sentence.
+
+  A Clock Out taken away from every site is
+  **refused** (409,
   `off_site_checkout_needs_admin`): nothing about the shift has been authorised by a place, so
   the system will not decide when it ended. The worker taps **Ask an administrator to close my
   shift** on their panel, which raises one critical alert under Alerts (one per shift, however
@@ -1155,6 +1172,21 @@ GET  /api/v1/admin/registrations/{id}/photo     the applicant's photo, while the
 POST /api/v1/admin/registrations/{id}/approve   {"note": "..."} -> the status becomes active
 POST /api/v1/admin/registrations/{id}/reject    {"note": "..."} -> the account goes, its face with it
 ```
+
+**The queue is a list, and one application is open at a time.** The tab used to draw every
+applicant as a complete card - the facts, the photograph box, a note field and the two answers - so
+six applications were six open forms and nineteen buttons before anything had been decided. What a
+reviewer does is scan for the one that matters and read *that* one, so the queue is rows: initials,
+name, role and number, and how long they have waited - in **days** once it is a day, because
+"162h 11m" is a figure somebody has to divide first. The face, the details, the note and the two
+answers belong to the one row that is open, which is why the screen carries exactly one note field
+and one pair of decisions however long the queue is. Opening an application is a move rather than a
+read - the queue is already in memory - so the switch, a decision and a language change all repaint
+from it and never re-order the list under somebody's hands, and the photograph is fetched by the act
+of opening, once, with the session's own token, because the face is the thing being judged. The
+registration link is one compact line above the queue, and *why* it is shut is said only when it is
+shut: an open link needs no explaining, and the three-line paragraph under it was three lines a
+reviewer read before the first applicant.
 
 **One link, ten phones.** The link is shared, so the band scan and the `INSERT` that consumes
 it are racing by design. They are serialized by `BEGIN IMMEDIATE`, so the ordinary case is ten
@@ -2447,6 +2479,12 @@ The parallel run is the one to use, and it is worth knowing how the suite is arr
 safe: each worker is a separate process, so a test's environment is its own, and each worker is
 handed its tests in collection order - which is what keeps a module's tests together in one worker
 (a module-scoped fixture is therefore never torn down while another module's test is running).
+
+The same suite is the push/PR gate, in [`.github/workflows/test.yml`](.github/workflows/test.yml):
+`ubuntu-latest`, Python 3.12, `-n auto`, with the browser-, model-, clock- and load-bound suites
+excluded so a green tick arrives in about two minutes. The workflow header carries the local
+recipe - the raw shell steps, and `act -j unit-tests` (or `act -j unit-tests -n` to print the
+steps without running them).
 
 The suite **never touches your data.** At import it copies `times.db` into a temp directory,
 points the application at the copy, and refuses to run if the app resolves anywhere else

@@ -18,9 +18,14 @@ What is asserted here:
 3. **The three phases.** Departure opens an unpaid, unconfirmed shift (``in_transit``); a
    checkpoint inside a fence confirms it, keeping the departure timestamp so travel is paid; and a
    clock-out that never reached a site is routed to review, not approved.
-4. **The biometric pipeline is not bypassed.** These punches run the same liveness and match the
-   gate does - the suite's stub engine returns an approved match, so a punch that succeeds here
-   has passed the whole chain.
+4. **The face check happens once per shift, where it belongs.** A departure and every ordinary
+   punch run the same liveness and match the gate does - the suite's stub engine returns an
+   approved match, so a punch that succeeds here has passed the whole chain - and a punch
+   without a frame is refused. The *arrival* is the one act that is not about a person: the
+   shift's identity was established when it began, so arriving is taken with no photograph at
+   all and the geofence is the whole proof (see
+   ``test_an_arrival_needs_no_face_because_the_shift_already_has_one`` for the boundary of that
+   exception, and ``test_every_other_punch_still_requires_a_selfie`` for its width).
 
 A shift that never reaches a site is *refused* its off-site ending rather than closed: see
 ``test_transit_pending_shift`` for the three states of that shift - pending on the road,
@@ -231,10 +236,66 @@ def test_an_arrival_that_is_not_at_a_site_is_refused_and_leaves_the_shift_in_tra
 
     response = clock_in(client, MOALLEM, headers=bearer(MOALLEM), coordinates=OUTSIDE_ALL_SITES)
     assert response.status_code == 422, response.text[:300]
-    assert "Cannot confirm arrival" in response.json()["detail"]
+    # The refusal carries a *code* as well as the server's English: the handset keys on the code
+    # to say this in the worker's own language (see ``ARRIVAL_REFUSAL_KEYS``), and a sentence is
+    # the one thing that cannot survive translation. The message stays for the log.
+    detail = response.json()["detail"]
+    assert detail["error_code"] == "arrival_outside_geofence", detail
+    assert "Cannot confirm arrival" in detail["message"], detail
 
     assert db_scalar("SELECT is_transit FROM active_sessions WHERE worker_id = ?", (MOALLEM,)) == 1
     assert _log_rows() == [], "a refused arrival writes no milestone"
+
+
+def _punch_without_a_photo(client, user_id: str, action: str, coordinates: str):
+    """The arrival's own shape: the same endpoint, with no ``selfie`` part at all."""
+    return client.post(
+        "/api/v1/attendance/verify",
+        data={"worker_id": user_id, "action": action, "location_input": coordinates},
+        headers=bearer(user_id),
+    )
+
+
+def test_an_arrival_needs_no_face_because_the_shift_already_has_one(client):
+    """The departure's face check authorises the person; this act only has to name a place.
+
+    Asking for the face again is the thing this contract exists to forbid: a worker at a gate
+    re-proving, to a phone in the sun, an identity verified hours earlier when they set off. The
+    punch is sent with no photograph part at all, and the milestone still lands.
+    """
+    _grant_transit(client)
+    _depart(client)
+
+    arrival = _punch_without_a_photo(client, MOALLEM, "Transit Checkpoint", INSIDE_DOWNTOWN)
+    assert arrival.status_code == 200, arrival.text[:300]
+    body = arrival.json()
+    assert body["status"] == "arrived"
+    assert body["site"] == DOWNTOWN, "the arrival names the site it was authorised by"
+
+    row = db_rows(
+        "SELECT site_name, is_transit FROM active_sessions WHERE worker_id = ?", (MOALLEM,)
+    )[0]
+    assert row[0] == DOWNTOWN and row[1] == 0
+
+    # The milestone row must not carry a number the absence of a face did not earn: 0.0 is the
+    # ledger's "not scored" value, and there is no liveness verdict to report either.
+    assert db_scalar(
+        "SELECT score FROM attendance_logs WHERE worker_id = ? AND action = ?",
+        (MOALLEM, main.ACTION_TRANSIT_CONFIRMED),
+    ) == 0.0
+    assert db_scalar(
+        "SELECT liveness_class FROM attendance_logs WHERE worker_id = ? AND action = ?",
+        (MOALLEM, main.ACTION_TRANSIT_CONFIRMED),
+    ) is None
+
+
+def test_every_other_punch_still_requires_a_selfie(client):
+    """The relaxation is exactly one act wide: a clock-in or clock-out with no frame is refused."""
+    refused = _punch_without_a_photo(client, MOALLEM, "Clock In", INSIDE_DOWNTOWN)
+    assert refused.status_code == 422, refused.text[:300]
+    assert "selfie" in refused.json()["detail"].lower()
+    assert db_scalar("SELECT COUNT(*) FROM active_sessions WHERE worker_id = ?", (MOALLEM,)) == 0
+    assert _log_rows() == [], "a refused punch writes no ledger row"
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +383,39 @@ def test_a_clock_out_at_a_site_confirms_and_closes_the_shift_in_one_tap(client):
     assert body["site"] == DOWNTOWN
     assert body["hours"] >= 2.4, f"the travel was not credited: {body}"
     assert db_scalar("SELECT COUNT(*) FROM active_sessions WHERE worker_id = ?", (MOALLEM,)) == 0
+
+
+def test_the_one_tap_arrival_tells_the_worker_too(client):
+    """The other route to an arrival must announce it: the card and the inbox have to agree.
+
+    A worker who drives straight to a site and ends the day there reaches the same milestone as
+    one who taps the arrival first - a geofence confirmed the trip - so the durable notice the
+    checkpoint writes belongs here too. Without it the same arrival told the worker something or
+    nothing depending on how many taps it took.
+    """
+    _grant_transit(client)
+    _depart(client)
+    _backdate_the_departure(hours=2.5)
+
+    closed = clock_in(
+        client,
+        MOALLEM,
+        action="Clock Out",
+        headers=bearer(MOALLEM),
+        coordinates=INSIDE_DOWNTOWN,
+        confirmed=True,
+    )
+    assert closed.status_code == 200, closed.text[:300]
+
+    notices = db_rows(
+        "SELECT kind, title, body FROM worker_notifications WHERE worker_id = ? ORDER BY id",
+        (MOALLEM,),
+    )
+    assert len(notices) == 1, notices
+    kind, title, body = notices[0]
+    assert kind == main.notifications.KIND_WORKER_TRANSIT_ARRIVED
+    assert DOWNTOWN in title and DOWNTOWN in body
+    assert "credited" in body, "the notice says what the arrival did to their hours"
 
 
 # ---------------------------------------------------------------------------

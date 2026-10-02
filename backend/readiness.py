@@ -36,9 +36,11 @@ a critical check fails. Three tiers, because blocking boot is a blunt instrument
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import platform
+import re
 import sqlite3
 import sys
 import tempfile
@@ -1095,6 +1097,232 @@ def _check_api_routes_authorised(ctx: dict) -> Check:
     )
 
 
+# ---------------------------------------------------------------------------
+# what an API answer is allowed to be cached as
+# ---------------------------------------------------------------------------
+#: API routes allowed to answer with a **cacheable** ``Cache-Control``, each beside the reason
+#: it holds nothing personal. Keyed by ``"<METHOD> <path>"`` like the authorisation lists and
+#: reviewed the same way, so adding a verb to a path does not inherit its neighbour's
+#: exemption.
+#:
+#: Everything else under ``/api/`` is ``Cache-Control: no-store``, applied by the default
+#: ``cache_policy`` middleware in ``main.py``. The route table cannot say what a response will
+#: carry, so that **default** is what protects the endpoint added tomorrow by somebody who
+#: never reads this file - this registry is only the reviewed list of deliberate exceptions. An
+#: exception must be a route that answers **without a session**: a per-account answer stored
+#: under a shared cache key is exactly the leak the default exists to prevent, which is why the
+#: check below refuses a role-guarded route here even when somebody declares it.
+CACHEABLE_API_ROUTES: dict[str, str] = {
+    "GET /api/v1/branding/logo": (
+        "the company's own mark, public and content-addressed: the URL carries the version of "
+        "the bytes it names, so there is nothing to revalidate and nothing personal to leak. "
+        "Answered ``public, max-age=31536000, immutable``."
+    ),
+}
+
+#: Directives that let a response be *stored and reused* rather than revalidated. A
+#: ``Cache-Control`` built only from ``no-store``, ``no-cache``, ``must-revalidate`` or
+#: ``private`` does not need declaring; ``public``, or a freshness lifetime that is not
+#: pinned to ``private``, does.
+_CACHEABLE_DIRECTIVES = ("public", "max-age", "s-maxage", "immutable", "stale-while-revalidate")
+
+#: The value of a handler's own ``Cache-Control``, read out of its source. Both shapes this
+#: codebase uses - ``Response(headers={"Cache-Control": "..."})`` and
+#: ``response.headers["Cache-Control"] = "..."`` - name the header in quotes, separate it from
+#: its value with ``:`` or ``=``, and quote the value. The header *name* is quoted too, so the
+#: pattern steps over its closing quote and the separator before capturing; matching straight
+#: from the name would otherwise capture the ``": "`` between them.
+_CACHE_CONTROL_IN_SOURCE = re.compile(
+    r"Cache-Control[\"']?\]?[\"']?\s*[:=]\s*[\"']([^\"']*)[\"']", re.IGNORECASE
+)
+
+#: Read by ``_check_api_response_cache_policy`` off the dispatch function of the middleware
+#: that applies the default. A marker rather than a name, so renaming the middleware cannot
+#: silently disarm the gate: the gate keeps looking for the marker and fails until the marker
+#: moves with the function.
+CACHE_POLICY_MARKER = "api_default_no_store"
+
+
+def _cacheable_directive(value: str) -> bool:
+    """Whether a ``Cache-Control`` lets an answer be *stored and reused* by a shared cache.
+
+    ``private`` is an accepted policy for personal data: it keeps the answer out of
+    intermediary and proxy caches, which is the leak this gate is about, and it is one of
+    the two policies the requirement names. So a directive that says ``private`` - with or
+    without a freshness lifetime, e.g. ``private, max-age=30`` - is **not** cacheable here,
+    while a bare freshness lifetime or ``public`` is. That leaves the two policies that
+    actually protect the answer (``no-store`` and ``private``) as the ones that need no
+    declaration, and everything shared as the ones that do.
+    """
+    lowered = value.lower()
+    if "private" in lowered and "public" not in lowered:
+        return False
+    return any(token in lowered for token in _CACHEABLE_DIRECTIVES)
+
+
+def _handler_cache_control(route) -> tuple[bool, str | None]:
+    """``(source_readable, value)``: the ``Cache-Control`` a handler sets for itself, if any.
+
+    Read off the handler's *own* source, because a route table cannot say what its responses
+    will carry. A handler whose source cannot be read (a frozen build - a zipapp, a
+    ``.pyc``-only deployment) is reported as unreadable rather than as "sets nothing": the
+    route is still covered by the default middleware, but "I looked and there was no
+    directive" must not be confused with "I could not look".
+
+    The limit worth stating: this sees the handler, not a helper it calls. A shared helper
+    that set a cacheable policy would be invisible here - which is the second reason the
+    default is ``no-store`` and this registry is a reviewed exception list rather than the
+    mechanism itself.
+    """
+    endpoint = getattr(route, "endpoint", None)
+    if endpoint is None:
+        return False, None
+    try:
+        source = inspect.getsource(endpoint)
+    except (OSError, TypeError):  # pragma: no cover - only a source-less deployment
+        return False, None
+    match = _CACHE_CONTROL_IN_SOURCE.search(source)
+    return True, (match.group(1) if match else None)
+
+
+def _default_cache_policy_installed(app) -> bool:
+    """Whether the middleware that gives every ``/api/`` answer its ``no-store`` is present."""
+    for middleware in getattr(app, "user_middleware", []) or []:
+        dispatch = (getattr(middleware, "kwargs", {}) or {}).get("dispatch")
+        if getattr(dispatch, "_cache_policy_marker", None) == CACHE_POLICY_MARKER:
+            return True
+    return False
+
+
+def _check_api_response_cache_policy(ctx: dict) -> Check:
+    """Every API route answers ``no-store``, unless it is declared cacheable with a reason.
+
+    ``api_routes_authorised`` answers "*may this caller read it*", and says nothing about what
+    the answer may be *kept* as afterwards. A token, a punch log, somebody's hours: an answer
+    like that in a browser's disk cache or an intermediary's is readable by the next person at
+    the device or the next tenant of the proxy, and it is the one kind of leak a response body
+    never shows. This is the check for it.
+
+    Three things are verified, and the first is load-bearing:
+
+    * **the default is installed** - a middleware carrying ``CACHE_POLICY_MARKER`` really does
+      run on this app, so an API answer is ``no-store`` unless its handler says otherwise. If
+      it is missing, every response is heuristically cacheable and none of the rest matters;
+    * **no handler opts out undeclared** - the handler's own source is read and a
+      ``public``/``max-age``/``immutable`` ``Cache-Control`` must appear in
+      ``CACHEABLE_API_ROUTES`` with its reason, or the gate fails naming it. A handler that
+      pins ``no-store`` for itself is fine: that is the safe direction;
+    * **the declarations are honest** - an entry for a route that no longer exists, an entry
+      whose route sets nothing cacheable any more, and an entry on a **role-guarded** route
+      are each reported. The last is the serious one: it means somebody asked for a per-account
+      answer to be stored under a key the whole deployment shares.
+
+    FATAL rather than advisory, unlike the deployment-shaped checks: this reads our own source,
+    so it cannot fail for a legitimate host difference, and a cached personal answer has no
+    degraded mode that is safer than refusing to serve.
+    """
+    app = ctx.get("app")
+    name = "api_response_cache_policy"
+    if app is None:  # pragma: no cover - only when called without an app
+        return Check(name, TIER_FATAL, True, "no app supplied; skipped")
+
+    default_installed = _default_cache_policy_installed(app)
+
+    seen: set[str] = set()
+    guarded: set[str] = set()
+    cacheable: list[str] = []
+    undeclared: list[str] = []
+    unreadable: list[str] = []
+    for path, route in iter_api_routes(app):
+        if not path.startswith("/api/"):
+            continue
+        enforced = any(
+            getattr(dependency.call, "_auth_marker", None) == "require_role"
+            for dependency in route.dependant.dependencies
+        )
+        readable, value = _handler_cache_control(route)
+        for method in sorted(route.methods or []):
+            key = f"{method} {path}"
+            seen.add(key)
+            if enforced:
+                guarded.add(key)
+            if not readable:
+                unreadable.append(key)
+            elif value is not None and _cacheable_directive(value):
+                cacheable.append(key)
+                if key not in CACHEABLE_API_ROUTES:
+                    undeclared.append(f"{key} (Cache-Control: {value})")
+
+    declared = set(CACHEABLE_API_ROUTES)
+    stale = sorted(declared - seen)
+    # A route whose source could not be read is not evidence that its declaration is unused,
+    # so it is excluded from this judgment rather than counted as "sets nothing".
+    unused = sorted(
+        key for key in declared if key in seen and key not in unreadable and key not in set(cacheable)
+    )
+    guarded_cacheable = sorted(key for key in cacheable if key in guarded)
+
+    # "Nothing was found" is not the same as "nothing is wrong": a traversal that stops
+    # working must fail the gate, not vouch for a surface it never looked at.
+    ok = (
+        bool(seen)
+        and default_installed
+        and not undeclared
+        and not stale
+        and not unused
+        and not guarded_cacheable
+    )
+    if ok:
+        detail = (
+            f"{len(seen)} API route(s) default to no-store ({len(guarded)} role-guarded); "
+            f"{len(cacheable)} declared cacheable without a session"
+        )
+    elif not seen:
+        detail = (
+            "no /api/ routes could be enumerated from the app, so this check verified nothing; "
+            "the route traversal is broken"
+        )
+    else:
+        problems = []
+        if not default_installed:
+            problems.append(
+                "the default no-store middleware is not installed, so every API answer is "
+                "heuristically cacheable"
+            )
+        if undeclared:
+            problems.append("cacheable API answers nobody declared: " + ", ".join(undeclared))
+        if guarded_cacheable:
+            problems.append(
+                "cacheable answers on session-guarded routes (personal data under a shared "
+                "cache key): " + ", ".join(guarded_cacheable)
+            )
+        if stale:
+            problems.append("declarations for routes that no longer exist: " + ", ".join(stale))
+        if unused:
+            problems.append(
+                "declarations whose route no longer sets a cacheable policy: " + ", ".join(unused)
+            )
+        detail = "; ".join(problems)
+
+    return Check(
+        name,
+        TIER_FATAL,
+        ok,
+        detail,
+        {
+            "routes": len(seen),
+            "guarded": len(guarded),
+            "default_installed": default_installed,
+            "cacheable": cacheable,
+            "undeclared": undeclared,
+            "guarded_but_cacheable": guarded_cacheable,
+            "stale_exemptions": stale,
+            "unused_exemptions": unused,
+            "unreadable": unreadable,
+        },
+    )
+
+
 def _check_no_unprefixed_admin_routes(ctx: dict) -> Check:
     app = ctx.get("app")
     # Effective paths, so this sees a route that was mounted without ``/api/v1`` - which
@@ -2140,6 +2368,7 @@ CHECKS = (
     _check_jwt_roundtrip,
     _check_admin_routes_guarded,
     _check_api_routes_authorised,
+    _check_api_response_cache_policy,
     _check_no_unprefixed_admin_routes,
     _check_static_mounts,
     _check_api_docs_disabled,

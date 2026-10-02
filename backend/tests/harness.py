@@ -43,7 +43,9 @@ SAFETY RULES THIS HARNESS ENFORCES
    would otherwise place a real API call (and message a personal number) from a
    test run.
 5. The temp database is restored from a pristine snapshot before every test, so
-   the tests that mutate data stay order-independent.
+   the tests that mutate data stay order-independent. The snapshot is migrated
+   *once* per session (see ``SESSION_TEMPLATE``) and then copied, rather than
+   re-migrated before every test.
 6. Every table that records *what people did* is then emptied in that copy (see
    ``ACTIVITY_TABLES``). The snapshot is a database in daily use, so without this a
    real punch, quick link or password reset from the same day sits inside a test's
@@ -100,6 +102,21 @@ def _deterministic_vector(size: int, *, seed: int = 0) -> list[float]:
 # ---------------------------------------------------------------------------
 TMP_ROOT = Path(tempfile.mkdtemp(prefix="attendance_security_tests_"))
 PRISTINE_DB = LIVE_DB.read_bytes()
+
+#: The session's pre-migrated database, as one self-contained file, built once and then copied.
+#:
+#: WHY IT EXISTS. The pristine snapshot above is the *live* database, and ``init_db`` replays
+#: thirty additive migrations against its copy. On a suite of thousands of tests that replay is
+#: the single largest cost of a reset (~19 ms) - and it is a property of the *build*, not of a
+#: test: every test runs against the same schema. So the schema is migrated once, and every
+#: reset after the first copies the result instead of rebuilding it.
+#:
+#: It is captured through SQLite's own backup API rather than by reading the file, so it is a
+#: consistent database whether or not the migrating connection folded its WAL, and it is one
+#: file with no ``-wal``/``-shm`` sidecars for a copy to lose step with. It then lives as
+#: immutable bytes, never opened and never written, so a test can only ever receive a copy.
+#: ``None`` until the first reset of the process builds it.
+SESSION_TEMPLATE: bytes | None = None
 
 #: Every test gets its own database *file*, and the reset that installs it never has to
 #: touch a file anything else has open. The previous design overwrote one fixed path in
@@ -163,6 +180,45 @@ FILE_TREES: Final = (
 GENERATION_DIRECTORIES: Final = tuple(directory for _, _, directory, _ in FILE_TREES)
 
 
+def _capture_session_template() -> bytes:
+    """Snapshot the migrated test database as one standalone file.
+
+    Called on the session's first reset, after ``init_db`` has migrated the pristine copy and
+    ``clear_activity`` has emptied it, and before anything is seeded: the result is the shape
+    every test needs, and none of the live data the snapshot it came from happened to hold.
+
+    The copy is made by SQLite's own backup API for the reason ``test_admin_readiness`` gives
+    when it clones a database the same way - it reads *committed* state, so it is exactly the
+    database regardless of a WAL that has not been folded, and no ``-wal``/``-shm`` file has to
+    be handled in step. The temporary file is read once and removed; the bytes are the snapshot.
+    """
+    handle, name = tempfile.mkstemp(prefix="session-template-", suffix=".db", dir=str(TMP_ROOT))
+    os.close(handle)
+    try:
+        source = sqlite3.connect(str(current_db_path()), timeout=30.0)
+        destination = sqlite3.connect(name)
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+            source.close()
+        return Path(name).read_bytes()
+    finally:
+        try:
+            os.unlink(name)
+        except OSError:  # pragma: no cover - cleanup is best effort
+            pass
+
+
+def _session_snapshot() -> bytes:
+    """The bytes a generation is built from: the migrated template once one exists.
+
+    Before the first reset has run, the pristine live snapshot is all there is - used only for
+    the import-time generation and a reset that has not yet paid for the migration.
+    """
+    return SESSION_TEMPLATE if SESSION_TEMPLATE is not None else PRISTINE_DB
+
+
 def _write_generation() -> Path:
     """Materialise one test's whole world: the pristine database and empty file trees.
 
@@ -178,7 +234,7 @@ def _write_generation() -> Path:
     generation = GENERATIONS_DIR / f"gen-{next(_GENERATION):06d}"
     generation.mkdir()
     target = generation / "times.db"
-    target.write_bytes(PRISTINE_DB)
+    target.write_bytes(_session_snapshot())
     for name in GENERATION_DIRECTORIES:
         (generation / name).mkdir()
     return generation
@@ -992,6 +1048,39 @@ IMPLAUSIBLE_COORDINATES = "0,0"      # the classic fixed mock-GPS reading
 # ---------------------------------------------------------------------------
 # 5. Database helpers
 # ---------------------------------------------------------------------------
+
+#: The seeded accounts' password hashes, computed once per process and reused after that.
+#:
+#: ``pwd_context.hash`` is twelve rounds of bcrypt on purpose - that is what makes a stolen
+#: hash expensive to attack - and it is pure cost here: the autouse fixture reseeds these five
+#: accounts before *every* test, and no test reads the hash except one, which only *verifies*
+#: it. bcrypt salts every hash, so hashing the same password again produces a different, equally
+#: valid string; nothing in the fixture depends on the bytes changing, which makes recomputing
+#: them ~1.5 s of CPU per test spent rewriting a row that did not change. One hash per account
+#: for the whole process is the same seeded state at a fraction of the cost, and it stays a
+#: real bcrypt hash - ``test_fixture_seed_state`` still verifies every seeded password against
+#: it, so the cache cannot trade correctness for speed unnoticed.
+#:
+#: Scoped to the test harness: ``security.pwd_context``, and so production hashing, is
+#: untouched. ``tools/load_test.py`` and ``tools/capacity_test.py`` already reuse one hash for
+#: their bulk accounts, and this is the same choice for the same reason.
+_SEEDED_PASSWORD_HASHES: dict[tuple[str, str], str] = {}
+
+
+def seeded_password_hash(app_module, user_id: str, password: str) -> str:
+    """The fixture password's bcrypt hash: computed on first use, reused thereafter.
+
+    Keyed by account *and* password, so a test that (deliberately) seeds a different password
+    for an account gets a hash for that password rather than a stale one from the cache.
+    """
+    key = (str(user_id), str(password))
+    digest = _SEEDED_PASSWORD_HASHES.get(key)
+    if digest is None:
+        digest = app_module.pwd_context.hash(password)
+        _SEEDED_PASSWORD_HASHES[key] = digest
+    return digest
+
+
 def seed_database(app_module) -> None:
     """Put the throwaway database into a deterministic state.
 
@@ -1003,7 +1092,7 @@ def seed_database(app_module) -> None:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     user_rows = []
     for user_id, (name, role, password, email) in SEED_USERS.items():
-        password_hash = app_module.pwd_context.hash(password)
+        password_hash = seeded_password_hash(app_module, user_id, password)
         # The biometric id is named explicitly because REPLACE drops every column this
         # insert does not mention - including that one, which names the files holding the
         # account's face (see SEED_BIOMETRIC_IDS).
@@ -1126,9 +1215,11 @@ def seed_database(app_module) -> None:
 def clear_activity() -> None:
     """Empty every activity table in the throwaway copy (see ``ACTIVITY_TABLES``).
 
-    Called on every reset, *after* ``init_db`` (so a table this build knows about exists even
-    when the snapshot predates it) and *before* ``seed_database`` (which writes the one seeded
-    session and the one ``pending_review`` record the tests address by id).
+    Called once per session - the first reset runs it *after* ``init_db`` (so a table this build
+    knows about exists even when the snapshot predates it), captures the emptied database as
+    ``SESSION_TEMPLATE``, and every later reset receives a copy of that already-empty database
+    from the rotation. It still runs *before* ``seed_database``, which writes the one seeded
+    session and the one ``pending_review`` record the tests address by id.
 
     A table that is missing from the snapshot is skipped rather than fatal: the copy is whatever
     generation the live database happened to be, and the suite's job is to run against the
@@ -1195,7 +1286,7 @@ def _restore_pristine() -> None:
     a test that had not started. There is no step left here that can block.
 
     The digest check survives from the old design: prove the file the next test will open is
-    byte-for-byte the pristine snapshot, not half a restore.
+    byte-for-byte the session snapshot it was built from, not half a restore.
 
     The same repoint carries the file trees (``refs``, ``photos``, ``frames``,
     ``quick_link_photos``): they are names inside the same junction, so one reset hands the next
@@ -1208,7 +1299,7 @@ def _restore_pristine() -> None:
     _repoint_current(generation)
 
     target = generation / "times.db"
-    expected_digest = hashlib.sha256(PRISTINE_DB).hexdigest()
+    expected_digest = hashlib.sha256(_session_snapshot()).hexdigest()
     restored_digest = hashlib.sha256(target.read_bytes()).hexdigest()
     if restored_digest != expected_digest:
         raise RuntimeError(
@@ -1274,17 +1365,23 @@ def with_site_windows(app_module, windows: dict[str, tuple[str | None, str | Non
 
 
 def reset_database(app_module) -> None:
-    """Restore the pristine snapshot, migrate it, and re-seed. Called before every test.
+    """Install a migrated, emptied, re-seeded database for the next test. Called before each.
 
-    The migrations matter: the snapshot is the *pre-remediation* live database, so
-    it has none of the columns the additive migrations introduce. Re-running
-    ``init_db()`` here is what keeps every test running against the same schema the
-    application ships, exactly as a real deployment would.
+    THE MIGRATIONS RUN ONCE PER SESSION, NOT ONCE PER TEST. The snapshot is the
+    *pre-remediation* live database, so it has none of the columns the additive migrations
+    introduce - but which migration is needed is a fact about the build, not about a test, and
+    every test in a run runs against the same schema. So the session's first reset installs the
+    pristine snapshot, migrates it with the application's own ``init_db``, empties it, and keeps
+    the result as ``SESSION_TEMPLATE``; every reset after that (and every xdist worker's first)
+    copies the migrated template rather than replaying thirty migrations. The schema a test sees
+    is still exactly the one the application ships.
 
     Between the two, every activity table is emptied (``clear_activity``): the snapshot is a
     live database, and the person using this application writes rows into it all day. See
     ``ACTIVITY_TABLES`` - the short version is that the clone gives the fixture its **shape and
-    its configuration**, and the tests give it their data.
+    its configuration**, and the tests give it their data. The emptying is part of the template
+    for the same reason the migrations are: it is the same operation on every test, so it is
+    done once, and the rotation hands each test a copy that was already empty.
 
     The biometric templates are re-seeded here too, not only at import: a template carries the
     pipeline that produced it, and a test that patches ``face_detector.PIPELINE`` while it
@@ -1295,9 +1392,16 @@ def reset_database(app_module) -> None:
     they are rotated with it, so a template written by a test that has finished is gone rather
     than merely overwritten.
     """
-    _restore_pristine()
-    app_module.init_db()
-    clear_activity()
+    global SESSION_TEMPLATE
+    if SESSION_TEMPLATE is None:
+        # The one reset that pays for the migrations: install the pristine snapshot, migrate it,
+        # empty it, and keep the result. Everything after this copies bytes.
+        _restore_pristine()
+        app_module.init_db()
+        clear_activity()
+        SESSION_TEMPLATE = _capture_session_template()
+    else:
+        _restore_pristine()
     seed_database(app_module)
     write_enrollment_templates()
     reset_rate_limits(app_module)

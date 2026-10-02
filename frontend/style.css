@@ -973,6 +973,10 @@ html.dark,
 .ops-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .ops-btn:focus-visible { outline: 2px solid var(--ops-primary); outline-offset: 2px; }
 .ops-btn svg { width: 16px; height: 16px; flex: none; }
+/* ``[hidden]`` is the user agent's ``display: none``, and ``.ops-btn`` sets a display of its
+   own, which outranks it - so without this line the timeline's Reset control is a control
+   that says it is hidden and is not. */
+.ops-btn[hidden] { display: none; }
 .ops-btn-primary { background: var(--ops-primary); border-color: var(--ops-primary); color: #fff; }
 .ops-btn-primary:hover:not(:disabled) { background: var(--ops-primary-ink); border-color: var(--ops-primary-ink); }
 .ops-btn-danger { border-color: var(--ops-danger); color: var(--ops-danger-ink); background: var(--ops-surface); }
@@ -1159,6 +1163,114 @@ html.dark,
 .ops-card-facts { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 10px; }
 .ops-card-foot { margin-top: 12px; display: flex; justify-content: flex-end; }
 
+/* --- the day's timeline -------------------------------------------------- */
+/* The board above answers "who is here now". This answers the question under it -
+   how did we get here - as one bar per shift from its arrival to its departure, over a
+   curve of how many people were on site at any minute of the day.
+
+   Every value here is a token that already existed, for the same reason the board's are:
+   the dark theme is a token swap, so a colour written into this block would be the one
+   part of the screen with no dark variant. */
+.ops-timeline { display: flex; flex-direction: column; gap: 12px; }
+.ops-timeline-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+/* The picker and the readout are the two ends of the same row: which gate's day this is, and
+   where in it the scrubber is standing. Each is its own flex row so the headline and the
+   "now" button wrap together on a phone instead of splitting across two lines. */
+.ops-timeline-scope { display: flex; align-items: center; min-width: 0; }
+.ops-timeline-readout { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-inline-start: auto; }
+.ops-timeline-at {
+    margin: 0; font-size: 15px; font-weight: 700; color: var(--ops-text);
+    font-variant-numeric: tabular-nums;
+}
+
+/* The scrubber is a range input, deliberately: it already answers the arrow keys, a
+   screen reader and a thumb, and it costs no script to drag. What it is *not* is left at the
+   platform default, which fills the whole track from the left - on a scrubber standing at
+   "now" that is a bar reading 100%, which says the opposite of what the control does. So the
+   track is a neutral rule and the thumb is the whole of the reading. */
+.ops-scrub { display: block; }
+.ops-scrub input[type='range'] {
+    width: 100%; height: 28px; margin: 0;
+    appearance: none; -webkit-appearance: none;
+    accent-color: var(--ops-primary);
+    background: transparent; cursor: pointer;
+}
+.ops-scrub input[type='range']::-webkit-slider-runnable-track {
+    height: 6px; border-radius: 999px; background: var(--ops-track);
+}
+.ops-scrub input[type='range']::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 20px; height: 20px; margin-top: -7px; border-radius: 999px;
+    background: var(--ops-primary); border: 2px solid var(--ops-surface);
+    box-shadow: var(--ops-shadow);
+}
+.ops-scrub input[type='range']::-moz-range-track {
+    height: 6px; border-radius: 999px; background: var(--ops-track);
+}
+.ops-scrub input[type='range']::-moz-range-thumb {
+    width: 20px; height: 20px; border-radius: 999px;
+    background: var(--ops-primary); border: 2px solid var(--ops-surface);
+    box-shadow: var(--ops-shadow);
+}
+.ops-scrub input[type='range']:focus-visible { outline: 2px solid var(--ops-primary); outline-offset: 2px; border-radius: 8px; }
+
+/* The hour marks sit under the track, unlabelled to a screen reader: the scrubber's own
+   ``aria-valuetext`` says which moment it is standing on, in words, and this is the ruler. */
+.ops-timeline-axis { position: relative; height: 16px; margin-top: -6px; }
+.ops-tick {
+    position: absolute; top: 0; transform: translateX(-50%);
+    font-size: 11px; color: var(--ops-muted); font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.ops-curve-wrap { position: relative; height: 72px; margin: 4px 0 2px; }
+.ops-curve { display: block; width: 100%; height: 100%; overflow: visible; }
+.ops-curve-area { fill: var(--ops-primary-wash); stroke: none; }
+.ops-curve-line { fill: none; stroke: var(--ops-primary); stroke-width: 2; }
+/* Where the scrubber stands. A rule down the whole chart, because the thing an operator
+   is comparing is the shape on the left of it against the shape on the right. */
+.ops-marker {
+    position: absolute; top: 0; bottom: 0; width: 2px; margin-inline-start: -1px;
+    background: var(--ops-live); border-radius: 2px;
+}
+
+/* One lane per shift. The name column is bounded so a long name cannot squeeze the bars
+   into a strip, and the track is the only thing that stretches. */
+.ops-lanes { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.ops-lane {
+    display: grid; grid-template-columns: minmax(0, 15rem) minmax(0, 1fr) auto;
+    align-items: center; gap: 10px;
+}
+.ops-lane-who { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.ops-lane-who .ops-avatar { width: 26px; height: 26px; font-size: 10px; }
+.ops-lane-name { font-weight: 600; color: var(--ops-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ops-lane-site { font-size: 12px; color: var(--ops-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ops-lane-track {
+    position: relative; height: 14px; border-radius: 999px;
+    background: var(--ops-track); overflow: hidden;
+}
+.ops-lane-bar {
+    position: absolute; top: 0; bottom: 0; border-radius: 999px;
+    background: var(--ops-calm); opacity: 0.55;
+}
+/* Present at the moment the scrubber is on: the bar takes the live hue and a lane nobody
+   was on is dimmed rather than removed - the row still has to say when that person worked,
+   and "not yet" is not the same answer as "not here". */
+.ops-lane.is-present .ops-lane-bar { background: var(--ops-live); opacity: 1; }
+.ops-lane.is-open .ops-lane-bar { background-image: linear-gradient(90deg, transparent 0, transparent 60%, var(--ops-live-wash) 100%); }
+.ops-lane.is-absent { opacity: 0.55; }
+.ops-lane-times {
+    font-family: var(--ops-mono); font-variant-numeric: tabular-nums;
+    font-size: 12px; color: var(--ops-muted); white-space: nowrap;
+}
+
+/* The toolbar's list-only half. ``contents`` so hiding it changes nothing about the row
+   it sits in - the controls land exactly where they did before they had a wrapper. */
+.ops-toolbar-board { display: contents; }
+.ops-toolbar-board[hidden] { display: none; }
+/* The reading switch sits at the end of the row, away from the filters it is not one of. */
+.ops-seg-view { margin-inline-start: auto; }
+
 /* --- states: loading, empty, filtered-empty, error ---------------------- */
 .ops-skeleton { display: flex; flex-direction: column; gap: 10px; }
 .ops-skeleton-row { display: flex; align-items: center; gap: 10px; }
@@ -1183,14 +1295,81 @@ html.dark,
     background: var(--ops-danger-wash); color: var(--ops-danger-ink); font-weight: 600;
 }
 
+/* --- how fresh the board is --------------------------------------------- */
+/* The dot is only allowed to breathe while the board can still back it up. A
+   read older than a minute stops animating; one older than five (or one with
+   no stream and no poll behind it) turns the warn hue and says so in words. */
+.ops-fresh {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 12px; font-weight: 700; color: var(--ops-muted);
+}
+.ops-fresh::before {
+    content: ''; width: 6px; height: 6px; flex: none; border-radius: 999px;
+    background: currentColor;
+}
+.ops-fresh.is-fresh { color: var(--ops-live-ink); }
+.ops-fresh.is-stale { color: var(--ops-warn); }
+.ops-live-dot.is-aging,
+.ops-live-dot.is-paused { background: var(--ops-muted); box-shadow: none; animation: none; }
+.ops-live-dot.is-stale { background: var(--ops-warn); box-shadow: none; animation: none; }
+
+/* --- who is where: the occupancy strip ---------------------------------- */
+/* The figures above are totals; this is their shape. One proportional bar per
+   site, so "one site is carrying the crew today" is visible before a name is
+   read. It is a list, not a chart: the bar repeats a number written beside it. */
+.ops-occupancy { display: flex; flex-direction: column; gap: 8px; }
+.ops-occupancy-title {
+    margin: 0; font-size: 11px; font-weight: 700; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--ops-muted);
+}
+.ops-occupancy-list {
+    list-style: none; margin: 0; padding: 0;
+    display: flex; flex-direction: column; gap: 6px;
+}
+.ops-occupancy-item {
+    display: grid; grid-template-columns: minmax(0, 1.1fr) 2fr auto;
+    align-items: center; gap: 10px;
+}
+.ops-occupancy-name {
+    font-size: 13px; font-weight: 600; color: var(--ops-text);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ops-occupancy-bar { height: 8px; border-radius: 999px; background: var(--ops-track); overflow: hidden; }
+.ops-occupancy-bar > span {
+    display: block; height: 100%; border-radius: 999px;
+    background: var(--ops-primary); transition: width 400ms ease;
+}
+.ops-occupancy-item:first-child .ops-occupancy-bar > span { background: var(--ops-live); }
+.ops-occupancy-count {
+    font-family: var(--ops-mono); font-variant-numeric: tabular-nums;
+    font-size: 13px; font-weight: 700; color: var(--ops-text);
+}
+
+/* --- the header's actions and the "needs me now" chip -------------------- */
+.ops-head-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.ops-chip svg { width: 14px; height: 14px; flex: none; }
+.ops-chip-attention[aria-pressed='true'] {
+    background: var(--ops-warn-wash); border-color: var(--ops-warn); color: var(--ops-warn);
+}
+
+/* --- a row arriving, not appearing -------------------------------------- */
+/* The board is repainted whole on a poll that found a change; a shallow rise
+   says "these are the rows, in this order" without moving anything under a
+   reading eye. ``--i`` is set per row by the renderer and clamped there. */
+@keyframes ops-rise { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.ops-row, .ops-card, .ops-lane { animation: ops-rise 240ms ease both; animation-delay: calc(var(--i, 0) * 28ms); }
+
 /* Motion is decoration here: every animation above has a still equivalent, and
    a visitor who asked for less gets the still one. */
 @media (prefers-reduced-motion: reduce) {
     .ops-live-dot,
     .ops-skeleton-bar { animation: none; opacity: 1; }
     .ops-progress > span,
+    .ops-occupancy-bar > span,
     .ops-panel > summary::after,
+    .ops-lane-bar,
     .ops-btn, .ops-chip { transition: none; }
+    .ops-row, .ops-card, .ops-lane { animation: none; }
 }
 
 @media (max-width: 767px) {
@@ -1198,6 +1377,38 @@ html.dark,
     .ops-title { font-size: 18px; }
     .ops-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .ops-stat-value { font-size: 22px; }
+    /* The header's controls wrap rather than pushing the figures off the row,
+       and every button on the board reaches the 44px touch floor - this screen
+       is usually opened on a phone, in gloves, with the gate open. */
+    .ops-head-actions { width: 100%; }
+    .ops-head-actions .ops-btn { flex: 1 1 auto; min-height: 44px; }
+    .ops-cards .ops-btn { min-height: 44px; }
+    /* The strip stays one line: it scrolls across instead of wrapping into a
+       column of sites that would push the board itself off the page. */
+    .ops-occupancy-list { flex-direction: row; gap: 8px; overflow-x: auto; padding-bottom: 4px; }
+    .ops-occupancy-item {
+        grid-template-columns: none; grid-auto-flow: column; flex: none;
+        white-space: nowrap;
+    }
+    .ops-occupancy-bar { width: 72px; }
+    /* The timeline on a phone: the reading switch keeps its own row so it is not
+       mistaken for the filters beside it, the scrubber gets a full-width thumb's
+       worth of height, and a lane drops the name column to one line above its own
+       bar - three columns on a 360px screen is three columns of two characters. */
+    .ops-seg-view { margin-inline-start: 0; width: 100%; }
+    .ops-seg-view .ops-seg-btn { flex: 1 1 0; min-height: 44px; }
+    .ops-scrub input[type='range'] { height: 44px; }
+    .ops-timeline-head .ops-btn { min-height: 44px; }
+    /* The scope picker is the only control in this header that is a select, and it is the one
+       an operator reaches for on the phone; a 40px control beside 44px ones reads as disabled. */
+    .ops-timeline-scope .ops-select { min-height: 44px; max-width: none; width: 100%; }
+    /* Three rows, not a name column beside a times column: at 360px those two compete
+       and the name loses ("Youssef Ade..."), which on the screen that gets read at the
+       gate is the wrong half of the lane to lose. */
+    .ops-lane { grid-template-columns: minmax(0, 1fr); grid-template-areas: 'who' 'track' 'times'; row-gap: 3px; }
+    .ops-lane-who { grid-area: who; }
+    .ops-lane-times { grid-area: times; }
+    .ops-lane-track { grid-area: track; height: 18px; }
 }
 
 /* ==========================================================================
@@ -2097,30 +2308,45 @@ html.dark .ui-btn-warn:hover:not(:disabled) { color: #0f172a; }
    them. Every number on this screen is the server's; nothing is derived here,
    which is why there is no arithmetic in this block either. */
 
+/* The front door is a glance, so its blocks sit closer together than a form's do: the page's own
+   ``ui-5`` rhythm is a reading pace, and this screen is not read top to bottom. */
+[data-dashboard='true'] { gap: var(--ui-4); }
 .dashboard-lead { max-width: 64ch; }
-.dashboard-stamp { margin: var(--ui-4) 0; }
+/* The stamp and the refresh control, now the first line of the fragment rather than the third
+   thing down it. The page gap is the whole of its spacing. */
+.dashboard-stamp { margin: 0; }
+/* ``ops-sub`` is a nowrap one-liner elsewhere in the console; here it is a sentence, so it wraps
+   instead of being cut off mid-word behind an ellipsis on a phone. */
+.dashboard-stamp .ops-sub { white-space: normal; }
+/* The freshness chip and the refresh control, side by side on the stamp row. The chip says how
+   old the one read is; the stamp beside it says exactly when it happened. */
+.dashboard-fresh-row {
+    display: flex; align-items: center; gap: var(--ui-3); flex-wrap: wrap;
+}
+.dashboard-fresh { white-space: nowrap; }
 .dashboard-panel { margin-bottom: var(--ui-4); }
 
 /* --- the vital strip -----------------------------------------------------
    The figures somebody needs *before* deciding to read anything, on one row that never
    switches away: the state of the deployment stays on the screen whatever view is under it.
-   ``auto-fit`` with a 150px floor rather than fixed columns, because the five figures are
-   five different widths in four different scripts - a fixed grid would clip one of them in
-   Arabic. The whole tile is the button, so the tap target is the card and not a word in it. */
+   ``auto-fit`` with a small floor rather than fixed columns, because the five figures are five
+   different widths in four different scripts - a fixed grid would clip one of them in Arabic -
+   and because a small floor is what lets five tiles sit in two rows on a phone instead of three.
+   The whole tile is the button, so the tap target is the card and not a word in it. */
 .dashboard-vitals {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-    gap: var(--ui-3);
-    margin-bottom: var(--ui-4);
+    grid-template-columns: repeat(auto-fit, minmax(108px, 1fr));
+    gap: var(--ui-2);
+    margin: 0;
 }
 .dashboard-vital {
     display: flex;
     flex-direction: column;
     align-items: flex-start;
-    gap: 2px;
-    /* 44px minimum, the console's own touch floor: this is the screen a phone opens on. */
-    min-height: 96px;
-    padding: var(--ui-3);
+    gap: 1px;
+    /* Comfortably over the console's 44px touch floor: this is the screen a phone opens on. */
+    min-height: 62px;
+    padding: var(--ui-2) var(--ui-3);
     border: 1px solid var(--ops-border);
     border-inline-start: 3px solid transparent;
     border-radius: var(--ui-radius);
@@ -2142,17 +2368,23 @@ html.dark .ui-btn-warn:hover:not(:disabled) { color: #0f172a; }
    is no tone that means "we do not know", and inventing one would be the false good news
    this screen exists to avoid. */
 .dashboard-vital.is-unknown { opacity: 0.7; }
+/* Stale: the read behind these figures is old enough that they are history rather than news. The
+   figure is dimmed to the muted ink but keeps whatever warn accent it had, the tile's edge goes
+   dashed, and the word that says so lives in the chip above and in each tile's accessible name -
+   a reader who is not looking at the chip still cannot mistake an old figure for a current one. */
+.dashboard-vital.is-stale .dashboard-vital-value { color: var(--ops-muted); }
+.dashboard-vital.is-stale { border-style: dashed; }
 .dashboard-vital-value {
     font-family: var(--ops-mono);
     font-variant-numeric: tabular-nums;
-    font-size: 30px;
+    font-size: 24px;
     font-weight: 700;
     line-height: 1.05;
 }
 .dashboard-vital-label {
-    font-size: 13px;
+    font-size: 12px;
     font-weight: 600;
-    line-height: 1.35;
+    line-height: 1.3;
     /* Two lines then an ellipsis: "Hours awaiting approval" is the longest of them, and a
        label that wrapped to four lines would make the row of cards four different heights. */
     display: -webkit-box;
@@ -2160,8 +2392,7 @@ html.dark .ui-btn-warn:hover:not(:disabled) { color: #0f172a; }
     -webkit-box-orient: vertical;
     overflow: hidden;
 }
-.dashboard-vital-note { font-size: 12px; color: var(--ops-muted); }
-.dashboard-vital-link { margin-top: auto; font-size: 12px; color: var(--ops-primary-ink); }
+.dashboard-vital-note { font-size: 11px; color: var(--ops-muted); }
 
 /* --- the view switcher ---------------------------------------------------
    One card at a time, chosen from five. The container borrows the ``ops-seg`` capsule the
@@ -2172,7 +2403,7 @@ html.dark .ui-btn-warn:hover:not(:disabled) { color: #0f172a; }
     display: flex;
     flex-wrap: wrap;
     max-width: 100%;
-    margin-bottom: var(--ui-4);
+    margin: 0;
     border-radius: var(--ui-radius);
 }
 .dashboard-switch-btn {
@@ -2273,6 +2504,19 @@ html.dark .ui-btn-warn:hover:not(:disabled) { color: #0f172a; }
     border-radius: var(--ui-radius);
     background: var(--ops-surface-2);
 }
+/* The row *is* the button where there is a queue to open (see ``dashboardQueueHtml``), so it needs
+   the same resets and the same press feedback the vital tile carries - and a width, because a bare
+   flex button shrinks to its text. */
+button.dashboard-queue {
+    width: 100%;
+    color: var(--ops-text);
+    font: inherit;
+    text-align: start;
+    cursor: pointer;
+    transition: border-color var(--ui-press), background var(--ui-press);
+}
+button.dashboard-queue:hover { background: var(--ops-surface); }
+button.dashboard-queue:focus-visible { outline: 2px solid var(--ops-primary); outline-offset: 2px; }
 /* The one figure on the page a reader is meant to take in without reading: the same size
    the credentials screen gives an id, for the same reason - it is the number the rest of
    the screen is about. */
@@ -2285,7 +2529,83 @@ html.dark .ui-btn-warn:hover:not(:disabled) { color: #0f172a; }
     color: var(--ops-text);
 }
 .dashboard-queue-label { font-size: 13px; color: var(--ops-muted); }
-.dashboard-queue .ui-btn { align-self: flex-start; margin-top: var(--ui-1); }
+
+/* ---------- Registrations: a queue of applications ------------------------
+   The tab was a stack of complete cards: a facts grid, a photograph box, a
+   note field and two answers for *every* applicant, so six applications were
+   six open forms and nineteen buttons before anything had been decided. A
+   reviewer scans for the one that matters and then reads that one, so the
+   queue is a list of one-line rows and the reading lives beside it - the same
+   split the notes tab uses, for the same reason, and with the same handset
+   rule (one pane at a time, and a way back).
+
+   Alignment and colour stay on the console's own tokens; nothing here names a
+   hex value. */
+
+/* The link, as one line. It is a setting rather than the work, so it is a
+   caption and a switch rather than the four-line card it used to be. */
+.registrations-intake { padding: var(--ui-3) var(--ui-4); }
+.registrations-intake-state { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.registrations-intake-value { font-size: 15px; font-weight: 700; color: var(--ops-text); }
+.registrations-intake .ui-note { margin: var(--ui-2) 0 0; }
+
+/* The two panes. One scrollable queue and one scrollable review, each keeping its
+   own place - which is the whole reason the tab is a split instead of a page swap. */
+.registrations-shell {
+    display: grid; grid-template-columns: minmax(280px, 380px) minmax(0, 1fr);
+    height: min(70vh, 780px); min-height: 420px;
+    margin-top: var(--ui-3);
+    border: 1px solid var(--ops-border); border-radius: var(--ui-radius);
+    background: var(--ops-surface); overflow: hidden;
+}
+.registrations-pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: auto; }
+.registrations-pane-queue { border-inline-end: 1px solid var(--ops-border); }
+.registrations-list { list-style: none; margin: 0; padding: 0; }
+
+/* A row: the initials, who it is, and how long they have waited. The whole row is the
+   target - comfortably over the console's 44px floor - and the open one is marked, so a
+   reader who looked away can see where they were. */
+.registrations-item { border-bottom: 1px solid var(--ops-border); }
+.registrations-item:last-child { border-bottom: 0; }
+.registrations-item.is-open { background: var(--ops-primary-wash); }
+.registrations-row {
+    display: flex; align-items: center; gap: 10px; width: 100%; min-height: 56px;
+    padding: 10px var(--ui-3); border: 0; background: transparent;
+    color: inherit; text-align: start; font: inherit; cursor: pointer;
+}
+.registrations-row:hover { background: var(--ops-surface-2); }
+.registrations-row:focus-visible { outline: 2px solid var(--ops-primary); outline-offset: -2px; }
+.registrations-row-main { display: flex; flex-direction: column; gap: 2px; flex: 1 1 auto; min-width: 0; }
+.registrations-row-top { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.registrations-row-name { font-size: 13.5px; font-weight: 600; color: var(--ops-text); }
+/* The waiting figure is the fact; the tone is the shortcut to it, never the message on its
+   own. Above a day it is printed in days, which is why it is short enough to sit on the row. */
+.registrations-row-wait { flex: 0 0 auto; font-size: 11.5px; color: var(--ops-warn); white-space: nowrap; }
+.registrations-row-wait.is-danger { color: var(--ops-danger); font-weight: 700; }
+.registrations-row-sub {
+    font-size: 12.5px; color: var(--ops-muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* The review. The card's own border and shadow are for a card that sits on the page; this
+   one fills a pane, so it keeps only the accent that says how long it has waited. */
+.registrations-review {
+    display: flex; flex-direction: column; gap: var(--ui-3);
+    border: 0; border-radius: 0; box-shadow: none;
+}
+.registrations-review-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.registrations-review-head .ops-who { flex: 1 1 auto; min-width: 0; }
+.registrations-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: var(--ui-3); }
+/* The way back to the queue, which exists only where the panes are one at a time. */
+.registrations-back { display: none; }
+
+@media (max-width: 900px) {
+    .registrations-shell { grid-template-columns: minmax(0, 1fr); height: auto; min-height: 0; }
+    .registrations-pane { overflow: visible; }
+    .registrations-pane-queue { border-inline-end: 0; }
+    .registrations-shell.is-open .registrations-pane-queue { display: none; }
+    .registrations-back { display: inline-flex; }
+}
 
 /* ---------- Company mark: the console's preview -------------------------
    The mark as the company set it, on the same ground the paper it prints on
@@ -3906,5 +4226,104 @@ th[aria-sort='descending'] .shifts-sort::after { content: '\2193'; opacity: 1; c
     .notes-thread-btn { padding: 10px var(--ui-2); }
     .notes-composer-row #noteReplyStatus { flex: 1 1 100%; }
 }
+
+/* ---------- Links dashboard ---------------------------------------------
+   The Links tab is a board now rather than a form with a table under it: a
+   live status line, four figures, a filter bar, and a list that arrives a row
+   at a time. Everything here is either a reading aid (an accent, a meter) or
+   the one entrance the reduced-motion query turns off.
+   ------------------------------------------------------------------------ */
+
+.links-board { gap: 14px; }
+.links-list { min-width: 0; }
+
+/* A row says what state its link is in twice: a hairline on its leading edge,
+   which is what the eye reads while scanning, and the pill in the State cell,
+   which is what the eye reads when it stops. No colour is doing this alone. */
+.links-table .ui-table tbody tr[data-state='active'] td:first-child { box-shadow: inset 3px 0 0 var(--ops-live); }
+.links-table .ui-table tbody tr[data-state='account_inactive'] td:first-child { box-shadow: inset 3px 0 0 var(--ops-danger); }
+.links-table .ui-table tbody tr[data-state='expired'] td:first-child,
+.links-table .ui-table tbody tr[data-state='used_up'] td:first-child { box-shadow: inset 3px 0 0 var(--ops-warn); }
+.links-table .ui-table tbody tr[data-state='revoked'] td:first-child { box-shadow: inset 3px 0 0 var(--ops-track); }
+.links-row.is-dead td { opacity: 0.72; }
+
+/* The worker cell: an initial in a chip, so a column of names has a shape to
+   scan without loading a photo for anybody. */
+.links-person { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.links-avatar {
+    width: 32px; height: 32px; flex: none; border-radius: 999px;
+    display: grid; place-items: center;
+    background: var(--ops-primary-wash); color: var(--ops-primary-ink);
+    font-weight: 700; font-size: 13px; text-transform: uppercase;
+}
+.links-person-body { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.links-person-name { font-weight: 700; color: var(--ops-text); }
+
+/* A tap count that fills up (when it is capped). One bar; the closing tone
+   says the thing behind it is nearly gone. The two halves of the figure are
+   inline and never wrapped: "2 no limit" is one fact, and a table cell that
+   broke it in half read as two. */
+.links-meter-label {
+    font-family: var(--ops-mono); font-variant-numeric: tabular-nums; font-size: 13px;
+}
+.links-meter-label, .links-meter-note { white-space: nowrap; }
+.links-meter-note { font-size: 12px; color: var(--ops-muted); }
+.links-meter-bar { display: block; }
+/* The column is wide enough for the fraction and the bar under it, and it never
+   wraps: the table has the room to give one cell 7rem, and the alternative was
+   the two halves of the figure breaking onto separate lines. */
+.links-table .ui-table th:nth-child(3),
+.links-table .ui-table td[data-link-uses] { min-width: 7rem; white-space: nowrap; }
+
+/* The card layout mirrors the row: the same facts, the same accents, stacked. */
+.links-cards { display: flex; flex-direction: column; gap: var(--ui-3); }
+.links-card { border-inline-start: 3px solid var(--ops-border); }
+.links-card[data-state='active'] { border-inline-start-color: var(--ops-live); }
+.links-card[data-state='account_inactive'] { border-inline-start-color: var(--ops-danger); }
+.links-card[data-state='expired'],
+.links-card[data-state='used_up'] { border-inline-start-color: var(--ops-warn); }
+.links-card[data-state='revoked'] { border-inline-start-color: var(--ops-track); }
+.links-card.is-dead { opacity: 0.75; }
+
+.links-meta { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; color: var(--ops-muted); }
+.links-meta > span { display: inline-flex; align-items: center; gap: 6px; }
+.links-meta .ops-progress { min-width: 70px; }
+
+/* "This worker is on shift right now" - static, unlike the status line's
+   breathing dot, because it repeats down the list. */
+.links-onshift { display: inline-flex; align-items: center; gap: 5px; }
+.links-onshift-dot {
+    width: 7px; height: 7px; border-radius: 999px; flex: none;
+    background: var(--ops-live); display: inline-block;
+}
+/* On the card it takes a line of its own. Left to wrap on its own it landed at
+   the end of the line above, reading as part of the *last tap* fact rather than
+   as a second one - the shift and the site are their own sentence. */
+.links-meta > .links-onshift { flex: 1 1 100%; }
+
+/* --- the entrance --------------------------------------------------------
+   One stagger, both layouts, and a final state that is simply the content:
+   ``both`` holds the "from" frame through the delay and the "to" frame after,
+   so a row is never invisible waiting its turn. Every animated node carries
+   its own ``--i``, clamped in the markup so a long list does not end in a
+   long wait. */
+@keyframes links-rise {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+.links-list [data-link] { animation: links-rise 320ms ease-out both; animation-delay: calc(var(--i, 0) * 35ms); }
+
+/* A just-issued link is the one event on this screen: it is shown once and
+   never again, so it lands rather than appearing. */
+@keyframes links-pop {
+    from { opacity: 0; transform: scale(0.97); }
+    to { opacity: 1; transform: scale(1); }
+}
+.links-issued { animation: links-pop 420ms cubic-bezier(0.2, 0.8, 0.2, 1) both; }
+
+@media (prefers-reduced-motion: reduce) {
+    .links-list [data-link], .links-issued { animation: none; }
+}
+
 
 

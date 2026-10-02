@@ -489,8 +489,11 @@ def test_the_schema_version_names_the_newest_migration():
     # walk-up registration link, and 30 the schema half of self-service registration:
     # ``users.registration_note`` plus the ``users(status)`` index the approval queue is read
     # with, so a walk-up submission is a real account held in a third status until an
-    # administrator approves it.)
-    assert migrations.SCHEMA_VERSION == 30
+    # administrator approves it, and 31 the link's own generation: ``link_generation`` on
+    # ``registration_settings`` with the ``link_rotated_*`` pair that records who replaced it
+    # and when, so the walk-up address is a token the console mints and revokes rather than a
+    # permanent public URL.)
+    assert migrations.SCHEMA_VERSION == 31
 
 
 def test_the_migration_is_replayable_and_idempotent():

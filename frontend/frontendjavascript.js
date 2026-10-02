@@ -1436,6 +1436,22 @@ const SHIFT_CLOCK = {
     }
 };
 
+//: The ways an arrival is refused, and the app's own sentence for each.
+//:
+//: ``/attendance/verify`` answers English - the API has one language, and its sentences are
+//: written for the log - so a refusal the *worker* has to read carries an ``error_code`` beside it
+//: and the handset says the thing in the reader's own language, exactly as the early clock-out
+//: question and the liveness gate already do. Falling through to the server's sentence handed an
+//: Arabic reader a button they could read and an answer to it they could not, at the one moment
+//: they are standing at a gate wondering what to do next.
+//:
+//: Keyed by the code, never by the message: the message is prose somebody may reword, and a
+//: translation wired to prose stops working the day it is edited.
+const ARRIVAL_REFUSAL_KEYS = {
+    arrival_outside_geofence: 'transitArriveOutside',
+    arrival_already_confirmed: 'transitArriveConfirmed'
+};
+
 const UI = {
     get appContainer() { return document.getElementById('app'); },
 
@@ -1466,12 +1482,12 @@ const UI = {
         if (seconds < 0) return seconds > -300 ? I18n.__('timeJustNow') : raw.slice(0, 10);
         if (seconds < 90) return I18n.__('timeJustNow');
         const minutes = Math.round(seconds / 60);
-        if (minutes < 60) return I18n.__('timeMinutesAgo').replace('{count}', minutes);
+        if (minutes < 60) return I18n.__p('timeMinutesAgo', minutes);
         const hours = Math.round(minutes / 60);
-        if (hours < 24) return I18n.__('timeHoursAgo').replace('{count}', hours);
+        if (hours < 24) return I18n.__p('timeHoursAgo', hours);
         const days = Math.round(hours / 24);
         if (days <= 1) return I18n.__('timeYesterday');
-        if (days < 7) return I18n.__('timeDaysAgo').replace('{count}', days);
+        if (days < 7) return I18n.__p('timeDaysAgo', days);
         return raw.slice(0, 10);
     },
 
@@ -2514,11 +2530,74 @@ const UI = {
         // each other, and the worker's second frame queued as a second punch. The flag
         // covers the GPS wait; the overlay check covers everything after it.
         if (this._attendanceBusy || this._cameraOpen) return;
+        // The transit arrival is not a punch about a person. The face that opened this shift
+        // was checked at the moment it began, and what arriving claims is *where the worker
+        // is* - a fact the geofence answers. So it is taken without the camera: one tap on the
+        // panel, a fix, and the server's own answer. See ``arriveAtSite``.
+        if (action === 'Transit Checkpoint') return this.arriveAtSite(action);
         this._attendanceBusy = true;
         try {
             const coords = await this.acquireLocation();
             if (!coords) return;
             this.openCamera(action, coords);
+        } finally {
+            this._attendanceBusy = false;
+        }
+    },
+
+    /**
+     * Report that a travel shift has reached a site - a location, not a face.
+     *
+     * The one punch with no camera behind it. A travel shift was opened with a full face
+     * check at the moment it started; the arrival's own claim is that the worker is inside a
+     * site's boundary, which is a GPS + geofence fact, and re-running the face chain here
+     * would be asking somebody at a gate to prove again, to a phone in the sun, an identity
+     * that was verified hours earlier. The server refuses it without a photograph (see the
+     * arrival block in ``/attendance/verify``), so this is the shape the endpoint expects,
+     * not a shortcut around it.
+     *
+     * No offline half either, deliberately: the geofence decision is the *point* of it, and a
+     * queued arrival would be a punch the phone cannot verify. A connection failure says so
+     * rather than pretending it saved one.
+     */
+    async arriveAtSite(action) {
+        if (!State.user) return;
+        if (this._attendanceBusy) return;
+        this._attendanceBusy = true;
+        try {
+            const coords = await this.acquireLocation();
+            if (!coords) return;
+            const formData = new FormData();
+            formData.append('worker_id', State.user.id);
+            formData.append('action', action);
+            formData.append('location_input', coords);
+            try {
+                const res = await API.request('/attendance/verify', { method: 'POST', body: formData });
+                State.gpsCoords = coords;
+                Toast.success(res.message || I18n.__('attendanceOk'));
+                // The next punch may well be somewhere with no bars.
+                if (typeof OFFLINE !== 'undefined' && OFFLINE.available()) {
+                    OFFLINE.refreshAnchor().catch(() => {});
+                }
+                // The card is repainted from the server's answer, which now names the site:
+                // this is the repaint that takes "In Transit" off the panel.
+                await this.renderApp();
+            } catch (err) {
+                if (await this.queueOfflinePunch(action, coords, null, err)) return;
+                if (!State.user) {
+                    Toast.error(I18n.__('sessionExpiredSignInAgain'));
+                    return;
+                }
+                // The two refusals this tap can produce are *about the worker* - they are not a
+                // geofence, they are not a face - so they are said in the worker's language
+                // rather than in the server's English (see ``ARRIVAL_REFUSAL_KEYS``).
+                const refusal = ARRIVAL_REFUSAL_KEYS[err && err.errorCode];
+                if (refusal) {
+                    Toast.error(I18n.__(refusal));
+                    return;
+                }
+                Toast.error(`${I18n.__('attendanceError')}: ${err.message}`);
+            }
         } finally {
             this._attendanceBusy = false;
         }
@@ -2725,6 +2804,15 @@ const UI = {
     async queueOfflinePunch(action, coords, blob, error) {
         if (typeof OFFLINE === 'undefined' || !OFFLINE.available()) return false;
         if (!OFFLINE.isConnectivityFailure(error)) return false;
+        // An arrival is a geofence decision the *server* makes - it is the proof a site was
+        // reached - and the offline queue carries only Clock In and Clock Out. Queueing it
+        // would be a punch the phone cannot verify, and "Unknown punch action." is not
+        // something a worker on the road can act on. So say what is actually wrong and let
+        // them tap again where there is signal.
+        if (action === 'Transit Checkpoint') {
+            Toast.error(I18n.__('transitArriveOffline'));
+            return true;
+        }
         try {
             const record = await OFFLINE.queuePunch({ action, coords, photoBlob: blob });
             this.closeCamera();
@@ -3300,29 +3388,39 @@ const UI = {
     },
 
     /**
-     * Fetch ``admin_modules.js``, once per session.
+     * Fetch the console - its own words, then its screens - once per session.
      *
-     * It is the largest file in the frontend and no worker screen can reach a line of it,
-     * so it is not in ``index.html``: a phone at a gate used to download the whole back
-     * office, on the connection this app is documented to assume is the worst one. The
-     * promise is what makes it once - a repaint while the first request is still in flight
-     * joins the same download instead of starting another.
+     * Two files, in this order. ``admin_i18n.js`` is the console's half of the English table
+     * (``i18n.js`` carries only what a worker screen can ask for now), and it has to land
+     * before ``admin_modules.js`` so the console paints in sentences rather than in key names.
+     * The order is the injection order because a classic ``<script src>`` cannot await - which
+     * is why the two are held together here rather than in the module itself.
+     *
+     * Neither file is in ``index.html``: no worker screen can reach a line of either, so a
+     * phone at a gate used to download the whole back office, on the connection this app is
+     * documented to assume is the worst one. The promise is what makes it once - a repaint
+     * while the first request is still in flight joins the same download instead of starting
+     * another.
      */
     loadConsoleModule() {
         if (typeof UI_MODULES !== 'undefined') return Promise.resolve(UI_MODULES);
         if (this._consoleModule) return this._consoleModule;
-        this._consoleModule = new Promise((resolve, reject) => {
+        const unavailable = () => new Error(I18n.__('consoleUnavailable'));
+        const load = (src) => new Promise((resolve, reject) => {
             const script = document.createElement('script');
-            script.src = 'admin_modules.js';
-            script.addEventListener('load', () => {
-                // A 200 that is not this module - a captive portal, a truncated deploy -
-                // leaves the binding missing. Fail where the message can still name it.
-                if (typeof UI_MODULES === 'undefined') reject(new Error(I18n.__('consoleUnavailable')));
-                else resolve(UI_MODULES);
-            });
-            script.addEventListener('error', () => reject(new Error(I18n.__('consoleUnavailable'))));
+            script.src = src;
+            script.addEventListener('load', () => resolve());
+            script.addEventListener('error', () => reject(unavailable()));
             (document.head || document.body).appendChild(script);
         });
+        this._consoleModule = load('admin_i18n.js')
+            .then(() => load('admin_modules.js'))
+            .then(() => {
+                // A 200 that is not this module - a captive portal, a truncated deploy -
+                // leaves the binding missing. Fail where the message can still name it.
+                if (typeof UI_MODULES === 'undefined') throw unavailable();
+                return UI_MODULES;
+            });
         this._consoleModule = this._consoleModule.catch((err) => {
             // A failure is not cached: the next frame tries again, so a connection that
             // comes back is enough to get the console without a sign-out and a sign-in.

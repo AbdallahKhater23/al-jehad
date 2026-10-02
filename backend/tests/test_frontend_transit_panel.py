@@ -124,9 +124,14 @@ const results = {};
         button: markup.indexOf('data-request-checkout') >= 0,
         button_label: env.evaluate("I18n.__('transitRequestCheckout')"),
         button_labelled: markup.indexOf(env.evaluate("I18n.__('transitRequestCheckout')")) >= 0,
-        // The primary action is unchanged: from inside a fence, Clock Out is how the trip is
-        // confirmed and the day closed. The request is the second thing, not a replacement.
-        clock_button: markup.indexOf("handleClock('Clock Out')") >= 0
+        // The primary action on the road is the arrival - the one tap that turns the
+        // placeholder into the site the worker reached. Clock Out is deliberately not offered
+        // here: away from a site it is refused, and a worker who has only just arrived may not
+        // have meant to end the day. The request stays the second thing.
+        arrival_button: markup.indexOf("handleClock('Transit Checkpoint')") >= 0,
+        arrival_label: env.evaluate("I18n.__('transitArrive')"),
+        arrival_labelled: markup.indexOf(env.evaluate("I18n.__('transitArrive')")) >= 0,
+        no_clock_out: markup.indexOf("handleClock('Clock Out')") < 0
     };
 
     const returned = env.evaluate(
@@ -166,6 +171,7 @@ const results = {};
     results.confirmed = {
         note: markup.indexOf('data-transit-pending') >= 0,
         button: markup.indexOf('data-request-checkout') >= 0,
+        arrival_button: markup.indexOf("handleClock('Transit Checkpoint')") >= 0,
         clock_button: markup.indexOf("handleClock('Clock Out')") >= 0
     };
 
@@ -192,12 +198,15 @@ def test_an_off_site_shift_is_explained_on_the_card(results):
     assert pending["title"] and pending["body"], "the note is not an empty band"
 
 
-def test_the_card_offers_the_request_the_refusal_points_at(results):
-    """The way out exists before the refusal, and it is labelled as the request it sends."""
+def test_the_card_offers_the_arrival_and_the_request_the_refusal_points_at(results):
+    """The action that changes the state leads; the way out of a trip that never arrives follows."""
     pending = results["pending"]
+    assert pending["arrival_button"] is True, "the arrival is the road's primary action"
+    assert pending["arrival_labelled"] is True
+    assert pending["arrival_label"], "the arrival action is not an empty label"
+    assert pending["no_clock_out"] is True, "an off-site Clock Out is a refusal, not an action"
     assert pending["button"] is True
     assert pending["button_labelled"] is True
-    assert pending["clock_button"] is True, "Clock Out is still how an arrival is confirmed"
 
 
 def test_the_request_is_one_post_to_the_shift_the_worker_is_on(results):
@@ -217,5 +226,6 @@ def test_a_confirmed_shift_carries_neither_the_note_nor_the_button(results):
     confirmed = results["confirmed"]
     assert confirmed["note"] is False
     assert confirmed["button"] is False
+    assert confirmed["arrival_button"] is False
     assert confirmed["clock_button"] is True, "the ordinary shift still closes the ordinary way"
     assert results["confirmed_requests"] == 0, "a confirmed shift cannot raise a request"

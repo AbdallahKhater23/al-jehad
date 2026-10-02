@@ -3,13 +3,26 @@
 WHY THIS EXISTS
 ---------------
 ``index.html`` named six scripts (five of them first-party, plus a CDN), and every session
-downloaded all of them. Two first-party files most
+downloaded all of them. Three first-party files most
 sessions never opened: ``admin_modules.js`` (255 KB, the console's eight screens, which no
-worker screen can reach - ``UI.renderApp`` sends a worker to the handset) and the Arabic
-and Hindi tables inside ``i18n.js`` (a further 93 KB for a reader who kept English). On
-site cellular, the connection this app is documented to assume is the worst one and the
-one its offline queue exists for, that was 348 KB of first-party download that could not
-change the screen the worker was looking at.
+worker screen can reach - ``UI.renderApp`` sends a worker to the handset), the console's own
+half of the English table (now ``admin_i18n.js``, which no handset asks a single key of), and
+the Arabic and Hindi tables inside ``i18n.js`` (a further 93 KB for a reader who kept
+English). On site cellular, the connection this app is documented to assume is the worst one
+and the one its offline queue exists for, that was hundreds of KB of first-party download
+that could not change the screen the worker was looking at.
+
+The console split, measured on this checkout (raw / gzip, each file as the browser fetches it):
+
+    i18n.js                    100,328 / 29,874  ->  34,777 / 11,584
+    admin_i18n.js                     -          66,933 / 19,539  (console sessions only)
+    the eight eager files       706,387 / 193,052 -> 641,746 / 175,063
+
+That is 9.2% off every phone's first load. A console session pays 1.3 KB more in gzip and
+one extra request for the file it now fetches beside its module; the phone that never opens
+the console never asks for it. The numbers are a record, not a contract - the assertion that
+matters is ``test_the_worker_table_carries_only_what_a_worker_can_reach``, which is about
+*which* keys travel, not how large they are today.
 
 They are fetched by the session that needs them now, and this suite is what keeps that
 true:
@@ -61,7 +74,7 @@ SHIPPED = [
 
 #: Fetched by the session that needs them, from the same directory - ``UI.loadConsoleModule``
 #: for the console, ``I18n.load`` for a language nobody has read yet.
-DEFERRED = ["admin_modules.js", "i18n.ar.js", "i18n.hi.js", "i18n.ur.js"]
+DEFERRED = ["admin_i18n.js", "admin_modules.js", "i18n.ar.js", "i18n.hi.js", "i18n.ur.js"]
 
 #: A worker's phone: the document's list, which is what the harness is given for the
 #: sessions below that must not have the console module in them.
@@ -144,7 +157,10 @@ function markup(env) { return env.evaluate("document.getElementById('app').inner
         asked_for: askedFor(env),
         // The shell's class is on the host element; the header is in the markup it drew.
         rendered_the_handset: env.evaluate("document.getElementById('app').className").indexOf('hand-app') >= 0
-            && markup(env).indexOf('hand-header') >= 0
+            && markup(env).indexOf('hand-header') >= 0,
+        // A console key resolves to itself here, because the table that carries it is a file
+        // this session never asks for. The same key is read back in the console session below.
+        console_key_absent: env.evaluate("I18n.__('dashboardAsOf') === 'dashboardAsOf'")
     };
 }
 
@@ -164,8 +180,14 @@ function markup(env) { return env.evaluate("document.getElementById('app').inner
         settled: await Promise.race([painting.then(() => 'painted'), Promise.resolve('waiting')]),
         joined_the_same_download: askedFor(env).length
     };
-    // The console module arrives.
-    arrive(env, 'admin_modules.js', 0);
+    // The console's own strings arrive first, then the module: the order a classic script's
+    // injection gives, and the order the console needs, or it paints in key names.
+    arrive(env, 'admin_i18n.js', 0);
+    await Promise.resolve();
+    await Promise.resolve();
+    results.console.asked_for_after_strings = askedFor(env);
+    results.console.strings_merged = env.evaluate("I18n.__('dashboardAsOf')");
+    arrive(env, 'admin_modules.js', 1);
     await painting;
     results.console.rail = markup(env).indexOf('admin-rail') >= 0;
     results.console.content_host = env.evaluate("!!document.getElementById('adminContent')");
@@ -174,7 +196,7 @@ function markup(env) { return env.evaluate("document.getElementById('app').inner
     results.console.asked_for_after_a_repaint = askedFor(env);
 }
 
-// --- the console's module never arrives ------------------------------------------
+// --- the first file the console asks for never arrives -----------------------------
 {
     const env = boot();
     watchScripts(env);
@@ -320,7 +342,7 @@ def test_no_string_is_declared_twice_in_a_table():
     ``"key":`` line, per table, with the key named in the failure.
     """
     key = re.compile(r'^\s*"([A-Za-z0-9_]+)":', re.MULTILINE)
-    for name in ("i18n.js", "i18n.ar.js", "i18n.hi.js", "i18n.ur.js"):
+    for name in ("i18n.js", "admin_i18n.js", "i18n.ar.js", "i18n.hi.js", "i18n.ur.js"):
         source = (FRONTEND / name).read_text(encoding="utf-8")
         found = key.findall(source)
         duplicates = sorted({entry for entry in found if found.count(entry) > 1})
@@ -358,7 +380,11 @@ def test_the_deferred_files_are_named_where_the_app_asks_for_them():
     """
     console = (FRONTEND / "frontendjavascript.js").read_text(encoding="utf-8")
     i18n = (FRONTEND / "i18n.js").read_text(encoding="utf-8")
-    assert "script.src = 'admin_modules.js'" in console
+    # The console's two files, named at the one place that asks for them - and the order they
+    # are asked for in, because the module paints out of the table the other file carries.
+    assert "load('admin_i18n.js')" in console
+    assert "load('admin_modules.js')" in console
+    assert "script.src = src" in console
     assert "CHUNKS: ['ar', 'hi', 'ur']" in i18n
     assert "script.src = 'i18n.' + code + '.js'" in i18n
 
@@ -395,20 +421,30 @@ def test_a_workers_session_renders_the_handset_without_the_console(sessions):
 def test_an_administrators_session_waits_for_the_console_rather_than_half_drawing_it(sessions):
     console = sessions["console"]
     assert console["module_in_this_session"] is False, "this session is meant not to have it"
-    assert console["asked_for"] == ["admin_modules.js"], (
-        "the console is fetched from the site root by the name index.html used to carry"
+    assert console["asked_for"] == ["admin_i18n.js"], (
+        "the console's own strings are fetched first, from the site root: the module behind "
+        "them paints sentences out of that table, so it is the one that has to be asked for "
+        "before anything else"
     )
     assert console["blank_while_it_loads"], (
-        "the console painted before its module arrived. A half console - or the sign-in "
+        "the console painted before its files arrived. A half console - or the sign-in "
         "screen an administrator never left - is worse than a moment of nothing"
     )
-    assert console["settled"] == "waiting", "the render finished without the module"
+    assert console["settled"] == "waiting", "the render finished without the console"
+    assert console["asked_for_after_strings"] == ["admin_i18n.js", "admin_modules.js"], (
+        "the module is fetched after the strings, not before them: "
+        f"{console['asked_for_after_strings']}"
+    )
+    assert console["strings_merged"] == "Counted at {stamp}. A snapshot, not a live board.", (
+        "the file the loader fetched did not merge its keys into the English table, so an "
+        "English console would paint key names: " + repr(console["strings_merged"])
+    )
     assert console["rail"] and console["content_host"], (
         "once the module lands, the console is the console: rail and content host"
     )
-    assert console["asked_for_after_a_repaint"] == ["admin_modules.js"], (
-        "a repaint while the module was in flight started a second download of the same "
-        "255 KB file"
+    assert console["asked_for_after_a_repaint"] == ["admin_i18n.js", "admin_modules.js"], (
+        "a repaint while the console was in flight started a second download of the same "
+        "files: " + str(console["asked_for_after_a_repaint"])
     )
 
 
@@ -425,7 +461,8 @@ def test_a_repaint_in_a_session_that_already_has_the_console_waits_for_nothing(e
 
 
 @pytest.mark.regression
-def test_the_console_says_so_and_offers_a_way_back_in_when_its_module_never_arrives(sessions):
+def test_the_console_says_so_and_offers_a_way_back_in_when_its_files_never_arrive(sessions):
+    """The first console file is the one that can fail - and a failure is not cached."""
     failure = sessions["console_failure"]
     assert failure["said"], "the administrator is told what could not be loaded"
     assert failure["offered_a_way_back_in"], "and can reload or sign out from there"
@@ -578,3 +615,69 @@ def test_the_english_table_really_is_all_that_i18n_js_carries():
             f"the {lang} table is back in a file every session downloads. It belongs in "
             f"frontend/i18n.{lang}.js"
         )
+    # And the same property for the newer split: the console's vocabulary is not in the file
+    # every session downloads. ``dashboardAsOf`` is the probe, and its absence is also asserted
+    # against a live worker session above (``worker["console_key_absent"]``).
+    assert '"dashboardAsOf"' not in shipped, (
+        "a console string is back in a file every session downloads; the console's half of the "
+        "table belongs in frontend/admin_i18n.js"
+    )
+
+
+#: The files a phone loads, and the three ways a key in them can be reached: named directly,
+#: built by ``codeLabel(namespace, code)`` from an API enum, or built by ``I18n.__p(base,
+#: count)`` from a plural category. A key that is none of those is not the worker's.
+WORKER_FILES = ("frontendjavascript.js", "worker_modules.js", "offline_queue.js", "index.html")
+WORKER_CODE_NAMESPACES = ("noteCat", "noteStatus", "alertKind")
+WORKER_PLURAL_BASES = ("timeMinutesAgo", "timeHoursAgo", "timeDaysAgo")
+
+KEY_LINE = re.compile(r'^\s*"([A-Za-z0-9_]+)":', re.MULTILINE)
+
+
+def _table_keys(source: str) -> set[str]:
+    return set(KEY_LINE.findall(source))
+
+
+def _worker_reachable(key: str, worker_text: str) -> bool:
+    if re.search(r'["\'`]' + re.escape(key) + r'["\'`]', worker_text):
+        return True
+    if any(key.startswith(namespace + "_") for namespace in WORKER_CODE_NAMESPACES):
+        return True
+    return any(key == base or key.startswith(base + "_") for base in WORKER_PLURAL_BASES)
+
+
+@pytest.mark.regression
+def test_the_worker_table_carries_only_what_a_worker_can_reach():
+    """The split, held to its rule - in both directions, from the sources.
+
+    ``i18n.js`` is the file every phone downloads and ``admin_i18n.js`` is fetched only by a
+    session that opens the console, so the two mistakes this guards against are a console
+    string drifting back into the worker table (the payload this split removes) and a worker
+    string drifting out of it (a handset painting a key name). The reachability rule is code
+    rather than a list: a key is the worker's if any file it loads names it, if a worker path
+    hands its namespace to ``codeLabel``, or if a worker path counts its plural base - the
+    three ways this frontend reaches a key a literal-only check would miss.
+    """
+    eager = (FRONTEND / "i18n.js").read_text(encoding="utf-8")
+    console = (FRONTEND / "admin_i18n.js").read_text(encoding="utf-8")
+    runtime = eager[eager.index("const I18n = {"):]
+    worker_text = "\n".join(
+        [(FRONTEND / name).read_text(encoding="utf-8", errors="ignore") for name in WORKER_FILES]
+        + [runtime]
+    )
+    eager_keys, console_keys = _table_keys(eager), _table_keys(console)
+    assert eager_keys and console_keys, "one of the two tables is empty"
+    assert not (eager_keys & console_keys), (
+        "a key is in both tables, so one of the two files is dead weight: "
+        + str(sorted(eager_keys & console_keys)[:8])
+    )
+    stranded = sorted(key for key in eager_keys if not _worker_reachable(key, worker_text))
+    assert stranded == [], (
+        "these keys are in i18n.js but no worker file can reach them - they belong in "
+        f"admin_i18n.js, which a phone never fetches: {stranded[:8]}"
+    )
+    misplaced = sorted(key for key in console_keys if _worker_reachable(key, worker_text))
+    assert misplaced == [], (
+        "these keys are reached by a worker file but live in admin_i18n.js, which a phone "
+        f"never fetches: {misplaced[:8]}"
+    )

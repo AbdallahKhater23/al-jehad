@@ -171,14 +171,19 @@ WORK_THE_QUEUE = r"""
     out.cards = document.querySelectorAll('[data-registration]').length;
     out.count_line = text(document.querySelector('[data-registrations-count]'));
 
-    // The photograph: hidden until it is asked for, then decoded.
+    // The queue draws no faces: this endpoint serves one account at a time, so the photograph is
+    // fetched by the act of opening an application - not preloaded for the whole list.
     const imageId = 'registrationPhoto%%A%%';
-    const before = document.getElementById(imageId);
-    out.image_present = before !== null;
-    out.hidden_before = before ? before.classList.contains('hidden') : null;
-    const photoButton = first ? first.querySelector('[data-registration-photo]') : null;
-    out.photo_button = photoButton !== null;
-    if (photoButton) photoButton.click();
+    out.face_before_open = document.getElementById(imageId) === null;
+
+    // Open the first application. The review pane beside the list is where the face, the note and
+    // the two answers live; opening it is what fetches and decodes the photograph, with this
+    // session's credential, at the stored size.
+    const openFirst = document.querySelector('[data-registration-open="%%A%%"]');
+    out.open_button = openFirst !== null;
+    if (openFirst) openFirst.click();
+    out.review_open = (await waitFor(() => document.querySelector('[data-registration-review="%%A%%"]'))) !== null;
+    out.image_present = (await waitFor(() => document.getElementById(imageId))) !== null;
     out.rendered = await waitFor(() => {
         const img = document.getElementById(imageId);
         return img && !img.classList.contains('hidden') && img.complete && img.naturalWidth > 0;
@@ -187,27 +192,32 @@ WORK_THE_QUEUE = r"""
     out.natural_width = shot ? shot.naturalWidth : 0;
     out.natural_height = shot ? shot.naturalHeight : 0;
     out.object_url = shot ? String(shot.src).indexOf('blob:') === 0 : false;
-    out.photo_button_after = first ? first.querySelector('[data-registration-photo]') !== null : null;
+    // The fetch is one tap: the button it replaced is gone once the face is on the pane.
+    out.photo_button_after = document.querySelector(`[data-registration-photo="%%A%%"]`) !== null;
 
     // Refuse the second one, with the reason the record keeps.
     const second = await waitFor(() => document.querySelector('[data-registration="%%B%%"]'));
     out.second_card = second !== null;
-    const reason = document.getElementById('registrationNote-%%B%%');
+    const openSecond = document.querySelector('[data-registration-open="%%B%%"]');
+    if (openSecond) openSecond.click();
+    const reason = await waitFor(() => document.getElementById('registrationNote-%%B%%'));
     out.reason_field = reason !== null;
     if (reason) reason.value = 'No formwork experience';
-    const refuse = second ? second.querySelector('[data-registration-reject]') : null;
+    const refuse = document.querySelector('[data-registration-reject="%%B%%"]');
     out.refuse_button = refuse !== null;
     if (refuse) refuse.click();
     const refused = await waitFor(() => document.querySelector('[data-registration-refused="%%B%%"]'));
     out.refused_receipt = text(refused);
     out.second_gone = (await waitFor(() => document.querySelector('[data-registration="%%B%%"]') === null)) !== null;
 
-    // Approve the first one, with a note.
-    const note = document.getElementById('registrationNote-%%A%%');
+    // Approve the first one, with a note. Its review pane is re-opened after the refusal closed
+    // the pane the second application had taken.
+    const reopenFirst = await waitFor(() => document.querySelector('[data-registration-open="%%A%%"]'));
+    if (reopenFirst) reopenFirst.click();
+    const note = await waitFor(() => document.getElementById('registrationNote-%%A%%'));
     out.note_field = note !== null;
     if (note) note.value = 'ID checked at the gate.';
-    const card = document.querySelector('[data-registration="%%A%%"]');
-    const approve = card ? card.querySelector('[data-registration-approve]') : null;
+    const approve = document.querySelector('[data-registration-approve="%%A%%"]');
     out.approve_button = approve !== null;
     if (approve) approve.click();
     const minted = await waitFor(() => document.querySelector('[data-registration-minted]'));
@@ -267,17 +277,18 @@ def test_the_console_works_the_registration_queue(
     )
     assert "2 waiting on a decision" in queue["count_line"], queue["count_line"]
 
-    # The photograph: hidden until it is asked for, then decoded at the stored size.
-    assert queue["image_present"], f"the card ships no photograph element.\n{seen.describe()}"
-    assert queue["hidden_before"] is True, (
-        f"an applicant's face was visible before anybody asked for it.\n{seen.describe()}"
+    # The photograph: the queue carries no faces, and opening one application fetches its own.
+    assert queue["face_before_open"], (
+        f"an applicant's face was on the queue before anybody opened the application.\n"
+        f"{seen.describe()}"
     )
-    assert queue["photo_button"], (
-        f"the card offers no way to see the photograph, so the delegated "
-        f"[data-registration-photo] binding is not attached.\n{seen.describe()}"
+    assert queue["open_button"] and queue["review_open"], (
+        f"the row offers no way into the review pane, so the delegated "
+        f"[data-registration-open] binding is not attached.\n{seen.describe()}"
     )
+    assert queue["image_present"], f"the review pane ships no photograph element.\n{seen.describe()}"
     assert queue["rendered"], (
-        f"tapping Show the photo did not put the stored picture on the card "
+        f"opening the application did not put the stored picture on the review pane "
         f"(width={queue['natural_width']}, height={queue['natural_height']}, "
         f"toast={queue['toast']}).\n{seen.describe()}"
     )

@@ -29,6 +29,7 @@ hardcoded demo value on every single start.
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import logging
 import math
@@ -42,6 +43,7 @@ import warnings
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Any, Mapping
+from urllib.parse import urljoin
 
 import numpy as np
 from fastapi import (
@@ -57,8 +59,9 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field, field_validator
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -183,9 +186,19 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # wrong once. Replaces ``CORSMiddleware``, whose single origin list served both the worker
 # app and the administrator console - see ``netguard`` for what that cost.
 #
-# Order matters: middleware added later wraps earlier ones. This one is added here, before
-# the routes, so it sits inside the frontend revalidation middleware (a refusal still gets
-# its Cache-Control) and outside the router (a refusal never reaches a handler).
+# Order matters: middleware added later wraps earlier ones. Compression is added *first* -
+# and so ends up innermost, closest to the router - for a reason worth stating: the two
+# ``@app.middleware("http")`` layers below are Starlette's ``BaseHTTPMiddleware``, which
+# re-wraps every response as a streamed body before anything outside it sees it. A GZip
+# middleware outside that stack never sees the single-message response whose length its
+# ``minimum_size`` is measured against, so it compresses a 20-byte JSON answer as readily as
+# a 213 KB script. Inside the stack, the threshold means what it says. What it does not
+# compress is a refusal netguard raises outside it - which is JSON a few dozen bytes long,
+# and the wrong thing to spend a frame on anyway.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+# netguard sits outside compression, so a refusal still gets its security headers and its
+# ``no-store``, and outside the router, so a refusal never reaches a handler.
 netguard.install(app)
 
 FRONTEND_DIR = str(PROJECT_ROOT / "frontend")
@@ -262,6 +275,16 @@ TRANSIT_ABANDONED_REASON = "Worker clocked out without confirming arrival at any
 #: rather than a worker in the wrong place. A constant because the review screen and the tests
 #: key on the same sentence.
 DELETED_SITE_REASON = "Site geofence was deleted: punch matched its last known boundary"
+#: ``error_code`` for an arrival taken outside every site boundary. The API has one language, so a
+#: refusal the *worker* has to read carries a code as well as a sentence and the handset writes its
+#: own words from it - the contract the liveness gate and the early clock-out question already keep.
+#: The code is the part that survives translation: the server's sentence is for the log, the
+#: worker's is for the phone they are holding.
+ARRIVAL_OUTSIDE_GEOFENCE = "arrival_outside_geofence"
+#: ``error_code`` for an arrival against a trip that has *already* been confirmed: a double tap, or
+#: an administrator closing the shift between the read and the write lock. A refusal about the
+#: worker's own act, so the worker reads it in their own language too.
+ARRIVAL_ALREADY_CONFIRMED = "arrival_already_confirmed"
 
 STATUS_APPROVED = "Approved"
 STATUS_PENDING_REVIEW = "pending_review"
@@ -2568,7 +2591,11 @@ async def verify_worker(
     worker_id: str = Form(...),
     action: str = Form(...),
     location_input: str = Form(...),
-    selfie: UploadFile = File(...),
+    #: Optional on purpose, and for exactly one act: the transit arrival is a fact about a
+    #: place, not a second identity check, so it is answered with no photograph at all (see
+    #: the arrival block below). Every other action still requires one - checked right after
+    #: it, before the upload policy - and a missing frame is refused rather than ignored.
+    selfie: UploadFile | None = File(default=None),
     #: Sent back by the phone after it has shown the early clock-out warning and the
     #: worker chose to go ahead. Absent on the first attempt, which is what makes the
     #: warning happen: the server, not the phone, decides whether a shift is short.
@@ -2719,6 +2746,59 @@ async def verify_worker(
                 status_code=403,
                 detail="Location Rejected. You are outside any designated construction site geofence.",
             )
+
+    # ---------------------------------------------------------------------------
+    # ARRIVAL - the one act that is a place, not a person
+    # ---------------------------------------------------------------------------
+    # A travel shift was opened with a full face check at the moment it began, on this
+    # account and this token, and what its arrival claims is *where the worker is*: a fact
+    # the geofence answers, not the camera. So it is answered here, before the upload - no
+    # selfie, no liveness pass, no second face match - and it is the only row this endpoint
+    # writes without biometrics of its own. That is deliberate: the alternative is a worker
+    # pulled over at a gate re-proving, to a phone in the sun, an identity that was verified
+    # hours earlier when they set off. ``Transit Checkpoint`` and a Clock In both mean "I am
+    # here" while a trip is open, so both are answered here; a Clock Out is a different act,
+    # with its own rules and its own face check.
+    if in_transit and action != ACTION_CLOCK_OUT:
+        with db(write=True) as conn:
+            session = conn.execute(
+                "SELECT worker_id, site_name, clock_in_time, is_transit, transit_start_time "
+                "FROM active_sessions WHERE worker_id = ?",
+                (current.id,),
+            ).fetchone()
+            if session is None or int(session["is_transit"] or 0) != 1:
+                # The trip was confirmed (or ended) between the read above and this lock - a
+                # double tap, or an administrator closing it. Say so rather than confirm it
+                # twice or write a second milestone against the same departure. The code is what
+                # the handset keys on to say it in the worker's own language; the message is the
+                # log's English, for whoever reads the refusal in a server trace.
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error_code": ARRIVAL_ALREADY_CONFIRMED,
+                        "message": "This travel shift has already been confirmed at a site.",
+                    },
+                )
+            return _arrive_transit_shift(
+                conn,
+                current=current,
+                session=session,
+                detected_site_row=detected_site_row,
+                deleted_site=deleted_site,
+                worker_name=user_row["name"],
+                rules=get_shift_rules(),
+                now=datetime.now(),
+                lat=lat,
+                lon=lon,
+                request=request,
+                background=background,
+            )
+
+    if selfie is None:
+        # Everything that is not an arrival is a punch about a person, and a punch with no
+        # frame behind it has no evidence at all: refused here, before the upload policy,
+        # rather than failing somewhere inside it.
+        raise HTTPException(status_code=422, detail="A selfie is required for this punch.")
 
     # One upload policy for the whole app (size while reading, image type from the
     # bytes, pixel ceiling): see ``uploads.py``. This endpoint used to read the body
@@ -2996,6 +3076,10 @@ async def verify_worker(
     #: The worker's crossing notice, when this clock-out made one (``overtime.announce_crossing``).
     #: Delivered after the transaction below, because a push cannot see an uncommitted row.
     crossing = None
+    #: The worker's own arrival notice, when this clock-out also confirmed a transit trip. The
+    #: explicit Transit Checkpoint writes the same one; this route - arrive and finish in one tap
+    #: - reaches the same fact, and is delivered with the crossing below for the same reason.
+    arrival_notice = None
     flag_reason = liveness_flag
 
     with db(write=True) as conn:
@@ -3065,153 +3149,6 @@ async def verify_worker(
                     "break_hours": 0.0,
                     "paid_hours": 0.0,
                     "overtime_hours": 0.0,
-                    "liveness": liveness_decision.as_payload(),
-                }
-
-            if session is not None and session_in_transit:
-                # PHASE B - ARRIVAL. An open transit shift and a fresh action: the worker is
-                # telling us they have reached a site. The arrival only counts if the fix is
-                # *actually* inside a geofence - a check-in from the car park is not an arrival -
-                # so an off-fence attempt answers 422 and leaves the shift exactly as it was.
-                #
-                # The destination may have been deleted while the worker was on the road, and
-                # then no live fence can ever confirm this trip however early they arrive: the
-                # boundary the site had when it was removed is the one they can be standing in,
-                # and `deleted_site_at` names it. A fix that matches neither is not an arrival.
-                arrival_site = detected_site if detected_site_row is not None else deleted_site
-                if arrival_site is None:
-                    punch_frames.discard_frame(punch_frame)
-                    raise HTTPException(
-                        status_code=422,
-                        detail="Outside target site geofence. Cannot confirm arrival.",
-                    )
-                #: True when this arrival is authorised by a deleted fence rather than a live
-                #: one: the milestone row and the audit entry say so instead of pretending the
-                #: site is still configured.
-                deleted_fence = detected_site_row is None
-                # ``clock_in_time`` is left untouched on purpose: it still holds the departure
-                # moment, so the whole travel-plus-work span is credited when the shift closes.
-                # The window is judged against that *departure* moment, since that is when the
-                # worker began the shift the site is now authorising.
-                transit_start = _parse_ts(session["transit_start_time"] or session["clock_in_time"])
-                site_window = shift_windows.effective_window(detected_site_row, rules)
-                late_flag = (
-                    None
-                    if transit_start is None or site_window.contains_moment(transit_start)
-                    else shift_windows.describe(site_window)
-                )
-                conn.execute(
-                    "UPDATE active_sessions SET site_name = ?, is_transit = 0, late_flag = ?, "
-                    "liveness_class = ? WHERE worker_id = ?",
-                    (arrival_site, late_flag, liveness_class, current.id),
-                )
-                # Same body, a different site and a different late flag - which is three of the
-                # five facts the board compares, so a journey becoming a shift is a change.
-                live_ops.board_changed()
-                transit_seconds = (
-                    shift_hours.elapsed_seconds(transit_start, now) if transit_start else 0
-                )
-                # The arrival milestone, written as its own zero-hour row: it authorises the shift
-                # rather than paying for it, and it is the auditable proof that a geofence was
-                # reached. ``site_arrival`` as the source keeps it distinguishable from a normal
-                # online punch in the ledger.
-                arrival_log_id = _insert_log(
-                    conn,
-                    worker_id=current.id,
-                    site_name=arrival_site,
-                    action=ACTION_TRANSIT_CONFIRMED,
-                    timestamp=now_str,
-                    hours=0.0,
-                    score=similarity_score,
-                    status=STATUS_APPROVED,
-                    status_code="approved",
-                    lat=lat,
-                    lon=lon,
-                    source=SOURCE_SITE_ARRIVAL,
-                    liveness_class=liveness_class,
-                    liveness_score=liveness_score,
-                    flag_reason=DELETED_SITE_REASON if deleted_fence else None,
-                    punch_frame=punch_frame,
-                )
-                if late_flag:
-                    notifications.notify(
-                        conn,
-                        kind=notifications.KIND_LATE_ARRIVAL,
-                        severity=notifications.SEVERITY_WARNING,
-                        title="Arrival outside the clock-in window",
-                        body=(
-                            f"{user_row['name']} (id {current.id}) began a transit shift at "
-                            f"{(session['transit_start_time'] or now_str)}, outside "
-                            f"{site_window.site_name or arrival_site}'s "
-                            f"{site_window.label()} clock-in window."
-                        ),
-                        worker_id=current.id,
-                        site_name=arrival_site,
-                        dedupe_key=f"late:{current.id}:{now_str[:10]}",
-                    )
-                _audit(
-                    conn,
-                    action="attendance_transit_confirmed",
-                    actor=current,
-                    entity="attendance_logs",
-                    entity_id=arrival_log_id,
-                    after={
-                        "site": arrival_site,
-                        "origin": {"lat": lat, "lon": lon},
-                        "transit_hours": round(transit_seconds / 3600.0, 2),
-                        "score": similarity_score,
-                        # The site is gone from ``construction_sites``: the arrival was
-                        # authorised by the boundary it had when it was deleted, and an
-                        # operator reading this later must not have to guess why a punch
-                        # matched no configured fence.
-                        "site_deleted": deleted_fence,
-                    },
-                    request=request,
-                )
-                # ... and the worker's own notice, in the same transaction as the milestone. It
-                # is the durable half of "you have arrived": the response below says it once, on
-                # one screen, and this is what survives the toast - the arrival is the moment the
-                # travel time they were watching becomes credited, and the inbox is where that
-                # can be read back afterwards. Pushed after the commit via ``background``, for
-                # the reason ``push`` gives: a notice written in an open transaction does not
-                # exist yet as far as the sender's own connection is concerned.
-                arrival_notice = notifications.notify_worker(
-                    conn,
-                    worker_id=current.id,
-                    kind=notifications.KIND_WORKER_TRANSIT_ARRIVED,
-                    title=f"Arrived at {arrival_site}",
-                    body=(
-                        f"Your travel shift was confirmed at {arrival_site} at {now_str}. The "
-                        f"time since you set off ({round(transit_seconds / 3600.0, 2)}h) is "
-                        f"credited to this shift, and your clock-out from the site will pay it."
-                    ),
-                    payload={
-                        "site_name": arrival_site,
-                        "site_deleted": deleted_fence,
-                        "transit_hours": round(transit_seconds / 3600.0, 2),
-                        "confirmed_at": now_str,
-                        "clock_in_time": session["clock_in_time"],
-                    },
-                    dedupe_key=f"transit_arrived:{current.id}:{session['clock_in_time']}",
-                )
-                background.add_task(
-                    overtime.deliver_worker_notices,
-                    {"worker_notified": arrival_notice},
-                )
-                telemetry.observe_punch(action="transit_confirmed", status="approved")
-                return {
-                    "status": "arrived",
-                    "message": (
-                        f"Arrival confirmed at {arrival_site}. Travel time is credited to this "
-                        "shift."
-                    ),
-                    "site": arrival_site,
-                    "score": similarity_score,
-                    "hours": 0.0,
-                    "break_hours": 0.0,
-                    "paid_hours": 0.0,
-                    "overtime_hours": 0.0,
-                    "transit_hours": round(transit_seconds / 3600.0, 2),
                     "liveness": liveness_decision.as_payload(),
                 }
 
@@ -3331,6 +3268,35 @@ async def verify_worker(
                     "FROM active_sessions WHERE worker_id = ?",
                     (current.id,),
                 ).fetchone()
+                # The worker's own "you have arrived" notice, written exactly as the explicit
+                # checkpoint writes it: this is the same arrival fact reached by the other route
+                # - a worker who drives straight to a site and ends the day there - and the panel
+                # and the inbox must not say nothing just because the trip and the close were one
+                # tap. Deduped on the shift, so a trip already confirmed by an earlier checkpoint
+                # can never be announced twice.
+                transit_start = _parse_ts(session["transit_start_time"] or session["clock_in_time"])
+                transit_seconds = (
+                    shift_hours.elapsed_seconds(transit_start, now) if transit_start else 0
+                )
+                arrival_notice = notifications.notify_worker(
+                    conn,
+                    worker_id=current.id,
+                    kind=notifications.KIND_WORKER_TRANSIT_ARRIVED,
+                    title=f"Arrived at {arrived_at}",
+                    body=(
+                        f"Your travel shift was confirmed at {arrived_at} at {now_str} and "
+                        f"closed with this clock-out. The time since you set off "
+                        f"({round(transit_seconds / 3600.0, 2)}h) is credited to it."
+                    ),
+                    payload={
+                        "site_name": arrived_at,
+                        "site_deleted": detected_site_row is None,
+                        "transit_hours": round(transit_seconds / 3600.0, 2),
+                        "confirmed_at": now_str,
+                        "clock_in_time": session["clock_in_time"],
+                    },
+                    dedupe_key=f"transit_arrived:{current.id}:{session['clock_in_time']}",
+                )
 
             clock_in_time = _parse_ts(session["clock_in_time"])
             if clock_in_time is None:
@@ -3505,9 +3471,12 @@ async def verify_worker(
             request=request,
         )
 
-    # Committed, so the notice is visible to the dispatcher - and on its own thread, so a
-    # worker standing at a gate is not waiting on somebody else's push service.
-    overtime.deliver_worker_notices(crossing)
+    # Committed, so the notices are visible to the dispatcher - and on its own thread, so a
+    # worker standing at a gate is not waiting on somebody else's push service. The arrival
+    # notice rides in the same dispatch as the crossing rather than a second pass; it is
+    # wrapped because ``notify_worker`` answers whether a row was written, which is the shape
+    # ``deliver_worker_notices`` reads.
+    overtime.deliver_worker_notices([crossing, {"worker_notified": arrival_notice}])
 
     return {
         "status": status_val,
@@ -5467,6 +5436,179 @@ def _early_checkout_refusal(record: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _arrive_transit_shift(
+    conn: sqlite3.Connection,
+    *,
+    current: CurrentUser,
+    session: sqlite3.Row,
+    detected_site_row: sqlite3.Row | None,
+    deleted_site: str | None,
+    worker_name: str,
+    rules: Mapping[str, Any],
+    now: datetime,
+    lat: float,
+    lon: float,
+    request: Request | None,
+    background: BackgroundTasks,
+) -> dict[str, Any]:
+    """Authorise an unconfirmed travel shift at the geofence it has reached.
+
+    The one writer of the arrival milestone. The shift was opened with a full face check at
+    the moment it began, on this account and this token; what its arrival claims is *where
+    the worker is*, and the geofence is the whole proof - so this takes no photograph and
+    records none. The row it writes is ``Transit Confirmed`` with the ledger's "not scored"
+    ``0.0`` and no liveness columns, which is how a reviewer tells a location-only arrival
+    from a scored punch, and ``site_arrival`` as its source keeps it apart from an ordinary
+    online punch.
+
+    ``clock_in_time`` is left untouched on purpose: it still holds the departure moment, so
+    the whole travel-plus-work span is credited when the shift closes. The clock-in window is
+    judged against that departure moment, since that is when the shift now being authorised
+    began.
+    """
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    arrival_site = (
+        detected_site_row["site_name"] if detected_site_row is not None else deleted_site
+    )
+    if arrival_site is None:
+        # Not at a site yet. A check-in from the car park is not an arrival, and the shift is
+        # left exactly as it was: open, in transit, and still counting. The code is what the
+        # handset keys on to say this in the worker's own language - a worker standing at the
+        # wrong gate reading an English sentence about a geofence is the one reader this refusal
+        # most needs to reach.
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error_code": ARRIVAL_OUTSIDE_GEOFENCE,
+                "message": "Outside target site geofence. Cannot confirm arrival.",
+            },
+        )
+    #: True when this arrival is authorised by a deleted fence rather than a live one: the
+    #: milestone row and the audit entry say so instead of pretending the site is configured.
+    deleted_fence = detected_site_row is None
+    transit_start = _parse_ts(session["transit_start_time"] or session["clock_in_time"])
+    site_window = shift_windows.effective_window(detected_site_row, rules)
+    late_flag = (
+        None
+        if transit_start is None or site_window.contains_moment(transit_start)
+        else shift_windows.describe(site_window)
+    )
+    # The shift's biometric provenance is left where the departure wrote it: this act says
+    # nothing about a face, so it has nothing to overwrite.
+    conn.execute(
+        "UPDATE active_sessions SET site_name = ?, is_transit = 0, late_flag = ? "
+        "WHERE worker_id = ?",
+        (arrival_site, late_flag, current.id),
+    )
+    # Same body, a different site and a different late flag - three of the five facts the
+    # board compares, so a journey becoming a shift is a change.
+    live_ops.board_changed()
+    transit_seconds = (
+        shift_hours.elapsed_seconds(transit_start, now) if transit_start else 0
+    )
+    arrival_log_id = _insert_log(
+        conn,
+        worker_id=current.id,
+        site_name=arrival_site,
+        action=ACTION_TRANSIT_CONFIRMED,
+        timestamp=now_str,
+        hours=0.0,
+        # Not a face score, and not a claim that one was taken: 0.0 is the sentinel the rest
+        # of the ledger uses for "not scored", and the approvals screen draws no score for
+        # it. Recording a number here would be the one entry an auditor could not see
+        # through.
+        score=0.0,
+        status=STATUS_APPROVED,
+        status_code="approved",
+        lat=lat,
+        lon=lon,
+        source=SOURCE_SITE_ARRIVAL,
+        flag_reason=DELETED_SITE_REASON if deleted_fence else None,
+    )
+    if late_flag:
+        notifications.notify(
+            conn,
+            kind=notifications.KIND_LATE_ARRIVAL,
+            severity=notifications.SEVERITY_WARNING,
+            title="Arrival outside the clock-in window",
+            body=(
+                f"{worker_name} (id {current.id}) began a transit shift at "
+                f"{(session['transit_start_time'] or now_str)}, outside "
+                f"{site_window.site_name or arrival_site}'s "
+                f"{site_window.label()} clock-in window."
+            ),
+            worker_id=current.id,
+            site_name=arrival_site,
+            dedupe_key=f"late:{current.id}:{now_str[:10]}",
+        )
+    _audit(
+        conn,
+        action="attendance_transit_confirmed",
+        actor=current,
+        entity="attendance_logs",
+        entity_id=arrival_log_id,
+        after={
+            "site": arrival_site,
+            "origin": {"lat": lat, "lon": lon},
+            "transit_hours": round(transit_seconds / 3600.0, 2),
+            # Named, because it is the difference between this row and every other punch on
+            # the shift: the arrival was authorised by a place, and no face was checked.
+            "evidence": "location_only",
+            # The site is gone from ``construction_sites``: the arrival was authorised by the
+            # boundary it had when it was deleted, and an operator reading this later must not
+            # have to guess why a punch matched no configured fence.
+            "site_deleted": deleted_fence,
+        },
+        request=request,
+    )
+    # ... and the worker's own notice, in the same transaction as the milestone. It is the
+    # durable half of "you have arrived": the response says it once, on one screen, and this
+    # is what survives the toast - the arrival is the moment the travel time they were
+    # watching becomes credited, and the inbox is where that can be read back afterwards.
+    # Pushed after the commit via ``background``, because a notice written in an open
+    # transaction does not exist yet as far as the sender's own connection is concerned.
+    arrival_notice = notifications.notify_worker(
+        conn,
+        worker_id=current.id,
+        kind=notifications.KIND_WORKER_TRANSIT_ARRIVED,
+        title=f"Arrived at {arrival_site}",
+        body=(
+            f"Your travel shift was confirmed at {arrival_site} at {now_str}. The "
+            f"time since you set off ({round(transit_seconds / 3600.0, 2)}h) is "
+            f"credited to this shift, and your clock-out from the site will pay it."
+        ),
+        payload={
+            "site_name": arrival_site,
+            "site_deleted": deleted_fence,
+            "transit_hours": round(transit_seconds / 3600.0, 2),
+            "confirmed_at": now_str,
+            "clock_in_time": session["clock_in_time"],
+        },
+        dedupe_key=f"transit_arrived:{current.id}:{session['clock_in_time']}",
+    )
+    background.add_task(
+        overtime.deliver_worker_notices,
+        {"worker_notified": arrival_notice},
+    )
+    telemetry.observe_punch(action="transit_confirmed", status="approved")
+    return {
+        "status": "arrived",
+        "message": (
+            f"Arrival confirmed at {arrival_site}. Travel time is credited to this shift."
+        ),
+        "site": arrival_site,
+        # No face was taken, so there is nothing to score and no verdict to report: the phone
+        # shows the site and the credited travel, not a match number.
+        "score": 0.0,
+        "hours": 0.0,
+        "break_hours": 0.0,
+        "paid_hours": 0.0,
+        "overtime_hours": 0.0,
+        "transit_hours": round(transit_seconds / 3600.0, 2),
+        "liveness": None,
+    }
+
+
 def _off_site_checkout_refusal(session: Mapping[str, Any]) -> dict[str, Any]:
     """The refusal a Clock Out gets while the shift is still unconfirmed, off every site.
 
@@ -6358,23 +6500,148 @@ app.include_router(developer.router, prefix="/api/v1")
 database.set_trace_provider(developer.current_trace_id)
 
 
+# ---------------------------------------------------------------------------
+# Front-end assets: one content hash, two cache policies
+#
+# Every page below is served with a ``?v=<content hash>`` on each asset it names,
+# and the asset route answers an immutable cache only when that token matches the
+# bytes on disk. The document itself is never cached: it *carries* the tokens, so a
+# cached copy would keep pointing a browser at a build the server no longer serves.
+#
+# The hash is computed here rather than at build time because there is no build:
+# these files are served straight from ``frontend/``, and the same checkout is also
+# hosted as plain files (VS Code Live Server, a static host). Stamping at request
+# time is what lets both keep working - the file on disk never changes, only the URL
+# the server hands the browser.
+# ---------------------------------------------------------------------------
+
+#: Extensions a page may reference and the server will stamp. Deliberately not
+#: ``.html``: a document carries the tokens, so it must revalidate rather than be
+#: cached under the token of a build it no longer describes.
+_STAMPABLE_SUFFIXES = (
+    ".js",
+    ".css",
+    ".svg",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".ico",
+    ".woff",
+    ".woff2",
+)
+
+#: A short content hash per file, keyed on (size, mtime). The token is what makes an
+#: asset immutable, so it is recomputed whenever the bytes change and never while they
+#: have not.
+_ASSET_VERSIONS: dict[str, tuple[int, int, str]] = {}
+
+#: ``src="..."`` / ``href="..."`` in the served markup, and the scheme prefix that marks
+#: a URL this server does not own (``data:``, ``mailto:``, an absolute address).
+_STAMPED_ATTRIBUTE = re.compile(r'(?P<lead>\b(?:src|href)=")(?P<url>[^"]+)(?P<tail>")')
+_URL_SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:")
+
+
+def frontend_asset_path(web_path: str) -> str | None:
+    """The file a web path names, if it is one this server ships.
+
+    ``/static/...`` and ``/...`` are the same directory (see the two mounts below), and
+    a path that climbs out of it is not an asset at all.
+    """
+    relative = web_path[len("/static/"):] if web_path.startswith("/static/") else web_path.lstrip("/")
+    candidate = os.path.normpath(os.path.join(FRONTEND_DIR, relative))
+    if candidate != FRONTEND_DIR and not candidate.startswith(FRONTEND_DIR + os.sep):
+        return None
+    return candidate if os.path.isfile(candidate) else None
+
+
+def asset_version(path: str) -> str | None:
+    """The content hash that cache-busts a file, or ``None`` if it is not one."""
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    cached = _ASSET_VERSIONS.get(path)
+    if cached and cached[0] == stat.st_size and cached[1] == stat.st_mtime_ns:
+        return cached[2]
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    version = digest.hexdigest()[:12]
+    _ASSET_VERSIONS[path] = (stat.st_size, stat.st_mtime_ns, version)
+    return version
+
+
+def versioned_asset_url(url: str, request_path: str) -> str:
+    """``url`` with its content hash appended, or unchanged if it is not one.
+
+    ``request_path`` rather than the file's directory is the base, because the link pages
+    are served one segment deep (``/q/<token>``) and ask for their script as
+    ``../quick.js`` - which the browser resolves against that URL, not against wherever the
+    file happens to live. Stamping against the file's directory would silently skip every
+    asset on those two pages.
+    """
+    if not url or "?" in url or url.startswith("#") or url.startswith("//") or _URL_SCHEME.match(url):
+        return url
+    web_path = urljoin(request_path, url)
+    # ``urljoin('/register', '../x')`` answers ``'x'`` rather than ``'/x'``: a base with no
+    # trailing slash is one segment deep, so ``..`` climbs past the root and the result is not
+    # absolute. The browser's own resolution lands on ``/x``, so rebuild that here.
+    if not web_path.startswith("/"):
+        web_path = "/" + web_path
+    if not web_path.lower().endswith(_STAMPABLE_SUFFIXES):
+        return url
+    absolute = frontend_asset_path(web_path)
+    version = asset_version(absolute) if absolute else None
+    return f"{url}?v={version}" if version else url
+
+
+def _stamp_frontend_assets(html: str, request_path: str) -> str:
+    return _STAMPED_ATTRIBUTE.sub(
+        lambda match: (
+            f"{match.group('lead')}{versioned_asset_url(match.group('url'), request_path)}{match.group('tail')}"
+        ),
+        html,
+    )
+
+
+def frontend_page_response(filename: str, request: Request):
+    """A page with its assets stamped, served so the document itself revalidates.
+
+    The body changes whenever an asset changes, so the ETag is computed over the *stamped*
+    body rather than the file on disk: a page whose tokens moved is a different page even if
+    its own bytes did not. ``no-cache`` means the browser asks every time, and the ETag is
+    what makes that ask cost a 304 instead of the body - which matters here, because the
+    entry documents are 4-17 KB and this app's connection is a phone at a gate.
+    """
+    path = os.path.join(FRONTEND_DIR, filename)
+    if not os.path.exists(path):
+        return {"error": f"{filename} not found in {FRONTEND_DIR}"}
+    with open(path, encoding="utf-8") as handle:
+        html = handle.read()
+    body = _stamp_frontend_assets(html, request.url.path)
+    etag = f'"{hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]}"'
+    headers = {"Cache-Control": "no-cache, must-revalidate", "ETag": etag}
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=headers)
+    return HTMLResponse(body, headers=headers)
+
+
 @app.get("/enroll/{token}", include_in_schema=False)
-async def enrollment_page(token: str):  # noqa: ARG001 - the token is read by the page itself
+async def enrollment_page(request: Request, token: str):  # noqa: ARG001 - the token is read by the page itself
     """Serve the standalone mobile capture page for a self-service enrollment link.
 
     Separate from the SPA on purpose: a worker enrolling on their own phone has no
     account yet, so this page must not load the admin/worker dashboard bundle, and it
     has to work from a bare link with no prior visit to the app.
     """
-    page = os.path.join(FRONTEND_DIR, "enroll.html")
-    if not os.path.exists(page):  # pragma: no cover - packaging accident
-        return {"error": f"enroll.html not found in {FRONTEND_DIR}"}
-    return FileResponse(page)
+    return frontend_page_response("enroll.html", request)
 
 
 @app.get("/register", include_in_schema=False)
 @app.get("/register/{token}", include_in_schema=False)
-async def registration_page():
+async def registration_page(request: Request):
     """Serve the console's registration form, under the token that is the link.
 
     Its own page for the same reason ``/enroll`` and ``/q`` have one: the person filling it in
@@ -6394,14 +6661,11 @@ async def registration_page():
     token-checked ``GET /api/v1/register/<token>`` is what the page reads both from. A link that
     has been switched off still has to answer.
     """
-    page = os.path.join(FRONTEND_DIR, "register.html")
-    if not os.path.exists(page):  # pragma: no cover - packaging accident
-        return {"error": f"register.html not found in {FRONTEND_DIR}"}
-    return FileResponse(page)
+    return frontend_page_response("register.html", request)
 
 
 @app.get("/q/{token}", include_in_schema=False)
-async def quick_link_page(token: str):  # noqa: ARG001 - the token is read by the page itself
+async def quick_link_page(request: Request, token: str):  # noqa: ARG001 - the token is read by the page itself
     """Serve the one-tap clock page for a quick link.
 
     Its own page rather than a route in the dashboard, for the same reason ``/enroll`` has
@@ -6409,11 +6673,8 @@ async def quick_link_page(token: str):  # noqa: ARG001 - the token is read by th
     so loading the console's bundle would show them a login screen instead of the button
     they were sent.
     """
-    page = os.path.join(FRONTEND_DIR, "quick.html")
-    if not os.path.exists(page):  # pragma: no cover - packaging accident
-        return {"error": f"quick.html not found in {FRONTEND_DIR}"}
-    return FileResponse(page)
-    
+    return frontend_page_response("quick.html", request)
+
 
 
 @asynccontextmanager
@@ -6483,11 +6744,8 @@ app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
 
 
 @app.get("/")
-async def read_index():
-    file_path = os.path.join(FRONTEND_DIR, "index.html")
-    if not os.path.exists(file_path):
-        return {"error": f"index.html not found in path: {os.path.abspath(file_path)}"}
-    return FileResponse(file_path)
+async def read_index(request: Request):
+    return frontend_page_response("index.html", request)
 
 
 # 5. Also serve the frontend from the site root. index.html loads its assets with
@@ -6496,23 +6754,67 @@ async def read_index():
 app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
 
 
-# 6. Make the browser revalidate the frontend on every load.
+# 6. What each response is allowed to be cached as.
 #
-# StaticFiles sends ETag/Last-Modified but no Cache-Control, so browsers apply
-# *heuristic* freshness and are free to keep running a months-old
-# frontendjavascript.js without ever asking. That is how a fixed frontend keeps
-# reproducing an already-fixed bug on a worker's phone: the server and the
-# browser disagree about which code is running, and nothing says so. Revalidation
-# on a site LAN costs a 304, which is a cheap price for the guarantee that the
-# frontend reaching the device is the frontend that was shipped.
+# The old rule was ``no-cache, must-revalidate`` on everything that was not an API answer, and
+# it was written to stop exactly one failure: StaticFiles sends ETag/Last-Modified but no
+# Cache-Control, so a browser is free to apply heuristic freshness and keep running a
+# months-old frontendjavascript.js without ever asking - the server and the phone disagree
+# about which code is running, and a fixed bug keeps reproducing on the device with the stale
+# copy. Revalidation fixed that, and cost a revalidation of seven scripts, a stylesheet and an
+# icon on *every* visit, including the warm one.
+#
+# The fix is not to weaken revalidation but to make it unnecessary for the assets that can
+# never go stale: every page is served with a ``?v=<content hash>`` on the assets it names
+# (see ``_stamp_frontend_assets``), and an asset is served ``immutable`` only when the token
+# in the URL is the hash of the bytes about to be sent. A new build is a new token, so a browser
+# fetches it the first time the new page names it; an old token - a bookmark, or a page from a
+# cache - falls back to ``no-cache`` rather than being handed an immutable stale copy. The
+# document itself always revalidates, because it carries the tokens: a cached copy would point
+# at a build the server may have replaced. ETags/Last-Modified still ride along for the
+# fallback, so the revalidation is a 304 and not a body.
+#
+# API answers default to ``no-store`` unless a handler says otherwise. An access token, a punch
+# log or somebody's hours must not sit in a browser's disk cache or an intermediary's, and the
+# default has to be the safe one because the route added next will not remember to ask. A handler
+# that does know better - the branding logo, which is public and content-addressed - sets its own
+# header and is left alone. ``/metrics`` is left to its handler too: it is a scrape, and it already
+# says ``no-store``.
 @app.middleware("http")
-async def revalidate_frontend_assets(request: Request, call_next):
+async def cache_policy(request: Request, call_next):
     response = await call_next(request)
-    # ``/metrics`` is excluded on purpose: a scrape must never be served from a cache, and
-    # "no-cache, must-revalidate" is an instruction a proxy is free to optimise around.
-    if not request.url.path.startswith("/api/") and request.url.path != "/metrics":
+    path = request.url.path
+    if path == "/metrics":
+        return response
+    if path.startswith("/api/"):
+        if "cache-control" not in response.headers:
+            response.headers["Cache-Control"] = "no-store"
+        return response
+    token = request.query_params.get("v")
+    absolute = frontend_asset_path(path)
+    if (
+        token
+        and absolute
+        and path.lower().endswith(_STAMPABLE_SUFFIXES)
+        and token == asset_version(absolute)
+    ):
+        # Content-addressed, so nothing can go stale under this URL. The ``stale-while-revalidate``
+        # is belt and braces for a shared cache: it only has anything to do a year from now, when
+        # a proxy may answer with the old copy while it refetches in the background.
+        response.headers["Cache-Control"] = (
+            "public, max-age=31536000, immutable, stale-while-revalidate=86400"
+        )
+    else:
         response.headers["Cache-Control"] = "no-cache, must-revalidate"
     return response
+
+
+#: Read by the startup gate (``readiness.api_response_cache_policy``): *this* is the middleware
+#: that gives every ``/api/`` answer its ``no-store`` default. The marker is set here rather than
+#: found by name, so a rename moves it with the function; if the marker is ever dropped the gate
+#: fails at boot rather than letting every response become heuristically cacheable again - which
+#: is the exact failure the policy above was written to end.
+cache_policy._cache_policy_marker = readiness.CACHE_POLICY_MARKER
 
 
 # 7. Tag every request with a trace id, and let the failures an operator needs to hear about

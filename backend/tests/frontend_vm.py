@@ -63,9 +63,10 @@ NODE = shutil.which("node")
 FRONTEND = PROJECT_ROOT / "frontend"
 
 #: Every file a browser ends up with, in the order it gets them. ``index.html`` itself lists
-#: only the first four; the rest are fetched on demand - the console's module the first time
-#: an administrator signs in, the two translation tables when a reader asks for one - and are
-#: loaded by the harness so that in a test "shipped" and "fetched later" are as
+#: only the first four; the rest are fetched on demand - the console's own strings and then its
+#: module the first time an administrator signs in, the two translation tables when a reader
+#: asks for one - and the harness loads them all, so that in a test "shipped" and "fetched
+#: later" are as
 #: distinguishable as they are in the browser. A suite that wants to drive the smaller session
 #: a phone really has passes its own list instead (see ``run(scripts=...)``).
 #:
@@ -80,6 +81,7 @@ DEFAULT_SCRIPTS: Final = (
     "i18n.ur.js",
     "frontendjavascript.js",
     "worker_modules.js",
+    "admin_i18n.js",
     "admin_modules.js",
 )
 
