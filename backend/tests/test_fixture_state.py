@@ -53,6 +53,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Final
 
@@ -603,6 +604,62 @@ def test_a_reset_rotates_one_whole_generation_and_sweeps_the_old_ones(app_module
             "have to create the directory - and a write that creates its own directory can "
             "create it in the wrong place"
         )
+
+
+def test_the_schema_is_migrated_once_per_session_and_then_copied(app_module, monkeypatch):
+    """The migrations are a per-*session* cost now, and the copy is still the build's schema.
+
+    Two facts, and the suite needs both. The template a reset copies must carry the application's
+    *fully migrated* schema - a template that stopped at the live snapshot's schema would run
+    every test against columns the application never shipped - and the reset must not replay the
+    migrations to get there, because a reset that did and merely agreed with the template would
+    have kept every millisecond this change removed.
+    """
+    assert harness.SESSION_TEMPLATE is not None, (
+        "the session built no migrated template, so every reset is still replaying the migrations"
+    )
+    # The reset now builds every generation from the template, not from the live snapshot.
+    assert harness._session_snapshot() is harness.SESSION_TEMPLATE
+    # ...and building a generation is a plain copy of it. This is the copy step itself: a reset's
+    # own content steps write into the generation afterwards, so the file is only byte-identical
+    # to the template before they run - which is exactly what this asserts.
+    fresh = harness._write_generation()
+    assert (fresh / "times.db").read_bytes() == harness.SESSION_TEMPLATE
+
+    # The template carries the application's own schema, and the live snapshot's activity was
+    # cleared before it was taken. Opened as a *file*, because that is how a generation is opened
+    # - a WAL-mode database image does not survive ``deserialize`` into memory.
+    import migrations
+
+    with tempfile.TemporaryDirectory() as directory:
+        probe = Path(directory) / "template.db"
+        probe.write_bytes(harness.SESSION_TEMPLATE)
+        connection = sqlite3.connect(str(probe))
+        try:
+            assert migrations.current_version(connection) == migrations.SCHEMA_VERSION, (
+                "the session template is not migrated to this build's schema, so the tests would "
+                "run against a database the application never shipped"
+            )
+            for table in ("attendance_logs", "active_sessions", "audit_log"):
+                assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0, (
+                    f"the session template carries live rows in {table}, so a test could read "
+                    "somebody else's traffic as its own fixture"
+                )
+        finally:
+            connection.close()
+
+    # A reset that still migrated would take this branch. It is patched to *explode* rather than
+    # counted, because "called it and got the same answer" is exactly the cost this removed.
+    def _refuse_replay():
+        raise AssertionError(
+            "a reset replayed the migrations although the session template already exists"
+        )
+
+    monkeypatch.setattr(app_module, "init_db", _refuse_replay)
+    harness.reset_database(app_module)
+    # Reaching here at all is the assertion: ``_refuse_replay`` would have raised if the reset had
+    # taken the branch that migrates. The generation it installed is still the template's schema,
+    # proven above, so the fast path is the correct one.
 
 
 # ---------------------------------------------------------------------------

@@ -176,6 +176,22 @@ PERIOD_PATTERN = r"^(?:month|\d{1,3})$"
 #: a quiet hour reads the same as a healthy one.
 REFUSED_WINDOW_HOURS = 24
 
+#: How old this snapshot may be before the console stops calling its figures *current*.
+#:
+#: The console ages the read it received and does not poll, so the only honest freshness it can
+#: report is how long ago its one counted read landed. These two windows are what turn that age
+#: into a word - under ``FRESHNESS_AGING_SECONDS`` a figure is what is happening, past it the
+#: strip admits the read is old, and past ``FRESHNESS_STALE_SECONDS`` it is history and says so.
+#:
+#: WHY THEY ARE *HERE* AND NOT IN THE CONSOLE. A window the browser keeps to itself is the second
+#: copy this module exists to prevent: the console would print "Read just now" for as long as its
+#: own number said, whatever this deployment meant by *just now*. They ride back with the read
+#: they describe, exactly as ``dormant_days`` rides with the dormant count - so the definition of
+#: current is one fact, owned once, and a deployment that lengthens the window changes it in one
+#: place instead of two that can drift.
+FRESHNESS_AGING_SECONDS = 60
+FRESHNESS_STALE_SECONDS = 300
+
 #: The audit actions that mean **an account joined this deployment**.
 #:
 #: There is no ``users.created_at`` column, so the audit log - append-only, and the record the
@@ -775,6 +791,16 @@ def build_dashboard(
         # than a live board: Live Ops polls, this does not, and a total that silently drifts
         # is worse than one that admits it is a minute old.
         "as_of": moment.strftime(_TS),
+        # The two boundaries the console's freshness verdict is measured against, sent *with* the
+        # read for the reason the watch figures send their windows: ``as_of`` is not an honest
+        # stamp until the reader can say what counts as old, and the words the strip prints
+        # ("Read just now", "Out of date") are a claim about this snapshot's age. A window on the
+        # wire is a claim somebody can check; a window only the browser knows is one the server
+        # cannot. Seconds, matching ``oldest_seconds`` and the rest of this payload's windows.
+        "freshness": {
+            "aging_seconds": FRESHNESS_AGING_SECONDS,
+            "stale_seconds": FRESHNESS_STALE_SECONDS,
+        },
         "day": {
             "start": start[:10],
             "end": end[:10],

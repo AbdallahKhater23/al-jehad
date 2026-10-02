@@ -563,6 +563,26 @@ def test_the_stamp_says_when_the_snapshot_was_taken(client):
     assert day["timezone"] == "Asia/Kuwait", day
 
 
+def test_the_freshness_windows_travel_with_the_read(client):
+    """"Read just now" is a claim about this snapshot's age; the window belongs on the wire.
+
+    The console does not poll, so the only freshness it can report is how long ago its one read
+    landed - and the word it prints is a verdict against a boundary. A console that kept its own
+    copy could keep calling a figure current for as long as its own number said, whatever this
+    deployment meant by *current*. So the two windows ride with the read they describe, exactly
+    as ``dormant_days`` rides with the dormant count: the definition is one fact, owned once.
+    """
+    body = payload(client)
+    assert set(body["freshness"]) == {"aging_seconds", "stale_seconds"}, body["freshness"]
+    assert body["freshness"]["aging_seconds"] == dashboard.FRESHNESS_AGING_SECONDS
+    assert body["freshness"]["stale_seconds"] == dashboard.FRESHNESS_STALE_SECONDS
+    # A window that does not move is not a window: aging has to end before stale begins, or the
+    # console's middle word is unreachable and every read past the first boundary reads stale.
+    assert (
+        body["freshness"]["aging_seconds"] < body["freshness"]["stale_seconds"]
+    ), body["freshness"]
+
+
 # ---------------------------------------------------------------------------
 # 2. the queues agree with the screens that list them
 # ---------------------------------------------------------------------------
@@ -1609,9 +1629,10 @@ def test_the_panel_names_are_the_ones_the_console_draws(client):
     """The payload's shape, pinned: the console draws a panel per name here."""
     body = payload(client)
     assert set(body) == {
-        "status", "as_of", "day", "people", "places", "now", "waiting", "period"
+        "status", "as_of", "freshness", "day", "people", "places", "now", "waiting", "period"
     }, sorted(body)
     assert body["status"] == "success"
+    assert set(body["freshness"]) == {"aging_seconds", "stale_seconds"}, body["freshness"]
     assert set(body["people"]) == {
         "accounts", "active", "pending_approval", "deactivated", "by_role", "enrolled",
         "no_face", "no_password", "new_this_week", "never_clocked_in", "onboarding",

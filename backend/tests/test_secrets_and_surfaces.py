@@ -108,6 +108,7 @@ def test_spa_entry_point_still_serves(client):
     [
         "style.css",
         "i18n.js",
+        "admin_i18n.js",
         "frontendjavascript.js",
         "offline_queue.js",
         "worker_modules.js",

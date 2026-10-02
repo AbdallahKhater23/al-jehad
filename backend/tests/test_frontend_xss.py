@@ -260,7 +260,16 @@ INLINE_HANDLER_BUDGET = {
     # that region is the manual-password box's ``oninput`` - which the suite asserts by name
     # (``test_a_password_for_a_note_can_be_typed_or_generated``) because the box has to record
     # every keystroke without a repaint that would wipe the reply beside it.
-    "admin_modules.js": 49,
+    # 35 since the Live Ops board's own controls joined the one delegated listener it was
+    # already using: the sort select and its two column headers left ``onchange``/``onclick``
+    # for ``data-`` hooks through ``onLiveOpsChange``/``onLiveOpsClick``, the refresh, the
+    # clear-filters button, the force-in CTA, the force-out button and the error block's retry
+    # followed, the search box moved from ``oninput`` to the same listener, and the force-in
+    # disclosure's ``ontoggle`` became a capture listener on the pane. The force-out button is
+    # the one worth naming: it carried a worker's *id, name and clock-in* inside an attribute,
+    # and they now ride as ``data-`` values read back by the listener, where a quote in a name
+    # cannot end a string and start a script.
+    "admin_modules.js": 35,
     "frontendjavascript.js": 19,
     "worker_modules.js": 10,
 }

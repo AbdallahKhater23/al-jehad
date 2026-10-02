@@ -175,19 +175,48 @@ function textOf(markup) {
     return markup.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-/** Every application card, in the order the screen drew them. */
-function cardsOf(markup) {
-    const cards = markup.match(/<article class="ui-card[^"]*" data-registration="[^"]*"[\s\S]*?<\/article>/g) || [];
-    return cards.map((card) => ({
-        id: (/data-registration="([^"]*)"/.exec(card) || [])[1],
-        waiting: /class="ui-badge[^"]*"/.test(card),
-        danger: card.indexOf('is-danger') >= 0,
-        photo: /data-registration-photo="([^"]*)"/.exec(card) ? true : false,
-        approve: /data-registration-approve="([^"]*)"/.exec(card) ? true : false,
-        reject: /data-registration-reject="([^"]*)"/.exec(card) ? true : false,
-        note: /id="registrationNote-[^"]*"/.test(card),
-        text: textOf(card)
+/**
+ * Every application row, in the order the screen drew them.
+ *
+ * The queue is a list now, so a row is an ``<li>`` holding one button - and what a row *carries* is
+ * deliberately small: who is asking, and how long they have waited. The facts, the face, the note
+ * and the two answers belong to the one row that is open (``reviewOf``).
+ */
+function rowsOf(markup) {
+    const rows = markup.match(/<li class="registrations-item[^"]*" data-registration="[^"]*"[\s\S]*?<\/li>/g) || [];
+    return rows.map((row) => ({
+        id: (/data-registration="([^"]*)"/.exec(row) || [])[1],
+        open: row.indexOf('is-open') >= 0,
+        expanded: /aria-expanded="true"/.test(row),
+        // The row is the button, and it carries the destination it opens.
+        opens: (/data-registration-open="([^"]*)"/.exec(row) || [])[1] ?? null,
+        face: /class="ops-avatar"/.test(row),
+        text: textOf(row)
     }));
+}
+
+/**
+ * The one application open for a decision, or ``null`` when the queue is alone on the screen.
+ *
+ * This is what replaced the per-card form: the face, the facts, the note and the two answers exist
+ * for exactly one applicant at a time, which is the whole difference between a queue somebody works
+ * and a wall of open forms.
+ */
+function reviewOf(markup) {
+    const found = /<article class="ui-card registrations-review[^"]*"[\s\S]*?<\/article>/.exec(markup);
+    if (!found) return null;
+    const review = found[0];
+    return {
+        id: (/data-registration-review="([^"]*)"/.exec(review) || [])[1] ?? null,
+        note: /id="registrationNote-[^"]*"/.test(review),
+        approve: /data-registration-approve="([^"]*)"/.exec(review) ? true : false,
+        reject: /data-registration-reject="([^"]*)"/.exec(review) ? true : false,
+        photo: /data-registration-photo="([^"]*)"/.exec(review) ? true : false,
+        back: /data-registration-close=/.test(review),
+        waiting: /class="ui-badge[^"]*"/.test(review),
+        danger: review.indexOf('is-danger') >= 0,
+        text: textOf(review)
+    };
 }
 
 function toasts(env) {
@@ -261,7 +290,12 @@ const results = {};
         page_flag: markup.indexOf('data-registrations="true"') >= 0,
         count: (/data-registrations-count="(\d+)"/.exec(markup) || [])[1],
         count_text: textOf((/<p class="ui-section-note" data-registrations-count="\d+">([\s\S]*?)<\/p>/.exec(markup) || [])[0] || ''),
-        cards: cardsOf(markup),
+        rows: rowsOf(markup),
+        // Nothing is open on arrival: the queue is the screen, and the face and the form are one
+        // tap away rather than six of them stacked. This is the whole redesign in two readings.
+        review: reviewOf(markup),
+        notes: (markup.match(/id="registrationNote-/g) || []).length,
+        answers: (markup.match(/data-registration-approve=/g) || []).length,
         reads: reads.slice(),
         closed_note: markup.indexOf('data-registrations-closed') >= 0,
         // The name an applicant typed is text, not markup - the second one is an <img> tag.
@@ -269,6 +303,45 @@ const results = {};
         raw_markup_injected: markup.indexOf('<img src=x onerror=alert(1)>') >= 0,
         bare_photo_url: /<img[^>]*src="[^"]*\/admin\/registrations/.test(markup),
         inline_handler: /onclick="[^"]*handleRegistration/.test(markup)
+    };
+}
+
+// 2b. opening one: the face, the facts, the note and the two answers, for that one
+{
+    const env = consoleEnv();
+    await env.evaluate("UI.renderAdminTab('Registrations')");
+    const readsBefore = reads.length;
+    await env.evaluate("UI_MODULES.openRegistration('8')");
+    const markup = render(env);
+    const rows = rowsOf(markup);
+    const photoCalls = env.requests.filter((r) => /\/registrations\/8\/photo$/.test(r.url));
+    results.open = {
+        review: reviewOf(markup),
+        rows: rows,
+        row_count: rows.length,
+        open_rows: rows.filter((row) => row.open).length,
+        // One note field and one pair of answers on the whole screen - this is the number the
+        // redesign exists to move.
+        notes: (markup.match(/id="registrationNote-/g) || []).length,
+        answers: (markup.match(/data-registration-approve=/g) || []).length,
+        // The face is fetched by the act of opening, with this session's credential, exactly once.
+        photo_calls: photoCalls.length,
+        photo_authorized: photoCalls.length ? photoCalls[0].headers.Authorization : null,
+        // ...and opening is not a read: the queue was already in memory.
+        queue_reads: reads.length - readsBefore,
+        // The second applicant's name is markup, so the escaping has to survive the move into a
+        // *row* as well as into the review.
+        escaped: markup.indexOf('&lt;img src=x onerror=alert(1)&gt;') >= 0,
+        raw_markup_injected: markup.indexOf('<img src=x onerror=alert(1)>') >= 0
+    };
+    // Closing it puts the queue back on its own, and costs no request either.
+    await env.evaluate("UI_MODULES.closeRegistration()");
+    const closed = render(env);
+    results.open_again = {
+        review: reviewOf(closed),
+        rows: rowsOf(closed).length,
+        open_rows: rowsOf(closed).filter((row) => row.open).length,
+        reads: reads.length - readsBefore
     };
 }
 
@@ -286,7 +359,7 @@ const results = {};
     const markup = render(env);
     results.empty = {
         flag: markup.indexOf('data-registrations-empty="true"') >= 0,
-        cards: cardsOf(markup).length,
+        rows: rowsOf(markup).length,
         text: textOf(markup),
         closed: env.evaluate("I18n.__('registrationsClosed')"),
         shows_closed: markup.indexOf('data-registrations-closed="true"') >= 0
@@ -297,6 +370,7 @@ const results = {};
 {
     const env = consoleEnv();
     await env.evaluate("UI.renderAdminTab('Registrations')");
+    await env.evaluate("UI_MODULES.openRegistration('7')");
     await env.evaluate("UI_MODULES.showRegistrationPhoto('7')");
     const fetched = env.requests.filter((r) => /\/admin\/registrations\/7\/photo$/.test(r.url))[0];
     results.photo = {
@@ -313,6 +387,7 @@ const results = {};
     const env = consoleEnv();
     photoMissing = true;
     await env.evaluate("UI.renderAdminTab('Registrations')");
+    await env.evaluate("UI_MODULES.openRegistration('7')");
     await env.evaluate("UI_MODULES.showRegistrationPhoto('7')");
     results.photo_gone = {
         toast: toasts(env).join(' | '),
@@ -326,6 +401,7 @@ const results = {};
 {
     const env = consoleEnv();
     await env.evaluate("UI.renderAdminTab('Registrations')");
+    await env.evaluate("UI_MODULES.openRegistration('7')");
     env.evaluate("document.getElementById('registrationNote-7').value = 'Hired for the B site'");
     await env.evaluate("UI_MODULES.handleRegistration('7', 'approve')");
     const markup = render(env);
@@ -352,6 +428,7 @@ const results = {};
     const env = consoleEnv();
     approveContact = { email: '', phone: '' };
     await env.evaluate("UI.renderAdminTab('Registrations')");
+    await env.evaluate("UI_MODULES.openRegistration('7')");
     await env.evaluate("UI_MODULES.handleRegistration('7', 'approve')");
     const markup = render(env);
     results.no_contact = {
@@ -366,6 +443,7 @@ const results = {};
     const env = consoleEnv();
     approveWritesTemplate = false;
     await env.evaluate("UI.renderAdminTab('Registrations')");
+    await env.evaluate("UI_MODULES.openRegistration('7')");
     await env.evaluate("UI_MODULES.handleRegistration('7', 'approve')");
     const markup = render(env);
     results.no_template = {
@@ -381,6 +459,7 @@ const results = {};
 {
     const env = consoleEnv();
     await env.evaluate("UI.renderAdminTab('Registrations')");
+    await env.evaluate("UI_MODULES.openRegistration('8')");
     await env.evaluate("UI_MODULES.handleRegistration('8', 'reject')");
     const blocked = {
         posted: decisions.length,
@@ -402,6 +481,7 @@ const results = {};
 {
     const env = consoleEnv();
     await env.evaluate("UI.renderAdminTab('Registrations')");
+    await env.evaluate("UI_MODULES.openRegistration('7')");
     const before = reads.length;
     decisionFails = 409;
     env.evaluate("document.getElementById('registrationNote-7').value = 'Hired'");
@@ -411,6 +491,43 @@ const results = {};
         reads_after: reads.length,
         toast: toasts(env).join(' | ')
     };
+}
+
+// 9b. the two answers go down while a decision is in flight
+{
+    const env = consoleEnv();
+    await env.evaluate("UI.renderAdminTab('Registrations')");
+    await env.evaluate("UI_MODULES.openRegistration('7')");
+    // The decision is started but *not* awaited, so the synchronous disable its body performs
+    // before its first await is observable; the same evaluate then awaits it, so the harness is
+    // left settled for the next scenario.
+    results.in_flight = await env.evaluate(`(async () => {
+        const approve = () => document.getElementById('registrationApprove-7');
+        const reject = () => document.getElementById('registrationReject-7');
+        const read = () => [!!approve().disabled, !!reject().disabled];
+        const before = read();
+        const pending = UI_MODULES.handleRegistration('7', 'approve');
+        const during = read();
+        await pending;
+        return { before: before, during: during };
+    })()`);
+}
+
+// 9c. a decision that fails lifts the answers again rather than leaving them dead
+{
+    const env = consoleEnv();
+    decisionFails = 500;
+    await env.evaluate("UI.renderAdminTab('Registrations')");
+    await env.evaluate("UI_MODULES.openRegistration('7')");
+    results.in_flight_failure = await env.evaluate(`(async () => {
+        const approve = () => document.getElementById('registrationApprove-7');
+        const reject = () => document.getElementById('registrationReject-7');
+        const read = () => [!!approve().disabled, !!reject().disabled];
+        const pending = UI_MODULES.handleRegistration('7', 'approve');
+        const during = read();
+        await pending;
+        return { during: during, after: read() };
+    })()`);
 }
 
 // 10. the waiting count reaches the tab's badge
@@ -434,6 +551,7 @@ const results = {};
     const env = consoleEnv();
     rejectDestroysPhoto = false;
     await env.evaluate("UI.renderAdminTab('Registrations')");
+    await env.evaluate("UI_MODULES.openRegistration('8')");
     env.evaluate("document.getElementById('registrationNote-8').value = 'Not this trade'");
     await env.evaluate("UI_MODULES.handleRegistration('8', 'reject')");
     const markup = render(env);
@@ -456,7 +574,7 @@ const results = {};
         error: markup.indexOf('class="ui-error"') >= 0,
         message: textOf(markup),
         retry: markup.indexOf("UI.renderAdminTab('Registrations')") >= 0,
-        cards: cardsOf(markup).length
+        rows: rowsOf(markup).length
     };
 }
 
@@ -490,19 +608,23 @@ const results = {};
     // answered rather than what it asked for.
     await env.evaluate("UI_MODULES.toggleRegistrationsIntake('close')");
     const closedMarkup = render(env);
-    // The card, cut at the sentence that closes it rather than at the first closing tag: the
-    // card is nested (a spread, a row of two facts), so a ``</div>``-terminated match stops
-    // before the reason line - which is the half this is about.
-    const cardText = (markup) => textOf((/<div class="ui-card" data-registrations-intake="[^"]*"[\s\S]*?<\/p>/.exec(markup) || [])[0] || '');
+    // The card, and separately the reason line inside it: the reason is drawn only when the link
+    // is *shut* - an open link needs no explaining - so a read that needed the card to end at a
+    // ``</p>`` would be reading the wrong half of the screen in one of the two states.
+    const cardText = (markup) => textOf((/<div class="ui-card[^"]*" data-registrations-intake="[^"]*"[\s\S]*?<\/div>/.exec(markup) || [])[0] || '');
+    const whyText = (markup) => textOf((/<p class="ui-note" data-registrations-intake-why>([\s\S]*?)<\/p>/.exec(markup) || [])[0] || '');
     results.intake = {
         open_state: (/data-registrations-intake-state="([^"]*)"/.exec(openMarkup) || [])[1],
         open_card: (/data-registrations-intake="([^"]*)"/.exec(openMarkup) || [])[1],
         open_action: (/data-registration-intake="([^"]*)"/.exec(openMarkup) || [])[1],
         open_text: cardText(openMarkup),
+        open_why: whyText(openMarkup),
+        accepting_sentence: env.evaluate("I18n.__('registrationsIntakeAccepting')"),
         open_sentence: env.evaluate("I18n.__('registrationsIntakeWhyOpen')"),
         closed_state: (/data-registrations-intake-state="([^"]*)"/.exec(closedMarkup) || [])[1],
         closed_action: (/data-registration-intake="([^"]*)"/.exec(closedMarkup) || [])[1],
         closed_text: cardText(closedMarkup),
+        closed_why: whyText(closedMarkup),
         closed_sentence: env.evaluate("I18n.__('registrationsIntakeWhyClosedByConsole')"),
         posts: intakePosts.slice(),
         toast: toasts(env).join(' | ')
@@ -522,7 +644,7 @@ const results = {};
         state: (/data-registrations-intake-state="([^"]*)"/.exec(closing) || [])[1],
         // ``data-registration-intake`` is the button; ``data-registrations-intake`` is the card.
         lever: (/data-registration-intake="([^"]*)"/.exec(closing) || [])[1],
-        text: textOf((/<div class="ui-card" data-registrations-intake="[^"]*"[\s\S]*?<\/p>/.exec(closing) || [])[0] || ''),
+        text: textOf((/<p class="ui-note" data-registrations-intake-why>([\s\S]*?)<\/p>/.exec(closing) || [])[0] || ''),
         sentence: env.evaluate("I18n.__('registrationsIntakeWhyClosedByDefault')"),
         posts: intakePosts.slice(),
         opened_state: (/data-registrations-intake-state="([^"]*)"/.exec(opened) || [])[1],
@@ -541,7 +663,7 @@ const results = {};
         lever: markup.indexOf('data-registration-intake=') >= 0,
         // The queue's own closed note is drawn from the queue read, so the screen still says
         // whether the link is accepting - there is just no control on it.
-        queue_drawn: cardsOf(markup).length
+        queue_drawn: rowsOf(markup).length
     };
 }
 """
@@ -582,24 +704,77 @@ def test_the_queue_is_read_pending_and_drawn_in_the_order_it_arrived(results):
         "own constant - the endpoint answers 400 for anything it does not know"
     )
     assert not queue["closed_note"], "intake is open in this answer"
-    # Oldest first, straight from the server: the card order is the response order.
-    assert [card["id"] for card in queue["cards"]] == ["7", "8"]
+    # Oldest first, straight from the server: the row order is the response order.
+    assert [row["id"] for row in queue["rows"]] == ["7", "8"]
     assert queue["count"] == "2"
     assert "2 waiting on a decision" in queue["count_text"]
 
 
-def test_every_card_carries_the_applicant_the_waiting_and_the_two_answers(results):
-    cards = {card["id"]: card for card in results["queue"]["cards"]}
-    first = cards["7"]
-    assert first["waiting"] is True, "an application waiting on a person says how long"
-    assert first["photo"] and first["approve"] and first["reject"] and first["note"]
+def test_the_queue_is_a_list_of_rows_and_none_of_them_is_a_form(results):
+    """The redesign, stated as the two numbers that changed.
+
+    Six applications used to be six open forms: a facts grid, a photograph box, a note field and two
+    answers each, which is nineteen buttons and nearly four thousand pixels before anything has been
+    decided. A row carries who is asking and how long they have waited, the whole row is the button,
+    and nothing on the screen is a form until somebody opens one.
+    """
+    queue = results["queue"]
+    rows = {row["id"]: row for row in queue["rows"]}
+    assert len(rows) == 2, queue["rows"]
+    first = rows["7"]
+    assert first["face"] is True, "a row draws the initials it has instead of the face it has not fetched"
+    assert first["opens"] == "7", "the row is the control that opens its own review"
+    assert first["open"] is False and first["expanded"] is False, (
+        "nothing is open on arrival: the queue is the screen"
+    )
     assert "Nadia Saleh" in first["text"]
     assert "Worker" in first["text"], "the requested role is shown as words, not as a code"
     assert "#7" in first["text"], "the request's own number, which the decision is filed under"
-    assert "Formwork, six years on tower sites." in first["text"]
-    assert "+965 555 0101" in first["text"]
-    # A contact line with no phone falls back to what is there rather than to an empty row.
-    assert "omar@example.com" in cards["8"]["text"]
+    assert "Waiting" in first["text"], "an application waiting on a person says how long"
+    # A day or more is said in days: "162h 11m" is a figure a reader has to divide first.
+    assert "d " in first["text"] or "d" in first["text"], first["text"]
+    assert queue["review"] is None, "a review was drawn for an application nobody opened"
+    assert queue["notes"] == 0, "the queue drew a note field before anybody had opened an application"
+    assert queue["answers"] == 0, "the queue drew the two answers before anybody had opened one"
+
+
+def test_opening_an_application_draws_the_face_the_details_the_note_and_the_two_answers(results):
+    """One applicant at a time, and the whole of them: the face, what they said, the decision."""
+    opened = results["open"]
+    review = opened["review"]
+    assert review is not None, "opening an application drew no review"
+    assert review["id"] == "8", review
+    assert review["photo"] and review["approve"] and review["reject"] and review["note"]
+    assert review["back"] is True, "the way back to the queue is missing"
+    assert review["waiting"] is True
+    # The second applicant's own name is markup, so the review head is the first place the escaping
+    # has to hold on this reading: the tag is text, not an element.
+    assert "&lt;img src=x onerror=alert(1)&gt;Omar" in review["text"], review["text"]
+    assert "Moallem" in review["text"]
+    assert "#8" in review["text"]
+    assert "omar@example.com" in review["text"], "a contact with no phone falls back to what is there"
+
+    # One row is open and the queue behind it is whole - it is a split, not a page swap.
+    assert opened["row_count"] == 2, opened["rows"]
+    assert opened["open_rows"] == 1, opened["rows"]
+    assert opened["notes"] == 1, "a second note field was drawn"
+    assert opened["answers"] == 1, "a second set of answers was drawn"
+
+    # The face is fetched by the act of opening, once, with this session's own credential.
+    assert opened["photo_calls"] == 1, "the face was not fetched exactly once on opening"
+    assert opened["photo_authorized"] == "Bearer tok-admin"
+    # ...and opening is not a read: the queue was already in memory.
+    assert opened["queue_reads"] == 0, "opening an application asked the server again"
+
+    # Markup a public form accepted is text in a row as much as in the review.
+    assert opened["escaped"] is True
+    assert opened["raw_markup_injected"] is False
+
+    # Closing it puts the queue back on its own, at no cost.
+    assert results["open_again"]["review"] is None, results["open_again"]
+    assert results["open_again"]["rows"] == 2
+    assert results["open_again"]["open_rows"] == 0
+    assert results["open_again"]["reads"] == 0, "closing the review asked the server again"
 
 
 def test_what_an_applicant_typed_is_text_and_the_photo_is_not_a_url(results):
@@ -736,6 +911,30 @@ def test_a_decision_somebody_else_made_re_reads_the_queue(results):
     assert "Another administrator reviewed this request first." in conflict["toast"]
 
 
+def test_the_two_answers_go_down_while_a_decision_is_in_flight(results):
+    """A second tap on an unanswered decision is a second account or a second refusal.
+
+    The answers live on the review *pane* now, not on the queue row, so this also pins the
+    disable to where the buttons are: scoping it to the row - the layout before the queue became
+    a list - finds no answer buttons and disables nothing.
+    """
+    flight = results["in_flight"]
+    assert flight["before"] == [False, False], flight
+    assert flight["during"] == [True, True], (
+        "the answers stayed tappable while the decision was in flight: " + repr(flight)
+    )
+
+
+def test_a_decision_that_fails_lifts_the_answers_again(results):
+    """A button left disabled by a failed decision is an application nobody can decide."""
+    failed = results["in_flight_failure"]
+    assert failed["during"] == [True, True], failed
+    assert failed["after"] == [False, False], (
+        "a failed decision left its buttons disabled, so the application could not be decided "
+        "at all: " + repr(failed)
+    )
+
+
 def test_the_waiting_count_reaches_the_tab_badge(results):
     badge = results["badge"]
     painted = badge["painted"]
@@ -759,13 +958,13 @@ def test_a_failed_read_is_stated_with_the_control_that_fixes_it(results):
         f"the server's own reason is the point of the error line: {failure['message']}"
     )
     assert failure["retry"] is True, "the error offers no way to try again"
-    assert failure["cards"] == 0, "a failed read drew rows from nothing"
+    assert failure["rows"] == 0, "a failed read drew rows from nothing"
 
 
 def test_an_empty_queue_says_what_empty_means(results):
     empty = results["empty"]
     assert empty["flag"] is True
-    assert empty["cards"] == 0
+    assert empty["rows"] == 0
     assert empty["text"].strip(), "the empty state says nothing at all"
     # A closed intake is still a queue with work in it some days, so it is a note on the
     # screen rather than a reason to draw nothing.
@@ -835,8 +1034,15 @@ def test_the_intake_switch_is_drawn_with_its_state_and_one_action(results):
         "an open link offers to close, and the attribute names the direction rather than the "
         "current position - a handler that read a position would send the opposite of the tap"
     )
-    assert intake["open_sentence"] in intake["open_text"], (
-        f"a state with no reason beside it is one an operator cannot act on: {intake['open_text']!r}"
+    # The state is drawn, and it is drawn *without* the reason: an open link needs no explaining,
+    # and the sentence that used to sit under it was four lines before the first applicant on a
+    # phone. The reason is for the states where something has to be done about it (see below).
+    assert intake["open_sentence"] not in intake["open_text"], (
+        f"an open link is still explaining itself: {intake['open_text']!r}"
+    )
+    assert intake["open_why"] == "", "a reason was drawn on an open link"
+    assert intake["accepting_sentence"] in intake["open_text"], (
+        f"the state itself is not on the card: {intake['open_text']!r}"
     )
 
 
@@ -857,7 +1063,9 @@ def test_closing_the_link_posts_the_switch_and_draws_what_came_back(results):
         "the link shut but the screen still says otherwise"
     )
     assert intake["closed_action"] == "open", "a closed link offers no way back"
-    assert intake["closed_sentence"] in intake["closed_text"], intake["closed_text"]
+    # The reason *is* drawn here, because the link is shut and the two ways it can be shut are a
+    # different afternoon's work each.
+    assert intake["closed_sentence"] in intake["closed_why"], intake["closed_why"]
 
 
 def test_a_deployment_that_ships_closed_is_a_link_the_console_can_open(results):

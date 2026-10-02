@@ -77,6 +77,30 @@ def test_every_seeded_account_is_the_one_the_tests_name(app_module):
         )
 
 
+def test_reseeding_reuses_the_password_hashes_instead_of_recomputing_them(app_module):
+    """The fixture's own hashes are computed once per process, not once per test.
+
+    ``pwd_context.hash`` is twelve rounds of bcrypt on purpose, and this suite reseeds its five
+    accounts before every test: recomputing them is the largest fixed cost in a run, spent
+    rewriting a hash nothing reads. A bcrypt hash is salted, so a *recomputation* yields a
+    different string - asserting the stored hash is byte-identical across two seeds is therefore
+    asserting the reuse, and verifying it still answers to the documented password is asserting
+    the reuse did not cost correctness.
+    """
+    columns = "SELECT password_hash FROM users WHERE id = ?"
+    before = {user_id: db_scalar(columns, (user_id,)) for user_id in SEED_USERS}
+    harness.seed_database(app_module)
+    after = {user_id: db_scalar(columns, (user_id,)) for user_id in SEED_USERS}
+    assert after == before, (
+        "a reseed recomputed the password hashes: the harness is paying bcrypt's cost once per "
+        "test for rows whose credentials did not change"
+    )
+    for user_id, (_, _, password, _) in SEED_USERS.items():
+        assert app_module.pwd_context.verify(password, after[user_id]), (
+            f"{user_id} no longer signs in with the password SEED_USERS names"
+        )
+
+
 def test_the_stored_biometric_id_survives_the_reseed(app_module):
     """``INSERT OR REPLACE`` deletes and re-inserts, so unnamed columns fall back to defaults.
 

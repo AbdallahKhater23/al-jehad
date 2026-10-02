@@ -739,10 +739,11 @@ def security_headers(
     return headers
 
 
-#: Statuses that carry no body at all. A ``304`` is the one that matters: the frontend is
-#: served ``Cache-Control: no-cache, must-revalidate`` on purpose (see ``revalidate_frontend_assets``
-#: in ``main.py``), so from the second load of a page onwards the browser revalidates and the
-#: server answers ``304 Not Modified``.
+#: Statuses that carry no body at all. A ``304`` is the one that matters: the entry documents
+#: and any asset requested without a matching ``?v=`` are served ``Cache-Control: no-cache,
+#: must-revalidate`` on purpose (see ``cache_policy`` in ``main.py``), so from the second load of
+#: a page onwards the browser revalidates and the server answers ``304 Not Modified``. A
+#: content-addressed asset is answered ``immutable`` instead, so it does not revalidate at all.
 _BODILESS_STATUSES = frozenset({204, 205, 304})
 
 

@@ -538,8 +538,19 @@ const WORKER_MODULES = {
         // drawn disabled rather than the tap being answered with a refusal nobody can act on:
         // there is nothing the worker can do differently, and nothing they did wrong.
         const pendingApproval = status.approvalStatus === 'pending_approval';
-        const action = status.nextAction || (active ? 'Clock Out' : 'Clock In');
-        const actionKey = action === 'Clock Out' ? 'clockOut' : 'clockIn';
+        // On the road the meaningful next step is the arrival, not the clock-out: an
+        // off-site Clock Out is refused until a site has authorised the shift, so a button
+        // offering it invites a tap that cannot succeed. The arrival is what turns the "In
+        // Transit" placeholder into the site the worker actually reached - so while the flag
+        // is set it is the primary action, whatever ``nextAction`` says (the offline queue
+        // knows only Clock In and Clock Out, and would otherwise keep offering the clock-out).
+        const inTransit = !!(active && active.in_transit);
+        const action = inTransit
+            ? 'Transit Checkpoint'
+            : (status.nextAction || (active ? 'Clock Out' : 'Clock In'));
+        const actionKey = action === 'Transit Checkpoint'
+            ? 'transitArrive'
+            : (action === 'Clock Out' ? 'clockOut' : 'clockIn');
         // Only a known clock-in time can be counted from; an offline cache without
         // one still shows the shift, just without a timer and without a false alarm.
         const clockInTime = active && active.clock_in_time ? active.clock_in_time : null;

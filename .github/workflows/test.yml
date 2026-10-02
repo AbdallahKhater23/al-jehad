@@ -1,0 +1,171 @@
+# The quality gate: the fast half of the backend suite, on every push and pull request.
+#
+# WHY THIS EXISTS
+# ---------------
+# The repository had exactly one workflow (``punch-memory.yml``) and it answers a memory
+# question, not a correctness one: it runs two selected test nodes and a saturation tool, and
+# its heavier jobs need a docker daemon and several minutes. Nothing ran the suite itself on a
+# push, so a regression that a test already pins could merge green. This file is that missing
+# gate.
+#
+# WHAT IT RUNS, AND WHAT IT DELIBERATELY DOES NOT
+# -----------------------------------------------
+# It runs the whole suite *except* the suites that are slow for a reason unrelated to the logic
+# under test - the ones that need a real browser, a face model, a wall clock, or a load. Those
+# are excluded so the gate is a couple of minutes rather than half an hour; they still run
+# locally and on the hand-dispatched jobs that already exist, and the exclusions are named and
+# commented below rather than hidden behind a selector.
+#
+# The suite clones the live ``times.db`` for its schema and refuses to start without one (an
+# empty file is enough); it is gitignored, so ``touch times.db`` makes it. That is the same
+# step ``punch-memory.yml`` takes.
+#
+# RUNNING IT LOCALLY
+# ------------------
+# The workflow is plain shell, so it can be reproduced without GitHub. From the repository root:
+#
+#     python -m venv backend/venv
+#     backend/venv/Scripts/python.exe -m pip install -r requirements.txt -r backend/requirements-dev.txt   # Windows
+#     backend/venv/bin/python        -m pip install -r requirements.txt -r backend/requirements-dev.txt   # Linux/macOS
+#     touch times.db
+#     cd backend && python -m pytest tests -q -n auto \
+#         --ignore=tests/test_browser_event_loop.py ...        # the same ignore list as the step below
+#
+# ``-n auto`` (pytest-xdist, a dev dependency) is what turns ~30 minutes serial into ~2 minutes.
+# Drop it for the same run in one process, or point it at a node to debug one failure.
+#
+# With `act` (https://github.com/nektos/act) the job itself can be run offline. It needs Docker,
+# and the image is large on first use:
+#
+#     act -j unit-tests                # the push path, exactly as CI runs it
+#     act -j unit-tests -n             # dry run: print the steps, execute nothing
+#     act pull_request -j unit-tests   # the pull-request event shape
+#
+# `act` runs the steps in a Linux container, so use the Linux command above if you are on
+# Windows and want the same shape by hand.
+
+name: Backend tests
+
+on:
+  push:
+    branches: ["main", "main-rollback"]
+  pull_request:
+    branches: ["main", "main-rollback"]
+  workflow_dispatch:
+
+# One run per ref, newest wins: a push that supersedes its own earlier push should not queue
+# behind it.
+concurrency:
+  group: backend-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    name: Fast unit tests
+    runs-on: ubuntu-latest
+    # Generous against a healthy ~2 minutes, tight enough that a hang (a deadlocked thread, a
+    # test waiting on a socket that never answers) is a failure rather than a job that sits
+    # until the 6-hour default.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # The project's Python version, asserted in three places: ``.python-version`` (3.12),
+      # ``Dockerfile`` (``python:3.12-slim``) and ``punch-memory.yml``. Pinned here rather than
+      # read from ``.python-version`` so a bump to the deployment is a deliberate edit with the
+      # deployment, not a silent CI-only change.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            backend/requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r backend/requirements-dev.txt
+
+      # The suite clones the live database for its schema before it will run: an empty file is
+      # enough, a missing one is a hard error at import (tests/harness.py). It is gitignored,
+      # so the checkout does not have it.
+      - name: Give the suite its empty database
+        run: touch times.db
+
+      # The exclusions, grouped by why. Each name is the whole file, so a new test inside one of
+      # these suites is picked up automatically; a *new* slow suite is a deliberate edit here.
+      #
+      #   * a real browser - Playwright drives a Chromium this runner does not install, and each
+      #     one boots a live server. They skip without the browser, but only after the setup.
+      #   * a face model - the ONNX files are gitignored, so these build detectors, load
+      #     embeddings, and sweep corpora this checkout does not ship; most issue a skip, slowly.
+      #   * a wall clock - real sleeps and background threads that wait for a tick to pass.
+      #   * a load - the capacity and punch-saturation gates measure memory, which is what
+      #     ``punch-memory.yml`` is for and why it is not here.
+      #
+      # ``backend/test_load.py`` and ``backend/test_login.py`` are deliberately absent for the
+      # same reason: they talk to a live server and ``pytest.ini`` keeps collection inside tests/.
+      - name: The fast half of the suite
+        working-directory: backend
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          # Without pipefail, ``tee`` would return 0 and the step would go green on a red run.
+          # The job fails the moment pytest exits non-zero; nothing after this step runs.
+          set -o pipefail
+          python -m pytest tests -q -n auto \
+            --ignore=tests/test_browser_event_loop.py \
+            --ignore=tests/test_pages_boot_in_a_browser.py \
+            --ignore=tests/test_pending_review_evidence_in_a_browser.py \
+            --ignore=tests/test_registrations_queue_in_a_browser.py \
+            --ignore=tests/test_signed_in_sessions_in_a_browser.py \
+            --ignore=tests/test_face_detector.py \
+            --ignore=tests/test_face_engine.py \
+            --ignore=tests/test_face_frame_chain.py \
+            --ignore=tests/test_face_process.py \
+            --ignore=tests/test_detector_640_geometry.py \
+            --ignore=tests/test_detector_resolution_ab.py \
+            --ignore=tests/test_scrfd_head_layouts.py \
+            --ignore=tests/test_subject_counting.py \
+            --ignore=tests/test_one_vcpu_profile.py \
+            --ignore=tests/test_calibration_corpus.py \
+            --ignore=tests/test_calibration_corpus_readiness.py \
+            --ignore=tests/test_corpus_capture_window.py \
+            --ignore=tests/test_corpus_cli.py \
+            --ignore=tests/test_corpus_ingest.py \
+            --ignore=tests/test_corpus_layout_and_enrolment.py \
+            --ignore=tests/test_corpus_worker_consent.py \
+            --ignore=tests/test_coverage_sweep.py \
+            --ignore=tests/test_standing_coverage_report.py \
+            --ignore=tests/test_retention.py \
+            --ignore=tests/test_undelivered_notice_alerts.py \
+            --ignore=tests/test_capacity_gates.py \
+            --ignore=tests/test_punch_saturation_gates.py \
+            2>&1 | tee pytest-fast.log
+
+      # The verdict and the failing lines, on the run page, so a reader does not have to open the
+      # raw log to know what broke. ``always()`` so it also runs on the red run it exists for.
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "### Backend tests"
+            echo
+            if [ -f backend/pytest-fast.log ]; then
+              tail -n 40 backend/pytest-fast.log
+            else
+              echo "the test step did not reach the suite (see the earlier steps)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-fast-log
+          path: backend/pytest-fast.log
+          if-no-files-found: warn
