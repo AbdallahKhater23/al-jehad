@@ -98,6 +98,7 @@ import sqlite3
 import threading
 from datetime import datetime, timedelta
 
+import audit
 import live_ops
 import migrations
 import notifications
@@ -178,17 +179,20 @@ def _overlay_stored_rules(values: dict, conn: sqlite3.Connection) -> None:
 
 
 def _audit_system(conn: sqlite3.Connection, *, action: str, entity_id: str, after: dict) -> None:
-    """Append a system-attributed event (no human actor) to the audit trail."""
-    try:
-        import json
+    """Append a system-attributed event (no human actor) to the audit trail.
 
-        conn.execute(
-            "INSERT INTO audit_log (actor_id, actor_role, action, entity, entity_id, after_json, created_at) "
-            "VALUES (NULL, 'system', ?, 'active_sessions', ?, ?, ?)",
-            (action, str(entity_id), json.dumps(after, default=str), datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-        )
-    except sqlite3.Error:
-        pass
+    ``active_sessions`` is the entity: these are the scanner's writes about a running shift,
+    and there is no person whose id could stand as the actor. Never raises.
+    """
+    audit.record(
+        conn,
+        action=action,
+        entity="active_sessions",
+        entity_id=entity_id,
+        after=after,
+        actor_role="system",
+        created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    )
 
 
 def announce_crossing(

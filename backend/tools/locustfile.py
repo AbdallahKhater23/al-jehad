@@ -154,6 +154,7 @@ problem is below your code (proxy, platform, network).
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import random
@@ -163,7 +164,16 @@ from datetime import date, timedelta
 
 import gevent
 from gevent.lock import BoundedSemaphore
-from locust import HttpUser, between, events, tag, task
+from locust import (
+    HttpUser,
+    SequentialTaskSet,
+    TaskSet,
+    between,
+    constant_pacing,
+    events,
+    tag,
+    task,
+)
 from locust.exception import StopUser
 
 log = logging.getLogger("locustfile")
@@ -1374,6 +1384,498 @@ class AdminUser(ApiUser):
 
 
 # --------------------------------------------------------------------------- #
+# The daily lifecycle: authenticate -> check in -> work -> check out
+# --------------------------------------------------------------------------- #
+# WHY A SECOND SHAPE, WHEN PunchUser ALREADY PUNCHES
+# --------------------------------------------------
+# ``PunchUser`` measures the *gate*: a staggered ramp of arrivals, one punch each, timed to a
+# slot so the spacing under test is the spacing that happens. What it does not model is a
+# person: one employee, one shift, in order, with the app reads their phone makes while they
+# are standing on site. That journey is this class - a ``SequentialTaskSet`` inside an
+# ``HttpUser`` - and it stops after one shift, the way `-u 20 -t 10m` above is meant to mean
+# 20 employees each living one shift.
+#
+# THE ENDPOINTS THE BRIEF NAMED, AND THE ONES THIS APP HAS
+# --------------------------------------------------------
+# A script written to the brief's paths verbatim would measure 404s: there is no
+# ``/api/v1/attendance/check-in``, no ``/attendance/status``, no ``/api/v1/notes`` and no
+# ``/api/v1/announcements`` in ``main.py`` or any router it mounts. The mapping is one for
+# one, and every field below was read out of the source rather than assumed:
+#
+#   brief                                  this app
+#   POST /api/v1/attendance/check-in       POST /api/v1/attendance/verify  action="Clock In"
+#   GET  /api/v1/attendance/status         GET  /api/v1/worker/me/stats
+#   POST /api/v1/notes                     POST /api/v1/worker/notes
+#   GET  /api/v1/announcements?limit=10    GET  /api/v1/worker/me/notifications?limit=10
+#   POST /api/v1/attendance/check-out      POST /api/v1/attendance/verify  action="Clock Out"
+#
+# The two differences that matter are not cosmetic. The punch is a **multipart upload with a
+# live selfie** - identity is part of the punch in this app, so a JSON body carrying
+# ``lat``/``lng``/``accuracy``/``device_id`` is a 422 on the only route that records
+# attendance; the fix travels in ``location_input`` as ``"lat,lon"``, the app's own form. And
+# a clock-out inside the paid day is answered with a **question** (409,
+# ``error_code=confirm_early_checkout``) that the phone repeats with ``confirm_early_checkout=1``
+# - both halves of that exchange are exercised here, because a compressed shift is always
+# short and a load test that only ever saw the refusal would never measure the close.
+#
+# WHAT IT NEEDS (and what it does without it)
+# -------------------------------------------
+# One roster account per virtual employee (``LOCUST_ROSTER``), each enrolled with the face its
+# ``selfie`` names - the same three requirements ``PunchUser`` has, for the same reasons (404
+# with no template, 422 on a mismatch, 403 outside every geofence). A ``token`` in the roster
+# entry skips the login entirely; otherwise each employee signs in for itself in ``on_start``.
+# Without a roster the class weighs zero and contributes nothing, so an existing run is
+# unchanged unless it is asked for:
+#
+#     LOCUST_ONLY=shift LOCUST_LIFECYCLE=1 \
+#       LOCUST_ROSTER=temp/loadtest/roster50.json LOCUST_SITE_FIX="30.05,31.23" \
+#       LOCUST_ALLOW_WRITES=1 \
+#       locust -f backend/tools/locustfile.py --headless \
+#           --host https://al-jehad-production.up.railway.app -u 20 -r 2 -t 10m \
+#           --csv temp/loadtest/shift --html temp/loadtest/shift.html --only-summary
+#
+# Two warnings that are not decoration. First, the login limiter is ``10/minute`` **per IP**
+# and a load test is one IP: raise ``LOGIN_RATE_LIMIT`` on the service for the run or start
+# from pre-minted tokens (``tools/mint_tokens.py``), exactly as the punch roster already does.
+# Second, a face match that lands in the review band writes a ``pending_review`` row, and an
+# unresolved review blocks that worker's clock-out - use photos that match their templates.
+
+#: ``LOCUST_ONLY=shift`` (or ``LOCUST_LIFECYCLE=1``) spawns the lifecycle class. Off by
+#: default so a run that was configured for the other classes keeps its mix and its numbers.
+LIFECYCLE_ON = _flag("LOCUST_LIFECYCLE") or "shift" in ONLY
+LIFECYCLE_WEIGHT = int(os.environ.get("LOCUST_LIFECYCLE_WEIGHT", "8") or 8)
+
+#: How many app reads a virtual employee makes between the two punches. A real shift holds a
+#: handful of these; the shift itself is compressed to seconds, so this is a handful of rounds
+#: rather than a handful of hours - enough to give the read paths a real share of the traffic.
+WORK_ROUNDS = (
+    int(os.environ.get("LOCUST_SHIFT_WORK_ROUNDS_MIN", "3") or 3),
+    int(os.environ.get("LOCUST_SHIFT_WORK_ROUNDS_MAX", "10") or 10),
+)
+
+#: The phone's steady poll cadence while on site, in seconds (``constant_pacing``: the gap
+#: between the *starts* of consecutive reads, which is what "polling every few seconds"
+#: means to a server).
+POLL_PACING = float(os.environ.get("LOCUST_SHIFT_POLL_PACING", "4") or 4)
+
+#: Whether an employee stopped mid-shift is checked out. On by default: a run that ends at
+#: ``-t`` stops every user, and leaving twenty shifts open on a live deployment is not a
+#: measurement, it is an unpaid-hours incident waiting for an administrator.
+CLOSE_ON_STOP = _flag("LOCUST_CLOSE_ON_STOP", True)
+
+#: The feed page size the handset asks for - the app's own screen asks for ten.
+FEED_LIMIT = int(os.environ.get("LOCUST_FEED_LIMIT", "10") or 10)
+
+#: Subjects and bodies for the notes a worker raises mid-shift. Written as a real request
+#: would be (no apostrophes: ``textguard.prose`` is a prose rule, and a sentence that reads
+#: like a complaint is the point - this is the path an office actually has to answer).
+NOTE_SUBJECTS = (
+    "Gate pass for tomorrow",
+    "Missing overtime hours",
+    "Helmet replacement",
+    "Wrong site on my shift",
+    "Boots size exchange",
+    "Half day request",
+)
+NOTE_BODIES = (
+    "My clock out for yesterday is missing from the timesheet. The gate was busy and I could not take the photo in time.",
+    "Please check the two hours from Saturday. The site name on my record looks wrong.",
+    "The helmet issued to me is cracked at the front. I need a replacement before the next shift.",
+    "I was moved to another site this morning and my record still shows the old one.",
+    "My boots are one size too small and the walk between blocks is long. Can I exchange them.",
+)
+
+
+def _counted(fn):
+    """Run one work task while the shift has rounds left; the round after the last one ends the
+    work phase and hands control back to the parent sequence (``interrupt``).
+
+    A decorator rather than a line in every task, because the budget is a property of the
+    phase and not of any one read - and because Locust still sees the wrapper as a task
+    (``functools.wraps`` keeps the name, ``@task`` is applied outermost).
+    """
+
+    @functools.wraps(fn)
+    def wrapper(self):
+        if self.rounds >= self.budget:
+            self.interrupt()
+            return
+        self.rounds += 1
+        return fn(self)
+
+    return wrapper
+
+
+class MidShiftWork(TaskSet):
+    """What the phone does between the two punches.
+
+    The brief's "mid-shift work": status is polled hardest (it is the screen the app opens
+    on, and the one a worker refreshes while standing at the gate), the feed and the history
+    are read, and a note is raised occasionally. Weighted rather than sequenced because none
+    of these has to follow another - what *is* ordered is the phase itself, and the round
+    budget is what ends it.
+    """
+
+    #: Paced, not random: a phone polls on a cadence. ``between`` would smear the poll rate
+    #: into a random variable and make the read load unrepeatable run to run.
+    wait_time = constant_pacing(POLL_PACING)
+
+    def on_start(self) -> None:
+        self.rounds = 0
+        self.budget = random.randint(WORK_ROUNDS[0], max(WORK_ROUNDS[0], WORK_ROUNDS[1]))
+
+    @task(6)
+    @_counted
+    def status(self) -> None:
+        """The high-frequency read: where this shift stands."""
+        self.user.read_status()
+
+    @task(3)
+    @_counted
+    def feed(self) -> None:
+        """The handset's notifications feed, exactly as its own screen asks for it."""
+        self.user.read_feed()
+
+    @task(2)
+    @_counted
+    def where_am_i(self) -> None:
+        """The window question, carrying a real fix - the same call the clock screen makes."""
+        self.user.read_site_window()
+
+    @task(2)
+    @_counted
+    def history(self) -> None:
+        self.user.read_history()
+
+    @task(1)
+    @_counted
+    def raise_note(self) -> None:
+        """Rare, and gated: a note is a write (``LOCUST_ALLOW_WRITES``)."""
+        self.user.raise_note()
+
+
+class ShiftLifecycle(SequentialTaskSet):
+    """One employee's day, in the only order that is legal: open, in, work, out, leave."""
+
+    @task
+    def open_app(self) -> None:
+        """The app's first request when the worker opens it: who am I, is my session good."""
+        if self.user.ready():
+            self.user.read_me()
+
+    @task
+    def check_in(self) -> None:
+        """Status first, then the punch - and adopt an already-open shift instead of punching
+        into a refusal. A previous run stopped before its clock-out leaves one open, and
+        "Already clocked in!" is a 400 that would otherwise make every later step a lie."""
+        if not self.user.ready():
+            return
+        state = self.user.read_status()
+        if state and state.get("active_session"):
+            self.user.adopt_open_shift(state)
+            return
+        if self.user.punch("Clock In")[0]:
+            self.user.clocked_in = True
+
+    @task
+    class mid_shift(MidShiftWork):
+        """The work phase; ``interrupt`` returns here when its rounds are spent."""
+
+    @task
+    def check_out(self) -> None:
+        """Close the shift the check-in opened. If the check-in was refused there is nothing
+        to close, so the employee simply finishes the day with their reads."""
+        if not self.user.ready() or not self.user.clocked_in:
+            return
+        if self.user.check_out():
+            self.user.clocked_in = False
+
+    @task
+    def end_shift(self) -> None:
+        """One shift per virtual employee: retire the greenlet rather than loop into a second
+        (a second shift would need a second set of shift rules, and it is not what ``-u`` said)."""
+        raise StopUser()
+
+
+class ShiftLifecycleUser(ApiUser):
+    """A virtual employee: one account, one enrolled face, one shift, start to finish.
+
+    Session state is per greenlet and nothing is shared but the login cache: this object owns
+    its account, its token, its selfie, its punch id and whether it is currently on shift.
+    """
+
+    tasks = [ShiftLifecycle]
+    token_label = "shift"
+    weight = LIFECYCLE_WEIGHT if LIFECYCLE_ON else 0
+    #: A person reads the screen between the steps of their day.
+    wait_time = between(1.5, 4.0)
+
+    account: dict | None = None
+    user_id = ""
+    selfie: bytes | None = None
+    clocked_in = False
+    ordinal = 0
+    #: The punch this worker is currently on: the server's own ``X-Punch-Id``, carried so a
+    #: run can be tied to the rows it wrote.
+    punch_id: str | None = None
+    #: The last status payload, kept as the worker's own copy of their shift.
+    state: dict | None = None
+
+    # -- session ------------------------------------------------------------
+    def on_start(self) -> None:
+        """Claim an account and authenticate it, once, the way a phone does at the gate.
+
+        The credentials come from the roster through ``_claim_account`` - a thread-safe
+        round-robin, so two greenlets never punch as the same person - and a pre-minted
+        ``token`` in a roster entry short-circuits the login (the steady state a 30-day
+        session produces, and the mode that keeps the per-IP login limiter out of the way).
+        """
+        claimed = _claim_account()
+        if not claimed:
+            log.warning("lifecycle: on with no LOCUST_ROSTER, so there is no employee to model")
+            return
+        self.ordinal, self.account = claimed
+        self.user_id = str(self.account["user_id"])
+        self.token_label = f"shift:{self.user_id}"
+        self.selfie = _read_selfie(self.account.get("selfie")) or PUNCH_BYTES
+        if self.account.get("token"):
+            self.token = str(self.account["token"])
+            _TOKENS[self.token_label] = self.token
+        else:
+            self.token = _login(
+                self.client,
+                user_id=self.user_id,
+                login_id=self.account.get("login") or "",
+                password=str(self.account.get("password") or ""),
+                label=self.token_label,
+                host=self.host or DEFAULT_HOST,
+                name=f"{LOGIN_PATH} [lifecycle sign-in]",
+            )
+            if self.token:
+                _TOKENS[self.token_label] = self.token
+        if not self.token:
+            log.warning("lifecycle: account %s could not sign in; it will do nothing", self.user_id)
+        if not self.selfie:
+            log.warning(
+                "lifecycle: account %s has no selfie (roster entry or LOCUST_SELFIE); "
+                "the punch would be refused, so only its reads will run",
+                self.user_id,
+            )
+        if not self.account.get("token"):
+            # A roster whose accounts do not already hold tokens means one bcrypt login per
+            # employee at the same moment. Worth saying out loud: the limiter is 10/minute/IP.
+            log.info("lifecycle: worker %s signed in (login path, limiter applies)", self.user_id)
+
+    def on_stop(self) -> None:
+        """Leave the deployment as it was found: an employee stopped mid-shift - by ``-t``, by
+        a lowered ``-u``, by a Ctrl-C - is checked out here. Best effort by definition (the
+        process may already be going away), which is why the check-in adoption in the sequence
+        also exists: a run that cannot finish this still leaves a recoverable account.
+        """
+        if not (CLOSE_ON_STOP and self.clocked_in and self.token and self.selfie):
+            return
+        log.warning(
+            "lifecycle: worker %s stopped mid-shift; closing it so the account is not left open",
+            self.user_id,
+        )
+        if self.check_out():
+            self.clocked_in = False
+
+    def ready(self) -> bool:
+        return bool(self.token and self.user_id)
+
+    def _relogin(self) -> bool:
+        """Re-mint this worker's token after a 401 - the account's ``token_version`` moved
+        (a password rotation revokes every session) or the token simply expired. The roster
+        credential is the one that can answer either."""
+        _forget(self.token_label)
+        self.token = None
+        if not (self.account and self.account.get("login")):
+            return False
+        self.token = _login(
+            self.client,
+            user_id=self.user_id,
+            login_id=self.account["login"],
+            password=self.account["password"],
+            label=self.token_label,
+            host=self.host or DEFAULT_HOST,
+            name=f"{LOGIN_PATH} [lifecycle re-auth]",
+        )
+        if self.token:
+            _TOKENS[self.token_label] = self.token
+        return bool(self.token)
+
+    # -- requests -----------------------------------------------------------
+    def _attempt(self, method, path, *, name, params=None, json_body=None):
+        with self.client.request(
+            method,
+            path,
+            params=params,
+            json=json_body,
+            headers=self.auth_headers(),
+            name=name,
+            catch_response=True,
+        ) as response:
+            self._judge(response)
+            return response
+
+    def _authed(self, method, path, *, name, params=None, json_body=None):
+        """One authenticated call, with the 401 drill: re-sign in, then repeat it once.
+
+        The first 401 is judged (and therefore counted) by ``_judge`` before the retry - a
+        wave of them on an otherwise healthy run is a finding about session lifetime, and
+        hiding it behind a silent retry is how that finding is lost.
+        """
+        response = self._attempt(method, path, name=name, params=params, json_body=json_body)
+        if response is not None and response.status_code == 401 and self._relogin():
+            log.warning("lifecycle: worker %s got 401 on %s; re-signed in and retrying", self.user_id, name)
+            response = self._attempt(method, path, name=name, params=params, json_body=json_body)
+        return response
+
+    def _json(self, method, path, *, name, params=None, json_body=None) -> dict | None:
+        response = self._authed(method, path, name=name, params=params, json_body=json_body)
+        if response is None or response.status_code >= 400:
+            return None
+        try:
+            body = response.json()
+        except ValueError:
+            return None
+        return body if isinstance(body, dict) else None
+
+    # -- the day's calls ----------------------------------------------------
+    def read_me(self) -> None:
+        """``GET /auth/me``: the session check the app makes when it opens."""
+        self._json("GET", "/api/v1/auth/me", name="/api/v1/auth/me [lifecycle]")
+
+    def read_status(self) -> dict | None:
+        """The shift state. This is the app's ``/attendance/status``."""
+        self.state = self._json("GET", "/api/v1/worker/me/stats", name="/api/v1/worker/me/stats")
+        return self.state
+
+    def read_feed(self) -> None:
+        """The notifications feed - this app's announcements."""
+        self._json(
+            "GET",
+            "/api/v1/worker/me/notifications",
+            name=f"/api/v1/worker/me/notifications?limit={FEED_LIMIT}",
+            params={"limit": FEED_LIMIT},
+        )
+
+    def read_site_window(self) -> None:
+        """The window question - a real fix, so the geofence really answers it."""
+        self._json(
+            "GET",
+            "/api/v1/worker/me/site-window",
+            name="/api/v1/worker/me/site-window?location_input=[fix]",
+            params={"location_input": _punch_fix()},
+        )
+
+    def read_history(self) -> None:
+        self._json(
+            "GET",
+            "/api/v1/worker/me/logs",
+            name="/api/v1/worker/me/logs?limit=[n]",
+            params={"limit": random.choice((20, 50, 100))},
+        )
+
+    def raise_note(self) -> None:
+        """A note to the office, with a body a person would actually write."""
+        if not (ALLOW_WRITES and self.ready()):
+            return
+        self._json(
+            "POST",
+            "/api/v1/worker/notes",
+            name="/api/v1/worker/notes [lifecycle]",
+            json_body={
+                "category": random.choice(NOTE_CATEGORIES),
+                "subject": random.choice(NOTE_SUBJECTS),
+                "body": random.choice(NOTE_BODIES),
+                "priority": random.choice(NOTE_PRIORITIES),
+            },
+        )
+
+    def adopt_open_shift(self, state: dict) -> None:
+        """Continue a shift a previous run left open instead of punching into a 400."""
+        session = state.get("active_session") or {}
+        self.state = state
+        self.clocked_in = True
+        log.info(
+            "lifecycle: worker %s already has a shift open (%s); adopting it",
+            self.user_id,
+            session.get("site_name") or "unknown site",
+        )
+
+    # -- the punch ----------------------------------------------------------
+    def punch(self, action: str, *, confirm_early: bool = False) -> tuple[bool, dict | None]:
+        """``POST /attendance/verify`` for one action, judged, with the refusal kept.
+
+        Returns ``(accepted, detail)``. The detail is what lets the caller tell the one
+        refusal that is a *question* - the early clock-out - from the ones that are answers.
+        """
+        if not (self.selfie and self.ready()):
+            return False, None
+        data = {
+            "worker_id": self.user_id,
+            "action": action,
+            "location_input": _punch_fix(),
+        }
+        if confirm_early:
+            data["confirm_early_checkout"] = "1"
+        with self.client.request(
+            "POST",
+            "/api/v1/attendance/verify",
+            data=data,
+            files={"selfie": ("selfie.jpg", self.selfie, "image/jpeg")},
+            headers={"Authorization": f"Bearer {self.token}"},
+            name=f"/api/v1/attendance/verify [{action}]",
+            catch_response=True,
+        ) as response:
+            detail: dict | None = None
+            if response.status_code >= 400:
+                try:
+                    body = response.json()
+                    detail = body.get("detail") if isinstance(body, dict) else None
+                except ValueError:
+                    detail = None
+                if not isinstance(detail, dict):
+                    detail = {"message": response.text[:200]}
+            self._judge(response)
+            if response.status_code == 200:
+                punch_id = response.headers.get("X-Punch-Id")
+                if punch_id:
+                    self.punch_id = punch_id
+                return True, detail
+            # Everything below is a refusal and is worth a line in the log with the context
+            # that made it: the action, the fix, the status, and the server's own words. The
+            # 429 is the per-IP limiter and ``_judge`` has already counted it as configured.
+            log.warning(
+                "lifecycle: punch refused worker=%s action=%s fix=%s status=%s detail=%s",
+                self.user_id,
+                action,
+                data["location_input"],
+                response.status_code,
+                str(detail)[:200],
+            )
+            return False, detail
+
+    def check_out(self) -> bool:
+        """Close the shift, answering the early-check-out question if the server asks it.
+
+        The question is a 409 whose ``error_code`` is ``confirm_early_checkout``, and the
+        phone's answer is the same punch with ``confirm_early_checkout=1``. Doing it in two
+        steps is not ceremony: it is the only way the test measures the server's real
+        behaviour on a short shift, which is what every compressed shift is.
+        """
+        accepted, detail = self.punch("Clock Out")
+        if accepted:
+            return True
+        if detail and detail.get("error_code") == "confirm_early_checkout":
+            log.info("lifecycle: worker %s was asked to confirm an early clock-out; confirming", self.user_id)
+            accepted, _ = self.punch("Clock Out", confirm_early=True)
+        return accepted
+
+
+# --------------------------------------------------------------------------- #
 # One-off wiring
 # --------------------------------------------------------------------------- #
 def _apply_only() -> None:
@@ -1384,8 +1886,14 @@ def _apply_only() -> None:
     """
     if not ONLY:
         return
-    classes = {"public": PublicUser, "worker": WorkerUser, "admin": AdminUser, "punch": PunchUser}
-    defaults = {"public": 5, "worker": 6, "admin": 3, "punch": 10}
+    classes = {
+        "public": PublicUser,
+        "worker": WorkerUser,
+        "admin": AdminUser,
+        "punch": PunchUser,
+        "shift": ShiftLifecycleUser,
+    }
+    defaults = {"public": 5, "worker": 6, "admin": 3, "punch": 10, "shift": LIFECYCLE_WEIGHT}
     for name, cls in classes.items():
         cls.weight = defaults[name] if name in ONLY else 0
 
@@ -1413,6 +1921,9 @@ def _announce(environment, **_kwargs) -> None:
         f"  worker traffic   : {'on' if WorkerUser.weight else 'OFF (no LOCUST_WORKER_* configured)'}",
         f"  admin traffic    : {'on' if AdminUser.weight else 'OFF (no LOCUST_ADMIN_* configured)'}",
         f"  punch cycle      : {'on - ' + str(len(ROSTER)) + ' roster accounts' if punch_on else 'OFF (no LOCUST_ROSTER)'}",
+        f"  shift lifecycle  : "
+        + (f"on - {len(ROSTER)} roster accounts, one shift each" if ShiftLifecycleUser.weight
+           else "OFF (LOCUST_ONLY=shift or LOCUST_LIFECYCLE=1, plus a roster)"),
         f"  punch fence      : {SITE_FIX or 'discovered from /admin/sites (needs admin creds)'}",
         f"  punch ramp       : {'every %.2fs, one shift each' % PUNCH_GAP if PUNCH_GAP else 'off (no stagger)'}",
         f"  arrival process  : "

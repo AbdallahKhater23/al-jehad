@@ -3751,6 +3751,7 @@ button.dashboard-queue:focus-visible { outline: 2px solid var(--ops-primary); ou
 .shifts-presets { display: flex; flex-wrap: wrap; align-items: center; gap: var(--ui-2); }
 .shifts-bar-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--ui-2); margin-inline-start: auto; }
 .shifts-export-format { width: auto; min-width: 118px; }
+
 .shifts-search { display: flex; flex-wrap: wrap; align-items: center; gap: var(--ui-2); margin-bottom: var(--ui-3); }
 .shifts-columns { margin-bottom: var(--ui-3); }
 

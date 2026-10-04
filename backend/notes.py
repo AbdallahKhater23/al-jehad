@@ -49,7 +49,6 @@ not a data change; nothing else about the note moves.
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from datetime import datetime
 from typing import Any
@@ -57,6 +56,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
+import audit
 import notifications
 import textguard
 from config import settings
@@ -160,25 +160,22 @@ def _audit(
     after: Any = None,
     request: Request | None = None,
 ) -> None:
-    """Append a notes event. Never raises - an audit failure must not lose the note."""
-    try:
-        conn.execute(
-            "INSERT INTO audit_log (actor_id, actor_role, action, entity, entity_id, "
-            "before_json, after_json, ip, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                actor.id if actor else None,
-                actor.role if actor else None,
-                action,
-                "worker_notes",
-                str(entity_id),
-                json.dumps(before, default=str) if before is not None else None,
-                json.dumps(after, default=str) if after is not None else None,
-                request.client.host if request is not None and request.client else None,
-                _now(),
-            ),
-        )
-    except sqlite3.Error:
-        pass
+    """Append a notes event. Never raises - an audit failure must not lose the note.
+
+    Every row here is filed against ``worker_notes``: the entity is the module's, and the
+    subject of every one of these events is a note.
+    """
+    audit.record(
+        conn,
+        action=action,
+        actor=actor,
+        entity="worker_notes",
+        entity_id=str(entity_id),
+        before=before,
+        after=after,
+        request=request,
+        created_at=_now(),
+    )
 
 
 def _clean_text(value: str, *, field: str, limit: int) -> str:

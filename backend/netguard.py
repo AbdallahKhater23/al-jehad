@@ -158,6 +158,43 @@ CSP_HTML = (
     "manifest-src 'self'"
 )
 
+#: The map origins the geofence editor needs, and the one page that needs them.
+#:
+#: This is the single deliberate exception to "no third-party origin", and it is worth
+#: spelling out why it is not the Tailwind CDN coming back. The editor draws a draggable
+#: fence on a real map, and a map is raster tiles from somewhere plus a library to place
+#: them: Leaflet and OpenStreetMap by default (no API key, no licence cost), with the
+#: Google Maps JavaScript API as the alternate engine when an operator supplies a key. The
+#: baseline policy above still names no third-party origin at all, so every *other* page -
+#: including the worker's punch screen, which is the one a phone at a gate loads - keeps
+#: the strict policy. ``main.frontend_page_response`` hands the relaxed policy to this one
+#: document; ``geofence.map_policy_for`` names the sources.
+CSP_HTML_MAPS = (
+    "default-src 'self'; "
+    "base-uri 'self'; "
+    "object-src 'none'; "
+    "frame-ancestors 'none'; "
+    "frame-src 'none'; "
+    "form-action 'self'; "
+    # Leaflet from the CDN, the Google Maps JS API (loaded only when a key is configured),
+    # and this origin for the page's own script.
+    "script-src 'self' https://unpkg.com https://maps.googleapis.com https://maps.gstatic.com; "
+    "script-src-attr 'unsafe-inline'; "
+    "style-src 'self' 'unsafe-inline' https://unpkg.com; "
+    "img-src 'self' data: blob: https://*.tile.openstreetmap.org https://tile.openstreetmap.org "
+    "https://maps.googleapis.com https://maps.gstatic.com https://*.googleapis.com "
+    "https://*.ggpht.com; "
+    "font-src 'self' data:; "
+    "media-src 'self' blob:; "
+    # The tiles and the Google API are XHR'd by the libraries; the page's own API calls are
+    # same-origin. No wildcard: a map page that could post anywhere is the thing the
+    # baseline policy exists to prevent.
+    "connect-src 'self' https://unpkg.com https://maps.googleapis.com https://maps.gstatic.com "
+    "https://*.tile.openstreetmap.org https://tile.openstreetmap.org; "
+    "worker-src 'self' blob:; "
+    "manifest-src 'self'"
+)
+
 CLASS_ADMIN = "admin"
 CLASS_WORKER = "worker"
 

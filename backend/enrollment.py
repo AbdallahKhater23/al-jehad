@@ -53,6 +53,7 @@ import numpy as np
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel, field_validator
 
+import audit
 import biometrics
 import face_detector
 import face_engine
@@ -119,23 +120,22 @@ def _audit(
     after: Any = None,
     request: Request | None = None,
 ) -> None:
-    try:
-        conn.execute(
-            "INSERT INTO audit_log (actor_id, actor_role, action, entity, entity_id, after_json, ip, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                actor.id if actor else None,
-                actor.role if actor else "public",
-                action,
-                entity,
-                str(entity_id),
-                json.dumps(after, default=str) if after is not None else None,
-                request.client.host if request is not None and request.client else None,
-                datetime.now().strftime(_TS),
-            ),
-        )
-    except sqlite3.Error:
-        pass
+    """Append an administrative event. Never raises - see ``audit.record``.
+
+    An action taken with no session is filed as ``public``: the enrollment link is opened by
+    workers who have not signed in yet.
+    """
+    audit.record(
+        conn,
+        action=action,
+        actor=actor,
+        entity=entity,
+        entity_id=entity_id,
+        after=after,
+        request=request,
+        actor_role="public",
+        created_at=datetime.now().strftime(_TS),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -982,9 +982,8 @@ def _process_item(job_id: int, item: sqlite3.Row, *, archive, photos: dict[str, 
     try:
         decision = face_engine.ENGINE.run(_require_liveness, image, stage="bulk_import")
     except (face_engine.FaceEngineBusy, face_engine.FaceEngineUnavailable) as exc:
-        # An item-level failure either way - a batch of photographs must not answer with a
-        # server fault, and the two codes stay apart because "the queue was full" and "the
-        # models could not be reached" are different things for an operator to see.
+        # An item-level failure either way - a batch must not answer with a server fault. The
+        # two codes stay apart: a full queue and unreachable models are different things.
         with db(write=True) as conn:
             finish(
                 conn,
@@ -1009,9 +1008,8 @@ def _process_item(job_id: int, item: sqlite3.Row, *, archive, photos: dict[str, 
     try:
         embedding = face_engine.ENGINE.run(_embed_image, image)
     except (face_engine.FaceEngineBusy, face_engine.FaceEngineUnavailable) as exc:
-        # An item-level failure either way - a batch of photographs must not answer with a
-        # server fault, and the two codes stay apart because "the queue was full" and "the
-        # models could not be reached" are different things for an operator to see.
+        # An item-level failure either way - a batch must not answer with a server fault. The
+        # two codes stay apart: a full queue and unreachable models are different things.
         with db(write=True) as conn:
             finish(
                 conn,

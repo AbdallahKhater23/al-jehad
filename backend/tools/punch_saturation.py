@@ -12,9 +12,9 @@ enforced by inspection, and inspection is what missed this in the first place.
 So this is the per-push half, and it deliberately measures less:
 
 * it runs **the same application**, from this checkout, with the real YuNet and FaceNet
-  models and the deployment's own memory profile (``FACE_INFERENCE_QUEUE=8``,
-  ``STANDING_SWEEP_ENABLED=0``, engine capacity 2), as a **child process** on a loopback
-  port, with a private data directory of its own;
+  models and the deployment's own memory profile (``FACE_INFERENCE_QUEUE=16``,
+  ``FACE_INFERENCE_CONCURRENCY=4``, ``STANDING_SWEEP_ENABLED=0``), as a **child process** on a
+  loopback port, with a private data directory of its own;
 * it drives ``POST /api/v1/attendance/verify`` to saturation - more concurrent punches than
   the engine can run, for several rounds, so frames are continuously in flight - and samples
   **the application's own process** while it does: resident set, the anonymous set (the part
@@ -134,7 +134,13 @@ from capacity_test import (  # noqa: E402
 #: of the same deployment - including the rate limiters, which are per client IP and which a
 #: burst from one address would otherwise spend its whole budget hitting.
 DEPLOYMENT_ENV: dict[str, str] = {
-    "FACE_INFERENCE_QUEUE": "8",
+    # The image's own numbers (see the Dockerfile's ``ENV`` block): sixteen queued jobs and four
+    # in flight, which is what the deployment runs and therefore what this harness has to
+    # measure. ``test_punch_saturation_gates`` holds every entry here to the Dockerfile, so a
+    # change to one that leaves the other behind is a failing test rather than a run that
+    # quietly describes a different process.
+    "FACE_INFERENCE_QUEUE": "16",
+    "FACE_INFERENCE_CONCURRENCY": "4",
     "STANDING_SWEEP_ENABLED": "0",
     "ATTENDANCE_RATE_LIMIT": "1000000/minute",
     "ENROLLMENT_RATE_LIMIT": "1000000/minute",

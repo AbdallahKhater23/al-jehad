@@ -1,12 +1,12 @@
 {
- "frames": 1546,
+ "frames": 1,
  "corpus": {
-  "frames": 1546,
-  "newest": "2026-09-26 13:55:35",
-  "newest_name": "3e516e8a993cd543243a34140c8559f9.jpg",
-  "total_bytes": 2702743
+  "frames": 1,
+  "newest": "2026-10-04 21:16:37",
+  "newest_name": "b67242bf66ef48758c9a373edc423f9e.jpg",
+  "total_bytes": 3643
  },
- "updated_at": "2026-09-26 14:19:04",
+ "updated_at": "2026-10-04 21:18:42",
  "runs": 2,
  "last_run": {
   "measured_at": "2026-09-26 14:19:04",

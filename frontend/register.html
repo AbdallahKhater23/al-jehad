@@ -211,6 +211,12 @@
       <input id="full-name" class="field" type="text" autocomplete="name"
              data-t-ph="register.name.placeholder" placeholder="Full name" />
     </div>
+    <!--
+      The name is stored under the language it was typed in, so the applicant is told which one
+      that is. The other three are filled in afterwards by an administrator or a translation
+      pass - a worker should not have to spell their own name four times at a gate.
+    -->
+    <p class="note" data-t="register.name.hint">Write your name in the language you are reading this page in.</p>
     <div class="row">
       <input id="password" class="field" type="password" autocomplete="new-password"
              data-t-ph="register.password.placeholder" placeholder="Choose a password" />
@@ -222,6 +228,18 @@
       <!-- Filled from the server's own list of what this link may register, so an option that
            would be refused is never offered. -->
       <select id="role" class="field"></select>
+    </div>
+    <!--
+      Who a worker answers to, and only for a worker: a moallem is not assigned to another
+      moallem, and the server refuses an assignment from any other role anyway. The list is the
+      server's, and the first option is always no moallem - a worker may send this without one,
+      and so may a link nobody has registered a moallem for yet. Shown and hidden by
+      ``register.js``.
+    -->
+    <div id="moallem-field" class="hidden">
+      <label class="field-label" for="moallem" data-t="register.moallem.label">Assigned Moallem</label>
+      <select id="moallem" class="field"></select>
+      <p class="note hidden" id="moallem-note"></p>
     </div>
     <div class="row">
       <input id="phone" class="field" type="tel" inputmode="tel"

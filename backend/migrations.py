@@ -35,7 +35,7 @@ from security import hash_password
 #: ``MIGRATIONS``. ``readiness`` refuses to start a deployment whose database is older, so a
 #: migration added without bumping this is a server that will not boot; the invariant is
 #: asserted in ``tests/test_site_shift_windows.py`` rather than left to memory.
-SCHEMA_VERSION = 31
+SCHEMA_VERSION = 33
 
 #: Magic number stamped into the SQLite header so we can recognise "this is our
 #: database" - cheap protection against pointing DATABASE_PATH at some other file.
@@ -1814,6 +1814,77 @@ def migration_30_self_service_registration(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_users_status ON users(status)")
 
 
+def migration_32_visual_geofence(conn: sqlite3.Connection) -> None:
+    """The visual geofence editor's own two tables, and nothing else.
+
+    WHY THESE TABLES ARE NEW RATHER THAN COLUMNS ON WHAT EXISTS
+    ----------------------------------------------------------
+    The console edits *one* fence - the deployment's own boundary - while
+    ``construction_sites`` holds a row per site, and the punch path has always judged a fix
+    against whichever site's row contains it. Those are two different questions ("where is
+    the deployment's fence" and "which of these sites is this fix inside"), and folding the
+    first into the second would have meant either a synthetic site row that appears in every
+    site list and report, or a column that means something different on one row than on the
+    other thirty. So the editor gets a table of its own, and the existing geofence logic is
+    left exactly as it is: this migration adds two tables and changes no existing one.
+
+    ``geofence_settings`` is append-only in the sense that matters: an edit **inserts** the
+    new boundary rather than overwriting the old one, and the active fence is the newest row
+    (``ORDER BY id DESC LIMIT 1``). That is deliberate - "when did this fence move, and who
+    moved it" is a question asked after a payroll dispute, and an ``UPDATE`` cannot answer
+    it. The audit entry the edit writes carries the same before/after pair, so the two
+    records agree about what changed.
+
+    ``attendance_punches`` is the ledger of *verified* punches: one row per approved punch,
+    carrying the distance that admitted it and the accuracy the phone reported. It is not a
+    second ``attendance_logs`` - nothing in the shift, hours or payroll pipeline reads it -
+    and it is deliberately not a foreign key into one: this table records what the geofence
+    check decided, and the punch pipeline that owns hours is a different system with its own
+    transaction. A refusal is never written here: it is answered before any write happens,
+    which is the fail-fast rule the punch path is built on.
+
+    ``accuracy_degraded`` is the GPS-drift flag: the fix was inside the fence and its own
+    uncertainty circle still reached the boundary. It is a column rather than something
+    derived at read time because the reading that produced it is gone by then - the phone
+    sends it once, and an administrator asking "was this punch borderline" is asking about
+    the fix that was taken, not about arithmetic re-run later.
+
+    The index is on ``(user_id, timestamp)``: the only read anybody makes of this table is
+    "this person's punches over a period", which is the shape every attendance screen asks
+    for.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS geofence_settings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            latitude REAL NOT NULL,
+            longitude REAL NOT NULL,
+            radius_meters REAL NOT NULL,
+            updated_at TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS attendance_punches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            latitude REAL NOT NULL,
+            longitude REAL NOT NULL,
+            distance_meters REAL NOT NULL,
+            accuracy_meters REAL,
+            status TEXT NOT NULL,
+            accuracy_degraded INTEGER NOT NULL DEFAULT 0,
+            timestamp TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_attendance_punches_user "
+        "ON attendance_punches(user_id, timestamp)"
+    )
+
+
 def migration_31_registration_link(conn: sqlite3.Connection) -> None:
     """The walk-up form is no longer a URL anybody can open: it is a link the console mints.
 
@@ -1885,6 +1956,50 @@ def migration_31_registration_link(conn: sqlite3.Connection) -> None:
     add_column(conn, "registration_settings", "link_rotated_by", "TEXT")
 
 
+def migration_33_worker_moallem_assignments(conn: sqlite3.Connection) -> None:
+    """A worker's moallem, and a name per language - two columns on ``users``, no new table.
+
+    WHY THE ASSIGNMENT IS A COLUMN
+    ------------------------------
+    A worker has at most one moallem, and the assignment is read on three surfaces that are
+    already a join against ``users`` (the credentials roster, the timesheet, the live board).
+    A table of its own would add a join to each of those reads to buy a cardinality of one, and
+    would let a worker carry two supervisors that every reader would then have to agree about.
+    One column cannot.
+
+    ``TEXT`` because the id is: this deployment's accounts are numbered strings with bands per
+    role (``security.ID_BANDS``), so a foreign key that points at ``users.id`` has to be the
+    same type as the column it points at.
+
+    ``REFERENCES ... ON DELETE SET NULL`` is declared for what it documents - deleting a
+    moallem unassigns their workers rather than pointing at nobody. SQLite does **not** enforce
+    it: this application never sets ``PRAGMA foreign_keys`` (see ``main._refuse_self_account``'s
+    note, and ``developer``'s page-level integrity check which reports it as off), so the
+    deletion, demotion and self-assignment rules live in the code that writes the column and are
+    tested there. The declaration is what tells the next reader of the schema what "no moallem"
+    means.
+
+    WHY THE NAMES ARE ONE JSON COLUMN AND NOT ``name_ar``/``name_en``
+    ----------------------------------------------------------------
+    Four languages are in use (en, ar, hi, ur), and the person filling the form types their
+    name in whichever one they are reading. Two fixed columns would leave Hindi and Urdu with
+    nowhere to go and would have to be re-migrated the first time a fifth language appears; a
+    map keyed by language carries however many the reader has. ``users.name`` stays, unchanged
+    and not backfilled: it is what every existing reader displays, and the translation pipeline
+    (``names``) falls back to it for any language the map does not carry. Copying it into a
+    language slot here would record a *guess* about which language that name is in as though the
+    applicant had said so.
+
+    The two indexes are the two questions asked of these columns: "who are the moallems"
+    (``role``, the roster's filter) and "who reports to this moallem" (``moallem_id``, the
+    join behind every row that shows an assignment).
+    """
+    add_column(conn, "users", "name_i18n", "TEXT")
+    add_column(conn, "users", "moallem_id", "TEXT REFERENCES users(id) ON DELETE SET NULL")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_users_moallem_id ON users(moallem_id)")
+
+
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "audit_notifications_shift_rules", migration_1_audit_notifications_shift_rules),
     (2, "provenance_columns_status_code", migration_2_provenance_columns),
@@ -1915,7 +2030,13 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (27, "transit_to_site_shifts", migration_27_transit_to_site_shifts),
     (29, "registration_intake_switch", migration_29_registration_intake_switch),
     (30, "self_service_registration", migration_30_self_service_registration),
-    (31, "registration_link", migration_31_registration_link),
+    (31, "registration_link", migration_31_registration_link),     # The visual geofence editor: one fence for the deployment, one ledger of the punches it
+    # verified. Additive - no existing table is touched, and the punch path's own geofence
+    # (``construction_sites``, read by ``main.site_at``) is unchanged.
+    (32, "visual_geofence", migration_32_visual_geofence),
+    # Who works for whom, and a name per language. Two columns on ``users``: the roster, the
+    # timesheet and the live board all show an assignment without a second table to join.
+    (33, "worker_moallem_assignments", migration_33_worker_moallem_assignments),
     # (28, "attendance_timestamps_to_utc", migration_28_attendance_timestamps_to_utc),
     #
     # NOT REGISTERED YET, ON PURPOSE. Migration 28 and its column contract

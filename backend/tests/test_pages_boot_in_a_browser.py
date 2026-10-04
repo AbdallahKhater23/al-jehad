@@ -39,6 +39,7 @@ from __future__ import annotations
 import pytest
 
 import browser as browser_support
+import harness
 from browser import DESKTOP, PAGES, PHONE
 
 pytestmark = pytest.mark.regression
@@ -134,6 +135,82 @@ def test_the_width_reaches_the_applications_own_layout_switch(browser, site, lin
     assert modes == {"phone": "mobile", "desktop": "desktop"}, (
         f"the app's own layout switch read {modes} for a 390px and a 1280px viewport"
     )
+
+
+def test_a_worker_applying_is_offered_the_moallems_this_site_has(browser, client, site, link_paths):
+    """The registration page's moallem list is the server's, and only a worker is asked for one.
+
+    The applicant has no session, so the list of moallems can only come from the link's own
+    public route - which is why this is driven in a browser rather than asserted about the
+    source: the field has to be on the screen, filled from a fetch, for the role the page
+    defaults to. A page that draws the dropdown and offers nobody looks identical to a page
+    whose read failed, and only the browser can tell them apart.
+
+    The rest is the business rule: a moallem is not assigned to another moallem, so the field
+    is put away and cleared the moment the role changes - and comes back with the list intact.
+    """
+    opened = client.post(
+        "/api/v1/admin/registrations/intake",
+        headers=harness.bearer(harness.HEAD_ADMIN),
+        json={"open": True},
+    )
+    assert opened.status_code == 200, opened.text
+
+    path = token_path(next(page for page in PAGES if page.path.startswith("/register/")), link_paths)
+    context = browser.new_context(locale="en-US")
+    try:
+        tab = context.new_page()
+        tab.goto(site(path), wait_until="load")
+        # The list arrives on a fetch of its own, after the policy, so this waits for it rather
+        # than reading the select before the server has answered.
+        tab.wait_for_function(
+            "() => document.getElementById('moallem').options.length > 1", timeout=8000
+        )
+        assert tab.evaluate("document.getElementById('role').value") == "worker", (
+            "this test is about the default role, and the page is not offering it"
+        )
+        assert not tab.evaluate(
+            "document.getElementById('moallem-field').classList.contains('hidden')"
+        ), "a worker is not shown the moallem field"
+
+        options = tab.evaluate(
+            "[...document.getElementById('moallem').options].map((o) => [o.value, o.textContent])"
+        )
+        assert options[0][0] == "" and options[0][1], (
+            f"the first option is not a way to choose nobody: {options[0]!r}"
+        )
+        named = [text for value, text in options if value]
+        assert any("Seed Lead Worker" in text for text in named), (
+            f"the seeded moallem is not in the list the page drew: {options!r}"
+        )
+
+        # A moallem answers to nobody: the field goes away, and the choice with it.
+        tab.select_option("#role", "moallem")
+        assert tab.evaluate(
+            "document.getElementById('moallem-field').classList.contains('hidden')"
+        ), "a moallem is still being asked for their own moallem"
+        assert tab.evaluate("document.getElementById('moallem').value") == "", (
+            "the moallem choice survived a role change"
+        )
+
+        # And back, with the list redrawn rather than left empty by the round trip.
+        tab.select_option("#role", "worker")
+        again = tab.evaluate(
+            "[...document.getElementById('moallem').options].map((o) => [o.value, o.textContent])"
+        )
+        assert again == options, f"the list did not survive the role round trip: {again!r}"
+
+        # The label is a word, so a language switch renames the field the way it renames the
+        # role list beside it.
+        tab.click('[data-lang="ar"]')
+        label = tab.evaluate(
+            "document.getElementById('moallem-field').querySelector('label').textContent"
+        )
+        assert label.strip() and label.strip() != "Assigned Moallem", (
+            f"the moallem label did not change with the language: {label!r}"
+        )
+    finally:
+        context.close()
 
 
 @pytest.mark.parametrize("path", ("/q/this-token-was-never-issued", "/enroll/this-token-was-never-issued"))

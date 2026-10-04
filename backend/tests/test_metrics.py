@@ -26,6 +26,7 @@ query plan instead of the query. So the claims pinned here are:
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import subprocess
 import sys
@@ -457,7 +458,22 @@ def test_the_label_sets_stay_small_after_a_full_exercise(client, app_module):
     for path in ("/api/v1/q/not-a-real-token", "/api/v1/q/another-made-up-token", "/nope"):
         client.get(path)
     assert route_labels(scrape(client)) - after_routes == set()
-    assert len(label_values(body, "attendance_http_requests_total", "status")) <= 12
+    # The status label is the one dimension here that **cannot** be minted from caller data: a
+    # status code is an integer the framework or a handler chose, not a string anybody sent. So
+    # what belongs in this assertion is the property rather than a count - a count on this
+    # label measures how much of the API the *session* happened to exercise (the same mistake
+    # the route ceiling above is annotated for), and it went from 12 to 15 the moment two new
+    # endpoints with their own 404 and 422 paths were added, with nothing leaking.
+    #
+    # The ceiling is therefore on the vocabulary an HTTP API can produce, and the assertion
+    # beside it is the one that would catch a leak: every label has to be a three-digit code.
+    statuses = label_values(body, "attendance_http_requests_total", "status")
+    assert len(statuses) <= 24, sorted(statuses)
+    for code in statuses:
+        assert code is not None and re.fullmatch(r"[1-5]\d\d", str(code)), (
+            f"{code!r} is not an HTTP status code, so something is putting caller data in this "
+            "label"
+        )
     assert len(label_values(body, "attendance_verifications_total", "outcome")) <= 6
     assert len(label_values(body, "attendance_sqlite_statements_total", "operation")) <= 10
 

@@ -66,6 +66,14 @@ KNOWN_EXITS: dict[tuple[str, str], str] = {
         "the only outbound HTTP in the application: pywebpush calls requests internally, which is "
         "the pair install_outbound_guard replaces. Covered."
     ),
+    ("sites.py", "requests"): (
+        "the Google Maps link resolver (``POST /api/v1/resolve-maps-link``): a shortened share "
+        "link carries no coordinates, so it is followed. Deliberately ``requests`` rather than "
+        "the ``httpx`` the brief suggested - ``requests`` is a runtime dependency this "
+        "deployment already ships and ``httpx`` is not, and it is the library "
+        "``install_outbound_guard`` replaces, so this call is covered by construction. The "
+        "host is checked against ``sites.MAPS_HOSTS`` before the connection is opened."
+    ),
     ("serve.py", "socket"): (
         "a UDP socket probe (`connect(('8.8.8.8', 80))`) that sends no payload - it asks the OS "
         "which interface routes outbound so it can print a phone-reachable LAN address. It is the "

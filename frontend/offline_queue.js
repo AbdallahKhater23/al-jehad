@@ -97,33 +97,112 @@ class OfflineError extends Error {
 // =====================================================================
 //  Crypto: canonical strings, HMAC signing, hashing
 // =====================================================================
+
+/**
+ * The double's exact value as ``mantissa * 2^exponent``, read from its own bits.
+ *
+ * Module scope rather than inside ``OFFLINE_CRYPTO`` so the object stays a plain
+ * namespace of the functions a caller reaches for, and so these two are shared by
+ * everything that formats a signed value.
+ */
+function exactParts(abs) {
+    const view = new DataView(new ArrayBuffer(8));
+    view.setFloat64(0, abs, true);
+    const bits = view.getBigUint64(0, true);
+    const exponentField = Number((bits >> 52n) & 0x7ffn);
+    const fraction = bits & 0xfffffffffffffn;
+    if (exponentField === 0) {
+        // Subnormal (and zero): no implicit leading bit.
+        return { mantissa: fraction, exponent: -1074 };
+    }
+    return { mantissa: fraction | (1n << 52n), exponent: exponentField - 1075 };
+}
+
+/** ``round_half_even(abs * 10^decimals)`` as an integer, computed exactly. */
+function roundHalfEvenScaled(abs, decimals) {
+    const parts = exactParts(abs);
+    if (parts.mantissa === 0n) return 0n;
+
+    // value = numerator / 10^scale, exactly. A negative binary exponent becomes a
+    // decimal denominator because 2^-k == 5^k / 10^k.
+    let numerator;
+    let scale;
+    if (parts.exponent < 0) {
+        scale = -parts.exponent;
+        numerator = parts.mantissa * 5n ** BigInt(scale);
+    } else {
+        scale = 0;
+        numerator = parts.mantissa << BigInt(parts.exponent);
+    }
+
+    const shift = scale - decimals;
+    if (shift <= 0) {
+        // The value already terminates at or before ``decimals`` places: exact.
+        return numerator * 10n ** BigInt(-shift);
+    }
+
+    const divisor = 10n ** BigInt(shift);
+    const quotient = numerator / divisor;
+    const remainder = numerator % divisor;
+    const twice = remainder * 2n;
+    if (twice > divisor) return quotient + 1n;
+    if (twice < divisor) return quotient;
+    return quotient % 2n === 0n ? quotient : quotient + 1n;   // a real tie: half to even
+}
+
+/** Render an integer scaled by ``10^decimals`` as a fixed-point string. */
+function formatScaled(scaled, decimals, negative) {
+    const sign = negative ? '-' : '';
+    const digits = scaled.toString();
+    if (decimals === 0) return sign + digits;
+    const padded = digits.padStart(decimals + 1, '0');
+    const cut = padded.length - decimals;
+    return `${sign}${padded.slice(0, cut)}.${padded.slice(cut)}`;
+}
+
 const OFFLINE_CRYPTO = {
     SIGNATURE_VERSION: 1,
 
     /**
-     * Python's fixed-point formatting, i.e. round-half-EVEN.
+     * Python's fixed-point formatting, i.e. round-half-EVEN on the *exact* value.
      *
-     * Number.toFixed() rounds halves away from zero, so it disagrees with Python on
-     * an exact tie - and a tie is reachable with real GPS data (an accuracy of
-     * exactly 8.25 is a genuine reading, not a contrived one). A disagreement here
-     * is a punch the phone can sign but the server can never verify, because the
-     * server re-formats every value before checking the signature.
+     * WHY THIS IS NOT `(number * factor)` THEN ROUND
+     * ---------------------------------------------
+     * The previous implementation multiplied by the power of ten first and then
+     * looked for a tie. That looks equivalent and is not, because the multiplication
+     * itself rounds. A multiply-then-round implementation is wrong in three ways, and
+     * all three are reachable with values the server really receives:
+     *
+     * 1. **Multiplying first invents ties.** ``0.05 * 10`` evaluates to exactly
+     *    ``0.5`` in binary floating point, but the double ``0.05`` is really
+     *    ``0.05000000000000000277…`` - strictly *above* the midpoint. Python's
+     *    ``f"{0.05:.1f}"`` therefore answers ``"0.1"`` while the multiply-then-round
+     *    code saw a tie and answered ``"0.0"``. The same holds for ``0.15``,
+     *    ``1.0000005`` and ``-2.0000005``: the product lands on the midpoint even
+     *    though the value never was one.
+     * 2. **A tie must be broken half-even, not half-up.** ``Number.toFixed()`` resolves
+     *    a tie toward the larger value, so ``(8.25).toFixed(1)`` is ``"8.3"`` where
+     *    Python answers ``8.25 -> "8.2"``.
+     * 3. **The sign of a zero is kept.** ``f"{-0.0:.1f}"`` is ``"-0.0"``, and the old
+     *    check (``number < 0``) is false for ``-0``, so the sign was dropped.
+     *
+     * A disagreement here is a punch the phone can sign but the server can never
+     * verify, because the server re-formats every value before checking the signature
+     * - and it happens on a device that was offline, where nobody can look.
+     *
+     * So the rounding is done on the double's *exact* rational value, recovered from
+     * its IEEE-754 fields with BigInt: no intermediate floating point, no invented
+     * ties, and half-even applied only to a genuine tie. This is a byte-for-byte port
+     * of ``mobile-client/src/offline/signing.ts``, and the two are held to the same
+     * Python reference by the same suite.
      */
     fixed(value, decimals) {
         if (value === null || value === undefined || value === '') return '';
         const number = Number(value);
         if (!isFinite(number)) return '';
-        const factor = Math.pow(10, decimals);
-        const scaled = number * factor;
-        const floor = Math.floor(scaled);
-        const fraction = scaled - floor;
-        let rounded;
-        if (fraction > 0.5) rounded = floor + 1;
-        else if (fraction < 0.5) rounded = floor;
-        else rounded = floor % 2 === 0 ? floor : floor + 1;   // half to even
-        const text = (rounded / factor).toFixed(decimals);
-        // Python keeps the sign of a value that rounds to zero: -0.0000004 -> "-0.000000".
-        return rounded === 0 && number < 0 ? `-${text}` : text;
+        // ``-0`` is a value Python formats with its sign, and ``-0 < 0`` is false.
+        const negative = number < 0 || Object.is(number, -0);
+        return formatScaled(roundHalfEvenScaled(Math.abs(number), decimals), decimals, negative);
     },
 
     /** Python `f"{float(v):.6f}"`, and "" for a missing value. */

@@ -260,6 +260,18 @@ function boot(options) {
         },
         querySelector() { return null; },
         querySelectorAll() { return []; },
+        // ``document.head``, and what is appended to it. A page whose own script loads a
+        // library from a CDN appends the tag *here* - ``ensureLeaflet``, ``Map.ensure`` - so a
+        // stub without this does not test that code, it makes it throw
+        // "Cannot read properties of undefined (reading 'appendChild')" from inside a loader
+        // that is working perfectly. The tags are recorded rather than discarded, so a suite
+        // can read back which script a page asked for and drive the load/error event the
+        // browser would fire.
+        head: {
+            __children: [],
+            appendChild(child) { if (child) child.__owner = this; this.__children.push(child);
+            }
+        },
         createElement(tag) {
             const el = makeElement(tag);
             if (tag === 'a') anchors.push(el);

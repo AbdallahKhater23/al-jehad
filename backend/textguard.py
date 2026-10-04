@@ -48,7 +48,8 @@ WHAT IS REFUSED, AND WHY EACH RULE IS HERE
 WHAT IS ALLOWED
 ---------------
 Names, site names and labels take an **allowlist**: Latin letters, Arabic letters in every
-block an Arabic keyboard can produce, Arabic and Western digits, the harakat, spaces, and
+block an Arabic keyboard can produce, Devanagari (a name typed in Hindi is a name - the
+registration link is read in Hindi too), Arabic and Western digits, the harakat, spaces, and
 ``. , - _ ( ) /``. Two deliberate consequences:
 
 * **Apostrophes are refused in identifiers.** ``O'Brien`` cannot be stored as a name. That is
@@ -56,9 +57,9 @@ block an Arabic keyboard can produce, Arabic and Western digits, the harakat, sp
   an unquoted SQL literal *and* escapes an HTML attribute, and it is the only rule here that
   a person can notice. A deployment that needs it widens ``IDENTIFIER_PUNCTUATION`` below -
   one line, one place - rather than the allowlist being loose for everyone.
-* **Arabic is a first-class citizen, not an exception.** The ranges are listed explicitly
-  instead of using ``\\w``, so what is accepted is a decision that can be read and tested
-  rather than whatever the current Unicode database says a word character is.
+* **Arabic and Hindi are first-class citizens, not exceptions.** The ranges are listed
+  explicitly instead of using ``\\w``, so what is accepted is a decision that can be read and
+  tested rather than whatever the current Unicode database says a word character is.
 
 Prose (note bodies, replies, rejection reasons, invite notes) takes everything except the
 four refusals above, because a worker writing "the lift did not work (again!) — 2 days lost"
@@ -120,6 +121,13 @@ _ARABIC_LETTERS: Final = (
 #: The harakat and the dagger alef. Refusing these would refuse something like "مُحَمَّد"
 #: written with its vowels.
 _ARABIC_MARKS: Final = "\u064b-\u065f\u0670"
+#: Hindi (Devanagari): the letters, the matras that carry its vowels, the nukta forms and the
+#: script's own digits. Hindi is one of the four languages this deployment is read in - a name
+#: typed in it is a name - and the class is a range because Devanagari's letters, marks and
+#: digits are laid out in blocks (U+0900-U+0963 then U+0966-U+097F) rather than interleaved the
+#: way Arabic's are. U+0964/U+0965 (the danda) are punctuation and stay out, exactly as the
+#: apostrophe does.
+_DEVANAGARI: Final = "\u0900-\u0963\u0966-\u097f"
 _LATIN: Final = "A-Za-z"
 #: Western digits plus both Arabic-Indic sets. A phone number typed on an Arabic keyboard is
 #: a phone number; refusing ``٠١٠`` would be a bug reported as "the app hates Arabic".
@@ -130,7 +138,12 @@ _DIGITS: Final = "0-9\u0660-\u0669\u06f0-\u06f9"
 IDENTIFIER_PUNCTUATION: Final = " .,-_()/"
 
 _IDENTIFIER_CLASS: Final = (
-    _LATIN + _ARABIC_LETTERS + _ARABIC_MARKS + _DIGITS + re.escape(IDENTIFIER_PUNCTUATION)
+    _LATIN
+    + _ARABIC_LETTERS
+    + _ARABIC_MARKS
+    + _DEVANAGARI
+    + _DIGITS
+    + re.escape(IDENTIFIER_PUNCTUATION)
 )
 #: ``fullmatch`` against this is the entire identifier rule.
 IDENTIFIER_RE: Final = re.compile(rf"[{_IDENTIFIER_CLASS}]+")
@@ -300,7 +313,7 @@ def identifier(
             f"{field} must be at most {max_length} characters; this one is {len(text)}."
         )
     allowed = (
-        "letters (English or Arabic), digits, spaces and any of "
+        "letters (English, Arabic or Hindi), digits, spaces and any of "
         f"{' '.join(IDENTIFIER_PUNCTUATION.strip())}"
     )
     _refuse_disallowed(text, IDENTIFIER_RE, field=field.capitalize(), allowed=allowed)

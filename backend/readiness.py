@@ -52,6 +52,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse
 
+import audit
 import database
 import migrations
 import notifications
@@ -961,6 +962,14 @@ PUBLIC_ROUTES: dict[str, str] = {
         "quarantined: it can sign in, and it cannot record a punch until an administrator "
         "approves it."
     ),
+    "GET /api/v1/register/{token}/moallems": (
+        "the same link, asked which moallems the applicant may be assigned to: the dropdown on "
+        "the same page, read without an account by the person filling it in. The path's token "
+        "is the credential here too (``require_link``), and what it answers is the *roster of "
+        "supervisors* - name and id of active moallem accounts, and nothing else about them. "
+        "It is deliberately not a public ``/moallems``: a staff list reachable from any URL "
+        "would be the first thing about this deployment a stranger could enumerate."
+    ),
     "GET /api/v1/q/{token}": (
         "one-tap clock link: the link token in the path is the credential. Reusing one does "
         "not authenticate anybody else."
@@ -996,6 +1005,15 @@ PAGE_ROUTES: frozenset[str] = frozenset(
         "GET /q/{token}",
         "GET /register",
         "GET /register/{token}",
+        # The visual geofence editor: an HTML file and nothing else. Like the four above it
+        # parses no request and answers no data - the fence it draws is read from
+        # ``GET /api/v1/geofence`` with the session's token, and the save it offers is
+        # refused unless that session is an administrator's.
+        "GET /geofence",
+        # The visual site-creation page, the same shape for the same reason: it draws the map
+        # a site's fence is set on, and every call it makes - ``POST /api/v1/sites``,
+        # ``POST /api/v1/resolve-maps-link`` - is administrator-only.
+        "GET /sites/new",
     }
 )
 
@@ -2551,19 +2569,21 @@ def _audit_system(action: str, *, entity: str, entity_id: str | int | None, afte
     than an update of the previous one. "How often has this deployment been started past a
     failing self-test" is a question an incident review asks, and a single overwritten row
     could not answer it - especially now that the alert itself is one row per *reason*.
+
+    Its own connection, deliberately: this runs from the startup gate - before the app serves
+    anything, and on paths that never reach a request - so there is no caller's transaction to
+    join. The write itself is ``audit.record``'s.
     """
     try:
         with database.db(write=True) as conn:
-            conn.execute(
-                "INSERT INTO audit_log (actor_id, actor_role, action, entity, entity_id, "
-                "after_json, created_at) VALUES (NULL, 'system', ?, ?, ?, ?, ?)",
-                (
-                    action,
-                    entity,
-                    str(entity_id) if entity_id is not None else None,
-                    json.dumps(after, default=str),
-                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                ),
+            audit.record(
+                conn,
+                action=action,
+                entity=entity,
+                entity_id=entity_id,
+                after=after,
+                actor_role="system",
+                created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             )
     except sqlite3.Error:
         pass

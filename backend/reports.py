@@ -42,11 +42,12 @@ import csv
 import io
 import sqlite3
 from datetime import date, datetime, timedelta
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 
+import names
 import shift_windows
 from database import db
 from notes import OPEN_STATUSES as OPEN_NOTE_STATUSES
@@ -225,7 +226,16 @@ SHIFT_TIMESHEET_SQL = """
     SELECT l.id AS log_id,
            l.worker_id,
            u.name AS worker_name,
+           -- The name map beside the canonical name: a timesheet is read in one of four
+           -- languages, and the row has to be readable in the reader's own (``names``).
+           u.name_i18n AS worker_names_json,
            u.role AS role,
+           -- Who the worker reports to, joined here rather than looked up per row: the
+           -- moallem is a column on the sheet, so "which crew was this" is answerable from
+           -- the same read that answered "how many hours".
+           u.moallem_id AS moallem_id,
+           m.name AS moallem_name,
+           m.name_i18n AS moallem_names_json,
            l.site_name,
            l.timestamp,
            l.hours,
@@ -241,6 +251,10 @@ SHIFT_TIMESHEET_SQL = """
            COALESCE(notes.open_notes, 0) AS open_notes
     FROM attendance_logs l
     LEFT JOIN users u ON l.worker_id = u.id
+    -- An unassigned worker is a row with no moallem, which is an answer ("nobody") and not a
+    -- missing row: an inner join here would drop the shifts of everyone who has no supervisor
+    -- yet, which is most of a new deployment.
+    LEFT JOIN users m ON m.id = u.moallem_id
     -- The arrival that started the shift this row closes: the worker's own latest Clock In
     -- before it, paired on the log id. The id is insertion order, which is the order these
     -- punches have always been paired in - ``active_sessions`` holds exactly one open shift
@@ -263,7 +277,7 @@ SHIFT_TIMESHEET_SQL = """
         GROUP BY worker_id
     ) notes ON notes.worker_id = l.worker_id
     WHERE l.action = 'Clock Out'
-      AND l.timestamp >= ? AND l.timestamp < ?
+      {range_clause}
       {extra}
     ORDER BY l.timestamp DESC, l.id DESC
 """
@@ -273,7 +287,8 @@ SHIFT_TIMESHEET_SQL = """
 #: to guess what is in a row. Not the CSV's order and not the screen's order: the screen's
 #: is the administrator's to rearrange, and this is the wire format.
 TIMESHEET_FIELDS = (
-    "log_id", "date", "timestamp", "worker_id", "worker_name", "role", "site_name",
+    "log_id", "date", "timestamp", "worker_id", "worker_name", "worker_names", "role",
+    "site_name", "moallem_id", "moallem_name", "moallem_names",
     "arrival_time", "arrival_verdict", "arrival_minutes",
     "hours", "recorded_hours", "approved_hours", "break_hours", "status_code", "status",
     "awaiting_approval", "open_notes",
@@ -440,7 +455,12 @@ def stored_report_columns(columns: object) -> str | None:
 
 
 def shift_timesheet_rows(
-    *, start: str, end: str, site: str | None = None, worker_id: str | None = None
+    *,
+    start: str | None = None,
+    end: str | None = None,
+    site: str | None = None,
+    worker_id: str | None = None,
+    log_ids: Iterable[int] | None = None,
 ) -> dict:
     """One period of shifts, one row per shift.
 
@@ -448,9 +468,31 @@ def shift_timesheet_rows(
     opens it for is almost always yesterday rather than the first of the month. The
     totals are sums over the rows beside them, never a separate query, so the header
     cannot disagree with the table under it.
+
+    ``log_ids`` selects shifts **by identity** instead of by date: a caller that was
+    handed a selection needs exactly the rows it was given, and a
+    range would either miss one at a boundary or drag in its neighbours. The range is
+    ignored when it is used, which is why ``start``/``end`` are optional here now - a
+    caller that names shifts has already said which ones.
     """
     extra = ""
-    params: list = [start, end]
+    params: list = []
+    if start and end:
+        range_clause = "AND l.timestamp >= ? AND l.timestamp < ?"
+        params += [start, end]
+    else:
+        range_clause = ""
+    if log_ids is not None:
+        wanted = [int(value) for value in log_ids]
+        if not wanted:
+            # Valid SQL and no rows, rather than an ``IN ()`` SQLite would refuse: an empty
+            # selection is a question with no shifts behind it, not a syntax error.
+            extra += " AND 1 = 0"
+        else:
+            # ``l.id``, not the ``log_id`` alias: a WHERE clause runs before the SELECT's own
+            # names exist, and ``l.log_id`` is a column this table has never had.
+            extra += f" AND l.id IN ({','.join('?' * len(wanted))})"
+            params += wanted
     if site:
         extra += " AND l.site_name = ?"
         params.append(site)
@@ -459,6 +501,7 @@ def shift_timesheet_rows(
         params.append(worker_id)
 
     sql = SHIFT_TIMESHEET_SQL.format(
+        range_clause=range_clause,
         extra=extra,
         note_statuses=",".join("?" * len(OPEN_NOTE_STATUSES)),
     )
@@ -523,8 +566,16 @@ def shift_timesheet_rows(
                 "timestamp": record["timestamp"],
                 "worker_id": str(record["worker_id"]),
                 "worker_name": record["worker_name"],
+                "worker_names": names.parse(record["worker_names_json"]),
                 "role": record["role"],
                 "site_name": record["site_name"],
+                # The assignment, for the Moallem column: the id for a filter, the two names
+                # for the cell - ``moallem_name`` the canonical value and ``moallem_names``
+                # the map the console re-renders in the reader's language. All three are
+                # null/empty for a worker nobody supervises yet.
+                "moallem_id": record["moallem_id"],
+                "moallem_name": record["moallem_name"],
+                "moallem_names": names.parse(record["moallem_names_json"]),
                 # The site's category, so the board can group and search by it without asking
                 # for the site list as well - and so a "warehouse" filter counts the shifts a
                 # reader can see rather than the sites somebody configured.

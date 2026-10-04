@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- Zoom is not blocked: WCAG 1.4.4 wants text resizable to 200%, and a worker
+         inspecting a figure in sunlight uses pinch-zoom for exactly that. The
+         double-tap-to-zoom lag a handset app usually bans is the price of that. -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#162F29" />
+    <!-- Light first, as the web app ships: the dark palette is a token swap the
+         worker opts into on Profile, and the WebView must not paint its own form
+         controls dark behind a white card before that choice is made. -->
+    <meta name="color-scheme" content="light dark" />
+    <meta name="format-detection" content="telephone=no" />
+    <title>Freebuff</title>
+  </head>
+  <body>
+    <div id="app" data-safe-insets="true"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -59,7 +59,13 @@ const { OFFLINE_CRYPTO } = require(process.argv[2]);
 const payload = JSON.parse(require('fs').readFileSync(0, 'utf8'));
 (async () => {
     const out = {};
-    if (payload.action_mode === 'time') {
+    if (payload.mode === 'format') {
+        // One rendered value per input, in both forms the signature carries.
+        out.formatted = payload.values.map((value) => ({
+            coord: OFFLINE_CRYPTO.fmtCoord(value),
+            accuracy: OFFLINE_CRYPTO.fmtAccuracy(value)
+        }));
+    } else if (payload.action_mode === 'time') {
         const base = OFFLINE_CRYPTO.parseTs(payload.base);
         out.effective_timestamp = OFFLINE_CRYPTO.formatTs(base + payload.offset_s * 1000);
         out.client_timestamp = OFFLINE_CRYPTO.formatTs(base + payload.wall_elapsed_s * 1000);
@@ -148,6 +154,16 @@ FIELDS = {
         pytest.param({"lat": 30.05, "lon": 31.0, "accuracy": 8.25}, id="exact-formatting"),
         pytest.param({"lat": -1.0, "lon": -0.000001, "accuracy": 100.0}, id="negative-and-small"),
         pytest.param({"action": "Clock Out", "client_punch_id": str(uuid.uuid4())}, id="clock-out"),
+        # The cases a multiply-then-round implementation gets wrong: the product lands on an
+        # exact midpoint even though the double never was one.
+        pytest.param({"lat": 1.0000005, "lon": -2.0000005}, id="spurious-tie-at-6dp"),
+        pytest.param({"accuracy": 0.05}, id="accuracy-half-up-not-even"),
+        pytest.param({"lat": 1.0000015, "lon": 2.0000015, "accuracy": 0.15}, id="near-tie-magnitudes"),
+        pytest.param({"lat": 89.9999999, "lon": -179.9999999, "accuracy": 1234.567}, id="extreme-magnitudes"),
+        # ``-0.0`` is a value Python renders with its sign, and the multiply-then-round
+        # version had no ``-0.0`` path at all.
+        pytest.param({"lat": -0.0, "accuracy": -0.0}, id="negative-zero-keeps-its-sign"),
+        pytest.param({"lat": 0.05, "lon": -28.650000000000002, "accuracy": 8.25}, id="half-even-ties"),
     ],
 )
 def test_canonical_string_and_signature_match_the_server(node_harness, overrides):
@@ -173,6 +189,82 @@ def test_the_photo_hash_matches_python(node_harness):
         {"device_key": "unused", "fields": FIELDS, "blob_hex": blob.hex()},
     )
     assert answer["photo_sha256"] == hashlib.sha256(blob).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# rounding: the one place the two languages genuinely differ
+# ---------------------------------------------------------------------------
+#: Values whose *exact* double differs from its product with a power of ten. A
+#: multiply-then-round implementation answers differently for every one of them, so
+#: each entry is a punch that could be signed on the phone and never verified here.
+ROUNDING_VECTORS = [
+    0.05,                 # 0.05 * 10 is exactly 0.5, but the double is above the midpoint
+    0.15,
+    8.25,                 # a real tie: Python rounds half-even, toFixed() rounds half-up
+    1.0000005,
+    -2.0000005,
+    1.0000015,
+    2.0000015,
+    18.6000005,
+    -6.2300005,
+    -28.650000000000002,
+    89.9999999,
+    -179.9999999,
+    1234.567,
+    0.0,
+    -0.0,                 # the sign of a zero survives Python's format; it must survive ours
+    1e-9,
+    -1e-9,
+]
+
+
+@pytest.mark.parametrize("value", ROUNDING_VECTORS, ids=lambda value: repr(value))
+def test_rounding_vectors_match_python(node_harness, value):
+    """Both rendered forms, against the server's own formatters.
+
+    Compared as strings: ``"-0.0"`` and ``"0.0"`` are different signed values, and the
+    signature covers the bytes, not the number.
+    """
+    answer = run_client(node_harness, {"mode": "format", "values": [value]})
+    rendered = answer["formatted"][0]
+    assert rendered["coord"] == offline_sync._fmt_coord(value)
+    assert rendered["accuracy"] == offline_sync._fmt_accuracy(value)
+
+
+def test_rounding_matches_python_across_a_random_sample(node_harness):
+    """Rounding is the one place the two languages genuinely differ, so it is sampled hard.
+
+    Values are shaped like readings (coordinates, accuracies) and deliberately placed near
+    decimal midpoints. A mismatch here is a punch the phone can sign and the server can
+    never verify.
+    """
+    import random
+
+    rng = random.Random(20261003)
+    values: list[float] = []
+    for _ in range(1500):
+        kind = rng.random()
+        if kind < 0.5:
+            values.append(rng.uniform(-90.0, 90.0))
+        elif kind < 0.7:
+            values.append(rng.uniform(0.0, 100.0))
+        elif kind < 0.85:
+            decimals = rng.choice([6, 1])
+            half = 10 ** (-decimals) / 2
+            base = rng.randint(-2000, 2000) / 10 ** rng.choice([0, 1, 2, 3])
+            values.append(base + rng.choice([half, -half]) * rng.choice([1.0, 1.0, 0.5, 2.0, 0.1]))
+        else:
+            values.append(rng.choice([0.0, -0.0, 1e-9, -1e-9, 0.05, 8.25, 0.15, 1.0000005, -2.0000005]))
+
+    answer = run_client(node_harness, {"mode": "format", "values": values})
+
+    mismatches = [
+        (value, got, offline_sync._fmt_coord(value), offline_sync._fmt_accuracy(value))
+        for value, got in zip(values, answer["formatted"])
+        if got["coord"] != offline_sync._fmt_coord(value)
+        or got["accuracy"] != offline_sync._fmt_accuracy(value)
+    ]
+    assert not mismatches, f"{len(mismatches)} rounding mismatch(es), first few: {mismatches[:5]}"
 
 
 # ---------------------------------------------------------------------------

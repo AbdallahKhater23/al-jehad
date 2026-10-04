@@ -34,6 +34,12 @@ ROSTER_FIELDS = {
     # because it is a privilege an administrator grants one person at a time, so the list has to
     # show who holds it.
     "transit_enabled",
+    # Who a worker answers to, and the worker's name as they entered it. Both are roster fields
+    # because the Credentials tab is where an assignment is set and where a name is corrected.
+    "name_i18n",
+    "moallem_id",
+    "moallem_name",
+    "moallem_names",
 }
 
 

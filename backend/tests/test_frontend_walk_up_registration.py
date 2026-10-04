@@ -31,6 +31,8 @@ from pathlib import Path
 
 import pytest
 
+import names as names_module
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 FRONTEND = PROJECT_ROOT / "frontend"
 
@@ -46,12 +48,17 @@ REGISTER_KEYS = (
     "register.sub",
     "register.intro",
     "register.name.placeholder",
+    "register.name.hint",
     "register.password.placeholder",
     "register.password2.placeholder",
     "register.phone.placeholder",
     "register.email.placeholder",
     "register.work.placeholder",
     "register.role.label",
+    "register.moallem.label",
+    "register.moallem.none",
+    "register.moallem.empty",
+    "register.moallem.offline",
     "register.consent",
     "register.submit",
     "register.sending",
@@ -275,6 +282,13 @@ def test_the_page_is_a_form_only_when_it_carries_the_link():
     assert flow.count("fetch(ENDPOINT") == 2, (
         "both calls - the policy read and the submission - have to go to the link's own address"
     )
+    # The moallem list is the third read from the same token, and it is derived from the same
+    # constant rather than written out again - a second literal would be a second address to
+    # keep in step with the route.
+    assert 'var MOALLEMS = ENDPOINT + "/moallems"' in flow, (
+        "the moallem list is fetched from somewhere other than this link's own address"
+    )
+    assert "fetch(MOALLEMS)" in flow, "nothing ever asks the server which moallems exist"
     assert 'sayKey("register.needLink", "err")' in flow, (
         "a page with no token does not say so, so it would look like a broken link"
     )
@@ -289,6 +303,89 @@ def test_a_closed_intake_says_so_instead_of_looking_broken():
     assert "registration_closed" in capture_body(), (
         "the intake's ``registration_closed`` code is not mapped to a sentence, so a refusal "
         "would reach the applicant in English prose"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The moallem a worker names while applying
+# ---------------------------------------------------------------------------
+def test_a_worker_picks_a_moallem_and_no_other_role_is_asked_for_one():
+    """The dropdown is the server's list, and it belongs to the worker role alone.
+
+    Three decisions live here. The list is the *server's* - the same page cannot read accounts
+    without a session, so an option that could be refused is never drawn. The field is shown for
+    ``worker`` and put away for every other role, because a moallem is not assigned to another
+    moallem and the server refuses that outright. And the choice is *optional*: the first option
+    is always no moallem, so a site that has registered none can still take applications.
+    """
+    body = page_body()
+    flow = flow_body()
+    for element in ('id="moallem-field"', 'id="moallem"', 'id="moallem-note"'):
+        assert element in body, f"the page has nowhere to put the moallem control ({element})"
+    assert 'data-t="register.moallem.label"' in body, "the dropdown has no label in any language"
+    assert '$("role").value !== "worker"' in flow, (
+        "the field is not gated on the role, so a moallem would be offered a moallem"
+    )
+    assert '$("moallem").value = ""' in flow, (
+        "a moallem chosen under the worker role survives a role change"
+    )
+    assert '$("role").addEventListener("change", syncMoallem)' in flow, (
+        "nothing re-reads the role when the applicant changes it"
+    )
+    assert 'Capture.t("register.moallem.none")' in flow, (
+        "the list has no \"no moallem\" option, so the assignment is not optional"
+    )
+    assert "names[Capture.lang]" in flow and "return entry.name || entry.id" in flow, (
+        "a moallem is not named in the reader's language, and nothing stands in when the "
+        "translation that matches is missing"
+    )
+    assert 'moallemNote = moallems.length ? "" : "register.moallem.empty"' in flow, (
+        "an empty list is drawn as an empty dropdown with no explanation"
+    )
+    assert 'moallemNote = "register.moallem.offline"' in flow, (
+        "a failed read is not told apart from a site that has registered no moallem"
+    )
+
+
+def test_the_form_carries_the_moallem_the_worker_chose():
+    """``moallem_id`` goes with every submission; empty means nobody, which the server accepts."""
+    flow = flow_body()
+    assert 'form.append("moallem_id"' in flow, (
+        "the choice never reaches the server, so every applicant is unassigned"
+    )
+
+
+def test_the_name_is_filed_under_the_language_it_was_written_in():
+    """A name typed in Arabic must not be stored as the English one.
+
+    The picker can be switched after the box is filled, and the box keeps its text - so the
+    language is stamped as the applicant types rather than read at submit, which would file
+    Arabic letters as English on a page somebody switched after typing.
+    """
+    flow = flow_body()
+    assert 'form.append("name_" + nameLang' in flow, (
+        "the name is not posted under a language key, so the server has only the plain field"
+    )
+    assert 'var nameLang = Capture.lang' in flow, "the name's language is never initialised"
+    assert '$("full-name").addEventListener("input"' in flow, (
+        "the language the name was written in is read at submit rather than as it is typed"
+    )
+    assert 'form.append("full_name"' in flow, (
+        "the plain name field was dropped; older deployments of the server still read it"
+    )
+
+
+def test_the_name_languages_are_the_ones_the_server_stores():
+    """``name_<code>`` has to be a key ``names.parse`` understands, or the name is dropped.
+
+    Read off both sides rather than written twice: the page's picker and the server's storage
+    are the same four codes, and a language added to one without the other is a name that never
+    arrives.
+    """
+    offered = sorted(set(re.findall(r'code: "([a-z]{2})"', capture_body())))
+    assert offered == sorted(names_module.LANGUAGES), (
+        f"capture.js offers {offered} and the server stores {sorted(names_module.LANGUAGES)}; "
+        "the page posts the name as name_<code>"
     )
 
 

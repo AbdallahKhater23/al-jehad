@@ -492,8 +492,16 @@ def test_the_schema_version_names_the_newest_migration():
     # administrator approves it, and 31 the link's own generation: ``link_generation`` on
     # ``registration_settings`` with the ``link_rotated_*`` pair that records who replaced it
     # and when, so the walk-up address is a token the console mints and revokes rather than a
-    # permanent public URL.)
-    assert migrations.SCHEMA_VERSION == 31
+    # permanent public URL. 32 adds the visual geofence's own two tables -
+    # ``geofence_settings`` (the deployment fence, append-only so a move is a row rather than
+    # an overwrite) and ``attendance_punches`` (the ledger of *verified* punches) - and
+    # changes no existing table: ``construction_sites`` is still what the shift pipeline reads.
+    # 33 adds the worker-moallem assignment and the name-per-language map: ``users.moallem_id``
+    # (which moallem a worker answers to, joined onto the roster, the timesheet and the live
+    # board) and ``users.name_i18n`` (the same name in each language the app reads, so an
+    # applicant who typed it in Hindi is not read as a blank name by an English screen), plus
+    # the two indexes those reads go through.)
+    assert migrations.SCHEMA_VERSION == 33
 
 
 def test_the_migration_is_replayable_and_idempotent():

@@ -1,0 +1,178 @@
+/* =====================================================================
+ *  clock.css -- what the Clock screen owns beyond the shared shell.
+ *
+ *  The screen itself is the web's: ``.hand-hero`` for the shift, the
+ *  ``.hand-policy`` grid for the numbers it is paid by, one ``.clock-button
+ *  .hand-clock`` for the action and a ``.hand-action-line`` footnote under it.
+ *  Those live in shell.css, so they cannot drift from the desk's copy.
+ *
+ *  What is left here is the part the web never has: the selfie preview strip
+ *  and the full-screen camera. Both are drawn on the same tokens, so the black
+ *  shutter screen is the only place in this build that is not the light theme.
+ * ===================================================================== */
+
+/* ---------------------------------------------------------------------
+ *  the selfie preview
+ * ------------------------------------------------------------------- */
+.clock-preview {
+  display: flex;
+  align-items: center;
+  gap: var(--ui-3);
+}
+
+.clock-preview__frame {
+  width: 64px;
+  height: 64px;
+  border-radius: var(--ui-radius-sm);
+  background: var(--ops-surface-2);
+  border: 1px solid var(--ops-border);
+  overflow: hidden;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ops-muted);
+}
+
+.clock-preview__frame img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.clock-preview__body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 13px;
+}
+
+.clock-preview__hint {
+  color: var(--ops-muted);
+  font-size: 12px;
+}
+
+/* ---------------------------------------------------------------------
+ *  the capture overlay
+ * -------------------------------------------------------------------
+ *  The one screen that is not the light theme, and the only one that can be:
+ *  a camera viewfinder has to be black behind the subject, or the preview
+ *  lies about the exposure of the frame that gets signed and uploaded.
+ * ------------------------------------------------------------------- */
+.clock-capture {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-sheet);
+  background: #000;
+  display: flex;
+  flex-direction: column;
+  padding-top: var(--safe-top);
+  padding-bottom: var(--safe-bottom);
+}
+
+.clock-capture[hidden] {
+  display: none;
+}
+
+.clock-capture__stage {
+  flex: 1;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.clock-capture__video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background: #000;
+}
+
+/* A framing guide, sized from the server's own working-distance band: the face
+   belongs inside the oval, and the oval is deliberately generous because a tight
+   crop loses the context the reviewer needs. */
+.clock-capture__guide {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.clock-capture__oval {
+  width: 62%;
+  max-width: 300px;
+  aspect-ratio: 3 / 4;
+  border-radius: 50%;
+  border: 3px solid rgba(255, 255, 255, 0.55);
+  box-shadow: 0 0 0 200vmax rgba(0, 0, 0, 0.42);
+}
+
+.clock-capture__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--ui-3);
+  padding: var(--ui-3) var(--hand-gutter);
+  color: #fff;
+}
+
+.clock-capture__hint {
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.78);
+  text-align: center;
+  padding: 0 var(--hand-gutter);
+}
+
+.clock-capture__foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-around;
+  gap: var(--ui-4);
+  padding: var(--ui-4) var(--hand-gutter) var(--ui-6);
+}
+
+.clock-capture__shutter {
+  width: 76px;
+  height: 76px;
+  min-height: 76px;
+  border-radius: 50%;
+  background: #fff;
+  border: 4px solid rgba(255, 255, 255, 0.35);
+  background-clip: padding-box;
+  box-shadow: 0 0 0 3px #fff inset;
+  transition: transform var(--ui-press) ease;
+}
+
+.clock-capture__shutter:active {
+  transform: scale(0.94);
+}
+
+.clock-capture__cancel {
+  min-height: var(--hand-tap);
+  min-width: 88px;
+  padding: 0 var(--ui-4);
+  border-radius: var(--ui-radius-sm);
+  background: rgba(255, 255, 255, 0.14);
+  color: #fff;
+  font-weight: 600;
+}
+
+.clock-capture__cancel:active {
+  background: rgba(255, 255, 255, 0.26);
+}
+
+.clock-capture__error {
+  margin: 0 var(--hand-gutter) var(--ui-4);
+  padding: var(--ui-3);
+  border-radius: var(--ui-radius-sm);
+  background: rgba(220, 38, 38, 0.22);
+  color: #fecaca;
+  font-size: 13px;
+}

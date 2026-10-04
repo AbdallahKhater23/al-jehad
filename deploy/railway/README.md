@@ -64,18 +64,11 @@ private range on the strength of this file.
 
 ### What the image sets for itself
 
-Three variables come from the `Dockerfile`, not from `variables.env`, because they are properties
-of the 512 MB / 1 vCPU instance rather than choices an operator makes per service - each one is
-documented in the image next to where it is set:
-
-| Variable | Value | Why |
-| --- | --- | --- |
-| `FACE_INFERENCE_QUEUE` | `8` | a queued punch holds its decoded frame, so the 64-deep default could ask for ~640 MB against this app's ~290 MB floor |
-| `STANDING_SWEEP_ENABLED` | `0` | the standing coverage report runs detectors on a timer, which on one core competes with the gate |
-| `FACE_ENGINE_PROCESS` | `1` | the models run in a child process, so the API process's floor falls from ~212 MiB to ~4 MiB and a model crash ends one punch instead of the service |
-
-All three can be turned off per service by pasting the variable with the other value into
-Railway's *Variables* tab; the deployment does not depend on any of them to boot.
+The `Dockerfile` sets four variables that are properties of the 512 MB / 1 vCPU instance rather
+than per-service choices, each documented next to where it is set: `FACE_INFERENCE_QUEUE=16`,
+`FACE_INFERENCE_CONCURRENCY=4`, `STANDING_SWEEP_ENABLED=0`, `FACE_ENGINE_PROCESS=1`. Any of them
+can be overridden in Railway's
+*Variables* tab; the deployment does not depend on them to boot.
 
 The variables were generated with the documented command (which is the same package the sender
 uses, so the encoding cannot drift from what pywebpush reads):

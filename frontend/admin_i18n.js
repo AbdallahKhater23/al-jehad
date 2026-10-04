@@ -167,6 +167,13 @@ Object.assign(TRANSLATIONS.en, {
         "credentialsTransit": "Allow off-site shift start (transit worker)",
         "credentialsTransitHint": "Grant this only to the people who drive between sites: with it on, they may begin a paid shift outside every site and have it authorised when they reach a geofence. It is per account - off for everyone until you give it.",
         "credentialsUserSaved": "Account updated.",
+        // The worker-moallem relationship. The word for the role itself is ``roleMoallem`` and is
+        // not repeated here: one word for one role, on the board and on the timesheet alike.
+        "moallemUnassigned": "Unassigned",
+        "credentialsMoallemInactive": "{name} (inactive)",
+        "credentialsMoallemHint": "A worker answers to one moallem, or to nobody. Only a worker is assigned: a moallem answers to nobody here.",
+        "credentialsNameLanguages": "Name in each language",
+        "credentialsNameLanguagesHint": "Each line is that language's spelling of the same name. A line left empty is not shown to a reader of that language; the name above is what every screen falls back to.",
         "credentialsUserDeleted": "Account deleted.",
         "credentialsDeactivated": "Account deactivated.",
         "credentialsReactivated": "Account reactivated.",
@@ -846,6 +853,12 @@ Object.assign(TRANSLATIONS.en, {
         "sitesDeleteConfirm": "Delete this site? Workers can no longer clock in here, and the shifts already recorded stay as they are.",
         "sitesAdded": "Site added",
         "sitesSaved": "Site saved",
+        // The way to the visual creation page: paste a Maps link, drag the circle, save.
+        // Its own key rather than a second use of "sitesAdd", because the two are different
+        // jobs - one is four boxes and a pair of numbers, the other is a map - and a reader
+        // deciding which one they want needs the difference on the button.
+        "sitesAddVisual": "Add on a map",
+        "sitesAddVisualHint": "Paste a Google Maps link, then drag the circle to fit the plot",
         "sitesEdit": "Edit",
         "sitesWindow": "Clock-in window",
         "sitesWindowHint": "When a clock-in at this site is on time. An end earlier than the start means an overnight shift (22:00 to 06:00). Leave the times empty to follow the company window set under Shift rules; fill them in and this site stops following it, and an arrival outside them is flagged for review rather than refused.",

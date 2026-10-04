@@ -347,6 +347,31 @@ PAGES: tuple[Page, ...] = (
             " || document.getElementById('message').textContent.length > 0"
         ),
     ),
+    Page(
+        name="site creation",
+        path="/sites/new",
+        script="add_site.js",
+        # The module is defined *and* the panel has painted its own state: ``Pages.paint``
+        # writes the HUD from the draft, so a HUD of em-dashes is a script that loaded but
+        # never booted - the two halves this harness exists to tell apart.
+        ran=(
+            "typeof SiteCreator !== 'undefined'"
+            " && document.getElementById('site-hud-radius').textContent.length > 0"
+        ),
+        why=(
+            "the page the console's Sites screen links to, and the only one that draws a map "
+            "on a page whose own script loads Leaflet from a CDN: a script that did not "
+            "execute, or a stylesheet the browser refused, leaves a form nobody can use"
+        ),
+        # The two ways in have to be *there*: a tab list with its panels, and the fields the "
+        # resolver writes. This is the requirement's dual-option UI, read off the live DOM.
+        answered=(
+            "document.querySelectorAll('.geo-tab').length === 2"
+            " && !!document.getElementById('site-maps-url')"
+            " && !!document.getElementById('site-lat')"
+            " && !!document.getElementById('site-radius')"
+        ),
+    ),
 )
 
 

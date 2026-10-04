@@ -123,12 +123,10 @@ class FaceEngineNested(FaceEngineError):
 class FaceEngineUnavailable(FaceEngineError):
     """The engine could not answer at all: no pool, no usable model, a model process that died.
 
-    Distinct from ``FaceEngineBusy`` in what it says about the *work*, not in what it asks the
-    caller to do: busy means "the queue stayed full", this means "the models could not be
-    reached" - a child that exited, was killed at its deadline (see ``face_process``), or a host
-    with no usable graph. Both are the server being unable to answer rather than an answer, so
-    both are answered with 503 + ``Retry-After`` and neither may blame the photograph (see
-    ``http_exception_for``).
+    Distinct from ``FaceEngineBusy``: busy means "the queue stayed full", this means "the models
+    could not be reached" - a child that exited or was killed at its deadline (see
+    ``face_process``), or a host with no usable graph. Both are the server being unable to answer
+    rather than an answer, so both are a 503 + ``Retry-After`` (see ``http_exception_for``).
     """
 
 
@@ -149,12 +147,53 @@ def _remote_enabled() -> bool:
     return bool(settings.face_engine_process)
 
 
+#: The child's exception types that mean *the call was refused* rather than *the server could
+#: not answer*, mapped back to the type this process raises for the same condition.
+#:
+#: ``face_process``'s own contract is that a failed op arrives as "the same exception the op
+#: would have raised in this process", and every caller here is written against that: a
+#: ``ValueError`` out of ``_represent`` is a frame with no face in it (``compare_faces_sync``
+#: catches exactly that type and answers "No face detected."), and a missing graph is a
+#: ``FileNotFoundError``. Closing the pipe and running the same call in this process must
+#: therefore produce the same *type*, or the deployment's refusal changes with a flag.
+#:
+#: It did: with ``FACE_ENGINE_PROCESS=1`` a no-face frame crossed as ``ValueError``, was
+#: wrapped below as ``FaceEngineUnavailable``, and reached the gate as a 500
+#: (``face_check_failed``, "The photo could not be checked just now") where the in-process
+#: build answers the 400 that tells the worker to fill the frame (``face_not_found``). The
+#: deployment's own log carries that swap: "face worker op 'represent' failed: No face
+#: detected in the photo." followed by "face check failed for worker 1" on 2026-10-03.
+_DOMAIN_ERRORS: dict[str, type[BaseException]] = {
+    "ValueError": ValueError,
+    "NoFaceDetected": NoFaceDetected,
+    "FileNotFoundError": FileNotFoundError,
+}
+
+
+def _domain_error(exc):
+    """The in-process exception a framed refusal from the child stands for.
+
+    ``exc`` is a ``face_process.FaceProcessRemoteError`` and is annotated loosely because
+    ``face_process`` is imported inside the calls that use it (a CLI command or the test
+    suite must not spawn a child to import this module). Anything unrecognised stays a
+    server fault: an unknown failure type is not evidence that the worker's photo is wrong.
+    """
+    kind = _DOMAIN_ERRORS.get(str(getattr(exc, "error_type", "")))
+    if kind is None:
+        return FaceEngineUnavailable(f"the face model process could not answer: {exc}")
+    return kind(str(getattr(exc, "message", "") or exc))
+
+
 def _remote_call(op: str, image, *, enforce_detection: bool, fallback_operation: str):
     """One model call, in the child, with this process's telemetry recorded around it.
 
     The child's own Prometheus counters are in another process and are never scraped, so the
     timing on ``/metrics`` is taken here, from the reply - measured around the model call
     rather than around the pipe, and labelled with what the child actually ran.
+
+    A *refusal* the child framed (it ran the model and the answer was no) is re-raised as
+    the type this process would have raised - see ``_DOMAIN_ERRORS``. Only a child that
+    could not answer at all is a ``FaceEngineUnavailable``.
     """
     import face_process
 
@@ -166,6 +205,9 @@ def _remote_call(op: str, image, *, enforce_detection: bool, fallback_operation:
             op, image, enforce_detection=enforce_detection
         )
         return reply.get("result")
+    except face_process.FaceProcessRemoteError as exc:
+        error = _domain_error(exc)
+        raise error from exc
     except face_process.FaceProcessError as exc:
         # ``FaceEngineUnavailable``, not a new error type: every endpoint already answers
         # that as a server fault - "we could not verify you right now" - rather than as a
@@ -663,14 +705,11 @@ def busy_http_exception(exc: FaceEngineError | None = None):
 
 
 def unavailable_http_exception(exc: FaceEngineError | None = None):
-    """The 503 a *model* failure answers with: nothing was judged, so nothing is the caller's.
+    """The 503 an unreachable *model* answers with: nothing was judged, so nothing is the caller's.
 
-    The same contract as ``busy_http_exception`` - the photo and the account are fine, the server
-    could not do the work, try again in a few seconds - and it is a separate sentence because the
-    two are different facts about the server: a full queue is a busy moment, an unreachable model
-    process is the models being down. It travels as its own ``error_code`` for the same reason the
-    busy one does: an operator reading a support ticket, or a client deciding whether to retry now
-    or to send the worker to re-enroll, has to be able to tell them apart.
+    Same contract as ``busy_http_exception`` - the photo is fine, the server could not do the
+    work, try again - with its own ``error_code``, because a full queue and models that cannot be
+    reached are different facts an operator has to be able to tell apart.
     """
     from fastapi import HTTPException
 
@@ -692,10 +731,8 @@ def unavailable_http_exception(exc: FaceEngineError | None = None):
 def http_exception_for(exc: FaceEngineError):
     """The HTTP answer for an engine failure, decided in one place.
 
-    Every endpoint that submits to this engine goes through here, so a failure mode cannot be a
-    coded 503 at one endpoint and an unhandled 500 at another - which is exactly what an
-    unreachable model process used to be: a dead or killed child raised ``FaceEngineUnavailable``
-    straight out of the punch, where only ``FaceEngineBusy`` was caught.
+    One mapping for every endpoint, so a failure mode cannot be a coded 503 at one site and an
+    unhandled 500 at another - which is what an unreachable model process used to be.
     """
     if isinstance(exc, FaceEngineUnavailable):
         return unavailable_http_exception(exc)

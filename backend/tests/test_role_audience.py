@@ -67,6 +67,17 @@ AUDIENCE_EXCEPTIONS: dict[str, tuple[str, ...]] = {
     # deployment rather than a rota, so there is no punch card and no template to need
     # (see ``SELF_ENROLL_ROLES`` in main.py).
     "/api/v1/worker/me/enroll": ("admin",),
+    # The geofence is an administrator's, read and written: moving the fence moves where
+    # every worker is allowed to clock in, which is an administrative act and not a thing a
+    # signed-in account should be able to do to its own geofence.
+    "/api/v1/geofence": ADMIN_ROLES,
+    "/api/v1/legacy/set-geofence": ADMIN_ROLES,
+    # The site-creation pair, and for the same reason: the path does not say which verb it
+    # is. ``POST /api/v1/sites`` creates a boundary every punch at that site is measured
+    # against, and ``POST /api/v1/resolve-maps-link`` makes this deployment fetch a URL the
+    # caller chose - neither is a thing a signed-in worker should be able to do.
+    "/api/v1/sites": ADMIN_ROLES,
+    "/api/v1/resolve-maps-link": ADMIN_ROLES,
 }
 
 _PARAM = re.compile(r"\{[^}]*\}")

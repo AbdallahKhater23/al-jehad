@@ -18,9 +18,11 @@ them is a way to get it wrong:
    showing a week, a day, or a shared link's odd range, and the sheet is still the month. It
    is clipped to today while the month is running, like the presets are - a timesheet ending
    in the future reads as a month that lost its last shifts.
-3. **The identity columns come off the table and into the header**: a one-worker sheet that
-   repeated the employee, the role and the id down every row would be twenty lines of the
-   same three facts, and the line above the table says them once.
+3. **The identity columns come off the table**: a one-worker sheet that repeated the
+   employee, the role, the id and the moallem down every row would be twenty lines of the
+   same four facts. The first three are said once, above the table; the moallem is not on
+   this sheet at all, because it is a fact about the person the whole sheet is about - it
+   stays on the tab, whose rows are nobody's in particular.
 
 What is asserted here, end to end through the real frontend files: the request (which month,
 whose rows), the sheet (whose, which month, whose rows and no one else's, which columns, what
@@ -493,9 +495,10 @@ def test_the_sheet_is_that_worker_s_month_and_nobody_else_s(results):
 def test_the_sheet_says_whose_it_is_once_and_the_identity_is_not_a_column(results):
     """Whose month it is belongs in the header, not repeated down every row.
 
-    The employee, the role and the id are columns of the *tab* - three of its ten - and on a
-    sheet about one person they would carry the same three facts on every line. They are said
-    once, above the table, and the columns that remain keep the administrator's own order.
+    The employee, the role, the id and the moallem are columns of the *tab* - four of its
+    eleven - and on a sheet about one person they would carry the same four facts on every
+    line. The first three are said once, above the table, and the columns that remain keep
+    the administrator's own order.
 
     The seven that remain are the tab's own default order with those three taken out, which is
     why *Category* is here: it sits between the site and the arrival on the tab, and a sheet

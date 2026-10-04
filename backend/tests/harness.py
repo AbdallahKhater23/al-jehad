@@ -548,20 +548,11 @@ class FakeFaceNetEngine:
         return _unit(vector)
 
 
-#: The fixture-driven suite stubs the models **in this process** (``FAKE_ENGINE`` below, and
-#: ``face_detector.detect_and_align`` further down), so it always runs the in-process engine -
-#: whatever the host's environment says. ``FACE_ENGINE_PROCESS=1`` in a developer's shell (or a
-#: CI job handed the deployment's own variables) would otherwise send every stubbed punch
-#: through a real child process: the child imports the *real* models, answers the fixtures'
-#: synthetic frames with "no face detected", and the punch, liveness and metrics suites fail
-#: for a reason that has nothing to do with the code under test (measured: 24 failures in
-#: ``test_metrics`` and ``test_phase02_liveness_and_shifts`` alone).
-#:
-#: The child mode is not thereby untested, it is tested where it belongs: ``test_face_process``
-#: (the transport against a stub worker that speaks the real protocol, plus the engine, liveness
-#: and preload wiring) and ``tools/face_process_memory.py`` for the real models. A test that
-#: wants the child asks for it explicitly - see that suite's ``remote`` fixture. Pinning it here
-#: is what keeps the rest of the suite a test of the application rather than of this machine.
+#: The suite stubs the models **in this process**, so it always runs the in-process engine -
+#: whatever the host's environment says. With ``FACE_ENGINE_PROCESS=1`` every stubbed punch would
+#: forward to a real child, which answers the fixtures' synthetic frames with "no face detected"
+#: and fails suites for reasons unrelated to the code under test. The child is tested where it
+#: belongs - ``test_face_process``, and explicitly via that suite's ``remote`` fixture.
 import config as _config
 
 _config.settings.face_engine_process = False
@@ -882,6 +873,16 @@ ACTIVITY_TABLES: Final = (
                                 # whose form refuses every submission it makes. A missing row is
                                 # the undecided state, so an emptied table is exactly the state
                                 # every deployment that never opened the console is in
+    "geofence_settings",        # the deployment's active fence, moved from the console. Live usage
+                                # leaves a real boundary here, and a suite that asserts "the
+                                # fence this test just saved is the one in force" would inherit
+                                # somebody's site and read it as its own setup. A missing row is
+                                # the cold-boot state the API is required to survive (see
+                                # ``geofence.DEFAULT_GEOFENCE``), which is exactly the state a
+                                # test that never saves a fence should start from
+    "attendance_punches",       # the ledger of the punches the geofence verified. Real usage files
+                                # these all day, and "exactly one punch was recorded" is the
+                                # assertion the whole punch path is tested with
 )
 
 #: Tables left exactly as the live database have them: the two ledgers this application
@@ -1423,6 +1424,7 @@ def reset_database(app_module) -> None:
     seed_database(app_module)
     write_enrollment_templates()
     reset_rate_limits(app_module)
+    reset_geofence_cache()
     install_test_band()
     FAKE_ENGINE.FACE_MODE = "match"
     FAKE_ENGINE.FACE_COUNT = 1
@@ -1438,6 +1440,42 @@ def reset_rate_limits(app_module) -> None:
                 method()
             except Exception:  # pragma: no cover - best effort only
                 pass
+
+
+def reset_geofence_cache() -> None:
+    """Put the process-local geofence cache back to the state a cold boot would produce.
+
+    The fence is read out of SQLite **once** - that is what makes the punch check cost no
+    query - so a test that saves a boundary through the API leaves it in the cache for
+    every test after it, while the database is rotated back underneath. The cache is the
+    one piece of application state the database rotation cannot reach, so it is reset here,
+    beside the rate-limit buckets, and for exactly the same reason: this suite's isolation
+    is otherwise bought by rotating files, and state that lives in the process has to be
+    put back by hand.
+
+    A cache that cannot be reached (the module is not imported in this process, or an older
+    build) is skipped rather than fatal: ``geofence_settings`` is emptied by
+    ``clear_activity`` anyway, so the next ``refresh_cache`` sees the cold-boot state.
+    """
+    try:
+        import geofence  # imported here: this module stays importable without the app path
+    except Exception:  # pragma: no cover - only outside the application's own suite
+        return
+    try:
+        geofence.refresh_cache()
+    except Exception:  # pragma: no cover - best effort only
+        pass
+    # The *site* fences are the same kind of state and need the same treatment, for a reason
+    # that is sharper than the deployment fence's: ``seed_database`` rewrites
+    # ``construction_sites`` with ``DELETE`` + ``INSERT``, so every seeded site gets a **new
+    # rowid** on every test while the cache still holds the previous one's. A test that
+    # resolved a site by id would then be measuring a fence that no longer exists, and one
+    # that asked by name would find a row whose ``site_id`` belongs to the last test's
+    # database. Re-read, here, beside the other reset.
+    try:
+        geofence.refresh_site_cache()
+    except Exception:  # pragma: no cover - best effort only
+        pass
 
 
 def db_scalar(sql: str, params: tuple = ()):

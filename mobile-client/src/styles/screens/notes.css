@@ -1,0 +1,25 @@
+/* =====================================================================
+ *  notes.css -- what the Notes screen owns beyond the shared shell.
+ *
+ *  The list, the thread, the bubbles and the composer are the web's own
+ *  ``.hand-card.is-note`` / ``.hand-bubble`` / ``.hand-composer`` blocks, which
+ *  live in shell.css so the office's copy of a note and the worker's copy are
+ *  the same objects. What is left is the character counter under the message
+ *  field, which the web gets for free from its own form.
+ * ===================================================================== */
+
+.note-limit {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--ops-muted);
+  text-align: end;
+}
+
+/* Over the server's limit is a state the field has to show before the tap, not
+   a refusal after it -- the server would answer 422 and the sentence would be
+   about a number the worker cannot see. */
+.note-limit--over {
+  color: var(--ops-danger-ink);
+  font-weight: 700;
+}

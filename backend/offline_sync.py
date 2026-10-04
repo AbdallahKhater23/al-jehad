@@ -98,7 +98,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-import json
 import logging
 import os
 import sqlite3
@@ -110,6 +109,7 @@ import numpy as np
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field, field_validator
 
+import audit
 import biometrics
 import face_detector
 import face_engine
@@ -406,25 +406,22 @@ def _audit(
     after: Any = None,
     request: Request | None = None,
 ) -> None:
-    try:
-        ip = request.client.host if request is not None and request.client else None
-        conn.execute(
-            "INSERT INTO audit_log (actor_id, actor_role, action, entity, entity_id, before_json, after_json, ip, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                actor.id if actor else None,
-                actor.role if actor else "system",
-                action,
-                entity,
-                str(entity_id),
-                json.dumps(before, default=str) if before is not None else None,
-                json.dumps(after, default=str) if after is not None else None,
-                ip,
-                datetime.now().strftime(_TS),
-            ),
-        )
-    except sqlite3.Error:
-        pass
+    """Append a sync event. Never raises - an audit failure must not lose the punch.
+
+    A row written with no actor is attributed to ``system`` rather than left blank.
+    """
+    audit.record(
+        conn,
+        action=action,
+        actor=actor,
+        entity=entity,
+        entity_id=entity_id,
+        before=before,
+        after=after,
+        request=request,
+        actor_role="system",
+        created_at=datetime.now().strftime(_TS),
+    )
 
 
 def _device_lookup(conn: sqlite3.Connection, worker_id: str, device_id: str) -> sqlite3.Row | None:

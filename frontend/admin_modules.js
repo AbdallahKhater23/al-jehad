@@ -194,7 +194,7 @@ const UI_MODULES = {
         play: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 5v14l11-7L8 5Z"></path></svg>',
         table: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="M3 10h18M9 10v9"></path></svg>',
         printer: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 8V4h10v4"></path><rect x="4" y="8" width="16" height="7" rx="2"></rect><path d="M7 15h10v5H7z"></path></svg>',
-        eye: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-6.5 10-6.5S22 12 22 12s-3.5 6.5-10 6.5S2 12 2 12Z"></path><circle cx="12" cy="12" r="2.5"></circle></svg>'
+        eye: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-6.5 10-6.5S22 12 22 12s-3.5 6.5-10 6.5S2 12 2 12Z"></path><circle cx="12" cy="12" r="2.5"></circle></svg>',
     },
 
     /**
@@ -720,7 +720,11 @@ const UI_MODULES = {
             // row. Any other term - a word, or "block 4" inside a longer one - searches
             // everything, site and category included, because "block 4" is a place and the
             // words say so.
-            const identity = [session.name, session.worker_id, session.role, this.roleLabel(session.role)]
+            // The moallem's name and not their id, for the same reason the Shifts tab gives:
+            // a bare number here names a worker, and a second number that answered for a whole
+            // crew would put ghosts on the board.
+            const identity = [session.name, session.worker_id, session.role, this.roleLabel(session.role),
+                session.moallem_name]
                 .map((value) => String(value === null || value === undefined ? '' : value).toLowerCase());
             const where = [session.site_name, category]
                 .map((value) => String(value === null || value === undefined ? '' : value).toLowerCase());
@@ -1205,6 +1209,7 @@ const UI_MODULES = {
                         </div>
                     </div>
                 </td>
+                <td data-fact="moallem">${this.moallemNameHtml(session)}</td>
                 <td>${this.escapeHtml(session.site_name || '\u2014')}</td>
                 <td><span class="ops-figure">${this.escapeHtml(this.liveOpsClockTime(session.clock_in_time))}</span></td>
                 <td>
@@ -1233,6 +1238,10 @@ const UI_MODULES = {
                     </div>
                 </div>
                 <div class="ops-card-facts">
+                    <div>
+                        <span class="ops-stat-label">${this.escapeHtml(I18n.__('roleMoallem'))}</span>
+                        <span data-fact="moallem">${this.moallemNameHtml(session)}</span>
+                    </div>
                     <div>
                         <span class="ops-stat-label">${this.escapeHtml(I18n.__('liveOpsOnSiteFor'))}</span>
                         <span class="ops-elapsed" data-fact="elapsed" ${this.liveOpsFactAttrs(facts)}>${this.escapeHtml(elapsed)}</span>
@@ -1273,6 +1282,7 @@ const UI_MODULES = {
                     <thead>
                         <tr>
                             <th scope="col">${this.liveOpsSortButtonHtml(I18n.__('name'), 'name')}</th>
+                            <th scope="col">${this.escapeHtml(I18n.__('roleMoallem'))}</th>
                             <th scope="col">${this.escapeHtml(I18n.__('site'))}</th>
                             <th scope="col">${this.escapeHtml(I18n.__('liveOpsClockIn'))}</th>
                             <th scope="col" aria-sort="${ariaSort}">${this.liveOpsSortButtonHtml(I18n.__('liveOpsOnSiteFor'), 'elapsed')}</th>
@@ -3540,6 +3550,18 @@ const UI_MODULES = {
                 </div>
                 ${this.sitesSearchHtml(all)}
                 <div class="sites-bar-actions">
+                    <!--
+                      The visual creation page, and the reason it is a link rather than a
+                      fold: drawing a fence needs Leaflet from a CDN, and this console's
+                      document policy names no third-party origin (a phone at a gate loads
+                      the same policy). So the one screen that draws a map is its own
+                      document, served with a policy that allows the map, and this is how
+                      an administrator gets to it - from the Sites tab, beside the plain
+                      "Add a site" form rather than instead of it.
+                    -->
+                    <a class="ui-btn sites-toggle" href="/sites/new" data-sites-visual>
+                        ${this.OPS_ICONS.pin}${this.escapeHtml(I18n.__('sitesAddVisual'))}
+                    </a>
                     <button type="button" class="ui-btn ui-btn-primary sites-toggle" data-sites-add
                             aria-expanded="${addOpen ? 'true' : 'false'}" aria-controls="sitesAddPanel">
                         ${this.OPS_ICONS.plus}${this.escapeHtml(I18n.__('sitesAdd'))}
@@ -3797,6 +3819,16 @@ const UI_MODULES = {
         return `
             <section id="sitesAddPanel" class="ui-card is-flat sites-fold" aria-label="${this.escapeHtml(I18n.__('sitesAdd'))}"${open ? '' : ' hidden'}>
                 <p class="ui-section-note">${this.escapeHtml(I18n.__('sitesLocationHint'))}</p>
+                <!--
+                  The way to the map, at the top of the form that asks for the numbers a
+                  map produces. An administrator who has the building open in Google Maps
+                  is two taps from a site here: paste the link, drag the circle, save.
+                -->
+                <p class="ui-section-note">
+                    <a class="ui-btn ui-btn-sm" href="/sites/new" data-sites-visual>
+                        ${this.OPS_ICONS.pin}${this.escapeHtml(I18n.__('sitesAddVisualHint'))}
+                    </a>
+                </p>
                 <form id="addSiteForm" class="ui-grid three" style="margin-top:12px">
                     <div>
                         <label class="ui-label" for="siteName">${this.escapeHtml(I18n.__('sitesName'))}</label>
@@ -5047,6 +5079,16 @@ const UI_MODULES = {
     },
 
     /**
+     * The four name slots, in the order the language picker offers them.
+     *
+     * The codes are ``names.LANGUAGES`` on the server - the ``name_<code>`` fields this form
+     * sends and the keys of the stored map - and ``test_moallem_assignment`` holds this list,
+     * the page's own picker and the server's to one another, so they cannot drift apart. The uppercase form is the label, the same ``EN``/``AR``/``HI``/``UR``
+     * the header's own language selector wears.
+     */
+    NAME_LANGUAGES: ['en', 'ar', 'hi', 'ur'],
+
+    /**
      * The accounts matching a search.
      *
      * Same rule as the shifts tab: every term has to match somewhere, so "tower 600"
@@ -6194,8 +6236,15 @@ const UI_MODULES = {
         const statusFact = this.accountStatus(user) === 'active'
             ? ''
             : `\n                        <span class="roster-fact" data-fact="status"><span class="roster-fact-label">${this.escapeHtml(I18n.__('credentialsStatus'))}</span>${this.accountStatusHtml(user)}</span>`;
+        // Who this account answers to, for the one role that has an answer. Drawn even when it
+        // is "Unassigned", because that is the state the control beside it exists to change -
+        // and it is what the shifts views say about the same worker. A moallem or an
+        // administrator has no moallem, and the row does not pretend otherwise with a word.
+        const moallemFact = role === 'worker'
+            ? `\n                        <span class="roster-fact" data-fact="moallem"><span class="roster-fact-label">${this.escapeHtml(I18n.__('roleMoallem'))}</span><span class="roster-moallem">${this.moallemNameHtml(user)}</span></span>`
+            : '';
         return `
-                <li class="roster-row" data-user="${id}" data-role="${this.escapeHtml(role)}" data-status="${this.accountStatus(user)}" data-sessions="${sessions}" data-face="${user.face_enrolled ? 'enrolled' : 'missing'}" data-password="${user.password_set ? 'set' : 'never'}">
+                <li class="roster-row" data-user="${id}" data-role="${this.escapeHtml(role)}" data-status="${this.accountStatus(user)}" data-sessions="${sessions}" data-moallem="${this.escapeHtml(user.moallem_id || '')}" data-face="${user.face_enrolled ? 'enrolled' : 'missing'}" data-password="${user.password_set ? 'set' : 'never'}">
                     <div class="roster-who">
                         ${this.liveOpsAvatarHtml(user)}
                         <span class="roster-id">
@@ -6207,7 +6256,7 @@ const UI_MODULES = {
                     <div class="roster-access">
                         <span class="roster-fact" data-fact="face"><span class="roster-fact-label">${this.escapeHtml(I18n.__('credentialsFace'))}</span>${this.credentialsFace(user)}</span>
                         <span class="roster-fact" data-fact="password"><span class="roster-fact-label">${this.escapeHtml(I18n.__('password'))}</span>${this.credentialsPasswordState(user)}</span>
-${sessionsFact}${statusFact}
+${sessionsFact}${statusFact}${moallemFact}
                     </div>
                     <div class="roster-actions">${this.credentialsActionHtml(user, true)}</div>
                 </li>`;
@@ -6745,8 +6794,18 @@ ${sessionsFact}${statusFact}
     /** The account being edited, as read from the server, or ``null``. */
     _credentialsEdit: null,
 
-    /** The edit form's fields, kept so a repaint never loses what was typed. */
-    _credentialsEditDraft: { name: '', email: '', phone: '', hourly_rate: '', transit_enabled: false },
+    /**
+     * The edit form's fields, kept so a repaint never loses what was typed.
+     *
+     * ``names`` is the per-language map, keyed by the same codes the server stores, and
+     * ``moallem_id`` is the assignment (empty for nobody). Both are read back from the form like
+     * the rest of the draft: the panel is repainted from this object, so a language added to one
+     * of the four boxes must survive anything else on the screen being redrawn.
+     */
+    _credentialsEditDraft: {
+        name: '', email: '', phone: '', hourly_rate: '', transit_enabled: false,
+        moallem_id: '', names: { en: '', ar: '', hi: '', ur: '' }
+    },
 
     /**
      * The replacement reference photo chosen on the edit panel, or ``null``.
@@ -6789,7 +6848,15 @@ ${sessionsFact}${statusFact}
                 phone: user.phone || '',
                 hourly_rate: user.hourly_rate === null || user.hourly_rate === undefined
                     ? '' : String(user.hourly_rate),
-                transit_enabled: user.transit_enabled === true
+                transit_enabled: user.transit_enabled === true,
+                // ``null`` is "nobody" on the wire and the empty string is what the select's own
+                // first option carries, so the two are the same state here.
+                moallem_id: user.moallem_id === null || user.moallem_id === undefined
+                    ? '' : String(user.moallem_id),
+                // The stored map, one slot per language. Copied rather than referenced: the draft
+                // is edited in place by every keystroke, and the account read from the server is
+                // what "was it changed" is decided against when the form is saved.
+                names: Object.assign({ en: '', ar: '', hi: '', ur: '' }, user.names || {})
             };
         } catch (err) {
             Toast.error(err.message);
@@ -6800,7 +6867,10 @@ ${sessionsFact}${statusFact}
 
     closeUserEdit() {
         this._credentialsEdit = null;
-        this._credentialsEditDraft = { name: '', email: '', phone: '', hourly_rate: '', transit_enabled: false };
+        this._credentialsEditDraft = {
+            name: '', email: '', phone: '', hourly_rate: '', transit_enabled: false,
+            moallem_id: '', names: { en: '', ar: '', hi: '', ur: '' }
+        };
         // The chosen file goes with the panel: it is a copy of somebody's face in memory, and
         // closing the form is what stops holding it.
         this._credentialsEditPhoto = null;
@@ -6821,6 +6891,19 @@ ${sessionsFact}${statusFact}
         });
         const rate = value('userEditRate');
         if (rate !== null) this._credentialsEditDraft.hourly_rate = rate.trim();
+        // The per-language names, read one slot at a time and only while the box is on the page:
+        // a repaint that dropped one (a role that has no moallem, say) must not clear the map the
+        // save is comparing against.
+        this.NAME_LANGUAGES.forEach((code) => {
+            const raw = value(`userEditName${code.toUpperCase()}`);
+            if (raw !== null) this._credentialsEditDraft.names[code] = raw.trim();
+        });
+        // Same treatment for the assignment: a moallem account has no select, and its absence
+        // must leave the draft alone rather than read as "nobody".
+        const moallem = document.getElementById('userEditMoallem');
+        if (moallem && typeof moallem.value === 'string') {
+            this._credentialsEditDraft.moallem_id = moallem.value;
+        }
         // The transit grant is a checkbox, so it is read for its ``checked`` state rather than
         // its value, and only while the box actually exists - a repaint that dropped it must
         // not silently turn a granted privilege off on the next save.
@@ -6829,6 +6912,37 @@ ${sessionsFact}${statusFact}
             this._credentialsEditDraft.transit_enabled = transit.checked;
         }
         return this._credentialsEditDraft;
+    },
+
+    /**
+     * The moallems an account may be assigned to, as the edit form's options.
+     *
+     * Built from the roster already on screen rather than from a request: the credentials list is
+     * the same list this form was opened from, and it carries each account's role and status.
+     * Three rules, and each one is a refusal the server would otherwise have to make:
+     *
+     *   - only *active* moallems are offered, because an assignment to a deactivated account is
+     *     refused - offered here, that would be a select whose option answers 400;
+     *   - the account's *current* moallem stays in the list even if they have since been
+     *     deactivated, or opened the form would silently drop an assignment nobody touched;
+     *   - if the assigned moallem is not on this screen at all (deleted, or a partial read), the
+     *     account's own row still names them, and that name is what the option says.
+     */
+    moallemOptionsHtml(user) {
+        const current = String((user && user.moallem_id) || '');
+        const option = (id, label) => `<option value="${this.escapeHtml(id)}" ${String(id) === current ? 'selected' : ''}>${this.escapeHtml(label)}</option>`;
+        const parts = [option('', I18n.__('moallemUnassigned'))];
+        const moallems = (this._credentials || []).filter(
+            (row) => String(row.role || '') === 'moallem' && this.accountStatus(row) === 'active'
+        );
+        moallems.forEach((row) => {
+            parts.push(option(String(row.id), row.name || String(row.id)));
+        });
+        if (current && !moallems.some((row) => String(row.id) === current)) {
+            parts.push(option(current, I18n.__('credentialsMoallemInactive')
+                .replace('{name}', user.moallem_name || current)));
+        }
+        return parts.join('');
     },
 
     credentialsEditPanelHtml() {
@@ -6854,6 +6968,15 @@ ${sessionsFact}${statusFact}
                     <p class="ui-note is-panel" data-user-edit-role="${this.escapeHtml(user.role || '')}">
                         ${I18n.__('role')}: <b>${this.escapeHtml(this.roleLabel(user.role))}</b>
                     </p>
+                    <!-- The assignment, for the one role that has one: a worker answers to a
+                         moallem, a moallem answers to nobody, and the server refuses an
+                         assignment from any other role - so the control is not drawn where it
+                         could only be refused. The list is the roster already in hand: an
+                         account's moallem is one of the people on this same screen. -->
+                    ${user.role === 'worker' ? `<label class="ui-stack is-flush ui-span-all" data-user-edit-moallem="true">
+                        <span class="${label}">${I18n.__('roleMoallem')}</span>
+                        <select id="userEditMoallem" class="${field}">${this.moallemOptionsHtml(user)}</select>
+                    </label>` : ''}
                     <label class="ui-stack is-flush ui-span-all">
                         <span class="${label}">${I18n.__('credentialsHourlyRate')}</span>
                         <input type="number" id="userEditRate" step="0.5" min="0" max="1000"
@@ -6870,8 +6993,27 @@ ${sessionsFact}${statusFact}
                         </span>
                     </label>
                 </div>
+                <!--
+                    The name in each language, as the account stores it: one slot per language the
+                    app speaks, pre-filled from the map and keyed by the same codes. The single
+                    name field above is the one every screen falls back to; these are what a reader
+                    of the other three languages is shown, and an empty slot is a language this
+                    person has no spelling for yet.
+                -->
+                <div class="ui-stack" style="margin-top:12px" data-user-edit-names="true">
+                    <span class="${label}">${I18n.__('credentialsNameLanguages')}</span>
+                    <div class="ui-grid two">
+                        ${this.NAME_LANGUAGES.map((code) => `<label class="ui-stack is-flush">
+                            <span class="ui-note">${code.toUpperCase()}</span>
+                            <input type="text" id="userEditName${code.toUpperCase()}"
+                                   value="${this.escapeHtml(draft.names[code] || '')}" class="${field}">
+                        </label>`).join('')}
+                    </div>
+                    <p class="ui-note">${I18n.__('credentialsNameLanguagesHint')}</p>
+                </div>
                 <p class="ui-note">${I18n.__('credentialsHourlyRateHint')}</p>
                 <p class="ui-note">${I18n.__('credentialsTransitHint')}</p>
+                ${user.role === 'worker' ? `<p class="ui-note">${I18n.__('credentialsMoallemHint')}</p>` : ''}
                 <!-- The face, which is the one thing about this person that is not a field on
                      their row. What is on file is stated rather than implied, because the two
                      cases are different jobs: a first photo is what makes the account able to
@@ -7005,6 +7147,24 @@ ${sessionsFact}${statusFact}
             // about the grant and the server treats an absent field as "leave it alone".
             transit_enabled: !!draft.transit_enabled
         };
+        // The assignment travels on every save for the same reason the transit grant does: the
+        // select states the whole truth about it, and the empty value is "nobody" rather than
+        // silence. An absent field would mean "leave it alone", so an unassignment that was
+        // never sent would look saved and change nothing. Only a worker has the control, and
+        // only a worker may be assigned.
+        if (user.role === 'worker') {
+            body.moallem_id = draft.moallem_id || '';
+        }
+        // The per-language names: only the slots the administrator actually changed. Re-sending
+        // the untouched ones would overwrite a correction another screen made while this panel
+        // was open with whatever this form read when it opened - and a slot that was cleared is
+        // a change, and travels as the empty string that clears it.
+        const storedNames = user.names || {};
+        this.NAME_LANGUAGES.forEach((code) => {
+            const typed = String(draft.names[code] || '').trim();
+            const had = String(storedNames[code] || '').trim();
+            if (typed !== had) body[`name_${code}`] = typed;
+        });
         // An empty rate box means "leave the rate as it is"; a 0 means "clear it". The
         // difference matters - the server treats them differently - so a value that is
         // neither is refused here rather than sent as something the admin did not mean.
@@ -7667,6 +7827,21 @@ ${sessionsFact}${statusFact}
             return value % limit;
         }
         return Math.floor(Math.random() * limit);
+    },
+
+    /**
+     * Who a row answers to, in the two words there are for it: the name, or none.
+     *
+     * One renderer for the roster, the live board and the timesheet, so the same worker is not
+     * "Unassigned" on one screen and blank on another. The word is *drawn* rather than the cell
+     * left empty on purpose: an empty cell on a timesheet reads as a value the page failed to
+     * get, and "nobody" is the answer, not a gap. It is muted for the same reason - it is the
+     * absence of a name, and it is what most rows said before this column existed.
+     */
+    moallemNameHtml(row) {
+        return row && row.moallem_name
+            ? this.escapeHtml(row.moallem_name)
+            : `<span class="ui-tone-faint">${this.escapeHtml(I18n.__('moallemUnassigned'))}</span>`;
     },
 
     /** Role codes are the wire's, the labels are the reader's. */
@@ -9689,6 +9864,10 @@ ${sessionsFact}${statusFact}
             // describes, and it is searchable (``shiftsMatches``) so "administrator" is
             // also a filter rather than only something to read.
             role: { label: 'role' },
+            // Who the worker answers to. It sits with the identity columns beside the name,
+            // because that is the question it answers - "whose crew is this row" - and it is
+            // the same assignment the Credentials tab sets and the live board shows.
+            moallem: { label: 'roleMoallem' },
             id: { label: 'userId' },
             site: { label: 'site' },
             // The kind of place the site is (a warehouse, a factory). The filter row has
@@ -9704,7 +9883,7 @@ ${sessionsFact}${statusFact}
 
     /** The order this tab was asked for, and the one Reset puts back. */
     defaultShiftsColumns() {
-        return ['date', 'employee', 'role', 'id', 'site', 'category', 'arrival', 'hours', 'awaiting', 'notes'];
+        return ['date', 'employee', 'role', 'moallem', 'id', 'site', 'category', 'arrival', 'hours', 'awaiting', 'notes'];
     },
 
     /**
@@ -10406,6 +10585,12 @@ ${sessionsFact}${statusFact}
                 // arrives, the label is what is on screen - and "who was that administrator
                 // again" is asked by typing the word the table shows.
                 row.role, this.roleLabel(row.role),
+                // Who the crew answered to, so "whose crew was that" is answerable by typing
+                // the name the timesheet now shows beside the worker's own. The name only - not
+                // the moallem's *id*: a bare number in this box is somebody's worker id, and a
+                // moallem's number in the haystack would make "600" answer with their whole
+                // crew's shifts instead of theirs.
+                row.moallem_name,
                 // The site's category, so a search for the word an operator thinks in - "مخزن" -
                 // finds the shifts worked at every warehouse instead of none of them.
                 row.site_category,
@@ -11217,6 +11402,12 @@ ${sessionsFact}${statusFact}
                 return row.role
                     ? this.escapeHtml(this.roleLabel(row.role))
                     : `<span class="ui-tone-faint">\u2014</span>`;
+            case 'moallem':
+                // Read from the shift's own row rather than looked up in the roster: the server
+                // joined the assignment onto this row when it served it, and a second lookup
+                // here could disagree with the row it is describing. A worker with nobody over
+                // them says so - an empty cell reads as "no value", which is a different claim.
+                return this.moallemNameHtml(row);
             case 'id':
                 return `<span class="ui-tone-muted">${this.escapeHtml(row.worker_id)}</span>`;
             case 'site':
@@ -11480,9 +11671,12 @@ ${sessionsFact}${statusFact}
 
     /** The columns one person's sheet carries: the tab's own order, without the identity. */
     workerMonthColumns() {
-        // The three that answer "whose row is this" - a question a one-worker sheet answers
-        // in its header instead of on every line.
-        const identity = ['employee', 'role', 'id'];
+        // The ones that answer "whose row is this" - a question a one-worker sheet answers in
+        // its header instead of on every line. The moallem is one of them: on a sheet about one
+        // person it would repeat the same supervisor's name down every line they worked, which
+        // is exactly what the role and the id were taken off this table for. It stays on the
+        // tab, where the rows are nobody's in particular and the column answers a real question.
+        const identity = ['employee', 'role', 'id', 'moallem'];
         return this.shiftsColumns().filter((key) => identity.indexOf(key) < 0);
     },
 

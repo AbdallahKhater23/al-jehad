@@ -120,7 +120,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 import logging
 import os
 import sqlite3
@@ -132,8 +131,10 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, field_validator
 
+import audit
 import biometrics
 import enrollment
+import names
 import face_engine
 import notifications
 import overtime
@@ -169,10 +170,12 @@ admin_router = APIRouter(prefix="/admin/registrations", tags=["registration"])
 #: ``active`` and ``inactive`` - go on meaning exactly what every reader of them thinks they
 #: mean, and so the quarantine is a fact about the *account*, checked on the punch itself.
 STATUS_PENDING_APPROVAL = "pending_approval"
+#: An account that may be assigned work: not waiting for a decision, not switched off.
+STATUS_ACTIVE = "active"
 
 #: What ``GET /admin/registrations`` will filter on. ``all`` is handled beside these rather than
 #: in the tuple: it is not a status, it is the absence of the filter.
-QUEUE_STATUSES = (STATUS_PENDING_APPROVAL, "active", "inactive")
+QUEUE_STATUSES = (STATUS_PENDING_APPROVAL, STATUS_ACTIVE, "inactive")
 
 #: Prefix of the dedupe key the administrators' "somebody is waiting" notice is filed under. One
 #: notice per waiting account, so a submission a phone retried does not bury the queue in copies -
@@ -537,30 +540,26 @@ def _audit(
     after: Any = None,
     request: Request | None = None,
 ) -> None:
-    """Append an administrative event. Never raises - see ``enrollment._audit``.
+    """Append an administrative event. Never raises - see ``audit.record``.
 
     ``before`` as well as ``after`` since the intake switch needs it: a decision that sets a
     value is only readable later against the value it replaced (see ``set_intake_switch``), while
     every other caller here is recording something that did not exist before it happened.
+
+    An action taken with no session - someone registering themselves - is filed as ``public``.
     """
-    try:
-        conn.execute(
-            "INSERT INTO audit_log (actor_id, actor_role, action, entity, entity_id, before_json, after_json, ip, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                actor.id if actor else None,
-                actor.role if actor else "public",
-                action,
-                entity,
-                str(entity_id),
-                json.dumps(before, default=str) if before is not None else None,
-                json.dumps(after, default=str) if after is not None else None,
-                request.client.host if request is not None and request.client else None,
-                _now(),
-            ),
-        )
-    except sqlite3.Error:
-        pass
+    audit.record(
+        conn,
+        action=action,
+        actor=actor,
+        entity=entity,
+        entity_id=entity_id,
+        before=before,
+        after=after,
+        request=request,
+        actor_role="public",
+        created_at=_now(),
+    )
 
 
 #: Prefix of the dedupe key an approval's worker notice is filed under. One account is decided
@@ -848,18 +847,114 @@ async def registration_intake(request: Request, token: str):
     }
 
 
+def _moallem_choice(conn: sqlite3.Connection, *, role: str, requested: str) -> str | None:
+    """The moallem to store for this applicant, or ``None``. Inside the caller's transaction.
+
+    Three rules, and they are the whole of the assignment contract:
+
+    * a **moallem** is not assigned to one. The role supervises, and a moallem reporting to
+      another moallem would make "who is in charge of this crew" a question with two answers -
+      and, with two such accounts, a loop. The field is ignored rather than refused: the form
+      never offers it, and a client that sends it anyway gets the account it asked for instead
+      of an error about a control it cannot see;
+    * a **worker** may be unassigned. The assignment is optional by decision, so an empty value
+      is an answer (``None``) and not a missing one;
+    * a named moallem must be an **active account in the moallem role**. Anything else - an id
+      that does not exist, one of the other roles, a deactivated or still-pending supervisor -
+      is refused by name, because storing it would leave the roster showing an assignment that
+      resolves to nobody. Read here, inside the write lock, with the insert it belongs to: a
+      target checked before the transaction is one a concurrent delete could invalidate.
+    """
+    wanted = str(requested or "").strip()
+    if role != "worker" or not wanted:
+        return None
+    row = conn.execute(
+        "SELECT id, role, status FROM users WHERE id = ?", (wanted,)
+    ).fetchone()
+    if row is None or row["role"] != "moallem" or row["status"] != STATUS_ACTIVE:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_code": "moallem_not_available",
+                "message": (
+                    "That moallem is not available. Pick one from the list, or leave it empty "
+                    "and an administrator can assign one later."
+                ),
+            },
+        )
+    return str(row["id"])
+
+
+@public_router.get("/{token}/moallems")
+async def registration_moallems(token: str) -> dict[str, Any]:
+    """The moallems this link's applicants may pick from: the active ones, newest id last.
+
+    WHY IT IS ON THE TOKEN AND NOT A PUBLIC ``/moallems``
+    ----------------------------------------------------
+    The registration form is the only unauthenticated surface this application has, and it is
+    not unauthenticated by accident: it is reached through the link the console mints
+    (``require_link``), and every read and write it makes is answering that link. A staff list
+    served from a URL anybody can call would be the first thing about this deployment a stranger
+    could enumerate - and the form would be handing them the names to go with it. The token is
+    the same one the page already carries, so the call costs it nothing.
+
+    WHAT IS IN THE ANSWER
+    ---------------------
+    ``names`` is the applicant's name map as stored - not a rendered string - because the
+    dropdown is drawn in whichever language the reader has chosen and the page re-renders it on
+    a language switch without a second request. The list is *active* accounts only: an
+    applicant cannot choose a supervisor who has been switched off or is still waiting for
+    approval themselves, because the write would refuse that choice (``_moallem_choice``) and a
+    control that offers what the server rejects is a trap.
+
+    An empty list is a normal answer, not an error: the deployment may have no moallems yet, and
+    the assignment is optional. The page shows the dropdown with nothing but its placeholder,
+    which is the same thing it shows before anybody has been assigned.
+    """
+    require_link(token)
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT id, name, name_i18n FROM users WHERE role = ? AND status = ? "
+            "ORDER BY CAST(id AS INTEGER) ASC",
+            ("moallem", STATUS_ACTIVE),
+        ).fetchall()
+    return {
+        "moallems": [
+            {
+                "id": str(row["id"]),
+                "name": row["name"],
+                "names": names.parse(row["name_i18n"]),
+            }
+            for row in rows
+        ]
+    }
+
+
 @public_router.post("/{token}")
 @limiter.limit(settings.registration_rate_limit)
 async def submit_registration(
     request: Request,
     token: str,
-    full_name: str = Form(...),
     password: str = Form(...),
+    full_name: str = Form(default=""),
     role: str = Form(default="worker"),
     phone: str = Form(default=""),
     email: str = Form(default=""),
     work_details: str = Form(default=""),
     consent: str = Form(default=""),
+    #: The applicant's name, in each language the form is read in. They fill the one they are
+    #: reading (the page sends ``name_<lang>`` for its own language) and the rest are filled by
+    #: the translation pass (``tools/translate_names.py``) or fall back to the one that was
+    #: typed - see ``names``. ``full_name`` is the single-name field every earlier client sends
+    #: and is still accepted: it is a name in no declared language, which is exactly what
+    #: ``users.name`` is.
+    name_en: str = Form(default=""),
+    name_ar: str = Form(default=""),
+    name_hi: str = Form(default=""),
+    name_ur: str = Form(default=""),
+    #: The moallem a worker chose, or empty for none. Ignored for a moallem - see
+    #: ``_moallem_choice`` - and optional for a worker: an administrator can assign one later.
+    moallem_id: str = Form(default=""),
     photo: UploadFile = File(...),
 ):
     """Accept one registration from the console's link, and create the account it is for.
@@ -921,7 +1016,23 @@ async def submit_registration(
 
     try:
         full_name = textguard.identifier(
-            full_name, field="Full name", max_length=textguard.MAX_NAME
+            full_name, field="Full name", max_length=textguard.MAX_NAME, allow_empty=True
+        )
+        typed = names.parse(
+            {
+                "en": textguard.identifier(
+                    name_en, field="Full name", max_length=textguard.MAX_NAME, allow_empty=True
+                ),
+                "ar": textguard.identifier(
+                    name_ar, field="Full name", max_length=textguard.MAX_NAME, allow_empty=True
+                ),
+                "hi": textguard.identifier(
+                    name_hi, field="Full name", max_length=textguard.MAX_NAME, allow_empty=True
+                ),
+                "ur": textguard.identifier(
+                    name_ur, field="Full name", max_length=textguard.MAX_NAME, allow_empty=True
+                ),
+            }
         )
         phone = textguard.contact(phone, field="Phone")
         email = textguard.contact(email, field="Email")
@@ -930,6 +1041,19 @@ async def submit_registration(
         )
     except ValueError as exc:
         raise textguard.http_error(exc) from None
+
+    # The one name the account is *called*: the first language the applicant filled, else the
+    # single unlabelled field an older client sent. At least one of the five has to be there -
+    # a nameless account would put a number on a timesheet with nobody behind it.
+    full_name = names.primary(typed) or full_name
+    if not full_name:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_code": "name_required",
+                "message": "Please enter your full name.",
+            },
+        )
 
     role = str(role or "").strip().lower()
     if role not in WORKFORCE_ROLES:
@@ -998,6 +1122,7 @@ async def submit_registration(
         password_hash = hash_password(password)
         stamp = _now()
         with immediate() as conn:
+            assignment = _moallem_choice(conn, role=role, requested=moallem_id)
             waiting = int(
                 conn.execute(
                     "SELECT COUNT(*) FROM users WHERE status = ?", (STATUS_PENDING_APPROVAL,)
@@ -1021,12 +1146,16 @@ async def submit_registration(
                 candidate = _next_workforce_id(conn)
                 try:
                     conn.execute(
-                        "INSERT INTO users (id, name, email, phone, password_hash, role, status, "
-                        "enrolled_at, template_version, biometric_id, registration_note) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                        "INSERT INTO users (id, name, name_i18n, email, phone, password_hash, "
+                        "role, status, enrolled_at, template_version, biometric_id, "
+                        "registration_note, moallem_id) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
                         (
                             candidate,
                             full_name,
+                            # NULL when the applicant gave one unlabelled name: the column is a
+                            # map of what was *said* in each language, not a place to guess.
+                            names.serialise(typed),
                             email,
                             phone,
                             password_hash,
@@ -1038,6 +1167,7 @@ async def submit_registration(
                             # leftover file is moved aside here (see ``biometrics.new_account_id``).
                             biometrics.new_account_id(candidate),
                             work_details or None,
+                            assignment,
                         ),
                     )
                 except sqlite3.IntegrityError:
@@ -1073,8 +1203,13 @@ async def submit_registration(
                 entity_id=assigned,
                 after={
                     "name": full_name,
+                    # What the applicant said their name is, per language - recorded even though
+                    # the account row carries it, because this is the row that says a *stranger*
+                    # said it, before any administrator touched the account.
+                    "names": typed or None,
                     "role": role,
                     "status": STATUS_PENDING_APPROVAL,
+                    "moallem_id": assignment,
                     # The consent evidence travels here rather than as a column on the account:
                     # this is the surface that already records who asked for what, from where
                     # and when, and ``request`` is what puts the submitting address in the row.
@@ -1090,6 +1225,7 @@ async def submit_registration(
                 body=(
                     f"{full_name} registered as a {role} and is waiting for approval. The "
                     "account can sign in but cannot clock in until you approve it."
+                    + (f" They chose moallem {assignment}." if assignment else "")
                 ),
                 worker_id=assigned,
                 payload={

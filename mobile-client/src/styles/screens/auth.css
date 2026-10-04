@@ -1,0 +1,102 @@
+/* =====================================================================
+ *  auth.css -- the sign-in screen.
+ *
+ *  A full-height column: the form sits in the middle of the screen rather than
+ *  at the top, so it lands under the thumb and above the keyboard. The mark is
+ *  on the company's green, which is the one screen in this app that belongs to
+ *  the company rather than to the job -- the same rule the web's login panel
+ *  follows, and the reason the brand colour is on the tile and nowhere else.
+ *
+ *  No webfont: the lockup either renders on the first frame or never. This is
+ *  the screen a worker opens at the gate on site cellular.
+ * ===================================================================== */
+
+.auth {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: var(--ui-5);
+  min-height: 100%;
+  padding: var(--ui-6) var(--hand-gutter) var(--ui-6);
+}
+
+.auth__brand {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--ui-2);
+  text-align: center;
+}
+
+/* The same 40px green tile the header carries, one size up. */
+.auth__mark {
+  width: 68px;
+  height: 68px;
+  border-radius: var(--ui-radius);
+  background: var(--brand-green);
+  display: grid;
+  place-items: center;
+  color: var(--brand-gold);
+}
+
+.auth__mark-icon {
+  width: 30px;
+  height: 30px;
+}
+
+.auth__title {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  color: var(--ops-text);
+}
+
+.auth__subtitle {
+  font-size: 13px;
+  color: var(--ops-muted);
+  max-width: 34ch;
+}
+
+.auth__form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ui-4);
+}
+
+.auth__footer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--ui-2);
+  font-size: 12px;
+  color: var(--ops-muted);
+  overflow-wrap: anywhere;
+}
+
+/* The gear sits in the header, which the shell renders; this is the
+   server-URL row inside the settings sheet. */
+.auth__server {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ui-1);
+}
+
+.auth__server-value {
+  font-family: var(--ops-mono);
+  font-size: 13px;
+  color: var(--ops-muted);
+  word-break: break-all;
+}
+
+/* The welcome a brand-new account is handed at sign-in: the id it was hired
+   under, in the server's own words. */
+.auth__welcome {
+  padding: var(--ui-3) var(--ui-4);
+  border-radius: var(--ui-radius-sm);
+  background: var(--ops-live-wash);
+  border-inline-start: 3px solid var(--ops-live);
+  color: var(--ops-text);
+  font-size: 13px;
+  white-space: pre-wrap;
+}

@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Add a site</title>
+<!--
+  Adding a site, visually.
+
+  WHAT THIS PAGE IS
+  -----------------
+  The workflow the requirements describe, in one screen: pick a place (by pasting a Google
+  Maps link, or by typing the coordinates, or by clicking the map), draw the fence around it
+  (a draggable pin and a radius slider, 20-500 m), name it, save it. The save posts to
+  ``POST /api/v1/sites``, which writes the row *and* the process-local cache the punch path
+  reads - so the site is live for the next punch rather than for the next restart.
+
+  TWO WAYS TO SET THE LOCATION, AND WHY BOTH ARE HERE
+  ---------------------------------------------------
+  An administrator who has found the building in Google Maps has a URL in their clipboard,
+  and that URL is a *better* input than two typed numbers: it is what the map itself says,
+  it survives a copy-and-paste, and it needs no coordinate format anybody has to remember.
+  That is the first tab. The second is for everybody else: type the pair, or click the map,
+  or drag the pin - and the fields follow, because a pin is the one control that cannot be
+  got wrong by transposing two numbers.
+
+  The link is parsed **in the browser first** (``SiteLink.coordinatesFrom``, the same shapes
+  the server reads). A shortened ``maps.app.goo.gl`` link carries no coordinates at all -
+  they only exist after the redirect has been followed - so that one case asks the server
+  (``POST /api/v1/resolve-maps-link``), which is the only thing on this page that makes an
+  outbound request, and the only reason that endpoint exists.
+
+  THE MAP IS NOT THE STATE
+  ------------------------
+  ``Draft`` is the whole state: ``{lat, lng, radius}``. The map renders it and never owns
+  it - every gesture writes the state and then asks the map to draw it - so a click, a drag
+  and a typed number all end in the same place, and a map library that will not load leaves
+  a page that can still be filled in and saved.
+
+  WHAT IT DOES NOT DO
+  -------------------
+  It does not authenticate anybody. The page is a static file served without a session, and
+  every call it makes carries the token the console stored: opening it while signed out
+  shows the sign-in notice rather than a form. Both endpoints it calls are administrator-only,
+  so a worker's token can read nothing here and write nothing.
+-->
+<!--
+  Root-absolute asset paths, and that is load-bearing rather than a style choice: this page
+  is served at ``/sites/new``, which is **two** segments deep. A bare ``add_site.js`` would
+  therefore resolve to ``/sites/add_site.js``, which the API router answers with a JSON
+  404 - and the browser refuses to execute a script whose MIME type is not JavaScript, so
+  the page would render and do nothing. Every asset below is root-absolute for that reason.
+  (``/q/<token>`` and ``/enroll/<token>`` are one segment deep and use ``../``; this page is
+  the first with a fixed two-segment path, and the browser suite is what caught it.)
+-->
+<link rel="icon" href="/icon.svg">
+<link rel="stylesheet" href="/style.css">
+<!--
+  Leaflet's stylesheet and script, from the CDN. ``defer`` on the script: the page's own
+  script waits for it (see ``Map.ensure``), and a slow CDN must not hold up the fields.
+  The SRI hash is the one the geofence editor uses - the same file, the same pin.
+-->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<link rel="stylesheet" href="/geofence.css">
+</head>
+<body class="geofence-page">
+<header class="geo-header">
+  <div class="geo-brand">
+    <img src="/logo-mark.svg" alt="" width="32" height="32">
+    <div>
+      <h1>Add a site</h1>
+      <p class="geo-sub" id="site-status">Sign in to the console, then reload this page.</p>
+    </div>
+  </div>
+  <div class="geo-engine">
+    <a class="geo-engine-btn" href="/geofence">Deployment fence</a>
+    <a class="geo-engine-btn" href="/">Back to the console</a>
+  </div>
+</header>
+
+<main class="geo-main">
+  <section class="geo-map-wrap">
+    <div id="site-map" class="geo-map" aria-label="Site location map"></div>
+    <p class="geo-map-note" id="site-map-note" role="status">Starting the map…</p>
+  </section>
+
+  <section class="geo-panel">
+    <!--
+      The two ways in, as a real tab list. ``role="tablist"`` rather than two buttons: the
+      two panels are alternatives, not steps, and a screen reader announces which one is on
+      screen. Both panels are always *in* the markup - only the hidden attribute moves - so
+      a switch never loses what was typed.
+    -->
+    <div class="geo-tabs" role="tablist" aria-label="How to set the location">
+      <button type="button" id="site-tab-link" class="geo-tab is-active" role="tab"
+              aria-selected="true" aria-controls="site-panel-link">Paste a Maps link</button>
+      <button type="button" id="site-tab-manual" class="geo-tab" role="tab"
+              aria-selected="false" aria-controls="site-panel-manual">Type coordinates</button>
+    </div>
+
+    <div id="site-panel-link" class="geo-tabpanel" role="tabpanel" aria-labelledby="site-tab-link">
+      <label class="ui-label" for="site-maps-url">Google Maps link</label>
+      <div class="geo-row">
+        <input type="url" id="site-maps-url" class="ui-field" autocomplete="off" spellcheck="false"
+               placeholder="https://maps.app.goo.gl/…">
+        <button type="button" id="site-resolve" class="geo-secondary">Find it</button>
+      </div>
+      <p class="geo-hint">
+        Any Maps link works: the address bar (<code>/maps/@29.351234,47.984712,17z</code>),
+        a share link (<code>?q=29.351234,47.984712</code>), or a shortened
+        <code>maps.app.goo.gl</code> one, which is followed on the server. The pin moves
+        there and the fields below fill in.
+      </p>
+      <pre class="geo-legacy-preview" id="site-resolve-result" aria-live="polite"></pre>
+    </div>
+
+    <div id="site-panel-manual" class="geo-tabpanel" role="tabpanel" aria-labelledby="site-tab-manual" hidden>
+      <p class="geo-hint">
+        Type the two numbers, or click anywhere on the map - the pin lands there and these
+        fields follow it. Dragging the pin moves them too.
+      </p>
+    </div>
+
+    <!--
+      The site itself. The coordinates are in both tabs' reach because they are the answer
+      either way: the link fills them in, the map writes them, and an administrator can
+      correct one digit without starting over.
+    -->
+    <div class="geo-field-grid">
+      <div>
+        <label class="ui-label" for="site-name">Site name</label>
+        <input type="text" id="site-name" class="ui-field" required placeholder="Tower B - phase 2">
+      </div>
+      <div>
+        <label class="ui-label" for="site-lat">Latitude</label>
+        <input type="number" id="site-lat" class="ui-field" step="0.000001" min="-90" max="90"
+               inputmode="decimal" placeholder="29.351234">
+      </div>
+      <div>
+        <label class="ui-label" for="site-lng">Longitude</label>
+        <input type="number" id="site-lng" class="ui-field" step="0.000001" min="-180" max="180"
+               inputmode="decimal" placeholder="47.984712">
+      </div>
+      <div style="grid-column:1/-1">
+        <label class="ui-label" for="site-radius">Allowed check-in radius
+          <output id="site-radius-out">100 m</output></label>
+        <input type="range" id="site-radius" min="20" max="500" step="5" value="100">
+        <p class="geo-hint" id="site-radius-hint">
+          Drag the slider until the circle covers the plot and stops at the street. 20 m is a
+          doorway, 500 m is a district - a fence that reaches a neighbouring site is a fence
+          that admits the wrong gate.
+        </p>
+      </div>
+    </div>
+
+    <div class="geo-hud" id="site-hud">
+      <div><span>Latitude</span><strong id="site-hud-lat">—</strong></div>
+      <div><span>Longitude</span><strong id="site-hud-lng">—</strong></div>
+      <div><span>Radius</span><strong id="site-hud-radius">—</strong></div>
+      <div><span>Area</span><strong id="site-hud-area">—</strong></div>
+    </div>
+
+    <div class="geo-actions">
+      <button type="button" id="site-save" class="geo-primary">Create the site</button>
+      <button type="button" id="site-reset" class="geo-secondary">Start over</button>
+    </div>
+    <pre class="geo-legacy-preview" id="site-save-result" aria-live="polite"></pre>
+  </section>
+</main>
+
+<div id="geo-toasts" class="geo-toasts" aria-live="polite"></div>
+
+<script src="/api-config.js"></script>
+<script src="/add_site.js"></script>
+</body>
+</html>

@@ -85,6 +85,7 @@ if _BACKEND_DIR not in sys.path:
 #: does not get.
 log = logging.getLogger("attendance.api")
 
+import audit
 import biometrics
 import branding
 import corpus
@@ -95,15 +96,18 @@ import developer
 import enrollment
 import face_detector
 import face_engine
+import geofence
 import liveness
 import live_ops
 import migrations
+import names
 import netguard
 import notes
 import notifications
 import offline_sync
 import overtime
 import punch_frames
+import punch_trace
 import push
 import quick_links
 import readiness
@@ -112,6 +116,7 @@ import reports
 import retention
 import schema_guard
 import security
+import sites
 import telemetry
 import textguard
 import shift_hours
@@ -393,38 +398,27 @@ def _audit(
     after: Any = None,
     request: Request | None = None,
 ) -> None:
-    """Append an administrative event. Never raises.
+    """Append an administrative event. Never raises. See ``audit.record``.
 
     ``audit_log`` is append-only *in the database* (triggers reject UPDATE and
     DELETE), so a correction has to be appended as a new event rather than
     silently rewriting history.
+
+    A browser console is what most of these events come from, so the caller's user
+    agent is recorded with them.
     """
-    ip = user_agent = None
-    if request is not None:
-        ip = request.client.host if request.client else None
-        user_agent = request.headers.get("user-agent")
-    try:
-        conn.execute(
-            """
-            INSERT INTO audit_log
-                (actor_id, actor_role, action, entity, entity_id, before_json, after_json, ip, user_agent, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                actor.id if actor else None,
-                actor.role if actor else None,
-                action,
-                entity,
-                str(entity_id) if entity_id is not None else None,
-                json.dumps(before, default=str) if before is not None else None,
-                json.dumps(after, default=str) if after is not None else None,
-                ip,
-                user_agent,
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            ),
-        )
-    except sqlite3.Error:
-        pass
+    audit.record(
+        conn,
+        action=action,
+        actor=actor,
+        entity=entity,
+        entity_id=entity_id,
+        before=before,
+        after=after,
+        request=request,
+        user_agent=True,
+        created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    )
 
 
 def _record_refused_punch(
@@ -866,6 +860,19 @@ class UserEditRequest(BaseModel):
     #: somebody must not silently revoke their travel privilege); ``True``/``False`` is the
     #: administrator handing the privilege out or taking it back, for exactly this account.
     transit_enabled: bool | None = None
+    #: The name in each language the console is read in. ``None`` leaves that language alone and
+    #: ``""`` clears it - the two different answers a form that edits one field at a time has to
+    #: be able to give. At least one name has to remain on the account: ``users.name`` is what a
+    #: timesheet prints and it cannot be empty, so clearing the last one is refused by name.
+    name_en: str | None = None
+    name_ar: str | None = None
+    name_hi: str | None = None
+    name_ur: str | None = None
+    #: The moallem this worker reports to, or ``""`` to unassign. ``None`` leaves the assignment
+    #: alone. Validated against the roster (``_moallem_assignment``): an account cannot be its own
+    #: moallem, a moallem account is never assigned to one, and the target must be an active
+    #: moallem - the same three rules the public form is held to.
+    moallem_id: str | None = None
 
     @field_validator("name")
     @classmethod
@@ -1543,20 +1550,83 @@ def _refuse_self_account(actor: CurrentUser, user_id: str, action: str) -> None:
         )
 
 
+def _moallem_assignment(
+    conn: sqlite3.Connection, *, user_id: str, role: str, requested: str
+) -> str | None:
+    """The moallem to store for one account, or ``None``. Never guesses, never raises blind.
+
+    The three rules are the public form's own (``registrations._moallem_choice``) and they are
+    repeated rather than shared because the two surfaces answer differently - that one is
+    handed an applicant's choice and this one an administrator's edit - while the *rule* has to
+    be one rule or a console could write an assignment the form would refuse:
+
+    * only a **worker** carries an assignment. A moallem supervises; a moallem assigned to a
+      moallem would make "who runs this crew" a question with two answers, and two such
+      accounts a loop;
+    * ``""`` is an answer - unassigned - and not a missing value;
+    * a named moallem must be an **active account in that role**. A stale console, a deleted
+      supervisor, or a hand-made request is refused by name, because an assignment that
+      resolves to nobody is worse than no assignment at all: every reader of the roster would
+      show a worker reporting to an id with no account behind it.
+
+    An account cannot be *its own* moallem, which is the one loop the two rules above do not
+    already close.
+    """
+    wanted = str(requested or "").strip()
+    if not wanted:
+        return None
+    if role != "worker":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Account {user_id} is a {role}. Only a worker is assigned to a moallem; a "
+                "moallem supervises."
+            ),
+        )
+    if wanted == str(user_id):
+        raise HTTPException(
+            status_code=400, detail="An account cannot be its own moallem."
+        )
+    target = conn.execute(
+        "SELECT id, name, role, status FROM users WHERE id = ?", (wanted,)
+    ).fetchone()
+    if target is None or target["role"] != "moallem" or target["status"] != "active":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "That account is not an active moallem, so nobody can be assigned to it. "
+                "Pick one from the list."
+            ),
+        )
+    return str(target["id"])
+
+
 def _user_snapshot(row: sqlite3.Row) -> dict:
     """The account fields worth recording, and never the password hash.
 
     ``audit_log`` is append-only, so whatever is written there is written for good; a
     bcrypt hash in it would be a credential with unlimited lifetime. The snapshot names
     the fields an administrator can actually change and stops there.
+
+    The name is recorded twice on purpose: ``names`` is the map the applicant filled in or the
+    translation pass wrote, parsed rather than as the stored JSON text (the log is read by
+    people), and ``name`` is the canonical value every other screen shows. They are the same
+    person's name and they are *not* the same field - clearing a language must not look like a
+    rename in the trail.
     """
     return {
         "name": row["name"],
+        "names": names.parse(row["name_i18n"]),
         "email": row["email"],
         "phone": row["phone"],
         "role": row["role"],
         "status": row["status"],
         "hourly_rate": row["hourly_rate"],
+        # Who this account reports to. Recorded like any other account field: "who moved this
+        # worker under a different moallem, and when" is a question asked the first time two
+        # supervisors disagree about a crew, and the roster cannot answer it - it only knows
+        # today's answer.
+        "moallem_id": row["moallem_id"],
         # The transit grant is audited like any other account field: "who was allowed to start
         # a shift on the road, and when did that change" is exactly the question this log exists
         # to answer, and a privilege that could be flipped without a ``before``/``after`` beside
@@ -2617,6 +2687,17 @@ async def verify_worker(
     so the existing client keeps working, and is rejected if it names anybody
     other than the token's owner.
     """
+    #: Where this punch's seconds go, for the sweeper in ``punch_trace``. Four punches on
+    #: 2026-10-03 sat open for 48-283 s and left nothing in the deployment's logs at all -
+    #: no access line, no model line, no error - because a request that never finishes cannot
+    #: report from where it is stuck. The trace answers "still in stage X" from outside the
+    #: code path that is waiting, and the platform's own request id is carried so a line here
+    #: and a row in Railway's HTTP log are the same punch.
+    trace = punch_trace.begin(
+        worker_id=str(current.id),
+        action=str(action),
+        request_id=request.headers.get("x-railway-request-id"),
+    )
     if str(worker_id) != current.id:
         raise HTTPException(
             status_code=403, detail="You may only record attendance for your own account."
@@ -2670,6 +2751,7 @@ async def verify_worker(
             detail="The developer account does not check in or out.",
         )
 
+    trace.enter(punch_trace.STAGE_GEOFENCE)
     lat, lon = parse_location_input(location_input)
     validate_plausible_coordinates(lat, lon)
 
@@ -2809,6 +2891,7 @@ async def verify_worker(
     # file instead of bytes, because this photo has to survive a wait for engine capacity (see
     # ``judge_punch_frame``). Held as bytes it would be megabytes per *waiting* punch, which is
     # what made a burst a memory event rather than a slow answer.
+    trace.enter(punch_trace.STAGE_UPLOAD)
     photo = await uploads.spool_photo(selfie, field="selfie")
     # Resolved before the job because the job needs the path it is scoring against - and the
     # 404 for a missing one is still raised below, where it has always been: after a liveness
@@ -2824,6 +2907,7 @@ async def verify_worker(
     # photo the policy refuses (an unreadable image, a declared pixel count over the ceiling)
     # answers with the same coded refusal it did before the decode moved - the refusal is raised
     # by ``uploads`` inside the job and travels out of it unchanged.
+    trace.enter(punch_trace.STAGE_MODEL)
     try:
         liveness_decision, face_data, image = await face_engine.ENGINE.run_async(
             judge_punch_frame, reference_filepath if has_reference else None, photo.path
@@ -2885,25 +2969,43 @@ async def verify_worker(
         # Advisory mode: recorded, flagged and notified, but not blocked. This is how a
         # threshold gets calibrated against real site traffic before it may reject anybody.
         liveness_flag = f"liveness {liveness_decision.result.verdict}"
-        with db(write=True) as conn:
-            notifications.notify(
-                conn,
-                kind=(
-                    notifications.KIND_LIVENESS_SPOOF
-                    if liveness_decision.result.verdict in {liveness.VERDICT_SPOOF, liveness.VERDICT_LOW_CONFIDENCE}
-                    else notifications.KIND_LIVENESS_DEGRADED
-                ),
-                severity=notifications.SEVERITY_WARNING,
-                title="Liveness check did not confirm a genuine face",
-                body=(
-                    f"{user_row['name']} (id {current.id}) clocked with liveness "
-                    f"'{liveness_decision.result.verdict}' ({liveness_decision.result.detail}). "
-                    "Recorded, not blocked, because LIVENESS_MODE is advisory."
-                ),
-                worker_id=current.id,
-                payload={"liveness": liveness_decision.as_payload()},
-                dedupe_key=f"liveness_advisory:{current.id}:{datetime.now().strftime('%Y-%m-%d %H:%M')}",
-            )
+        # A *missing* evaluator is a fact about the deployment, not about this punch, and it
+        # must not become an event per punch. The deployment this ran against has no
+        # ``minifasnet.onnx`` in its image, so every punch arrives here with verdict
+        # ``unavailable``: notified per worker per minute, that is an administrator alert for
+        # each worker on the site, a write inside the punch's own path, and a push dispatch
+        # behind it - a queue of writes at the gate, at exactly the moment the gate is busy,
+        # in exchange for repeating what ``liveness_anti_spoofing`` already reports on the
+        # readiness surface. Advisory verdicts that say something about the frame (spoof,
+        # low_confidence) still notify, because those are the ones an operator has to act on.
+        unjudged = liveness_decision.result.verdict in {
+            liveness.VERDICT_UNAVAILABLE,
+            liveness.VERDICT_ERROR,
+        }
+        if not unjudged:
+            with db(write=True) as conn:
+                notifications.notify(
+                    conn,
+                    kind=(
+                        notifications.KIND_LIVENESS_SPOOF
+                        if liveness_decision.result.verdict
+                        in {liveness.VERDICT_SPOOF, liveness.VERDICT_LOW_CONFIDENCE}
+                        else notifications.KIND_LIVENESS_DEGRADED
+                    ),
+                    severity=notifications.SEVERITY_WARNING,
+                    title="Liveness check did not confirm a genuine face",
+                    body=(
+                        f"{user_row['name']} (id {current.id}) clocked with liveness "
+                        f"'{liveness_decision.result.verdict}' ({liveness_decision.result.detail}). "
+                        "Recorded, not blocked, because LIVENESS_MODE is advisory."
+                    ),
+                    worker_id=current.id,
+                    payload={"liveness": liveness_decision.as_payload()},
+                    dedupe_key=(
+                        f"liveness_advisory:{current.id}:"
+                        f"{datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                    ),
+                )
 
     if not has_reference:
         # One wall, two audiences. A worker cannot register a template for themselves - that
@@ -3082,6 +3184,7 @@ async def verify_worker(
     arrival_notice = None
     flag_reason = liveness_flag
 
+    trace.enter(punch_trace.STAGE_DATABASE)
     with db(write=True) as conn:
         # The open shift, re-read inside the write lock. The gate above read it for the geofence
         # decision; this is the read the state machine acts on, so a session another request
@@ -3476,6 +3579,7 @@ async def verify_worker(
     # notice rides in the same dispatch as the crossing rather than a second pass; it is
     # wrapped because ``notify_worker`` answers whether a row was written, which is the shape
     # ``deliver_worker_notices`` reads.
+    trace.enter(punch_trace.STAGE_RESPONSE)
     overtime.deliver_worker_notices([crossing, {"worker_notified": arrival_notice}])
 
     return {
@@ -3536,7 +3640,8 @@ async def list_users(current: CurrentUser = Depends(admin_only)):
     hide_sql, hide_params = developer.visibility_clause(current, column="id")
     with db() as conn:
         rows = conn.execute(
-            "SELECT id, name, email, phone, role, status, enrolled_at, biometric_id, "
+            "SELECT id, name, name_i18n, email, phone, role, status, enrolled_at, "
+            "biometric_id, moallem_id, "
             "COALESCE(transit_enabled, 0) AS transit_enabled, "
             "COALESCE(token_version, 0) AS token_version, "
             "(password_hash IS NOT NULL AND password_hash <> '') AS password_set "
@@ -3554,10 +3659,27 @@ async def list_users(current: CurrentUser = Depends(admin_only)):
                 "AND entity_id IS NOT NULL GROUP BY entity_id"
             ).fetchall()
         }
+        # The moallem *labels*, in one query for the whole roster, keyed by the ids the roster
+        # actually references - not a query per row, and not a list of every moallem in the
+        # deployment: a name is looked up here only to be shown beside a worker who carries the
+        # assignment, so nothing unreferenced is ever published.
+        referenced = sorted({str(row["moallem_id"]) for row in rows if row["moallem_id"]})
+        labels: dict[str, dict] = {}
+        if referenced:
+            placeholders = ",".join("?" for _ in referenced)
+            for row in conn.execute(
+                f"SELECT id, name, name_i18n FROM users WHERE id IN ({placeholders})",
+                referenced,
+            ).fetchall():
+                labels[str(row["id"])] = {
+                    "name": row["name"],
+                    "names": names.parse(row["name_i18n"]),
+                }
     return [
         {
             "id": row["id"],
             "name": row["name"],
+            "name_i18n": names.parse(row["name_i18n"]),
             "email": row["email"],
             "phone": row["phone"],
             "role": row["role"],
@@ -3578,6 +3700,12 @@ async def list_users(current: CurrentUser = Depends(admin_only)):
             # the switch's position for everyone, which is how an administrator audits who holds
             # the privilege without opening each account in turn.
             "transit_enabled": bool(row["transit_enabled"]),
+            # The assignment, as the id and as the name to put in the column: ``moallem_id``
+            # alone would make the roster a second lookup screen, and the console draws the
+            # name in the reader's own language from ``moallem_names``.
+            "moallem_id": row["moallem_id"],
+            "moallem_name": (labels.get(str(row["moallem_id"])) or {}).get("name"),
+            "moallem_names": (labels.get(str(row["moallem_id"])) or {}).get("names") or {},
         }
         for row in rows
     ]
@@ -3888,10 +4016,15 @@ async def edit_user(
     """
     user_id = str(req.user_id).strip()
     name = str(req.name or "").strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="Name must not be empty.")
     email = str(req.email or "").strip()
     phone = str(req.phone or "").strip()
+    # A name has to arrive, but not necessarily in the single ``name`` field any more: the
+    # console sends the per-language ones, and the canonical value is derived from them below
+    # (one person, one display name). This is the "nothing was sent at all" case, refused here
+    # so a request naming nobody is answered before the roster is read; a payload whose language
+    # fields were sent but *all empty* is refused inside the transaction, beside the write.
+    if not name and all(getattr(req, f"name_{language}") is None for language in names.LANGUAGES):
+        raise HTTPException(status_code=400, detail="Name must not be empty.")
 
     with db(write=True) as conn:
         target = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
@@ -3901,6 +4034,43 @@ async def edit_user(
 
         before = _user_snapshot(target)
         changes: dict[str, Any] = {"name": name, "email": email, "phone": phone}
+
+        # The per-language names, when the console sent any. The canonical ``users.name`` is then
+        # *derived* from the map: one person has one display name, and letting this form write
+        # both would be two sources of truth for it - the roster would show whichever the last
+        # writer touched.
+        if any(getattr(req, f"name_{language}") is not None for language in names.LANGUAGES):
+            merged = dict(before["names"])
+            for language in names.LANGUAGES:
+                supplied = getattr(req, f"name_{language}")
+                if supplied is None:
+                    continue
+                # The allowlist, the same one the single ``name`` field is held to: clearing a
+                # slot is a write like any other, and it is the door markup would otherwise
+                # come in through.
+                try:
+                    cleaned = textguard.identifier(
+                        supplied,
+                        field="Full name",
+                        max_length=textguard.MAX_NAME,
+                        allow_empty=True,
+                    )
+                except ValueError as exc:
+                    raise textguard.http_error(exc) from None
+                if cleaned:
+                    merged[language] = cleaned
+                else:
+                    merged.pop(language, None)
+            if not merged and not name:
+                raise HTTPException(status_code=400, detail="Name must not be empty.")
+            changes["name_i18n"] = names.serialise(merged)
+            name = names.primary(merged) or name
+            changes["name"] = name
+
+        if req.moallem_id is not None:
+            changes["moallem_id"] = _moallem_assignment(
+                conn, user_id=user_id, role=str(target["role"]), requested=req.moallem_id
+            )
 
         if req.hourly_rate is not None:
             rate = float(req.hourly_rate)
@@ -3925,6 +4095,11 @@ async def edit_user(
             f"UPDATE users SET {assignments} WHERE id = ?", (*changes.values(), user_id)
         )
         after = {**before, **changes}
+        # ``changes`` is shaped for the UPDATE (``name_i18n`` is the JSON text the column
+        # stores); the snapshot the log records carries the parsed map instead, which is the
+        # shape ``before`` already has - a pair whose halves are stored differently cannot be
+        # compared by the person reading them.
+        after["names"] = names.parse(changes.get("name_i18n", target["name_i18n"]))
         _audit(
             conn,
             action="user_edit",
@@ -4115,6 +4290,22 @@ async def delete_user(
         queued = conn.execute(
             "DELETE FROM punch_queue WHERE worker_id = ?", (user_id,)
         ).rowcount
+        # Whoever reported to this account is released *before* it goes: the id is about to stop
+        # existing, and an assignment pointing at nobody is a roster row with no answer. The
+        # column declares ``ON DELETE SET NULL``, which SQLite only enforces when
+        # ``PRAGMA foreign_keys`` is on - it is not, in this deployment (see the migration) - so
+        # the write is made here, in the same transaction, and the ids are named on the delete
+        # row: "who lost their moallem when this account went" is a question a payroll week
+        # later cannot answer any other way.
+        released = [
+            str(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM users WHERE moallem_id = ? ORDER BY CAST(id AS INTEGER) ASC",
+                (user_id,),
+            ).fetchall()
+        ]
+        if released:
+            conn.execute("UPDATE users SET moallem_id = NULL WHERE moallem_id = ?", (user_id,))
         conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
         _audit(
             conn,
@@ -4130,6 +4321,7 @@ async def delete_user(
                 "devices_removed": int(devices or 0),
                 "invites_removed": int(invites or 0),
                 "punches_removed": int(queued or 0),
+                "workers_released": released,
             },
             request=request,
         )
@@ -4253,6 +4445,11 @@ async def add_site(request: Request, req: SiteModel, current: CurrentUser = Depe
             after={"lat": lat, "lon": lon, "radius": req.radius, **window, "category_id": category_id},
             request=request,
         )
+    # The site cache the punch endpoint reads (``geofence.SITE_CACHE``) holds the same rows
+    # this route just wrote, so it is refreshed before the response is returned - otherwise a
+    # punch that names this new site is refused as unknown until the process restarts. One
+    # query here, on an administrator's write, against zero queries on every punch.
+    geofence.refresh_site_cache()
     return {"status": "success", "message": f"Site '{req.site_name}' successfully added at ({lat}, {lon})."}
 
 
@@ -4304,6 +4501,9 @@ async def edit_site(request: Request, req: SiteModel, current: CurrentUser = Dep
             },
             request=request,
         )
+    # Moving a pin moves a fence: the cached boundary has to move with it, or the punch path
+    # would keep measuring against where the site used to be.
+    geofence.refresh_site_cache()
     return {"status": "success", "message": f"Site '{req.site_name}' updated successfully."}
 
 
@@ -4344,6 +4544,9 @@ async def delete_site(
             before=dict(existing),
             request=request,
         )
+    # A deleted site must stop answering punches: the cache is keyed by id *and* by name, and
+    # forgetting is the whole removal - there is no row left to refresh from.
+    geofence.SITE_CACHE.forget(site_name=site_name)
     return {"status": "success", "message": f"Site '{site_name}' deleted successfully."}
 
 
@@ -4609,9 +4812,12 @@ async def list_active_sessions(current: CurrentUser = Depends(admin_only)):
     with db() as conn:
         rows = conn.execute(
             """
-            SELECT a.worker_id, u.name, a.site_name, a.clock_in_time, u.role, a.late_flag
+            SELECT a.worker_id, u.name, u.name_i18n, u.moallem_id, a.site_name,
+                   a.clock_in_time, u.role, a.late_flag,
+                   m.name AS moallem_name, m.name_i18n AS moallem_name_i18n
             FROM active_sessions a
             JOIN users u ON a.worker_id = u.id
+            LEFT JOIN users m ON m.id = u.moallem_id
             ORDER BY a.clock_in_time DESC
             """
         ).fetchall()
@@ -4622,6 +4828,13 @@ async def list_active_sessions(current: CurrentUser = Depends(admin_only)):
         {
             "worker_id": row["worker_id"],
             "name": row["name"],
+            # The board draws a name, so it needs the map beside the canonical value: a reader
+            # who chose Arabic reads the Arabic name here, and one who filled in only an English
+            # name sees that instead (``names.display`` on the client).
+            "name_i18n": names.parse(row["name_i18n"]),
+            "moallem_id": row["moallem_id"],
+            "moallem_name": row["moallem_name"],
+            "moallem_names": names.parse(row["moallem_name_i18n"]),
             "site_name": row["site_name"],
             "clock_in_time": row["clock_in_time"],
             "role": row["role"],
@@ -6472,6 +6685,18 @@ app.include_router(notes.router, prefix="/api/v1")
 app.include_router(notes.admin_router, prefix="/api/v1")
 # Quick clock links: the admin surface (issue, list, revoke, review the punches) and the
 # public one-tap punch the link itself authenticates. Additive, like the routers above.
+# The visual geofence editor's API: the active fence, the two ways of setting it (the modern
+# JSON payload and the legacy ``lat``/``lng``/``rad`` one the old microservice still posts),
+# and the punch that is judged against the cached fence before anything else happens.
+# Additive, like every router above - four new paths under ``/api/v1``, and the punch path
+# that already existed (``/api/v1/attendance/verify``) is untouched: this one records a
+# location verdict, not a shift.
+app.include_router(geofence.router, prefix="/api/v1")
+# Creating a site: the Maps-link resolver, the create endpoint that writes the row *and* the
+# process-local site cache the punch reads (``app.state.sites_cache``), and a read of that
+# cache for diagnostics. Additive - ``/admin/sites/add`` is untouched and still the console's
+# path; this one is what the visual creation page posts to.
+app.include_router(sites.router, prefix="/api/v1")
 app.include_router(quick_links.admin_router, prefix="/api/v1")
 app.include_router(quick_links.public_router, prefix="/api/v1")
 # Walk-up registration: one permanent public link anybody can submit to, and the administrators'
@@ -6623,6 +6848,16 @@ def frontend_page_response(filename: str, request: Request):
     body = _stamp_frontend_assets(html, request.url.path)
     etag = f'"{hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]}"'
     headers = {"Cache-Control": "no-cache, must-revalidate", "ETag": etag}
+    # One page - the geofence editor - is allowed to load a map library from a CDN, and it
+    # says so for itself here. ``netguard`` merges the baseline into every response that
+    # does not already carry a policy, so setting it on this one response is exactly the
+    # "the handler that knows what the body is wins" case that middleware was built for
+    # (see ``_merge_headers``). Every other document keeps the strict policy, which is why
+    # the worker's punch screen - the page a phone at a gate loads - still names no
+    # third-party origin at all.
+    relaxed = geofence.map_policy_for(filename)
+    if relaxed:
+        headers["Content-Security-Policy"] = relaxed
     if request.headers.get("if-none-match") == etag:
         return Response(status_code=304, headers=headers)
     return HTMLResponse(body, headers=headers)
@@ -6664,6 +6899,45 @@ async def registration_page(request: Request):
     return frontend_page_response("register.html", request)
 
 
+@app.get("/geofence", include_in_schema=False)
+async def admin_geofence_page(request: Request):
+    """Serve the visual geofence editor.
+
+    Its own page rather than a tab inside the console bundle, because it is the one screen
+    that pulls in a third-party map library: a phone at a gate must not download Leaflet to
+    clock in, and the console's own bundle is already 255 KB that a worker never fetches.
+    Serving it is not authorising it - the page asks for ``GET /api/v1/geofence`` with the
+    session's token, and the write it offers is refused unless the session is an
+    administrator's (see ``geofence.update_geofence``).
+
+    Deliberately *not* under ``/admin/``: that prefix is the administrator API's, and the
+    startup gate refuses to serve while any ``/admin/`` route answers without a role guard
+    (``auth_enforced_on_admin_routes``) or exists outside the versioned API
+    (``no_unprefixed_duplicate_routes``). This is a document, not an endpoint - the same
+    shape as ``/enroll/{token}``, ``/q/{token}`` and ``/register`` - so it lives at the
+    root beside them and the guard that matters is on the data it reads.
+    """
+    return frontend_page_response("admin_geofence.html", request)
+
+
+@app.get("/sites/new", include_in_schema=False)
+async def admin_add_site_page(request: Request):
+    """Serve the visual site-creation page.
+
+    The workflow the console's Sites screen links to: a Google Maps link or a pair of typed
+    coordinates on the left, a Leaflet map with a draggable pin and a radius circle on the
+    right, and one save that creates the site and puts its fence in force. Its own page for
+    the same reason ``/geofence`` has one - it pulls Leaflet from a CDN, and the console's
+    bundle (and every worker's phone) must not.
+
+    A document, not an endpoint, so it lives at the root rather than under ``/admin/``: the
+    startup gate refuses to serve while any ``/admin/`` route answers without a role guard.
+    Serving it is not authorising it - it reads and writes ``/api/v1/sites`` and
+    ``/api/v1/resolve-maps-link``, both of which are administrator-only.
+    """
+    return frontend_page_response(sites.PAGE, request)
+
+
 @app.get("/q/{token}", include_in_schema=False)
 async def quick_link_page(request: Request, token: str):  # noqa: ARG001 - the token is read by the page itself
     """Serve the one-tap clock page for a quick link.
@@ -6682,6 +6956,25 @@ async def lifespan(application: FastAPI):
     """Bring the database up to date, verify the build, then start the overtime timer."""
     summary = init_db()
     application.state.startup_summary = summary
+    # The active geofence, read out of SQLite *once* and published where the punch path
+    # reads it. This is the load the zero-latency check is bought with: after this line a
+    # punch decides inside/outside from application memory, with no query, no disk and no
+    # network before it has answered - and a cold boot with no row gets the documented
+    # default fence rather than an uninitialised one (see ``geofence.DEFAULT_GEOFENCE``).
+    #
+    # It runs before the readiness gate because the gate's report is where an operator reads
+    # what this deployment came up with, and a cache loaded after the verdict would be
+    # invisible to it. An edit refreshes it through ``geofence.store_geofence``; a restart
+    # re-reads it here.
+    application.state.geofence_cache = geofence.CACHE
+    geofence.refresh_cache()
+    # Every site's fence, read once, in the same breath. ``app.state.sites_cache`` is what
+    # ``POST /api/v1/attendance/punch`` resolves a named site against, so a punch that says
+    # "I am at site 4" decides with no query - the row is already here. A create or an edit
+    # writes through to it (``geofence.store_site_fence``), and the console's own site routes
+    # refresh it, so the two copies cannot drift for longer than one request.
+    application.state.sites_cache = geofence.SITE_CACHE
+    geofence.refresh_site_cache()
     application.state.gate_report = readiness.run_startup_gate(application)
     # Started only after the gate has passed: the watcher must not run against a
     # schema the gate has just declared unusable.
@@ -6721,12 +7014,16 @@ async def lifespan(application: FastAPI):
     # purpose: it removes only files *no request references*, and only ones older than the
     # configured window, because a photo that is still somebody's evidence must survive a restart.
     registrations.sweep_orphan_photos()
+    application.state.punch_watchdog = punch_trace.start_watcher()
     try:
         yield
     finally:
         overtime.stop_watcher()
         retention.stop_watcher()
         coverage_report.stop_watcher()
+        # The punch watchdog is only a logger, but an instrument that outlives the loop it
+        # logs from is a traceback on shutdown, so it goes with the other timers.
+        punch_trace.stop_watcher(application.state.punch_watchdog)
         # Stops the inference workers, so a graceful shutdown does not wait on threads that
         # uvicorn knows nothing about. They are daemons and would die with the process
         # anyway; saying so here is what keeps the queue from being drained behind a

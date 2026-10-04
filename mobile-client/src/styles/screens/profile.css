@@ -1,0 +1,49 @@
+/* =====================================================================
+ *  profile.css -- what the Profile screen owns beyond the shared shell.
+ *
+ *  The account, the device facts and the two action rows are the web's own
+ *  ``.hand-card`` + ``.hand-dl`` lists (shell.css), because a label and a value
+ *  on the handset and on the desk are the same object.
+ *
+ *  What is left is the anchor meter: an offline punch is only replayable while
+ *  the phone holds a server-signed anchor that has not aged out, so "how long
+ *  have I got" is drawn as a bar that empties -- and it changes colour as it
+ *  goes, so the answer survives a glance in sunlight.
+ * ===================================================================== */
+
+.device-anchor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ui-1);
+  margin-top: var(--ui-3);
+}
+
+.device-anchor__bar {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--ops-track);
+  overflow: hidden;
+}
+
+.device-anchor__fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--ops-live);
+  transition: width var(--t-mid) linear;
+}
+
+.device-anchor__fill--low {
+  background: var(--ops-warn);
+}
+
+.device-anchor__fill--expired {
+  background: var(--ops-danger);
+}
+
+.device-anchor__meta {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--ui-2);
+  font-size: 12px;
+  color: var(--ops-muted);
+}

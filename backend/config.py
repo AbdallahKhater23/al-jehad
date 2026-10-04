@@ -338,16 +338,15 @@ class Settings(BaseModel):
     face_inference_wait_seconds: float = 20.0
     #  ``face_engine_process`` moves the model calls into a child process (see
     #  ``face_process`` and ``face_worker``). **Off by default here, on in the deployment image**
-    #  (``Dockerfile``: ``FACE_ENGINE_PROCESS=1``). The library default is what the test suite
-    #  and the tools run - a suite whose models are stubbed in-process must not spawn real ones -
-    #  and the image is where the trade below is actually wanted.
+    #  (``Dockerfile``: ``FACE_ENGINE_PROCESS=1``): the default is what the suite and the tools
+    #  run, and the image is where the trade below is wanted.
     #
     #  What it buys: the API process stops importing the 87 MiB FaceNet graph, stops
     #  building an ONNX session and stops running a detector, so an ONNX Runtime allocation
     #  failure, a corrupt model or the kernel's OOM killer ends the *child* - which the next
     #  punch restarts - instead of ending the process that serves the gate, the console and
-    #  every other endpoint. Measured with ``tools/face_process_memory.py``: the API process's
-    #  floor falls from +211.9 MiB to +3.8 MiB while the child holds 279.0 MiB. What it costs: a second interpreter, every frame copied over a
+    #  every other endpoint (the API process's floor falls from ~212 MiB to ~4 MiB; the child
+    #  holds ~280 MiB). What it costs: a second interpreter, every frame copied over a
     #  pipe, one inference at a time (see ``face_process``) and a slightly *larger* host
     #  total, because the models now live in a process of their own. This is a decision about
     #  survivability, not about the size of the machine, which is why it is a flag.
@@ -364,6 +363,15 @@ class Settings(BaseModel):
     face_engine_process_python: str | None = None
     #: How long a child status answer is reused (``/api/v1/status`` and readiness call it).
     face_engine_process_status_seconds: float = 5.0
+
+    # -- where a punch's seconds went --------------------------------------
+    #: How long a punch may stay open before the process says so, and how long a *finished*
+    #: punch may have taken before it reports its own stages. Four punches on 2026-10-03 ran
+    #: for 48-283 s and left no line at all in the deployment's logs (see ``punch_trace``);
+    #: these two are what makes the next one legible. The watchdog is a sweeper, not a
+    #: timeout - nothing here cancels a request - and 0 turns it off.
+    punch_watchdog_seconds: float = 30.0
+    punch_slow_seconds: float = 5.0
 
     # -- rapid enrollment ---------------------------------------------------
     enrollment_token_ttl_hours: int = 72
@@ -912,6 +920,8 @@ def build_settings(*, env_file: Path | None = None) -> Settings:
         face_engine_process_status_seconds=_env_float(
             "FACE_ENGINE_PROCESS_STATUS_SECONDS", 5.0
         ),
+        punch_watchdog_seconds=_env_float("PUNCH_WATCHDOG_SECONDS", 30.0),
+        punch_slow_seconds=_env_float("PUNCH_SLOW_SECONDS", 5.0),
         bulk_enroll_max_rows=_env_int("BULK_ENROLL_MAX_ROWS", 500),
         bulk_enroll_max_zip_mb=_env_int("BULK_ENROLL_MAX_ZIP_MB", 64),
         quick_link_ttl_hours=_env_int("QUICK_LINK_TTL_HOURS", 24 * 30),

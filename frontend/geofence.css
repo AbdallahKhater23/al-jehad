@@ -1,0 +1,240 @@
+/*
+ * The geofence editor's stylesheet.
+ *
+ * Deliberately standalone rather than a section of ``style.css``: the page is its own
+ * document with its own single job, and the console's stylesheet is 2,000 lines of screens
+ * this one never draws. It is still served from the same folder with the same cache-busting
+ * token, so it costs nothing to keep apart.
+ *
+ * The map needs a real height in a 50,000-libraries-in-one is what the stylesheet is for.
+ */
+:root { color-scheme: light dark; }
+
+.geofence-page {
+    margin: 0;
+    min-height: 100vh;
+    background: #f1f5f9;
+    color: #0f172a;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+.geo-header {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 18px;
+    background: #0f172a;
+    color: #f8fafc;
+}
+
+.geo-brand { display: flex; align-items: center; gap: 12px; }
+.geo-brand h1 { font-size: 17px; margin: 0; }
+.geo-sub { margin: 2px 0 0; font-size: 12px; color: #cbd5e1; }
+
+.geo-engine { display: flex; gap: 6px; }
+.geo-engine-btn {
+    border: 1px solid #334155;
+    background: #1e293b;
+    color: #e2e8f0;
+    border-radius: 6px;
+    padding: 7px 11px;
+    font-size: 12.5px;
+    cursor: pointer;
+}
+.geo-engine-btn.is-active { background: #2563eb; border-color: #2563eb; color: #fff; }
+.geo-engine-btn:focus-visible { outline: 2px solid #93c5fd; outline-offset: 2px; }
+
+.geo-main {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 340px;
+    gap: 14px;
+    padding: 14px;
+    align-items: start;
+}
+
+.geo-map-wrap { position: relative; }
+.geo-map {
+    height: min(72vh, 720px);
+    min-height: 320px;
+    border-radius: 10px;
+    overflow: hidden;
+    background: #dbeafe;
+    box-shadow: 0 1px 3px rgba(15, 23, 42, .18);
+}
+.geo-map-note { margin: 8px 2px 0; font-size: 12.5px; color: #334155; }
+
+.geo-fallback {
+    margin-top: 10px;
+    padding: 12px;
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+    background: #fff;
+    font-size: 13px;
+}
+.geo-fallback label { display: block; font-weight: 600; margin-bottom: 4px; }
+.geo-fallback input { width: 100%; padding: 7px 8px; border: 1px solid #cbd5e1; border-radius: 6px; }
+.geo-fallback p { margin: 8px 0 0; color: #475569; }
+
+.geo-panel {
+    background: #fff;
+    border-radius: 10px;
+    padding: 14px;
+    box-shadow: 0 1px 3px rgba(15, 23, 42, .18);
+}
+.geo-panel h2 { margin: 0 0 10px; font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: #475569; }
+
+.geo-hud {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-bottom: 12px;
+}
+.geo-hud > div { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px; }
+.geo-hud span { display: block; font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: .03em; }
+.geo-hud strong { font-size: 15px; font-variant-numeric: tabular-nums; }
+
+.geo-field { display: block; font-size: 12px; color: #475569; margin: 8px 0 3px; }
+.geo-field output { font-variant-numeric: tabular-nums; color: #0f172a; font-weight: 600; }
+
+.geo-panel input[type="number"],
+.geo-panel input[type="text"] {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 7px 8px;
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+    font: inherit;
+    font-variant-numeric: tabular-nums;
+}
+
+.geo-panel input[type="range"] { width: 100%; margin: 4px 0 2px; }
+
+.geo-hint { font-size: 11.5px; color: #64748b; margin: 6px 0 0; }
+
+.geo-actions { display: flex; gap: 8px; margin-top: 14px; }
+.geo-primary, .geo-secondary {
+    flex: 1;
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    border: 1px solid transparent;
+}
+.geo-primary { background: #2563eb; color: #fff; }
+.geo-primary:disabled { background: #93c5fd; cursor: progress; }
+.geo-secondary { background: #fff; color: #1e293b; border-color: #cbd5e1; }
+
+.geo-check { display: flex; gap: 8px; align-items: flex-start; margin: 14px 0 6px; font-size: 12.5px; }
+.geo-check input { margin-top: 2px; }
+
+.geo-legacy-preview {
+    margin: 6px 0 0;
+    padding: 8px;
+    background: #0f172a;
+    color: #e2e8f0;
+    border-radius: 6px;
+    font-size: 11.5px;
+    overflow-x: auto;
+}
+
+.geo-details { margin-top: 14px; font-size: 12.5px; }
+.geo-details summary { cursor: pointer; font-weight: 600; color: #1e293b; }
+
+.geo-toasts {
+    position: fixed;
+    right: 14px;
+    bottom: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-width: min(360px, 90vw);
+    z-index: 9999;
+}
+.geo-toast {
+    padding: 10px 12px;
+    border-radius: 8px;
+    background: #1e293b;
+    color: #f8fafc;
+    font-size: 12.5px;
+    box-shadow: 0 4px 14px rgba(15, 23, 42, .3);
+    transition: opacity .5s ease, transform .5s ease;
+}
+.geo-toast.is-ok { background: #047857; }
+.geo-toast.is-error { background: #b91c1c; }
+.geo-toast.is-info { background: #1d4ed8; }
+.geo-toast.is-leaving { opacity: 0; transform: translateY(6px); }
+
+/* The map fills its own box; Leaflet and Google both need the container to have a size. */
+.leaflet-container { height: 100%; width: 100%; background: #dbeafe; }
+
+/* -- the site-creation page's own two controls ---------------------------- */
+/* The engine toggle doubles as a link on that page ("Back to the console"), so the anchor
+   has to carry the button's own box: an <a> is inline by default and would collapse. */
+a.geo-engine-btn { display: inline-block; text-decoration: none; }
+
+/* The two ways to set a location. A real tab list rather than two buttons: the panels are
+   alternatives, and aria-selected is what tells a screen reader which one is on screen. */
+.geo-tabs {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 10px;
+    border-bottom: 1px solid #e2e8f0;
+}
+.geo-tab {
+    border: none;
+    background: none;
+    padding: 8px 10px;
+    font: inherit;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: #64748b;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+}
+.geo-tab.is-active { color: #1d4ed8; border-bottom-color: #2563eb; }
+.geo-tab:focus-visible { outline: 2px solid #93c5fd; outline-offset: 2px; }
+.geo-tabpanel { padding-top: 4px; }
+
+/* A field and the button that goes with it, on one line. */
+.geo-row { display: flex; gap: 6px; align-items: stretch; }
+.geo-row .ui-field { flex: 1 1 auto; min-width: 0; }
+.geo-row .geo-secondary { flex: 0 0 auto; padding: 7px 12px; }
+
+/* The name and the two coordinates: a name on its own line, the pair side by side. */
+.geo-field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
+.geo-field-grid > div:first-child { grid-column: 1 / -1; }
+.geo-field-grid .ui-label { display: block; font-size: 12px; color: #475569; margin-bottom: 3px; }
+.geo-field-grid .ui-label output { font-variant-numeric: tabular-nums; color: #0f172a; font-weight: 600; }
+.geo-field-grid .ui-field {
+    width: 100%;
+    box-sizing: border-box;
+    font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-color-scheme: dark) {
+    .geo-tabs { border-bottom-color: #1e293b; }
+    .geo-tab { color: #94a3b8; }
+    .geo-tab.is-active { color: #93c5fd; border-bottom-color: #3b82f6; }
+    .geo-field-grid .ui-label { color: #94a3b8; }
+    .geo-field-grid .ui-label output { color: #f8fafc; }
+}
+
+@media (max-width: 900px) {
+    .geo-main { grid-template-columns: minmax(0, 1fr); }
+    .geo-map { height: 58vh; }
+}
+
+@media (prefers-color-scheme: dark) {
+    .geofence-page { background: #0b1220; color: #e2e8f0; }
+    .geo-panel { background: #111a2b; }
+    .geo-hud > div { background: #0f172a; border-color: #1e293b; }
+    .geo-hud strong, .geo-field output { color: #f8fafc; }
+    .geo-secondary { background: #0f172a; color: #e2e8f0; border-color: #334155; }
+    .geo-panel input[type="number"], .geo-panel input[type="text"] {
+        background: #0f172a; color: #e2e8f0; border-color: #334155;
+    }
+    .geo-fallback { background: #111a2b; border-color: #334155; }
+}

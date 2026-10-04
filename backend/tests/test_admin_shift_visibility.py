@@ -223,13 +223,17 @@ const RULES = {
 };
 
 // Two people on site, one of them the administrator who runs the site and works it: the
-// role is the only difference between the two rows.
+// role is the only difference between the two rows - and the worker's moallem is a name this
+// fixture uses nowhere else, so a search for it answers about the assignment rather than
+// about the worker's own name.
 function sessions() {
     return [
         { worker_id: '1000', name: 'Seed Admin', site_name: 'Downtown Tower A',
-          clock_in_time: ago(3), role: 'admin', late_flag: 0 },
+          clock_in_time: ago(3), role: 'admin', late_flag: 0,
+          moallem_id: null, moallem_name: null },
         { worker_id: '1', name: 'Seed Worker', site_name: 'Downtown Tower A',
-          clock_in_time: ago(2), role: 'worker', late_flag: 0 }
+          clock_in_time: ago(2), role: 'worker', late_flag: 0,
+          moallem_id: '600', moallem_name: 'Ustad Karim' }
     ];
 }
 
@@ -245,8 +249,10 @@ function shift(overrides) {
 }
 
 const ROWS = [
-    shift({ worker_id: '1000', worker_name: 'Seed Admin', role: 'admin', log_id: 901, hours: 9 }),
-    shift({ worker_id: '1', worker_name: 'Seed Worker', role: 'worker', log_id: 902, hours: 8 })
+    shift({ worker_id: '1000', worker_name: 'Seed Admin', role: 'admin', log_id: 901, hours: 9,
+            moallem_id: null, moallem_name: null }),
+    shift({ worker_id: '1', worker_name: 'Seed Worker', role: 'worker', log_id: 902, hours: 8,
+            moallem_id: '600', moallem_name: 'Ustad Karim' })
 ];
 
 function totalsOf(rows) {
@@ -274,6 +280,9 @@ function shiftsReport() {
             'log_id', 'date', 'timestamp', 'worker_id', 'worker_name', 'role', 'site_name',
             'arrival_time', 'arrival_verdict', 'arrival_minutes',
             'hours', 'recorded_hours', 'approved_hours', 'break_hours', 'status_code', 'status',
+            // The server joins the assignment onto the row, so the column is this row's fact
+            // rather than a second lookup the console could get wrong.
+            'moallem_id', 'moallem_name',
             'awaiting_approval', 'open_notes'
         ],
         note: 'A timesheet: one row per shift.',
@@ -307,6 +316,32 @@ function rendered(env) {
 function sessionMarkup(markup, id) {
     const match = new RegExp('<(?:tr|article)[^>]*data-session="' + id + '"[\\s\\S]*?</(?:tr|article)>').exec(markup);
     return match ? match[0] : '';
+}
+
+/** Whom a row answers to: the table's cell, or the phone card's fact. */
+function moallemCell(row) {
+    const match = /<td data-fact="moallem">([\s\S]*?)<\/td>/.exec(row)
+        || /<span data-fact="moallem">([\s\S]*?)<\/span>/.exec(row);
+    return match ? match[1].replace(/<[^>]*>/g, '').trim() : null;
+}
+
+function moallemOf(markup, id) {
+    return moallemCell(sessionMarkup(markup, id));
+}
+
+/**
+ * One cell of the Shifts table, found by the column's own key.
+ *
+ * By key rather than by position in the row: the columns are the administrator's to
+ * rearrange, so the row's third cell is only the role until somebody moves it. The key
+ * order is the one the table's own editor publishes.
+ */
+function shiftsCell(markup, workerId, key) {
+    const order = ((/data-column-editor data-order="([^"]*)"/.exec(markup) || [])[1] || '').split(',');
+    const cells = (shiftsRow(markup, workerId).match(/<td[^>]*>[\s\S]*?<\/td>/g) || [])
+        .map((cell) => cell.replace(/<[^>]*>/g, '').trim());
+    const at = order.indexOf(key);
+    return at >= 0 ? cells[at] : null;
 }
 
 /** The small line under the name: the role, then what else that layout has room for. */
@@ -347,7 +382,15 @@ const results = {};
         sub_admin: subOf(markup, '1000'),
         sub_worker: subOf(markup, '1'),
         has_table: markup.indexOf('data-live-ops-table') >= 0,
-        filtered: boardRowIds(env)
+        filtered: boardRowIds(env),
+        // The moallem column, next to the name: the admin has nobody over them and the worker
+        // names theirs. The header is read in the artwork's order, because "next to the name"
+        // is the placement the requirement is about.
+        headers: (markup.match(/<th[^>]*>[\s\S]*?<\/th>/g) || [])
+            .map((cell) => cell.replace(/<[^>]*>/g, '').trim()),
+        moallem_admin: moallemOf(markup, '1000'),
+        moallem_worker: moallemOf(markup, '1'),
+        unassigned_word: env.evaluate("I18n.__('moallemUnassigned')")
     };
 }
 
@@ -390,7 +433,11 @@ const results = {};
         sub_admin: subOf(markup, '1000'),
         sub_worker: subOf(markup, '1'),
         has_cards: markup.indexOf('ops-cards') >= 0,
-        has_table: markup.indexOf('data-live-ops-table') >= 0
+        has_table: markup.indexOf('data-live-ops-table') >= 0,
+        // A card has no columns, so the fact is drawn with its own label - the same value as
+        // the table's cell, for the same person.
+        moallem_admin: moallemOf(markup, '1000'),
+        moallem_worker: moallemOf(markup, '1')
     };
 }
 
@@ -402,10 +449,16 @@ const results = {};
     const byLabel = await searchShifts(shifts, 'administrator');
     const byCode = await searchShifts(shifts, 'admin');
     const byWorker = await searchShifts(shifts, 'worker');
+    // The moallem is a filter as well as a column: typing the supervisor's name is how an
+    // administrator asks "whose crew is this", and the column is what answers on the row.
+    const byMoallem = await searchShifts(shifts, 'karim');
     results.shifts = {
         headers: (markup.match(/<th>[\s\S]*?<\/th>/g) || []).map((cell) => cell.replace(/<[^>]*>/g, '').trim()),
         admin_cells: cellsOf(shiftsRow(markup, '1000')),
         worker_cells: cellsOf(shiftsRow(markup, '1')),
+        moallem_admin: shiftsCell(markup, '1000', 'moallem'),
+        moallem_worker: shiftsCell(markup, '1', 'moallem'),
+        moallem_rows: (byMoallem.match(/data-worker="([^"]*)"/g) || []).map((a) => /"([^"]*)"/.exec(a)[1]),
         label_rows: (byLabel.match(/data-worker="([^"]*)"/g) || []).map((a) => /"([^"]*)"/.exec(a)[1]),
         code_rows: (byCode.match(/data-worker="([^"]*)"/g) || []).map((a) => /"([^"]*)"/.exec(a)[1]),
         label_row_cells: cellsOf(shiftsRow(byLabel, '1000')),
@@ -437,6 +490,45 @@ def test_the_board_names_the_administrator_in_the_readers_words(board):
         parts = sub.split(" · ")
         assert parts[0] == label and parts[1] == "Downtown Tower A", sub
         assert clock.match(parts[2]), sub
+
+
+@VM
+def test_the_moallem_is_next_to_the_name_on_both_views(board):
+    """The supervisor is on the board and on the timesheet, beside the worker's own name.
+
+    Both views, because both are where the question is asked - the board while somebody is on
+    site, the timesheet when the month is reconciled - and a column on one of them would leave
+    the other answering "whose crew was this" with a phone call. The administrator's own row has
+    nobody over them and the word for that is *drawn*: an empty cell reads as a fact the page
+    failed to fetch, which is the opposite of "nobody is assigned".
+
+    The column is also searchable, because a name is how an administrator asks the question.
+    """
+    seen = board["board"]
+    assert "Moallem" in seen["headers"], seen["headers"]
+    assert seen["headers"].index("Moallem") == seen["headers"].index("Name") + 1, (
+        f"the column is not beside the worker's name: {seen['headers']}"
+    )
+    assert seen["moallem_worker"] == "Ustad Karim"
+    assert seen["moallem_admin"] == seen["unassigned_word"], (
+        "a row with nobody over it is not told apart from a value the page lost"
+    )
+
+    # A card has no columns, so the same fact is drawn with its own label - for the same person.
+    mobile = board["mobile"]
+    assert mobile["moallem_worker"] == "Ustad Karim"
+    assert mobile["moallem_admin"] == seen["unassigned_word"]
+
+    shifts = board["shifts"]
+    assert "Moallem" in shifts["headers"], shifts["headers"]
+    assert shifts["moallem_worker"] == "Ustad Karim"
+    assert shifts["moallem_admin"] == seen["unassigned_word"]
+    assert shifts["moallem_rows"] == ["1"], (
+        f"the supervisor's name does not find their crew's rows: {shifts['moallem_rows']}"
+    )
+    # The role is where it was: the new column sits beside the identity columns, not over one.
+    assert shifts["admin_cells"][2] == "Administrator", shifts["admin_cells"]
+    assert "role" in shifts["columns"].split(",")
 
 
 @VM

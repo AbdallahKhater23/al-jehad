@@ -163,11 +163,9 @@ def test_a_refusal_does_not_leave_a_half_recorded_punch(client, monkeypatch):
 def test_a_dead_model_process_answers_the_punch_with_503_not_a_crash(client, monkeypatch):
     """The child-process failure, at the gate: a coded 503, never a bare 500.
 
-    ``FaceEngineUnavailable`` is what a model process that exited, was killed at its deadline or
-    could not be started raises (see ``face_process``). The punch used to catch only
-    ``FaceEngineBusy``, so a dead child left the endpoint as an unhandled exception: the worker
-    got a 500 that told them nothing, the server logged a traceback, and no client could tell a
-    retryable moment from a broken deployment.
+    ``FaceEngineUnavailable`` is what a dead, killed or unstartable model process raises. The
+    punch used to catch only ``FaceEngineBusy``, so a dead child left the endpoint as an unhandled
+    exception - a 500 that told the worker nothing and no client could retry.
     """
 
     async def _dead(*args, **kwargs):
@@ -194,11 +192,8 @@ def test_a_dead_model_process_answers_the_punch_with_503_not_a_crash(client, mon
 def test_the_two_engine_failures_have_two_codes_and_one_answer():
     """One mapping for every endpoint: a full queue and an unreachable model both answer 503.
 
-    They stay distinguishable - ``face_check_busy`` is a busy moment, ``face_check_unavailable``
-    is the models being down - because an operator reading a ticket, or a client deciding whether
-    to retry or to send the worker somewhere, has to be able to tell them apart. What must not
-    differ is the *shape*: both retryable, neither blaming the photograph, and neither reaching a
-    caller as an unhandled 500.
+    The codes stay apart - ``face_check_busy`` is a busy moment, ``face_check_unavailable`` is the
+    models being down - but the shape must not differ: both retryable, neither blaming the photo.
     """
     busy = face_engine.http_exception_for(face_engine.FaceEngineBusy("the queue stayed full"))
     gone = face_engine.http_exception_for(

@@ -94,6 +94,11 @@ function shift(overrides) {
         status: 'Approved by Admin',
         awaiting_approval: false,
         open_notes: 0,
+        // Who the worker answered to on this shift, as the server joins it onto the row. The
+        // default is nobody - a moallem's own row has no moallem over it, and the timesheet has
+        // to say that rather than leave the cell blank - and the worker rows below name one.
+        moallem_id: null,
+        moallem_name: null,
         // Where the shift's clock-in fell against the site's window. The server sends the
         // verdict and the minutes; the wording is the console's.
         arrival_time: '2026-08-07 04:20:00',
@@ -134,12 +139,17 @@ const DEFAULT_ROWS = [
     shift({
         log_id: 902, date: '2026-08-06', timestamp: '2026-08-06 15:04:00', worker_id: '601',
         worker_name: 'Ana Torres', role: 'worker', site_name: 'Harbour Depot', site_category: 'Depot',
+        // Their moallem is somebody who has no shift in this fixture, so "the search excluded
+        // the moallem's own row" and "the moallem's name is in the moallem column" stay two
+        // different assertions.
+        moallem_id: '700', moallem_name: 'Ustad Karim',
         hours: 4, recorded_hours: 4.5, break_hours: 0.5,
         arrival_time: '2026-08-06 05:10:00'
     }),
     shift({
         log_id: 903, date: '2026-08-05', timestamp: '2026-08-05 16:30:00', worker_id: '602',
         worker_name: 'Bilal Khan', role: 'worker', site_name: 'Harbour Depot', site_category: 'Depot',
+        moallem_id: '700', moallem_name: 'Ustad Karim',
         hours: 3, recorded_hours: 5, break_hours: 0.5,
         status_code: 'pending_review', status: 'pending_review', awaiting_approval: true, open_notes: 2,
         arrival_time: '2026-08-05 07:12:00', arrival_verdict: 'late', arrival_minutes: 42
@@ -458,10 +468,12 @@ function adminEnv(options) {
     return env;
 }
 
-const DEFAULT_COLUMNS = 'date,employee,role,id,site,arrival,hours,awaiting,notes';
+const DEFAULT_COLUMNS = 'date,employee,role,moallem,id,site,category,arrival,hours,awaiting,notes';
 // The labels those columns are painted with, in English (the harness boots in the default
-// language). Written out here so a renamed translation cannot pass unnoticed.
-const DEFAULT_HEADERS = ['Date', 'Employee', 'Role', 'User ID', 'Site', 'Arrival', 'Hours', 'Awaiting approval', 'Open notes'];
+// language). Written out here so a renamed translation cannot pass unnoticed. The moallem
+// column sits beside the role because it answers the same kind of question the role does -
+// whose row this is - and it is painted with the role's own word (``roleMoallem``).
+const DEFAULT_HEADERS = ['Date', 'Employee', 'Role', 'Moallem', 'User ID', 'Site', 'Category', 'Arrival', 'Hours', 'Awaiting approval', 'Open notes'];
 
 // The scenarios. ``results`` is printed by the epilogue in ``frontend_vm``.
 const results = {};
@@ -836,7 +848,7 @@ const results = {};
         const searched = env.evaluate("document.getElementById('adminContent').innerHTML");
         const firstRow = allRows(html)[0] || [];
         results.no_arrival = Object.assign(cardValues(html), {
-            cell: firstRow.length > 6 ? firstRow[6] : null,
+            cell: firstRow.length > 7 ? firstRow[7] : null,
             search_no_match: cardValues(searched).has_no_matches
         });
     }
@@ -1345,18 +1357,19 @@ def test_a_shift_waiting_for_an_administrator_is_marked_and_not_counted_as_appro
     assert initial["approved_hours"] != initial["hours"], "waiting hours are not counted hours"
     # The third fixture row is the pending one (3 h of the period's 15) and its awaiting cell
     # says so, where an approved row names the decision that was made instead.
-    assert initial["first_row"][8] == "Approved by Admin", initial["first_row"]
-    assert initial["rows"][2][8] == "Awaiting approval", initial["rows"][2]
+    assert initial["first_row"][9] == "Approved by Admin", initial["first_row"]
+    assert initial["rows"][2][9] == "Awaiting approval", initial["rows"][2]
 
 
 def test_the_default_column_order_is_the_one_the_tab_was_asked_for(results):
     default = results["columns_default"]
-    assert default["columns"] == "date,employee,role,id,site,category,arrival,hours,awaiting,notes"
+    assert default["columns"] == "date,employee,role,moallem,id,site,category,arrival,hours,awaiting,notes"
     assert default["column_order"] == [
-        "date", "employee", "role", "id", "site", "category", "arrival", "hours", "awaiting", "notes"
+        "date", "employee", "role", "moallem", "id", "site", "category", "arrival", "hours",
+        "awaiting", "notes"
     ]
     assert default["headers"] == [
-        "Date", "Employee", "Role", "User ID", "Site", "Category", "Arrival", "Hours",
+        "Date", "Employee", "Role", "Moallem", "User ID", "Site", "Category", "Arrival", "Hours",
         "Awaiting approval", "Open notes", PRINT_ACTION_HEADER
     ], "the data columns, then the row action - which is not one of them"
     assert default["has_columns_panel"] is True, "the admin needs a way to change it"
@@ -1366,33 +1379,39 @@ def test_the_default_column_order_is_the_one_the_tab_was_asked_for(results):
 def test_the_first_row_carries_the_column_values_in_that_order(results):
     """Date, name, role, id, site, arrival, hours, approval - the row lines up with its header."""
     cells = results["columns_default"]["first_row"]
-    # Eleven cells: the ten data columns and the action, which carries no text of its own -
+    # Twelve cells: the eleven data columns and the action, which carries no text of its own -
     # its label is its ``aria-label``, and what is inside it is an icon.
-    assert cells is not None and len(cells) == 11, cells
-    assert cells[10] == "", cells
+    assert cells is not None and len(cells) == 12, cells
+    assert cells[11] == "", cells
     assert cells[0] == "2026-08-07"
     assert cells[1] == "Seed Lead"
     # The role, in the reader's words: the wire says "moallem", the table says "Moallem".
     assert cells[2] == "Moallem"
-    assert cells[3] == "600"
-    assert cells[4] == "Downtown Tower A"
+    # Their own row has no moallem over it - a moallem answers to nobody - and the cell says so
+    # rather than going blank, which is what an administrator reads as "nobody is assigned".
+    assert cells[3] == "Unassigned", cells
+    assert cells[4] == "600"
+    assert cells[5] == "Downtown Tower A"
     # The site's category, resolved by the server on this row: the value the chip filter
     # above the table selects by, and now a column of its own.
-    assert cells[5] == "Warehouse"
-    assert cells[6] == "On time"
-    assert cells[7] == "8"
-    assert cells[8] == "Approved by Admin"
-    assert cells[9] == "1", "this worker has one note open"
+    assert cells[6] == "Warehouse"
+    assert cells[7] == "On time"
+    assert cells[8] == "8"
+    assert cells[9] == "Approved by Admin"
+    assert cells[10] == "1", "this worker has one note open"
+    # ...and a shift that *was* worked under somebody names them: the column is not a permanent
+    # "Unassigned" the test could not tell from a broken read.
+    assert results["columns_default"]["rows"][1][3] == "Ustad Karim"
 
 
 def test_moving_a_column_moves_it_in_the_header_the_panel_and_every_row(results):
     moved = results["columns_moved"]
     # One step per button press, all the way to the front of the table. One step swaps a
     # column with its neighbour and nothing else - no reshuffle, no jump.
-    assert len(moved["steps"]) == 9
-    assert moved["steps"][0] == "date,employee,role,id,site,category,arrival,awaiting,hours,notes"
-    assert moved["steps"][1] == "date,employee,role,id,site,category,awaiting,arrival,hours,notes"
-    assert moved["steps"][-1] == "awaiting,date,employee,role,id,site,category,arrival,hours,notes"
+    assert len(moved["steps"]) == 10
+    assert moved["steps"][0] == "date,employee,role,moallem,id,site,category,arrival,awaiting,hours,notes"
+    assert moved["steps"][1] == "date,employee,role,moallem,id,site,category,awaiting,arrival,hours,notes"
+    assert moved["steps"][-1] == "awaiting,date,employee,role,moallem,id,site,category,arrival,hours,notes"
     assert moved["column_order"][0] == "awaiting"
     assert moved["headers"][0] == "Awaiting approval"
     # The cells follow the header: the newest shift is signed off, the one below it is not.
@@ -1401,7 +1420,8 @@ def test_moving_a_column_moves_it_in_the_header_the_panel_and_every_row(results)
     assert moved["first_row"][1] == "2026-08-07"
     assert moved["first_row"][2] == "Seed Lead"
     assert sorted(moved["column_order"]) == sorted([
-        "date", "employee", "role", "id", "site", "category", "arrival", "hours", "awaiting", "notes"
+        "date", "employee", "role", "moallem", "id", "site", "category", "arrival", "hours",
+        "awaiting", "notes"
     ]), "reordering must never lose or add a column"
     assert moved["hours"] == "15", "and the figures survive the repaint"
 
@@ -1409,12 +1429,12 @@ def test_moving_a_column_moves_it_in_the_header_the_panel_and_every_row(results)
 def test_the_chosen_order_is_remembered_in_the_browser(results):
     moved = results["columns_moved"]
     assert moved["stored"] == (
-        '["awaiting","date","employee","role","id","site","category","arrival","hours","notes"]'
+        '["awaiting","date","employee","role","moallem","id","site","category","arrival","hours","notes"]'
     ), "the order has to outlive the repaint that follows the click"
     persist = results["columns_persist"]
-    assert persist["before"] == "date,employee,role,id,site,category,arrival,notes,hours,awaiting"
+    assert persist["before"] == "date,employee,role,moallem,id,site,category,arrival,notes,hours,awaiting"
     assert persist["column_order"] == persist["before"].split(","), "a re-render keeps it"
-    assert persist["headers"][7] == "Open notes", "and the header follows the stored order"
+    assert persist["headers"][8] == "Open notes", "and the header follows the stored order"
 
 
 def test_a_stale_or_junk_stored_order_cannot_break_the_table(results):
@@ -1422,17 +1442,17 @@ def test_a_stale_or_junk_stored_order_cannot_break_the_table(results):
     repair = results["columns_repair"]
     # Unknown keys are dropped, duplicates collapse, and a column the stored order forgets is
     # appended - so a release that adds a column shows it instead of hiding it for ever.
-    assert repair["stale"]["order"] == "notes,date,employee,role,id,site,category,arrival,hours,awaiting"
+    assert repair["stale"]["order"] == "notes,date,employee,role,moallem,id,site,category,arrival,hours,awaiting"
     assert repair["stale"]["headers"][0] == "Open notes"
     assert repair["stale"]["has_table"] is True
-    assert repair["junk"]["order"] == "date,employee,role,id,site,category,arrival,hours,awaiting,notes", (
+    assert repair["junk"]["order"] == "date,employee,role,moallem,id,site,category,arrival,hours,awaiting,notes", (
         "junk under the key falls back to the default order, it does not empty the table"
     )
     assert repair["junk"]["headers"] == [
-        "Date", "Employee", "Role", "User ID", "Site", "Category", "Arrival", "Hours",
+        "Date", "Employee", "Role", "Moallem", "User ID", "Site", "Category", "Arrival", "Hours",
         "Awaiting approval", "Open notes", PRINT_ACTION_HEADER
     ]
-    assert repair["wrong_type"] == "date,employee,role,id,site,category,arrival,hours,awaiting,notes", (
+    assert repair["wrong_type"] == "date,employee,role,moallem,id,site,category,arrival,hours,awaiting,notes", (
         "a stored value that is not a list is not an order"
     )
 
@@ -1442,11 +1462,12 @@ def test_the_ends_of_the_column_list_are_ends_and_reset_puts_the_default_back(re
     assert reset["at_start"] == "no-move", "the first column cannot move further left"
     assert reset["edges"]["first_cannot_go_earlier"] is True, "and the button says so"
     assert reset["edges"]["last_cannot_go_later"] is True
-    assert reset["before_reset"] == "date,employee,role,id,site,category,arrival,hours,notes,awaiting", (
+    assert reset["before_reset"] == "date,employee,role,moallem,id,site,category,arrival,hours,notes,awaiting", (
         "one step left puts Open notes beside the hours it explains"
     )
     assert reset["column_order"] == [
-        "date", "employee", "role", "id", "site", "category", "arrival", "hours", "awaiting", "notes"
+        "date", "employee", "role", "moallem", "id", "site", "category", "arrival", "hours",
+        "awaiting", "notes"
     ]
     assert reset["stored_after_reset"] is None, "reset forgets the choice, it does not store the default"
 
@@ -1602,9 +1623,9 @@ def test_a_number_in_the_search_box_is_a_worker_id_and_not_a_digit_of_the_date(r
     ids = results["worker_ids"]
     assert ids["all"]["shift_rows"] == 2
     assert ids["by_id"]["shift_rows"] == 1, "'4' is one worker, not everyone who worked on the 4th"
-    assert ids["by_id"]["first_row"][3] == "4", "and the row is that worker's"
+    assert ids["by_id"]["first_row"][4] == "4", "and the row is that worker's"
     assert ids["by_other_id"]["shift_rows"] == 1, "'2' is the other one"
-    assert ids["by_other_id"]["first_row"][3] == "2"
+    assert ids["by_other_id"]["first_row"][4] == "2"
     assert ids["by_year"]["shift_rows"] == 0, (
         "a number that names nobody is a search with no matches, not the whole period"
     )
@@ -1694,9 +1715,9 @@ def test_the_timesheet_says_who_arrived_late_and_by_how_much(results):
     """One row's arrival is the shift's own clock-in against the window its site applies."""
     initial = results["initial"]
     assert initial["late_arrivals"] == "1", "one of the three shifts walked in late"
-    # Column order: date, employee, role, id, site, arrival, hours, awaiting, notes.
-    assert initial["rows"][0][6] == "On time", initial["rows"][0]
-    assert initial["rows"][2][6] == "Late 42 min", initial["rows"][2]
+    # Column order: date, employee, role, moallem, id, site, category, arrival, hours, awaiting, notes.
+    assert initial["rows"][0][7] == "On time", initial["rows"][0]
+    assert initial["rows"][2][7] == "Late 42 min", initial["rows"][2]
 
 
 def test_a_search_for_late_arrivals_finds_them_and_their_minutes(results):
@@ -1908,8 +1929,8 @@ def test_the_phone_layout_shows_one_card_per_shift_with_the_same_columns(results
     assert mobile["has_table"] is False
     assert mobile["hours"] == "15"
     # The same columns, in the same order - a card is a row that had to fold.
-    assert mobile["labels"][:10] == [
-        "Date", "Employee", "Role", "User ID", "Site", "Category", "Arrival", "Hours",
+    assert mobile["labels"][:11] == [
+        "Date", "Employee", "Role", "Moallem", "User ID", "Site", "Category", "Arrival", "Hours",
         "Awaiting approval", "Open notes"
     ]
     assert mobile["site_names"] == ["Downtown Tower A", "Harbour Depot", "Harbour Depot"], (
@@ -1922,7 +1943,7 @@ def test_a_shift_with_no_site_on_file_still_gets_a_row(results):
     table = results["sites"]["no_site"]
     assert table["shift_rows"] == 1
     assert table["site_names"] == []
-    assert table["first_row"][4] == table["em_dash"], "an em dash, not an empty cell"
+    assert table["first_row"][5] == table["em_dash"], "an em dash, not an empty cell"
     assert table["hours"] == "6"
 
 
@@ -2117,13 +2138,13 @@ def test_a_column_can_be_sorted_and_the_third_press_puts_the_period_back(results
 
     # Hours starts at its biggest: 8, 4, 3 - which here is also the order they arrived in.
     assert sorting["by_hours"]["sort"] == '{"key":"hours","direction":"desc"}'
-    assert [row[7] for row in sorting["by_hours"]["rows"]] == ["8", "4", "3"]
+    assert [row[8] for row in sorting["by_hours"]["rows"]] == ["8", "4", "3"]
     assert len(sorting["by_hours"]["sorted_headers"]) == 1, sorting["by_hours"]["sorted_headers"]
     assert 'aria-sort="descending"' in sorting["by_hours"]["sorted_headers"][0]
 
     # Pressed again: the same column, the other way, smallest shift first.
     assert sorting["by_hours_asc"]["sort"] == '{"key":"hours","direction":"asc"}'
-    assert [row[7] for row in sorting["by_hours_asc"]["rows"]] == ["3", "4", "8"]
+    assert [row[8] for row in sorting["by_hours_asc"]["rows"]] == ["3", "4", "8"]
     assert sorting["by_hours_asc"]["rows"][0][1] == "Bilal Khan"
     assert 'aria-sort="ascending"' in sorting["by_hours_asc"]["sorted_headers"][0]
 

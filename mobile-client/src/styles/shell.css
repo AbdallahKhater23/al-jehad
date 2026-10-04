@@ -1,0 +1,1991 @@
+/* =====================================================================
+ *  shell.css -- the app frame and the components every screen shares.
+ *
+ *  Ported from the worker web app's own blocks in ``frontend/style.css``:
+ *  the header is ``.hand-header`` / ``.hand-brand`` / ``.hand-who``, the bar
+ *  is ``.hand-tabs`` with its 3-way active marker (top rule + wash + weight),
+ *  and the cards are ``.hand-card`` / ``.hand-hero``. Class names are the
+ *  web's, so the two screens stay one design instead of two looks.
+ *
+ *  One structural difference, and it is about the platform: on the web the
+ *  header is ``sticky`` and the bar is ``position: fixed``, with the page
+ *  scrolling behind both. A Capacitor WebView puts the on-screen keyboard
+ *  over a fixed bar and fights the insets, so this file lays the same three
+ *  bands out as a grid and scrolls only ``.hand-main``. The bands do not
+ *  move, the insets still reach the glass, and nothing overlaps the keyboard.
+ * ===================================================================== */
+
+.hand-app {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  height: 100%;
+  width: 100%;
+  max-width: var(--hand-max);
+  margin: 0 auto;
+  background: var(--ops-surface-2);
+  color: var(--ops-text);
+  /* Left/right insets are padding rather than margins so a landscape cutout
+     cannot overlap content. */
+  padding-left: var(--safe-left);
+  padding-right: var(--safe-right);
+}
+
+/* ---------------------------------------------------------------------
+ *  header -- the web's own header, band for band
+ * ------------------------------------------------------------------- */
+.hand-header {
+  grid-row: 1;
+  position: sticky;
+  top: 0;
+  z-index: var(--z-header);
+  background: color-mix(in srgb, var(--ops-surface) 92%, transparent);
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--ops-border);
+  /* The green (on the brand tile) reaches the very top of the screen while the
+     header's own content stays below the cutout. */
+  padding-top: var(--safe-top);
+  padding-left: var(--hand-gutter);
+  padding-right: var(--hand-gutter);
+}
+
+.hand-header-inner {
+  display: flex;
+  align-items: center;
+  gap: var(--ui-3);
+  max-width: var(--hand-max);
+  margin: 0 auto;
+  padding: var(--ui-3) 0;
+  min-width: 0;
+}
+
+/* The mark, on the company's green: the handset carries the identity the same
+   way the console rail does, and it is the only colour up here that belongs to
+   the company rather than to the job. */
+.hand-brand {
+  width: 40px;
+  height: 40px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border-radius: var(--ui-radius-sm);
+  background: var(--brand-green);
+}
+.hand-brand img {
+  width: 20px;
+  height: auto;
+  display: block;
+}
+
+.hand-who {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.hand-who-name {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hand-who-role {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--ops-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hand-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--ui-2);
+  flex: none;
+}
+.hand-actions .icon-button {
+  width: 40px;
+  height: 40px;
+  background: transparent;
+}
+
+/* The header's icon button, as the console draws it. */
+.icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: var(--ops-surface);
+  color: inherit;
+  padding: 0;
+}
+.icon-button svg {
+  width: 18px;
+  height: 18px;
+  flex: none;
+}
+.icon-button:active {
+  background: var(--ops-surface-2);
+}
+.icon-button:focus-visible {
+  outline: 2px solid var(--ops-primary);
+  outline-offset: 2px;
+}
+
+/* ---------------------------------------------------------------------
+ *  main scroller
+ * ------------------------------------------------------------------- */
+.hand-main {
+  grid-row: 2;
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
+  width: 100%;
+  padding: var(--ui-4) var(--hand-gutter) calc(var(--ui-5) + var(--safe-bottom));
+  display: flex;
+  flex-direction: column;
+  gap: var(--ui-4);
+  min-width: 0;
+}
+
+.hand-screen {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ui-4);
+  min-width: 0;
+}
+
+/* ---------------------------------------------------------------------
+ *  the bottom bar, as the web rebuilt it
+ * ------------------------------------------------------------------- */
+.hand-tabs {
+  grid-row: 3;
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  align-items: stretch;
+  background: color-mix(in srgb, var(--ops-surface) 94%, transparent);
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+  border-top: 1px solid var(--ops-border);
+  /* The bottom inset is added, so the bar's own surface fills the gesture area
+     while its buttons stay above it. The *side* insets are not repeated here:
+     the app frame above already insets every band, and a landscape cutout would
+     otherwise push the bar in twice and pull it off the frame's centre line. */
+  padding-bottom: var(--safe-bottom);
+  z-index: var(--z-tabs);
+}
+
+.hand-tabs button {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  min-height: var(--tabbar-height);
+  padding: 8px 4px;
+  background: transparent;
+  border: 0;
+  color: var(--ops-muted);
+  font-size: 11px;
+  font-weight: 600;
+  transition: color var(--ui-press) ease, background-color var(--ui-press) ease;
+}
+.hand-tabs button svg {
+  width: 22px;
+  height: 22px;
+  flex: none;
+}
+.hand-tabs button:focus-visible {
+  outline: 2px solid var(--ops-primary);
+  outline-offset: -3px;
+}
+/* The press feedback a handset needs and a mouse never asks for. There is no
+   ``:hover`` rule in this block on purpose: a touch device fires hover on tap
+   and leaves it stuck. */
+.hand-tabs button:active {
+  background: var(--ops-surface-2);
+}
+
+/* The active tab is marked three ways -- a top rule, a wash and a weight
+   change -- because a 12% wash on a phone in direct sunlight is invisible,
+   and because "which tab am I on" must not depend on colour vision. */
+.hand-tabs button[aria-current='page'] {
+  color: var(--ops-primary-ink);
+  font-weight: 800;
+  background: var(--ops-primary-wash);
+}
+.hand-tabs button[aria-current='page']::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  inset-inline-start: 22%;
+  width: 56%;
+  height: 3px;
+  border-radius: 0 0 999px 999px;
+  background: var(--ops-primary);
+}
+
+/* The unread count on the alerts tab: a numeral over the icon's shoulder.
+   ``inset-inline-end`` so an Arabic or Urdu handset mirrors it with the rest of
+   the bar, and 18px of height because that is what a two-digit number needs at
+   11px -- it is a badge, not a control, and nothing is ever tapped on it. */
+.hand-tab-count {
+  position: absolute;
+  top: 3px;
+  inset-inline-end: 20%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  border-radius: 999px;
+  /* The fill, not the dark-theme danger tint: white on --ops-danger is 4.83:1
+     in light but only 2.77:1 under the dark theme's #f87171. */
+  background: var(--ops-action-out);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  box-shadow: 0 0 0 2px var(--ops-surface);
+}
+
+/* =====================================================================
+ *  The shift, as the one card that matters
+ * =====================================================================
+ *  The card is a *reading order* -- what this is, which state it is in, how
+ *  long it has been running, and the numbers it is paid by -- one band each,
+ *  left aligned. The panel is 16px of padding because on a phone the card is
+ *  the whole screen and the inset is what makes it read as a card.
+ * ------------------------------------------------------------------- */
+.hand-hero {
+  position: relative;
+  overflow: hidden;
+  padding: var(--ui-4);
+  border: 1px solid var(--ops-border);
+  border-radius: var(--hand-radius);
+  background: var(--ops-surface);
+  box-shadow: var(--ops-shadow);
+  text-align: start;
+  min-width: 0;
+}
+/* On shift, the card says so with a wash and a left edge rather than a whole
+   dark panel: the phone is read in sunlight, and a saturated fill is the one
+   thing that becomes unreadable there. */
+.hand-hero.is-live {
+  border-inline-start: 3px solid var(--ops-live);
+  background:
+    radial-gradient(120% 70% at 0% 0%, rgba(22, 163, 74, 0.09), transparent 58%),
+    var(--ops-surface);
+}
+
+.hand-hero-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--ui-2);
+  min-width: 0;
+}
+.hand-hero-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ops-muted);
+}
+/* The site is the one fact here the worker did not choose and cannot change, so
+   it is a quiet chip in the corner rather than a second headline. It truncates
+   instead of wrapping: a 40-character site name must not push the timer off
+   the first screen. */
+.hand-hero-site {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  max-width: 55%;
+  margin: 0;
+  padding: 3px 9px;
+  border: 1px solid var(--ops-border);
+  border-radius: 999px;
+  background: var(--ops-surface-2);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ops-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hand-hero-site strong {
+  color: var(--ops-text);
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hand-dot {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 999px;
+  background: var(--ops-live);
+  box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.2);
+  animation: hand-breathe 2.4s ease-in-out infinite;
+}
+.hand-dot.is-off {
+  background: var(--ops-track);
+  box-shadow: none;
+  animation: none;
+}
+@keyframes hand-breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+/* The clock panel's own column. The host it paints into is a plain div inside
+   the scroller, so the scroller's gap never reaches these blocks: without this
+   the card, the button and the facts sit flush and read as one slab. */
+.hand-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ui-4);
+  min-width: 0;
+}
+
+/* The state as a sentence at 20px, not a 24px shout: the biggest thing on this
+   card is the clock, and a headline that competes with it makes two heroes and
+   no hierarchy. */
+.hand-hero-word {
+  margin: 10px 0 0;
+  font-size: 20px;
+  font-weight: 800;
+  line-height: 1.25;
+  letter-spacing: -0.015em;
+}
+.hand-hero.is-live .hand-hero-word {
+  color: var(--ops-live-ink);
+}
+
+/* The figure, and beside it the dial that says how much of the paid day it is. */
+.hand-figure {
+  display: flex;
+  align-items: center;
+  gap: var(--ui-3);
+  margin-top: 10px;
+}
+.hand-figure-main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.hand-ring {
+  flex: 0 0 auto;
+  width: 56px;
+  height: 56px;
+  transform: rotate(-90deg);
+}
+.hand-ring-track {
+  fill: none;
+  stroke: var(--ops-track);
+  stroke-width: 5;
+}
+/* ``pathLength="100"`` on the circle makes the dash array percentages rather
+   than an arc length, so the tick writes the same figure as the line below. */
+.hand-ring-fill {
+  fill: none;
+  stroke: var(--ops-live);
+  stroke-width: 5;
+  stroke-linecap: round;
+  stroke-dasharray: 0 100;
+  transition: stroke-dasharray 600ms ease, stroke 200ms ease;
+}
+.hand-ring-fill.is-over {
+  stroke: var(--ops-warn);
+}
+
+/* What is left of the paid day, in words: the same figure as the ring, for the
+   reader who wants a duration rather than a proportion. */
+.hand-day-line {
+  margin: 8px 0 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ops-muted);
+}
+.hand-day-line.is-done {
+  color: var(--ops-warn);
+}
+
+/* The month so far, as a footer under a running shift's own facts. */
+.hand-hero-foot {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--ui-2);
+  margin: var(--ui-3) 0 0;
+  padding-top: var(--ui-3);
+  border-top: 1px solid var(--ops-border);
+  font-size: 12px;
+  color: var(--ops-muted);
+}
+.hand-hero-foot b {
+  color: var(--ops-text);
+  font-size: 13px;
+}
+.hand-hero-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: var(--ui-3) 0 0;
+  font-size: 13px;
+  color: var(--ops-muted);
+}
+.hand-hero-meta strong {
+  color: var(--ops-text);
+  font-weight: 700;
+}
+.hand-hero-meta.is-warn {
+  color: var(--ops-warn);
+}
+
+/* The figure the whole screen is about. 40px is read at arm's length and still
+   fits a 360px handset beside its own label. */
+.hand-timer {
+  display: block;
+  margin: 10px 0 0;
+  font-family: var(--ops-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: clamp(32px, 10vw, 40px);
+  font-weight: 700;
+  line-height: 1.05;
+  letter-spacing: -0.02em;
+  color: var(--ops-primary-ink);
+}
+.hand-timer.is-over {
+  color: var(--ops-warn);
+}
+/* The time of day, when there is no shift to count: plain text, not the primary
+   blue -- the blue is the colour of a number that is moving. */
+.hand-timer.is-now {
+  color: var(--ops-text);
+}
+.hand-timer-label {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ops-muted);
+}
+
+/* The clock-in time, the paid day and the unpaid break: facts with a label
+   each, because without them the timer reads as the thing that gets paid. */
+.hand-policy {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+  gap: var(--ui-2) var(--ui-3);
+  margin: var(--ui-3) 0 0;
+  padding-top: var(--ui-3);
+  border-top: 1px solid var(--ops-border);
+}
+.hand-policy-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+/* The recorded stamp, on its own row: a 19-character time does not fit a third
+   of a 342px card. */
+.hand-policy-cell.is-wide {
+  grid-column: 1 / -1;
+}
+.hand-policy-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ops-muted);
+}
+.hand-policy-value {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ops-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hand-policy-value.is-mono {
+  font-family: var(--ops-mono);
+  font-variant-numeric: tabular-nums;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.hand-policy b {
+  color: var(--ops-text);
+  font-weight: 700;
+}
+
+/* =====================================================================
+ *  The one action
+ * =====================================================================
+ *  The web's ``.clock-button`` base plus the handset's own ``.hand-clock``
+ *  step: the phone's roomier radius and the extra weight a 17px label needs
+ *  beside an 18px icon.
+ * ------------------------------------------------------------------- */
+.clock-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--ui-2);
+  width: 100%;
+  min-height: 52px;
+  padding: 6px var(--ui-4);
+  border: 1px solid transparent;
+  border-radius: var(--ui-radius-sm);
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1.1;
+  letter-spacing: 0;
+  color: #fff;
+  transition: background-color var(--ui-press) ease, border-color var(--ui-press) ease,
+    transform var(--ui-press) ease;
+}
+.clock-button svg {
+  width: 18px;
+  height: 18px;
+  flex: none;
+}
+/* A press that moves the button, not the page: ``scale`` on a full-width
+   control nudges every neighbour with it. */
+.clock-button:active:not(:disabled) {
+  transform: translateY(1px);
+}
+.clock-button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.clock-button:focus-visible {
+  outline: 2px solid var(--ops-primary);
+  outline-offset: 2px;
+}
+.clock-button.in {
+  background: var(--ops-action-in);
+}
+.clock-button.in:active:not(:disabled) {
+  background: var(--ops-action-in-press);
+}
+.clock-button.out {
+  background: var(--ops-action-out);
+}
+.clock-button.out:active:not(:disabled) {
+  background: var(--ops-action-out-press);
+}
+
+.hand-clock {
+  position: relative;
+  min-height: 52px;
+  border-radius: var(--hand-radius);
+  font-size: 17px;
+}
+.hand-clock svg {
+  width: 18px;
+  height: 18px;
+  flex: none;
+}
+
+/* What a punch needs from this phone, as a footnote to the button rather than a
+   card beside the shift. */
+.hand-action-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ops-muted);
+}
+.hand-ready-dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 999px;
+  background: var(--ops-track);
+}
+.hand-ready-dot.is-ok {
+  background: var(--ops-live);
+}
+.hand-ready-dot.is-warn {
+  background: var(--ops-warn);
+}
+
+/* =====================================================================
+ *  Facts, cards, rows
+ * ===================================================================== */
+.hand-card {
+  padding: var(--ui-4);
+  border: 1px solid var(--ops-border);
+  border-radius: var(--hand-radius);
+  background: var(--ops-surface);
+  box-shadow: var(--ops-shadow);
+  min-width: 0;
+}
+.hand-card.is-live {
+  border-inline-start: 3px solid var(--ops-live);
+}
+/* A panel that draws its own card must not be wrapped in a second one: the
+   border inside a border is the box-in-a-box that reads as unstyled HTML. */
+.hand-card.is-bare {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.hand-card.is-flat {
+  background: var(--ops-surface-2);
+  box-shadow: none;
+}
+/* A list of rows inside one card: the rows own their own padding. */
+.hand-card.is-flush {
+  padding: 0;
+  overflow: hidden;
+}
+
+.hand-section-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--ui-2);
+  margin-bottom: var(--ui-3);
+}
+.hand-section-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+}
+.hand-section-note {
+  margin: 2px 0 0;
+  font-size: 12px;
+  color: var(--ops-muted);
+  max-width: 52ch;
+}
+
+/* A card that is also a button: the whole note is the target, so it is a real
+   ``<button>`` -- keyboard-operable and announced as one. */
+.hand-card.is-note {
+  display: block;
+  width: 100%;
+  text-align: start;
+  font: inherit;
+  color: inherit;
+  transition: border-color var(--ui-press) ease, background-color var(--ui-press) ease;
+}
+.hand-card.is-note:active {
+  border-color: var(--ops-muted);
+  background: var(--ops-surface-2);
+}
+.hand-card.is-note:focus-visible {
+  outline: 2px solid var(--ops-primary);
+  outline-offset: 2px;
+}
+/* Unread is carried by an edge and a weight change, not by colour alone. */
+.hand-card.is-note.is-unread {
+  border-inline-start: 3px solid var(--ops-primary);
+}
+
+.hand-note-subject {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hand-note-tags {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 0 0;
+}
+.hand-note-preview {
+  margin: 8px 0 0;
+  font-size: 13px;
+  color: var(--ops-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hand-note-stamp {
+  margin: 6px 0 0;
+  font-size: 11px;
+  color: var(--ops-muted);
+}
+.hand-note-tags .hand-note-stamp {
+  margin: 0 0 0 auto;
+}
+.hand-note-who {
+  color: var(--ops-text);
+}
+
+/* =====================================================================
+ *  A callout, not a billboard
+ * =====================================================================
+ *  One edge and a wash rather than a saturated outline on all four sides:
+ *  outlined at full warning saturation this was the loudest object on the
+ *  screen, louder than the shift it describes. The icon and the sentence still
+ *  carry the meaning for anyone who cannot see the colour.
+ * ------------------------------------------------------------------- */
+.hand-alert {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px var(--ui-3);
+  border: 0;
+  border-inline-start: 3px solid var(--ops-warn);
+  border-radius: var(--ui-radius-sm);
+  background: var(--ops-warn-wash);
+  /* The ink, not the status hue: on the wash, --ops-warn is 4.18:1 at 13px. */
+  color: var(--ops-warn-ink);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.45;
+  text-align: start;
+}
+.hand-alert.is-danger {
+  border-inline-start-color: var(--ops-danger);
+  background: var(--ops-danger-wash);
+  color: var(--ops-danger-ink);
+}
+.hand-alert.is-info {
+  border-inline-start-color: var(--ops-primary);
+  background: var(--ops-primary-wash);
+  color: var(--ops-primary-ink);
+}
+.hand-alert svg {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  margin-top: 2px;
+}
+.hand-alert p {
+  margin: 0;
+}
+.hand-alert button {
+  margin-top: var(--ui-2);
+  min-height: 40px;
+}
+
+/* The overtime / transit note, the same shape as the callout above it. */
+.hand-note {
+  margin-top: var(--ui-3);
+  padding: 10px var(--ui-3);
+  border: 0;
+  border-inline-start: 3px solid var(--ops-warn);
+  border-radius: var(--ui-radius-sm);
+  background: var(--ops-warn-wash);
+  color: var(--ops-warn-ink);
+  font-size: 13px;
+  line-height: 1.45;
+  text-align: start;
+}
+.hand-note-title {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+  font-weight: 700;
+}
+.hand-note-title svg {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  margin-top: 1px;
+}
+.hand-note-sub {
+  margin: 3px 0 0;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+/* =====================================================================
+ *  History: the record as a rail
+ * =====================================================================
+ *  A stop per punch -- a filled dot for a clock-in, a hollow one for a
+ *  clock-out -- because the question this answers is "what did my week look
+ *  like", and a sequence of stops answers it in a way four aligned columns
+ *  never did. The rail is drawn stop by stop rather than as one line down the
+ *  list, so it cannot hang in space above the newest punch.
+ * ------------------------------------------------------------------- */
+.hand-rail {
+  position: relative;
+  margin: 0;
+  padding: 0 0 0 var(--ui-4);
+  list-style: none;
+}
+.hand-stop::after {
+  content: '';
+  position: absolute;
+  inset-inline-start: calc(-1 * var(--ui-4) + 5px);
+  top: calc(var(--ui-3) + 15px);
+  bottom: -22px;
+  width: 2px;
+  background: var(--ops-border);
+}
+.hand-stop:last-child::after {
+  content: none;
+}
+.hand-stop {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--ui-3);
+  padding: var(--ui-3) 0;
+  min-width: 0;
+}
+.hand-stop + .hand-stop {
+  border-top: 1px solid var(--ops-border);
+}
+.hand-stop::before {
+  content: '';
+  position: absolute;
+  inset-inline-start: calc(-1 * var(--ui-4) + 1px);
+  top: calc(var(--ui-3) + 5px);
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: var(--ops-surface);
+  border: 2px solid var(--ops-muted);
+}
+.hand-stop.is-in::before {
+  border-color: var(--ops-live);
+  background: var(--ops-live);
+}
+.hand-stop.is-out::before {
+  border-color: var(--ops-danger);
+  background: var(--ops-surface);
+}
+.hand-stop-what {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.hand-stop-action {
+  font-size: 14px;
+  font-weight: 700;
+}
+.hand-stop.is-in .hand-stop-action {
+  color: var(--ops-live);
+}
+.hand-stop.is-out .hand-stop-action {
+  color: var(--ops-danger-ink);
+}
+.hand-stop-when,
+.hand-stop-where {
+  font-size: 12px;
+  color: var(--ops-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hand-stop-when {
+  font-family: var(--ops-mono);
+  font-variant-numeric: tabular-nums;
+}
+.hand-stop-tally {
+  flex: none;
+  text-align: end;
+}
+.hand-stop-hours {
+  margin: 0;
+  font-family: var(--ops-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 15px;
+  font-weight: 700;
+}
+.hand-stop-status {
+  margin: 1px 0 0;
+  font-size: 11px;
+  color: var(--ops-muted);
+}
+
+/* =====================================================================
+ *  A definition list -- the account facts on Profile
+ * ===================================================================== */
+.hand-dl {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+}
+.hand-dl-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--ui-3);
+  padding: var(--ui-3) 0;
+  min-width: 0;
+}
+.hand-dl-row + .hand-dl-row {
+  border-top: 1px solid var(--ops-border);
+}
+.hand-dl dt {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ops-muted);
+  flex: none;
+}
+.hand-dl dd {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--ops-text);
+  text-align: end;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.hand-dl dd.is-mono {
+  font-family: var(--ops-mono);
+  font-variant-numeric: tabular-nums;
+}
+.hand-dl-row.is-action {
+  width: 100%;
+  text-align: start;
+}
+.hand-dl-row.is-action:active {
+  background: var(--ops-surface-2);
+}
+
+/* =====================================================================
+ *  Stacks and bubbles -- the note thread
+ * ===================================================================== */
+.hand-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ui-2);
+  min-width: 0;
+}
+.hand-thread {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+/* The day marker, when a note runs across days. */
+.hand-day {
+  display: flex;
+  align-items: center;
+  gap: var(--ui-2);
+  margin: 2px 0;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ops-muted);
+}
+.hand-day::before,
+.hand-day::after {
+  content: '';
+  flex: 1 1 auto;
+  height: 1px;
+  background: var(--ops-border);
+}
+.hand-bubble-row {
+  display: flex;
+}
+.hand-bubble-row.is-mine {
+  justify-content: flex-end;
+}
+.hand-bubble {
+  max-width: 85%;
+  padding: var(--ui-3);
+  border-radius: var(--hand-radius);
+  border: 1px solid var(--ops-border);
+  background: var(--ops-surface-2);
+  color: var(--ops-text);
+}
+.hand-bubble.is-mine {
+  background: var(--ops-primary-fill);
+  border-color: var(--ops-primary-fill);
+  color: #fff;
+}
+.hand-bubble-row.is-internal .hand-bubble {
+  border-style: dashed;
+  border-color: var(--ops-warn);
+}
+.hand-bubble-who {
+  margin: 0 0 3px;
+  font-size: 11px;
+  font-weight: 700;
+  opacity: 0.75;
+}
+.hand-bubble-body {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* The composer: the one place on the thread that is a control, so it is
+   outlined in the primary hue rather than being one more card. */
+.hand-composer {
+  padding: var(--ui-4);
+  border: 1px solid var(--ops-primary);
+  border-radius: var(--hand-radius);
+  background: var(--ops-primary-wash);
+}
+.hand-field-label {
+  display: block;
+  margin-bottom: 5px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ops-muted);
+}
+.hand-field-group {
+  display: block;
+  margin-bottom: var(--ui-3);
+}
+
+/* =====================================================================
+ *  The welcome a brand-new worker meets
+ * =====================================================================
+ *  The first card a hired worker's own account ever draws, and the only card
+ *  in the app that leads with a fact rather than a state: the id they sign in
+ *  with. The edge is the live green rather than the warning orange -- nothing
+ *  here is wrong, and the one impression a new worker must not take from their
+ *  own welcome is that something is.
+ * ------------------------------------------------------------------- */
+.hand-welcome {
+  padding: var(--ui-3);
+  border: 0;
+  border-inline-start: 3px solid var(--ops-live);
+  border-radius: var(--ui-radius);
+  background: var(--ops-live-wash);
+  box-shadow: var(--ops-shadow);
+  text-align: start;
+}
+.hand-welcome-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--ops-live-ink);
+}
+.hand-welcome-title svg {
+  width: 18px;
+  height: 18px;
+  flex: none;
+}
+.hand-welcome-lead {
+  margin: 4px 0 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ops-text);
+}
+.hand-welcome-id {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--ui-3);
+  margin: var(--ui-3) 0 0;
+  padding: 8px var(--ui-3);
+  border: 1px solid var(--ops-border);
+  border-radius: var(--ui-radius-sm);
+  background: var(--ops-surface);
+}
+.hand-welcome-id-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ops-muted);
+}
+.hand-welcome-id-value {
+  font-family: var(--ops-mono);
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1.1;
+  color: var(--ops-text);
+}
+.hand-welcome-body {
+  margin: var(--ui-3) 0 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ops-text);
+}
+.hand-welcome-ok {
+  margin-top: var(--ui-3);
+  width: 100%;
+}
+.hand-welcome-kept {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--ops-muted);
+}
+
+/* =====================================================================
+ *  States: empty, loading, error
+ * ===================================================================== */
+.hand-empty,
+.ui-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--ui-2);
+  padding: var(--ui-6) var(--ui-4);
+  text-align: center;
+  /* The web's dashed box: an empty state is a place where something will be, and
+     the outline says so without being loud about it. ``.hand-empty`` is the same
+     rule because it was the handset's name for it before the port. */
+  border: 1px dashed var(--ops-border);
+  border-radius: var(--ui-radius);
+  color: var(--ops-muted);
+}
+.hand-empty-icon,
+.ui-empty-icon {
+  width: 44px;
+  height: 44px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  background: var(--ops-primary-wash);
+  color: var(--ops-primary-ink);
+}
+.hand-empty-icon svg,
+.ui-empty-icon svg {
+  width: 22px;
+  height: 22px;
+}
+.hand-empty-title,
+.ui-empty-title {
+  margin: 0;
+  font-weight: 700;
+  color: var(--ops-text);
+}
+.hand-empty-body,
+.ui-empty-body {
+  margin: 0;
+  font-size: 13px;
+  max-width: 48ch;
+}
+
+.hand-skeleton {
+  border-radius: var(--ui-radius-sm);
+  background: linear-gradient(
+    90deg,
+    var(--ops-surface-2) 25%,
+    #eef2f7 37%,
+    var(--ops-surface-2) 63%
+  );
+  background-size: 400% 100%;
+  animation: hand-shimmer 1.3s ease-in-out infinite;
+}
+@keyframes hand-shimmer {
+  0% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0 50%;
+  }
+}
+.hand-skeleton--line {
+  height: 14px;
+  margin: var(--ui-2) 0;
+}
+.hand-skeleton--block {
+  height: 96px;
+}
+
+/* =====================================================================
+ *  Small shared pieces
+ * ===================================================================== */
+.hand-mono {
+  font-family: var(--ops-mono);
+  font-variant-numeric: tabular-nums;
+}
+.hand-dim {
+  color: var(--ops-muted);
+}
+/* No opacity: at 0.8 over the app surface this measured 4.41:1 at 12px, and
+   "faint" is a tone, not a licence to fail 4.5:1. */
+.hand-faint {
+  color: var(--ops-muted);
+}
+.hand-spread {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--ui-2);
+}
+.hand-inline {
+  display: flex;
+  align-items: center;
+  gap: var(--ui-2);
+}
+.hand-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+/* =====================================================================
+ *  The console's primitives, as the worker screens use them
+ * =====================================================================
+ *  These are the web's ``.ui-*`` rules, ported so a field, a button, a chip
+ *  and a badge on the handset are the same objects they are on the desk. The
+ *  only edits are the pointer-only states, which become ``:active`` press
+ *  feedback on a touch screen.
+ * ------------------------------------------------------------------- */
+.ui-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  color: var(--ops-text);
+}
+.ui-hint {
+  margin: 4px 0 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ops-muted);
+  max-width: 74ch;
+}
+.ui-note {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ops-muted);
+}
+.ui-note.is-body {
+  font-size: 14px;
+}
+.ui-note.is-strong {
+  font-weight: 700;
+}
+.ui-note.is-warn {
+  color: var(--ops-warn);
+}
+.ui-note.is-danger {
+  color: var(--ops-danger-ink);
+}
+.ui-note.is-ok {
+  color: var(--ops-live-ink);
+}
+.ui-note.is-mono {
+  font-family: var(--ops-mono);
+  overflow-wrap: anywhere;
+}
+.ui-note.is-center {
+  text-align: center;
+}
+.ui-note.is-block {
+  margin: 0;
+}
+.ui-note.is-panel {
+  padding: 10px var(--ui-3);
+  border-inline-start: 3px solid var(--ops-border);
+  border-radius: var(--ui-radius-sm);
+  background: var(--ops-surface-2);
+}
+
+.ui-alert {
+  margin: 0;
+  padding: var(--ui-3);
+  border: 1px solid var(--ops-border);
+  border-radius: var(--ui-radius-sm);
+  background: var(--ops-surface-2);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.ui-alert > :first-child {
+  margin-top: 0;
+}
+.ui-alert > :last-child {
+  margin-bottom: 0;
+}
+.ui-alert.is-warn {
+  border-color: var(--ops-warn);
+  background: var(--ops-warn-wash);
+}
+.ui-alert.is-ok {
+  border-color: var(--ops-live);
+  background: var(--ops-live-wash);
+}
+.ui-alert.is-info {
+  border-color: var(--ops-primary);
+  background: var(--ops-primary-wash);
+}
+.ui-alert.is-danger {
+  border-color: var(--ops-danger);
+  background: var(--ops-danger-wash);
+}
+
+.ui-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ui-3);
+  min-width: 0;
+}
+.ui-section-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--ui-2);
+}
+.ui-section-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--ops-text);
+}
+.ui-section-note {
+  margin: 0;
+  font-size: 12px;
+  color: var(--ops-muted);
+}
+
+.ui-card {
+  padding: var(--ui-4);
+  border: 1px solid var(--ops-border);
+  border-radius: var(--ui-radius-lg);
+  background: var(--ops-surface);
+  box-shadow: var(--ops-shadow);
+}
+.ui-card.is-flat {
+  background: var(--ops-surface-2);
+  box-shadow: none;
+}
+.ui-card.is-tight {
+  padding: var(--ui-3);
+}
+.ui-card.is-accent {
+  border-inline-start: 3px solid var(--ops-primary);
+}
+.ui-card.is-warn {
+  border-inline-start: 3px solid var(--ops-warn);
+}
+.ui-card.is-danger {
+  border-inline-start: 3px solid var(--ops-danger);
+}
+.ui-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--ui-2);
+}
+.ui-card-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--ops-text);
+}
+
+.ui-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ui-3);
+  min-width: 0;
+}
+.ui-stack.is-tight {
+  gap: var(--ui-2);
+}
+.ui-stack.is-flush {
+  gap: var(--ui-1);
+}
+.ui-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ui-2);
+}
+.ui-row.is-tight {
+  gap: var(--ui-1);
+}
+.ui-row.is-loose {
+  gap: var(--ui-3);
+}
+.ui-row.is-top {
+  align-items: flex-start;
+}
+.ui-row.is-bottom {
+  align-items: flex-end;
+}
+.ui-spread {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--ui-2);
+}
+
+/* ---- fields --------------------------------------------------------- */
+.ui-field {
+  width: 100%;
+  min-height: var(--hand-tap);
+  padding: 10px var(--ui-3);
+  border: 1px solid var(--ops-border);
+  border-radius: var(--ui-radius-sm);
+  background: var(--ops-surface);
+  color: var(--ops-text);
+  font-size: 16px; /* 16px is the floor that stops Android zooming on focus */
+}
+.ui-field::placeholder {
+  color: var(--ops-muted);
+}
+.ui-field:focus-visible {
+  outline: 2px solid var(--ops-primary);
+  outline-offset: 1px;
+}
+.ui-field:disabled {
+  opacity: 0.55;
+}
+/* A field the server refused for what is in it: the border is the whole signal,
+   because the sentence beside it says which value and what to do about it. */
+.ui-field.is-danger {
+  border-color: var(--ops-danger);
+}
+select.ui-field {
+  cursor: pointer;
+}
+.ui-field.is-flex {
+  flex: 1 1 220px;
+  width: auto;
+  min-width: 0;
+}
+textarea.ui-field {
+  min-height: 88px;
+  resize: none;
+  line-height: 1.5;
+}
+.ui-field-label {
+  display: block;
+  margin-bottom: 5px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ops-muted);
+}
+.ui-field-error {
+  display: block;
+  margin-top: 4px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ops-danger-ink);
+}
+
+/* ---- the switch ----------------------------------------------------- */
+/* A handset's own control, drawn on the console's tokens: the track is the
+   track colour the web uses for a progress ring (``--ops-track``), the on
+   state is the primary blue the web fills a pressed chip with, and the row it
+   sits in is the target -- a 44px box is not a thumb target, the whole line is. */
+.hand-switch {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--ui-3);
+  width: 100%;
+  min-height: var(--hand-tap);
+  padding: 10px 0;
+  text-align: start;
+}
+.hand-switch + .hand-switch {
+  border-top: 1px solid var(--ops-border);
+}
+.hand-switch__text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.hand-switch__label {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ops-text);
+}
+.hand-switch__hint {
+  font-size: 12px;
+  color: var(--ops-muted);
+}
+.hand-switch__track {
+  flex: none;
+  width: 48px;
+  height: 28px;
+  padding: 3px;
+  border-radius: 999px;
+  background: var(--ops-track);
+  transition: background-color var(--ui-press) ease;
+}
+.hand-switch__thumb {
+  display: block;
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  background: var(--ops-surface);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.35);
+  transition: transform var(--ui-press) ease;
+}
+.hand-switch[aria-checked='true'] .hand-switch__track {
+  background: var(--ops-primary);
+}
+.hand-switch[aria-checked='true'] .hand-switch__thumb {
+  transform: translateX(20px);
+}
+.hand-switch:active .hand-switch__thumb {
+  width: 26px;
+}
+
+/* The console's checkbox: the label is the target, not the box. */
+.ui-check {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--ui-2);
+  min-height: var(--hand-tap);
+  font-size: 14px;
+  color: var(--ops-text);
+}
+.ui-check input {
+  width: 18px;
+  height: 18px;
+  flex: none;
+  accent-color: var(--ops-primary);
+}
+
+/* ---- buttons -------------------------------------------------------- */
+.ui-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--ui-2);
+  min-height: 42px;
+  padding: 8px var(--ui-4);
+  border: 1px solid var(--ops-border);
+  border-radius: var(--ui-radius-sm);
+  background: var(--ops-surface);
+  color: var(--ops-text);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1;
+  white-space: nowrap;
+  transition: background-color var(--ui-press) ease, border-color var(--ui-press) ease,
+    color var(--ui-press) ease;
+}
+.ui-btn svg {
+  width: 16px;
+  height: 16px;
+  flex: none;
+}
+.ui-btn:active:not(:disabled) {
+  background: var(--ops-surface-2);
+  border-color: var(--ops-muted);
+}
+.ui-btn:disabled {
+  opacity: 0.5;
+}
+.ui-btn:focus-visible {
+  outline: 2px solid var(--ops-primary);
+  outline-offset: 2px;
+}
+.ui-btn-primary {
+  background: var(--ops-primary-fill);
+  border-color: var(--ops-primary-fill);
+  color: #fff;
+}
+.ui-btn-primary:active:not(:disabled) {
+  background: var(--ops-primary-fill-press);
+  border-color: var(--ops-primary-fill-press);
+  color: #fff;
+}
+.ui-btn-danger {
+  border-color: var(--ops-danger);
+  color: var(--ops-danger-ink);
+  background: var(--ops-surface);
+}
+.ui-btn-danger:active:not(:disabled) {
+  background: var(--ops-danger-wash);
+  border-color: var(--ops-danger);
+}
+.ui-btn-quiet {
+  border-color: transparent;
+  background: transparent;
+  color: var(--ops-muted);
+}
+.ui-btn-quiet:active:not(:disabled) {
+  background: var(--ops-calm-wash);
+  border-color: transparent;
+  color: var(--ops-text);
+}
+.ui-btn-sm {
+  min-height: 32px;
+  padding: 4px var(--ui-3);
+  font-size: 13px;
+}
+.ui-btn.is-block {
+  width: 100%;
+}
+.ui-btn.is-grow {
+  flex: 1 1 0;
+  min-width: 0;
+}
+.ui-btn.is-icon {
+  padding: 0;
+  min-width: 32px;
+}
+/* An action the design wants read as a word, not a control: "back to the
+   notes" above a thread. It keeps the hit area and the focus ring. */
+.ui-btn.is-link {
+  min-height: 0;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+  color: var(--ops-primary-ink);
+}
+.ui-btn.is-link:active:not(:disabled) {
+  background: transparent;
+  border-color: transparent;
+  text-decoration: underline;
+}
+.ui-btn.is-spaced-top {
+  margin-top: var(--ui-4);
+}
+/* The two additions the handset needs from a button and the web does not: a
+   label wrapper, so a two-line button can sit the label over its own sub-line,
+   and a spinner that replaces the icon in place rather than changing the width. */
+.ui-btn__label {
+  display: block;
+}
+.ui-btn__sub {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  opacity: 0.85;
+}
+.hand-spinner {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: hand-spin 640ms linear infinite;
+}
+@keyframes hand-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ---- chips ---------------------------------------------------------- */
+.ops-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.ops-chip,
+.ui-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  padding: 0 var(--ui-3);
+  border: 1px solid var(--ops-border);
+  border-radius: 999px;
+  background: var(--ops-surface);
+  color: var(--ops-text);
+  font-size: 13px;
+  font-weight: 600;
+  transition: background-color var(--ui-press) ease, border-color var(--ui-press) ease,
+    color var(--ui-press) ease;
+}
+.ops-chip svg,
+.ui-chip svg {
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
+.ops-chip:focus-visible,
+.ui-chip:focus-visible {
+  outline: 2px solid var(--ops-primary);
+  outline-offset: 2px;
+}
+.ops-chip[aria-pressed='true'],
+.ui-chip[aria-pressed='true'],
+.ui-chip.is-active {
+  background: var(--ops-primary-fill);
+  border-color: var(--ops-primary-fill);
+  color: #fff;
+}
+
+/* ---- badges --------------------------------------------------------- */
+.ui-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: var(--ops-calm-wash);
+  color: var(--ops-calm);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.ui-badge svg {
+  width: 12px;
+  height: 12px;
+  flex: none;
+}
+.ui-badge.is-ok {
+  background: var(--ops-primary-wash);
+  color: var(--ops-primary-ink);
+}
+.ui-badge.is-live {
+  background: var(--ops-live-wash);
+  color: var(--ops-live-ink);
+}
+.ui-badge.is-warn {
+  background: var(--ops-warn-wash);
+  color: var(--ops-warn-ink);
+}
+.ui-badge.is-danger {
+  background: var(--ops-danger-wash);
+  color: var(--ops-danger-ink);
+}
+.ui-badge.is-quiet {
+  background: var(--ops-calm-wash);
+  color: var(--ops-calm);
+}
+.ui-badge.is-info {
+  background: var(--ops-primary-wash);
+  color: var(--ops-primary-ink);
+}
+.ui-badge.is-solid {
+  background: var(--ops-primary-fill);
+  color: #fff;
+}
+
+/* =====================================================================
+ *  Bottom sheet -- mobile only
+ * =====================================================================
+ *  The web opens its modals as a centred dialog; a phone cannot, so the same
+ *  content arrives from the bottom edge where a thumb can reach it. Everything
+ *  else about it -- the surface, the hairline, the radius language -- is the
+ *  web's.
+ * ------------------------------------------------------------------- */
+.hand-sheet {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-sheet);
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+}
+.hand-sheet[hidden] {
+  display: none;
+}
+.hand-sheet__scrim {
+  position: absolute;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.5);
+  opacity: 0;
+  transition: opacity var(--t-mid) var(--ease);
+}
+.hand-sheet--in .hand-sheet__scrim {
+  opacity: 1;
+}
+.hand-sheet__panel {
+  position: relative;
+  width: 100%;
+  max-width: var(--hand-max);
+  margin: 0 auto;
+  max-height: 92vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--ops-surface);
+  border-top-left-radius: var(--ui-radius-lg);
+  border-top-right-radius: var(--ui-radius-lg);
+  border-top: 1px solid var(--ops-border);
+  box-shadow: 0 -8px 28px rgba(15, 23, 42, 0.24);
+  padding-bottom: var(--safe-bottom);
+  transform: translateY(100%);
+  transition: transform var(--t-mid) var(--ease);
+}
+.hand-sheet--in .hand-sheet__panel {
+  transform: none;
+}
+.hand-sheet__grip {
+  width: 40px;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--ops-border);
+  margin: var(--ui-2) auto var(--ui-1);
+  flex: 0 0 auto;
+}
+.hand-sheet__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--ui-3);
+  padding: var(--ui-2) var(--hand-gutter) var(--ui-3);
+  border-bottom: 1px solid var(--ops-border);
+  flex: 0 0 auto;
+}
+.hand-sheet__title {
+  font-size: 18px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+}
+.hand-sheet__body {
+  padding: var(--ui-4) var(--hand-gutter);
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  display: flex;
+  flex-direction: column;
+  gap: var(--ui-4);
+}
+.hand-sheet__foot {
+  display: flex;
+  gap: var(--ui-3);
+  padding: var(--ui-3) var(--hand-gutter) var(--ui-4);
+  border-top: 1px solid var(--ops-border);
+  flex: 0 0 auto;
+}
+.hand-sheet__foot .ui-btn,
+.hand-sheet__foot .hand-btn {
+  flex: 1;
+}
+
+/* =====================================================================
+ *  Toasts
+ * ===================================================================== */
+.hand-toasts {
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: calc(var(--safe-top) + var(--ui-2));
+  z-index: var(--z-toast);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--ui-2);
+  padding: 0 var(--hand-gutter);
+  pointer-events: none;
+}
+.hand-toast {
+  width: 100%;
+  max-width: var(--hand-max);
+  display: flex;
+  align-items: flex-start;
+  gap: var(--ui-2);
+  padding: var(--ui-3) var(--ui-4);
+  border-radius: var(--ui-radius);
+  background: var(--ops-surface);
+  border: 1px solid var(--ops-border);
+  box-shadow: 0 8px 24px -12px rgba(15, 23, 42, 0.4);
+  font-size: 13px;
+  font-weight: 600;
+  animation: hand-toast-in var(--t-mid) var(--ease);
+  pointer-events: auto;
+}
+.hand-toast--out {
+  animation: hand-toast-out var(--t-mid) var(--ease) forwards;
+}
+.hand-toast--ok {
+  border-color: var(--ops-live);
+  background: var(--ops-live-wash);
+  color: var(--ops-live-ink);
+}
+.hand-toast--error {
+  border-color: var(--ops-danger);
+  background: var(--ops-danger-wash);
+  color: var(--ops-danger-ink);
+}
+.hand-toast--warn {
+  border-color: var(--ops-warn);
+  background: var(--ops-warn-wash);
+  color: var(--ops-warn-ink);
+}
+.hand-toast__text {
+  flex: 1;
+}
+@keyframes hand-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes hand-toast-out {
+  to {
+    opacity: 0;
+    transform: translateY(-10px);
+  }
+}
+
+/* =====================================================================
+ *  Phone ergonomics
+ * =====================================================================
+ *  The web raises its own controls to 40px under 900px because a mouse can hit
+ *  32px and a thumb cannot. This is a handset, so the floor is the full 48px,
+ *  applied here once rather than rule by rule: every control below is one a
+ *  finger has to land on, and the reason is the same for all of them.
+ * ------------------------------------------------------------------- */
+.hand-app button,
+.hand-app .ui-chip,
+.hand-app .ops-chip,
+.hand-app .ui-btn,
+.hand-app .ui-field,
+.hand-app select,
+.hand-app input,
+.hand-app textarea {
+  min-height: var(--hand-tap);
+}
+/* A chip that grows taller wraps its row; a chip that grows *wider* does not,
+   so the width floor is stated only for the icon-only controls. */
+.hand-app .ui-btn.is-icon,
+.hand-app .icon-button {
+  min-width: var(--hand-tap);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hand-dot {
+    animation: none;
+  }
+  .hand-ring-fill {
+    transition: none;
+  }
+  .hand-tabs button {
+    transition: none;
+  }
+}

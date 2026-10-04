@@ -78,32 +78,30 @@ ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
 # single-worker values that ``backend/tests/test_face_engine.py`` pins - they are what this
 # *deployment* overrides, and each one is a trade this instance has already lost:
 #
-#   FACE_INFERENCE_QUEUE=8    - at 64, every queued punch holds its decoded frame in memory
+#   FACE_INFERENCE_QUEUE=16   - at 64, every queued punch holds its decoded frame in memory
 #                               while it waits (~10 MB a job, measured), so the queue alone
-#                               could ask for ~640 MB against this app's ~290 MB floor. Eight
-#                               deep is still far more arrival-burst than two workers drain,
-#                               and a job that will not fit is answered 503 + Retry-After
-#                               instead of being stacked up invisibly.
+#                               could ask for ~640 MB against this app's ~290 MB floor. Sixteen
+#                               deep trades headroom for burst absorption - twice the frames
+#                               eight held - and a job that will not fit is answered
+#                               503 + Retry-After instead of being stacked up invisibly.
+#   FACE_INFERENCE_CONCURRENCY=4
+#                             - the measured default is 2: ``config.py`` records 1 -> 1.90/s,
+#                               2 -> 2.55/s, 4 -> 2.56/s, so the third and fourth concurrent
+#                               inference add no throughput and double the latency a worker
+#                               waits at the gate. Four is set here for in-flight frames, not
+#                               for rate - the same drain, more memory held while it waits.
 #   STANDING_SWEEP_ENABLED=0  - the standing coverage report runs *detectors* on a timer
 #                               (a thread, not a task: it is blocking CPU work). On 1 vCPU
 #                               that is the sweep competing with the gate for the only core,
 #                               and it is a measurement tool, not something the site needs to
 #                               clock in. ``python -m coverage_report --once`` is the
 #                               cron-shaped way to keep the report current off-box.
-#   FACE_ENGINE_PROCESS=1     - the models leave this process. The FaceNet graph (87 MB on disk)
-#                               and the detector's arena are a one-time floor the API process can
-#                               never give back, and an ONNX allocation failure or a corrupt model
-#                               kills whichever process they are in. In a child interpreter (see
-#                               ``backend/face_process.py``) the *critical* process stops carrying
-#                               them, and a crash ends one punch - the next call respawns the
-#                               child. Measured with ``tools/face_process_memory.py``: the API
-#                               process's floor goes from +211.9 MiB to +3.8 MiB while the child
-#                               holds 279.0 MiB, so the host total grows and the process serving the
-#                               gate, the console and every non-face endpoint shrinks. Its failure
-#                               modes are already answered: a child that dies or stops answering is
-#                               a coded ``503 + Retry-After`` (``face_check_unavailable``), never an
-#                               unhandled 500.
-ENV FACE_INFERENCE_QUEUE=8 \
+#   FACE_ENGINE_PROCESS=1     - the models run in a child process, so a model crash ends one
+#                               punch instead of the whole API. The API process's floor drops from
+#                               ~212 MiB to ~4 MiB (``tools/face_process_memory.py``); the host
+#                               total grows by the child's own ~280 MiB.
+ENV FACE_INFERENCE_QUEUE=16 \
+    FACE_INFERENCE_CONCURRENCY=4 \
     STANDING_SWEEP_ENABLED=0 \
     FACE_ENGINE_PROCESS=1
 

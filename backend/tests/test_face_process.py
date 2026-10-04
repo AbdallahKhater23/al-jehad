@@ -366,6 +366,49 @@ def test_a_dead_model_process_is_a_server_fault_not_a_photo_problem(remote):
         face_engine.ENGINE.represent_direct("an-image")
 
 
+def test_a_refusal_the_child_framed_is_the_type_this_process_raises(remote):
+    """A no-face frame is the worker's photo, not our fault - even across the pipe.
+
+    ``face_process``'s contract is that a framed failure arrives as the exception the op would
+    have raised *here*; this is the test that holds the engine to it. It did not: with
+    ``FACE_ENGINE_PROCESS=1`` the child's ``ValueError`` ("No face detected in the photo.")
+    crossed as ``FaceEngineUnavailable``, so a frame with nobody in it answered a 500
+    (``face_check_failed``, "The photo could not be checked just now") where the in-process
+    build answers the 400 that tells the worker to fill the frame. The deployment's own log
+    carries exactly that swap - worker 1, 2026-10-03 20:31, "face worker op 'represent'
+    failed: No face detected in the photo." followed by "face check failed".
+    """
+    stand_in = remote()
+    stand_in.errors["represent"] = face_process.FaceProcessRemoteError(
+        "ValueError", "No face detected in the photo."
+    )
+
+    with pytest.raises(ValueError) as caught:
+        face_engine.ENGINE.represent_direct("an-image")
+
+    assert "No face detected" in str(caught.value)
+    assert not isinstance(caught.value, face_engine.FaceEngineUnavailable), (
+        "a photo the detector could not use is not the server being unable to answer"
+    )
+
+
+def test_a_missing_model_across_the_pipe_stays_a_file_error(remote):
+    stand_in = remote()
+    stand_in.errors["represent"] = face_process.FaceProcessRemoteError(
+        "FileNotFoundError", "the detector model is not installed"
+    )
+    with pytest.raises(FileNotFoundError):
+        face_engine.ENGINE.represent_direct("an-image")
+
+
+def test_an_unknown_remote_failure_is_still_our_fault(remote):
+    """The mapping is a closed list: an unrecognised failure is not the photo's fault."""
+    stand_in = remote()
+    stand_in.errors["represent"] = face_process.FaceProcessRemoteError("MemoryError", "boom")
+    with pytest.raises(face_engine.FaceEngineUnavailable):
+        face_engine.ENGINE.represent_direct("an-image")
+
+
 def test_the_model_calls_stay_local_when_the_flag_is_off(monkeypatch):
     face_process.use(None)
     monkeypatch.setattr(config.settings, "face_engine_process", False)

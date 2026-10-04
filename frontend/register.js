@@ -28,6 +28,12 @@
  * it is what the person signs in with. What the account cannot do until an administrator
  * approves it is record attendance, and that is refused at the punch itself rather than here.
  *
+ * A worker also names their moallem here, out of the server's own list of the active ones, or
+ * names nobody: the assignment is optional and takes effect at once (no approval from the
+ * moallem, who is only told). The name is stored under the language it was written in, because
+ * that is the language the applicant reads - the other three are filled in later, by a person or
+ * a translation pass, rather than asked of somebody standing at a gate with a phone.
+ *
  * ONE KIND OF DECIDING
  * --------------------
  * The page refuses only what it can decide alone: a missing name, a password under the floor
@@ -68,6 +74,10 @@
     //: Where both calls go: the link's own address, under the API prefix.
     var ENDPOINT = API + "/register/" + encodeURIComponent(TOKEN);
 
+    //: The active moallems a worker may be assigned to. Fetched beside the policy, with the
+    //: same token and the same reason: the page has no session, so the server publishes both.
+    var MOALLEMS = ENDPOINT + "/moallems";
+
     //: The server's answer to ``GET /register/<token>``: the roles this link may register, the
     //: photo policy, and the shortest password. Null until it arrives, which is why nothing the
     //: applicant types is checked against it before then.
@@ -76,6 +86,20 @@
     //: Whether intake is open. The camera and the submit both wait on it, so a closed link
     //: cannot be armed by a photo arriving later.
     var open = false;
+
+    //: The moallems the server offers, or null before the list has been read. Null and an empty
+    //: list are not the same thing: one means "not known yet", the other "nobody to offer".
+    var moallems = null;
+
+    //: Why there is no list to offer, when there is none - ``register.moallem.empty`` for a site
+    //: that has registered no moallem, ``register.moallem.offline`` for a read that failed.
+    //: Empty when the list is on the screen.
+    var moallemNote = "";
+
+    //: The language the name in the box was written in. Tracked as it is typed, because the
+    //: picker can be switched afterwards and the box keeps its text: keying the name under
+    //: whatever is chosen at submit would file Arabic letters as English.
+    var nameLang = Capture.lang;
 
     var camera = null;
 
@@ -141,6 +165,93 @@
     }
 
     /**
+     * A moallem's name in the reader's language, out of the names the server stored.
+     *
+     * The answer carries every language it has for this person plus the canonical name as a
+     * fallback, and this picks the one being read - then any other, then that fallback. The same
+     * order ``names.display`` walks on the server, so the two cannot disagree about which name a
+     * worker is shown.
+     */
+    function nameFor(entry) {
+        var names = entry.names || {};
+        if (names[Capture.lang]) return names[Capture.lang];
+        var offered = Capture.languages();
+        for (var i = 0; i < offered.length; i += 1) {
+            if (names[offered[i].code]) return names[offered[i].code];
+        }
+        return entry.name || entry.id;
+    }
+
+    /**
+     * The moallem options: always a way to choose nobody, then the server's list.
+     *
+     * Rebuilt rather than appended to, so a language switch renames the options instead of
+     * doubling them - and so the one line that can change while this page is open (a moallem
+     * deactivated in the console) drops out of the list the next time it is drawn.
+     */
+    function renderMoallems() {
+        var select = $("moallem");
+        var chosen = select.value;
+        select.innerHTML = "";
+        var none = document.createElement("option");
+        none.value = "";
+        none.textContent = Capture.t("register.moallem.none");
+        select.appendChild(none);
+        var list = moallems || [];
+        for (var i = 0; i < list.length; i += 1) {
+            var option = document.createElement("option");
+            option.value = String(list[i].id);
+            option.textContent = nameFor(list[i]);
+            select.appendChild(option);
+        }
+        // The choice survives a language switch; if the person it named is gone from the list,
+        // the select falls back to "no moallem" rather than to nothing at all.
+        select.value = chosen;
+    }
+
+    /**
+     * Shows the moallem dropdown for a worker and hides it for everybody else.
+     *
+     * A moallem is not assigned to another moallem, and the server refuses an assignment from
+     * any other role - so the field is not merely empty for those roles, it is put away and
+     * cleared, and a form sent twice cannot carry a moallem chosen under an earlier role.
+     */
+    function syncMoallem() {
+        var field = $("moallem-field");
+        var note = $("moallem-note");
+        if (!open || $("role").value !== "worker") {
+            $("moallem").value = "";
+            field.classList.add("hidden");
+            return;
+        }
+        renderMoallems();
+        note.textContent = moallemNote ? Capture.t(moallemNote) : "";
+        note.classList.toggle("hidden", !moallemNote);
+        field.classList.remove("hidden");
+    }
+
+    /**
+     * Reads the moallems the server publishes for this link, once, beside the policy.
+     *
+     * A read that fails is not a reason to refuse the form: the assignment is optional, so the
+     * page says it could not read the list and offers nobody - which is also what an empty list
+     * means. Both sentences live in the reader's language off ``moallemNote``.
+     */
+    function loadMoallems() {
+        fetch(MOALLEMS)
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (body) {
+                moallems = (body && body.moallems) || [];
+                moallemNote = moallems.length ? "" : "register.moallem.empty";
+            })
+            .catch(function () {
+                moallems = [];
+                moallemNote = "register.moallem.offline";
+            })
+            .then(function () { syncMoallem(); });
+    }
+
+    /**
      * The receipt: the account exists, the number is on the screen, and the form is gone.
      *
      * THE NUMBER IS THE WHOLE POINT
@@ -195,6 +306,10 @@
                 fillRoles(res.body.roles || []);
                 open = true;
                 $("btn-submit").disabled = true;
+                // The roles are known now, so what a worker may choose is drawn; the list itself
+                // arrives on its own and redraws the field when it does.
+                syncMoallem();
+                loadMoallems();
             })
             .catch(function () {
                 sayKey("offline", "err");
@@ -233,9 +348,16 @@
         }
 
         var form = new FormData();
+        // The name under the language it was written in, and ``full_name`` beside it: the server
+        // reads the per-language map into its own storage, and the plain field is what older
+        // deployments of it take.
+        form.append("name_" + nameLang, $("full-name").value.trim());
         form.append("full_name", $("full-name").value.trim());
         form.append("password", $("password").value);
         form.append("role", $("role").value);
+        // Empty means no moallem, which is what the server stores for a worker who chose none -
+        // and for every other role the field was cleared the moment the role changed.
+        form.append("moallem_id", $("moallem").value || "");
         form.append("phone", $("phone").value || "");
         form.append("email", $("email").value || "");
         form.append("work_details", $("work").value || "");
@@ -275,8 +397,10 @@
             document.title = Capture.t("register.headTitle");
             $("credit").textContent = Capture.credit();
             Capture.applyPolicy();
-            // The role names are words too, so the list is rebuilt in the new language.
+            // The role names are words too, so the list is rebuilt in the new language - and the
+            // moallem options with it, each moallem named in the language now being read.
             if (policy) fillRoles(policy.roles || []);
+            syncMoallem();
             // The message box is not a ``data-t`` node: a refusal written in the language it
             // arrived in is the leak this closes.
             resay();
@@ -294,6 +418,10 @@
         $("btn-retake").addEventListener("click", function () { camera.retake(); });
         $("btn-submit").addEventListener("click", submit);
         $("file").addEventListener("change", function (event) { camera.chooseFromInput(event.target); });
+        // The role decides whether a moallem is asked for at all, and the name is stamped with
+        // the language it was written in as it is written.
+        $("role").addEventListener("change", syncMoallem);
+        $("full-name").addEventListener("input", function () { nameLang = Capture.lang; });
 
         // No token is not a closed form and not a broken one, it is a person who reached this
         // address without the link - so the page answers with the one thing that is true and

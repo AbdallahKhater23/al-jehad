@@ -201,6 +201,40 @@ def test_missing_model_fails_closed_in_enforce_and_open_in_advisory(
     assert _latest_clock_in(MOALLEM) == "unavailable"
 
 
+def test_a_missing_liveness_model_does_not_alert_once_per_punch(
+    monkeypatch, app_module, client, jpeg
+):
+    """A deployment with no model is a *state*, not an event - see the note in ``verify_worker``.
+
+    The deployed image ships no ``minifasnet.onnx``, so in advisory mode every punch reaches
+    the advisory branch with verdict ``unavailable``. Notified there, that is an administrator
+    alert per worker per minute: a notification row written inside the punch's own path and a
+    push dispatch behind it, at the gate, at exactly the moment a shift change is happening -
+    in exchange for repeating what ``liveness_anti_spoofing`` already reports on the readiness
+    surface. A verdict that says something about the *frame* still alerts; the absence of an
+    evaluator does not.
+    """
+    _install_session(monkeypatch, available=False)
+    _spy_on_face_matching(monkeypatch, app_module)
+    monkeypatch.setattr(settings, "liveness_mode", "advisory")
+    before = db_scalar(
+        "SELECT COUNT(*) FROM admin_notifications WHERE kind = 'liveness_degraded'"
+    )
+
+    response = clock_in(client, MOALLEM, image=jpeg, headers=bearer(MOALLEM))
+
+    assert response.status_code == 200, response.text[:300]
+    assert _latest_clock_in(MOALLEM) == "unavailable", "the record still says the frame was not judged"
+    log_id = db_scalar("SELECT MAX(id) FROM attendance_logs WHERE worker_id = ?", (MOALLEM,))
+    assert db_scalar("SELECT flag_reason FROM attendance_logs WHERE id = ?", (log_id,)), (
+        "the punch is still flagged - it is the per-punch *alert* that was noise"
+    )
+    assert (
+        db_scalar("SELECT COUNT(*) FROM admin_notifications WHERE kind = 'liveness_degraded'")
+        == before
+    ), "the deployment's own missing model must not alert once per punch"
+
+
 def test_readiness_reports_enforce_without_a_model_as_fatal(monkeypatch):
     _install_session(monkeypatch, available=False)
     monkeypatch.setattr(settings, "liveness_mode", "enforce")

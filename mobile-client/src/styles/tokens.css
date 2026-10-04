@@ -1,0 +1,301 @@
+/* =====================================================================
+ *  tokens.css -- the design system, ported from the worker web app.
+ *
+ *  This file is a port of the token layers in ``frontend/style.css``, not
+ *  a palette that resembles them, so the handset and the web worker screen
+ *  are the same design and cannot drift apart:
+ *
+ *    * ``--ops-*``  the console/worker palette (light, plus the dark swap).
+ *      The values are copied verbatim, including the two action fills and
+ *      ``--ops-track``, which exist because a status hue (#16a34a at 3.3:1)
+ *      cannot carry a white label but a *button fill* has to.
+ *    * ``--ui-*``   the spacing/radius/motion scale (4px rhythm, 120ms press).
+ *    * ``--brand-*`` Al-Jehad's own green and gold. The green (#162F29) is the
+ *      brand tile on the header and the Android theme colour, exactly as it is
+ *      the rail's colour on the web.
+ *    * ``--hand-*`` the handset's own geometry (gutter, radius, 48px tap floor,
+ *      720px reading column). Same names and values as the web block.
+ *
+ *  Deliberate differences from the web file, all mobile-only:
+ *
+ *    1. ``env(safe-area-inset-*)`` are read here and used by the shell, because
+ *       a Capacitor WebView is edge-to-edge behind the cutout and the gesture
+ *       bar. The web reads the same variables but never has a nonzero inset.
+ *    2. The dark theme is kept as a *token swap* (the web's ``html.dark`` /
+ *       ``[data-theme='dark']`` block) rather than as ``prefers-color-scheme``.
+ *       The web ships light, so this build ships light: Android reporting a dark
+ *       system theme must not silently change what the worker sees. The only
+ *       thing that sets ``html.dark`` is the Profile switch in ``ui/theme.ts``.
+ *    3. Three values are added for contrast, measured on the handset's own
+ *       combinations (see the notes on each): a darker ``--ops-live-ink``, a
+ *       ``--ops-warn-ink``, and the ``--ops-primary-fill`` pair that keeps a
+ *       white label legible on the dark theme's button and chip fills. Every
+ *       other value is the web's, verbatim.
+ * ===================================================================== */
+
+:root {
+  /* ---- safe areas --------------------------------------------------- */
+  /* Read as lengths so they can be added to padding without a calc() at
+     every use. Same names as the web block; only a WebView makes them real. */
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+
+  /* ---- the palette, verbatim from frontend/style.css ------------------ */
+  --ops-surface: #ffffff;
+  --ops-surface-2: #f8fafc;
+  --ops-border: #e2e8f0;
+  --ops-text: #0f172a;
+  --ops-muted: #475569;
+  --ops-primary: #2563eb;
+  --ops-primary-ink: #1d4ed8;
+  --ops-primary-wash: rgba(37, 99, 235, 0.12);
+  --ops-warn: #c2410c;
+  --ops-warn-wash: rgba(234, 88, 12, 0.14);
+  --ops-danger: #dc2626;
+  --ops-danger-ink: #b91c1c;
+  --ops-danger-wash: rgba(220, 38, 38, 0.14);
+  --ops-calm: #475569;
+  --ops-calm-wash: rgba(100, 116, 139, 0.14);
+  --ops-live: #16a34a;
+  --ops-live-wash: rgba(22, 163, 74, 0.14);
+  /* The handset's two solid action fills, and the one word drawn in the live hue.
+     These are deliberately *not* the status colours above: a fill has to carry
+     white 17px text at 4.5:1, which --ops-live manages only 3.3:1 of. */
+  --ops-action-in: #15803d;
+  --ops-action-in-press: #166534;
+  --ops-action-out: #dc2626;
+  --ops-action-out-press: #b91c1c;
+  /* The green that carries *text*. Darker than ``--ops-live`` because 13px on
+     the live wash measured 4.12:1 (#15803d) and this must clear 4.5:1; on a
+     white card it reads 7.0:1. */
+  --ops-live-ink: #166534;
+  /* The orange that carries text on the warning wash. ``--ops-warn`` is a
+     status hue, legible on a card but only 4.18:1 at 13px on its own wash; this
+     darkens it to clear 4.5:1 there and is not used for fills. */
+  --ops-warn-ink: #9a3412;
+  /* The blue fills that carry a white label (primary button, pressed chip,
+     solid badge, own chat bubble). In the light theme these are exactly
+     ``--ops-primary`` / ``--ops-primary-ink``; the dark theme redefines the
+     pair, because #3b82f6 under white text is 3.68:1 and its pressed shade
+     #93c5fd only 1.80:1. ``--ops-primary`` itself stays the dark theme's
+     accent for focus rings and links, where it is not a fill. */
+  --ops-primary-fill: #2563eb;
+  --ops-primary-fill-press: #1d4ed8;
+  --ops-track: rgba(100, 116, 139, 0.22);
+  --ops-shadow: 0 1px 2px rgba(15, 23, 42, 0.06), 0 8px 24px -20px rgba(15, 23, 42, 0.35);
+  --ops-mono: ui-monospace, SFMono-Regular, 'SF Mono', 'Cascadia Mono', Menlo, Consolas, monospace;
+
+  /* ---- brand (Al-Jehad's own lockup) --------------------------------- */
+  /* Capitalised exactly as the web writes them, so a diff of the two token blocks
+     comes back empty rather than arguing about hex letter-case. */
+  --brand-green: #162F29;
+  --brand-green-2: #1B3A32;
+  --brand-green-ink: #102420;
+  --brand-gold-hi: #FBF0CB;
+  --brand-gold: #DDC48C;
+  --brand-gold-lo: #B9945A;
+  --brand-cream: #EDE7D6;
+  --brand-serif: Georgia, 'Trajan Pro', 'Times New Roman', serif;
+
+  /* ---- the console's spacing and radius scale ------------------------ */
+  --ui-1: 4px;
+  --ui-2: 8px;
+  --ui-3: 12px;
+  --ui-4: 16px;
+  --ui-5: 24px;
+  --ui-6: 32px;
+  --ui-radius-sm: 10px;
+  --ui-radius: 14px;
+  --ui-radius-lg: 18px;
+  --ui-press: 120ms;
+
+  /* ---- the handset's own geometry ------------------------------------ */
+  --hand-gutter: 16px;
+  --hand-radius: 16px;
+  --hand-tap: 48px;
+  --hand-max: 720px;
+
+  /* ---- shell geometry ------------------------------------------------ */
+  /* 68px is the web bar's height: a 22px icon over an 11px label with a 3px
+     top rule, tall enough that the whole tab is the target. */
+  --tabbar-height: 68px;
+  /* ---- type ---------------------------------------------------------- */
+  /* Both the brand serif and the UI stack are the device's own; see the note
+     above about webfonts. ``--ops-mono`` is the tabular stack every figure on
+     the clock card and the record is set in. */
+  /* No webfont is fetched: this screen is opened at a gate on site cellular,
+     and a render-blocking third-party request costs more than it returns. */
+  --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: var(--ops-mono);
+
+  /* ---- motion -------------------------------------------------------- */
+  --t-fast: 120ms;
+  --t-mid: 200ms;
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+
+  /* ---- stacking ------------------------------------------------------ */
+  --z-header: 30;
+  --z-tabs: 40;
+  --z-sheet: 60;
+  --z-toast: 80;
+
+  /* The web app ships light. Declaring it stops the WebView painting its own
+     dark form controls and a dark scrollbar behind a white card. */
+  color-scheme: light;
+}
+
+/* The dark theme, as the web writes it: a token swap, applied only when
+   something sets ``html.dark`` or ``data-theme="dark"``. The one thing that
+   sets it is the Profile switch (``ui/theme.ts``), i.e. only when the worker
+   asks -- Android reporting a dark system theme must not change the screen a
+   worker was trained on. Kept as a token swap so that switch is one attribute,
+   not a second stylesheet. */
+html.dark,
+[data-theme='dark'] {
+  --ops-surface: #1f2937;
+  --ops-surface-2: #111827;
+  --ops-border: #374151;
+  --ops-text: #f8fafc;
+  --ops-muted: #cbd5e1;
+  --ops-primary: #3b82f6;
+  --ops-primary-ink: #93c5fd;
+  --ops-primary-wash: rgba(96, 165, 250, 0.18);
+  --ops-warn: #fdba74;
+  --ops-warn-wash: rgba(251, 146, 60, 0.2);
+  --ops-danger: #f87171;
+  --ops-danger-ink: #fca5a5;
+  --ops-danger-wash: rgba(248, 113, 113, 0.2);
+  --ops-calm: #cbd5e1;
+  --ops-calm-wash: rgba(148, 163, 184, 0.2);
+  --ops-live: #22c55e;
+  --ops-live-wash: rgba(34, 197, 94, 0.2);
+  /* The action fills are held identical to light on purpose: what sits behind
+     those white labels is the button, not the theme. */
+  --ops-action-in: #15803d;
+  --ops-action-in-press: #166534;
+  --ops-action-out: #dc2626;
+  --ops-action-out-press: #b91c1c;
+  --ops-live-ink: #4ade80;
+  --ops-warn-ink: #fdba74;
+  /* The fill pair, restated: #3b82f6 carries white at only 3.68:1 and its
+     pressed shade carries it at 1.80:1, so the dark theme keeps a fill that
+     measures 4.70:1 with white text and 3.12:1 against the card behind it.
+     ``--ops-primary`` is untouched and still draws focus rings and links. */
+  --ops-primary-fill: #2e6ee4;
+  --ops-primary-fill-press: #1d4ed8;
+  --ops-track: rgba(148, 163, 184, 0.28);
+  --ops-shadow: none;
+  color-scheme: dark;
+}
+
+/* =====================================================================
+ *  reset -- the parts that matter on a touch device
+ * ===================================================================== */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden; /* the scroller is .hand-main, not the page */
+}
+
+body {
+  background: var(--ops-surface-2);
+  color: var(--ops-text);
+  font-family: var(--font);
+  font-size: 15px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  /* No tap highlight: every control supplies its own :active feedback, and the
+     blue flash on a white card looks like a rendering fault. */
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior-y: none;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+  border: 0;
+  background: none;
+  /* A tap target is a token, and a button is never smaller than one. */
+  min-height: var(--hand-tap);
+}
+
+a {
+  color: var(--ops-primary);
+  text-decoration: none;
+}
+
+h1,
+h2,
+h3,
+h4,
+p {
+  margin: 0;
+}
+
+ul,
+ol {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+img {
+  max-width: 100%;
+  display: block;
+}
+
+/* Scrollbars are noise on a phone; the scroll position is shown by the content. */
+::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+:focus-visible {
+  outline: 2px solid var(--ops-primary);
+  outline-offset: 2px;
+}
+
+/* Read aloud, never drawn: a tab's unread count, the shell's route/live
+   announcements. The 1px box is clipped rather than moved off screen, so a
+   screen reader still sees it in the accessibility tree. */
+.hand-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Respect a user who has asked for less motion. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -41,7 +41,17 @@ function roster() {
             id: '1', name: 'Seed Worker', role: 'worker', phone: '+200000000001',
             email: 'seed@example.test', status: 'active', face_enrolled: true,
             enrolled_at: '2026-08-01 07:00:00', password_set: true,
-            password_changed_at: null, sessions_revoked: 0
+            password_changed_at: null, sessions_revoked: 0,
+            // Assigned to the moallem below, who is *inactive*: the case the edit form's own
+            // option list has to keep rather than drop, or opening the form would silently
+            // unassign somebody.
+            moallem_id: '600', moallem_name: 'Ana Torrez', name_i18n: null
+        },
+        {
+            id: '602', name: 'Standing Moallem', role: 'moallem', phone: '',
+            email: 'standing@example.test', status: 'active', face_enrolled: true,
+            enrolled_at: null, password_set: true, password_changed_at: null,
+            sessions_revoked: 0, moallem_id: null, moallem_name: null, name_i18n: null
         },
         {
             // Inactive, and with a past-due name: the two things this screen has to show
@@ -60,11 +70,26 @@ function roster() {
     ];
 }
 
-const DETAIL = {
-    id: '600', name: 'Ana Torrez', email: 'ana@example.test', phone: '',
-    role: 'moallem', status: 'inactive', hourly_rate: 9.5,
-    face_enrolled: false, enrolled_at: null, transit_enabled: false
+//: One detail per account, because the edit form's own fields differ by role: only a worker
+//: has a moallem, and only this worker has names in more than one language.
+const DETAILS = {
+    '600': {
+        id: '600', name: 'Ana Torrez', email: 'ana@example.test', phone: '',
+        role: 'moallem', status: 'inactive', hourly_rate: 9.5,
+        face_enrolled: false, enrolled_at: null, transit_enabled: false,
+        names: {}, moallem_id: null
+    },
+    '1': {
+        id: '1', name: 'Seed Worker', email: 'seed@example.test', phone: '+200000000001',
+        role: 'worker', status: 'active', hourly_rate: null,
+        face_enrolled: true, enrolled_at: '2026-08-01 07:00:00', transit_enabled: false,
+        // The stored name map - the English spelling and the Arabic one, with nothing supplied
+        // for the other two - and who this worker answers to.
+        names: { en: 'Seed Worker', ar: '\u0639\u0627\u0645\u0644 \u0627\u0644\u0628\u0630\u0648\u0631' },
+        moallem_id: '600', moallem_name: 'Ana Torrez'
+    }
 };
+const DETAIL = DETAILS['600'];
 
 const edits = [];
 const statuses = [];
@@ -105,7 +130,8 @@ function responders(url, init) {
         return { status: deleteStatus, body: deleteReply };
     }
     if (url.indexOf('/admin/users/') >= 0 && method === 'GET') {
-        return { status: 200, body: DETAIL };
+        const id = url.split('?')[0].split('/').pop();
+        return { status: 200, body: DETAILS[id] || DETAIL };
     }
     if (url.indexOf('/admin/users') >= 0) return { status: 200, body: roster() };
     return { status: 200, body: {} };
@@ -266,6 +292,97 @@ const results = {};
     results.refused_edit = {
         toast: toasts(env).slice(-1)[0],
         still_open: render(env).indexOf('data-user-edit=') >= 0
+    };
+}
+
+// 4e. who a worker answers to, on the row and on the form
+{
+    const env = await credentialsEnv(HEAD);
+    const markup = render(env);
+    const rowOf = (id) => (markup.match(
+        new RegExp('<li class="roster-row"[^>]*data-user="' + id + '"[\\s\\S]*?</li>')
+    ) || [''])[0];
+    results.moallem_rows = {
+        assigned: (/data-moallem="([^"]*)"/.exec(rowOf('1')) || [])[1],
+        unassigned: (/data-moallem="([^"]*)"/.exec(rowOf('602')) || [])[1],
+        // The worker's row says it in a fact of its own; a moallem's row does not pretend to
+        // have one, because a moallem answers to nobody.
+        worker_row_says_it: rowOf('1').indexOf('data-fact="moallem"') >= 0,
+        moallem_row_says_it: rowOf('600').indexOf('data-fact="moallem"') >= 0,
+        unassigned_word: env.evaluate("I18n.__('moallemUnassigned')")
+    };
+}
+
+// 4f. a worker's form carries the assignment and the name in each language
+{
+    const env = await credentialsEnv(HEAD);
+    await env.evaluate("UI_MODULES.openUserEdit('1')");
+    const markup = render(env);
+    // Read off the markup rather than the element: this harness's stub DOM has no ``options``
+    // collection, and the rendered option list is what the reader is handed anyway.
+    const select = (/<select id="userEditMoallem"[\s\S]*?<\/select>/.exec(markup) || [''])[0];
+    const options = (select.match(/<option value="[^"]*"[^>]*>[^<]*<\/option>/g) || []).map((tag) => ({
+        value: (/value="([^"]*)"/.exec(tag) || [])[1],
+        selected: /\sselected/.test(tag),
+        label: tag.replace(/<[^>]*>/g, '')
+    }));
+    const chosen = options.filter((option) => option.selected)[0] || {};
+    results.moallem_form = {
+        select_present: markup.indexOf('id="userEditMoallem"') >= 0,
+        options: options.map((option) => option.value),
+        selected: chosen.value,
+        // The account's current moallem has been deactivated since: the option stays, says so,
+        // and is the selected one - opening this form must not quietly unassign the worker.
+        selected_label: chosen.label || '',
+        inactive_label: env.evaluate("I18n.__('credentialsMoallemInactive').replace('{name}', 'Ana Torrez')"),
+        // The four slots, prefilled from the stored map: two languages have a spelling and two
+        // do not, which is what an empty slot means.
+        names: ['en', 'ar', 'hi', 'ur'].map((code) => valueOf(markup, 'userEditName' + code.toUpperCase())),
+        hint: markup.indexOf(env.evaluate("I18n.__('credentialsNameLanguagesHint')")) >= 0
+    };
+}
+
+// 4g. a moallem's own form is not offered an assignment, because there is nothing to set
+{
+    const env = await credentialsEnv(HEAD);
+    await env.evaluate("UI_MODULES.openUserEdit('600')");
+    results.moallem_form_for_moallem = {
+        select_present: render(env).indexOf('id="userEditMoallem"') >= 0
+    };
+}
+
+// 4h. saving a worker sends the assignment and only the name slots that changed
+{
+    const env = await credentialsEnv(HEAD);
+    await env.evaluate("UI_MODULES.openUserEdit('1')");
+    // The stub DOM does not seed an ``<input>``'s value from its ``value=`` attribute, so the
+    // fields the save reads back are written here *as the browser would have prefilled them* -
+    // the markup prefill itself is asserted in 4f. Writing them is what makes "unchanged" mean
+    // unchanged: an empty box here would be a cleared name, which is a change worth sending.
+    env.evaluate("document.getElementById('userEditName').value = 'Seed Worker'");
+    env.evaluate("document.getElementById('userEditEmail').value = 'seed@example.test'");
+    env.evaluate("document.getElementById('userEditPhone').value = '+200000000001'");
+    env.evaluate("document.getElementById('userEditNameEN').value = 'Seed Worker'");
+    env.evaluate("document.getElementById('userEditMoallem').value = '602'");
+    env.evaluate("document.getElementById('userEditNameAR').value = '\u0639\u0627\u0645\u0644 \u0627\u0644\u062d\u0642\u0644'");
+    await env.evaluate("UI_MODULES.saveUserEdit()");
+    const reassigned = edits[edits.length - 1].body;
+
+    // And the other way: choosing nobody sends the empty value that unassigns, rather than
+    // omitting the field and leaving the assignment where it was.
+    edits.length = 0;
+    await env.evaluate("UI_MODULES.openUserEdit('1')");
+    env.evaluate("document.getElementById('userEditName').value = 'Seed Worker'");
+    env.evaluate("document.getElementById('userEditNameEN').value = 'Seed Worker'");
+    env.evaluate("document.getElementById('userEditNameAR').value = '\u0639\u0627\u0645\u0644 \u0627\u0644\u0628\u0630\u0648\u0631'");
+    env.evaluate("document.getElementById('userEditMoallem').value = ''");
+    await env.evaluate("UI_MODULES.saveUserEdit()");
+    results.moallem_saved = {
+        reassigned: reassigned,
+        cleared: edits[edits.length - 1].body,
+        // Read from the fixture, not the DOM: this is the "what the server still holds" side
+        // of the omission asserted below.
+        stored_names: JSON.stringify(DETAILS['1'].names)
     };
 }
 
@@ -505,6 +622,68 @@ def test_saving_sends_the_account_and_what_was_typed(results):
     assert saved["authorized"] == "Bearer tok-5000"
     assert "updated" in saved["toast"].lower()
     assert saved["panel_closed"] is True
+
+
+def test_the_roster_row_says_who_a_worker_answers_to(results):
+    """The assignment is on the row, and only on the row of the role that has one.
+
+    A moallem and an administrator answer to nobody, and a screen that put the word
+    "Unassigned" under both would be a screen where the word means nothing. For a worker it is
+    drawn even when it is empty, because that is the state the form beside it exists to change.
+    """
+    rows = results["moallem_rows"]
+    assert rows["assigned"] == "600", "the worker's row does not carry their moallem"
+    assert rows["unassigned"] == "", "an unassigned worker's row claims an assignment"
+    assert rows["worker_row_says_it"] is True
+    assert rows["moallem_row_says_it"] is False, "a moallem's own row is asked who their moallem is"
+
+
+def test_a_worker_s_edit_form_offers_the_assignment_and_every_language(results):
+    """Two controls on one form: who they answer to, and their name as each language has it.
+
+    The moallem list is the roster already in hand, so the option set is asserted for what it
+    *keeps*: an account's current moallem stays in the list even after being deactivated -
+    otherwise opening the form and saving it would unassign the worker to nobody - and an
+    active moallem is offered beside them. The name slots are prefilled from the stored map, and
+    an empty slot is a language this person has no spelling for.
+    """
+    form = results["moallem_form"]
+    assert form["select_present"] is True, "a worker's form has no way to set their moallem"
+    assert form["options"] == ["", "602", "600"], form["options"]
+    assert form["selected"] == "600", "the form opens on the assignment the account already has"
+    assert "Ana Torrez" in form["selected_label"] and "inactive" in form["selected_label"], (
+        f"a deactivated moallem is not named as such: {form['selected_label']!r}"
+    )
+    assert form["names"][:2] == ["Seed Worker", "\u0639\u0627\u0645\u0644 \u0627\u0644\u0628\u0630\u0648\u0631"], form["names"]
+    assert form["names"][2:] == ["", ""], "a language with no spelling is drawn empty"
+    assert form["hint"] is True, "the four boxes are offered with no explanation"
+
+
+def test_a_moallem_s_own_form_has_no_assignment_to_set(results):
+    """The server refuses it, so the control is absent rather than present-and-refused."""
+    assert results["moallem_form_for_moallem"]["select_present"] is False
+
+
+def test_saving_sends_the_assignment_and_only_the_changed_names(results):
+    """An untouched slot is not sent: another screen may have corrected it while this was open.
+
+    The moallem, on the other hand, travels on *every* save - the select states the whole truth
+    about the assignment, and the empty value is "nobody" rather than silence. The stored names
+    are asserted untouched by the save, which is what makes the omission meaningful.
+    """
+    saved = results["moallem_saved"]
+    reassigned = saved["reassigned"]
+    assert reassigned["moallem_id"] == "602"
+    assert reassigned["name_ar"] == "\u0639\u0627\u0645\u0644 \u0627\u0644\u062d\u0642\u0644", reassigned
+    assert "name_en" not in reassigned, "an unchanged spelling was sent back anyway"
+    assert "name_hi" not in reassigned and "name_ur" not in reassigned
+    assert saved["cleared"]["moallem_id"] == "", (
+        "choosing nobody omits the field, so the old assignment would stay"
+    )
+    assert "name_ar" not in saved["cleared"], (
+        "the second save re-sent a spelling nobody touched in it"
+    )
+    assert saved["stored_names"].find("Seed Worker") >= 0
 
 
 def test_an_empty_rate_is_left_alone_and_a_zero_clears_it(results):

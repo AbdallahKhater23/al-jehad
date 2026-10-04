@@ -1403,7 +1403,10 @@ def start_container(args: argparse.Namespace, tag: str, port: int, secret: str) 
         "--env", "ENROLLMENT_RATE_LIMIT=1000000/minute",
         # The deployment's own memory profile, restated so --image reusing a hand-built
         # image without the Dockerfile's ENV is measured as this deployment, not as a default.
-        "--env", "FACE_INFERENCE_QUEUE=8",
+        # The numbers are the Dockerfile's ``ENV`` block, which is the one place they are set:
+        # a harness that measured a different queue depth would be reporting on another process.
+        "--env", "FACE_INFERENCE_QUEUE=16",
+        "--env", "FACE_INFERENCE_CONCURRENCY=4",
         "--env", "STANDING_SWEEP_ENABLED=0",
         # Required to boot (see ``runtime_secret``) and inherited by every ``docker exec``,
         # so the seed signs the tokens the server will then verify.
@@ -1582,7 +1585,7 @@ def run_container(args: argparse.Namespace) -> int:
     )
     notes = [
         "rate limiters raised for this run (one client IP, thirty punches)",
-        f"queue depth 8, engine capacity {args.engine_concurrency}, wait 20 s (the deployment's profile)",
+        f"queue depth 16, engine capacity {args.engine_concurrency}, wait 20 s (the deployment's profile)",
         f"SECRET_KEY {secret_source}",
     ]
     if args.templates == "synthetic":
@@ -1770,7 +1773,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--container-name", default="attendance-capacity", help="docker container name to use")
     parser.add_argument("--keep", action="store_true", help="leave the container behind for inspection")
     parser.add_argument("--startup-timeout", type=float, default=180.0, help="seconds to wait for /api/v1/status (default 180)")
-    parser.add_argument("--engine-concurrency", type=int, default=2, help="for the report only: the engine's pool size")
+    parser.add_argument("--engine-concurrency", type=int, default=4, help="for the report only: the engine's pool size (the image sets FACE_INFERENCE_CONCURRENCY=4)")
 
     # attach mode
     parser.add_argument("--target-url", default=None, help="measure this already-running deployment instead of a container")
