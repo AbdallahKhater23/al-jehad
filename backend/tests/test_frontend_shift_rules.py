@@ -489,6 +489,12 @@ def test_the_panel_warns_when_the_automatic_close_has_stood_down(results):
     assert warned["unreachable_notice"] is False, "the crossing is observable; that is the point"
     assert "standing down" in warned["notice_text"], warned["notice_text"]
     assert "8.1" in warned["notice_text"] and "8" in warned["notice_text"]
+    # The deferred advisory names {regular} four times and {notify} twice. A first-only
+    # substitution leaves the later ones literal - the operator reads "... above the paid
+    # day ({regular} h) ... reported at {notify} h ...". Every occurrence has to be filled.
+    assert "{regular}" not in warned["notice_text"] and "{notify}" not in warned["notice_text"], (
+        warned["notice_text"]
+    )
 
 
 def test_the_panel_warns_when_the_alert_cannot_fire_at_all(results):
@@ -496,6 +502,8 @@ def test_the_panel_warns_when_the_alert_cannot_fire_at_all(results):
     assert warned["unreachable_notice"] is True
     assert warned["deferred_notice"] is False
     assert "strictly" in warned["notice_text"].lower(), warned["notice_text"]
+    # Same contract for the unreachable advisory, which names {regular} twice.
+    assert "{regular}" not in warned["notice_text"], warned["notice_text"]
 
 
 def test_the_panel_is_quiet_when_the_two_rules_agree(results):

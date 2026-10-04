@@ -2761,8 +2761,8 @@ const UI = {
                 <div class="ui-stack">
                     <h3 class="ui-title">${I18n.__('earlyClockOutTitle')}</h3>
                     <p class="ui-note is-body">${I18n.__('earlyClockOutBody')
-                        .replace('{paid}', paid)
-                        .replace('{regular}', regular)}</p>
+                        .replace(/\{paid\}/g, paid)
+                        .replace(/\{regular\}/g, regular)}</p>
                     <div class="ui-pair">
                         <button id="confirmEarlyOut" class="ui-btn ui-btn-primary is-grow">${I18n.__('earlyClockOutConfirm')}</button>
                         <button id="cancelEarlyOut" class="ui-btn ui-btn-quiet is-grow">${I18n.__('cancel')}</button>

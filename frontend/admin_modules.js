@@ -9527,15 +9527,15 @@ ${sessionsFact}${statusFact}${moallemFact}
                 ${alertLost
                     ? `<p class="ui-note is-body is-warn" data-rules-alert="unreachable">${this.escapeHtml(
                         I18n.__('shiftRulesAlertUnreachable')
-                            .replace('{regular}', String(regular))
-                            .replace('{notify}', String(overtimeAt))
+                            .replace(/\{regular\}/g, String(regular))
+                            .replace(/\{notify\}/g, String(overtimeAt))
                     )}</p>`
                     : ''}
                 ${closeDeferred
                     ? `<p class="ui-note is-body is-warn" data-rules-alert="deferred">${this.escapeHtml(
                         I18n.__('shiftRulesCloseDeferred')
-                            .replace('{regular}', String(regular))
-                            .replace('{notify}', String(overtimeAt))
+                            .replace(/\{regular\}/g, String(regular))
+                            .replace(/\{notify\}/g, String(overtimeAt))
                     )}</p>`
                     : ''}
 
