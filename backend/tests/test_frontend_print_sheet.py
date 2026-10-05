@@ -214,3 +214,25 @@ def test_the_stylesheet_is_what_takes_the_page_out_of_the_paper():
     assert "body.is-printing-report > *:not(.print-sheet)" in css, (
         "everything that is not the sheet leaves the page while the dialog is open"
     )
+
+
+def test_no_sheet_inherits_another_sheet_s_note(scripts):
+    """The note describes what one report prints, so the frame may not supply one.
+
+    The drift this closes: ``sheetHtml`` fell back to the console's sentence whenever a sheet
+    stated none, so three of the four sheets printed a note written for a different report -
+    and when the console's Shifts sheet stopped printing the column that sentence named, the
+    paper went on describing a marking that was no longer on it. Every sheet now states its
+    own sentence beside the columns it describes (``shiftsSheetNote``, ``myHoursSheetNote``,
+    ``dashboardPeriodPrintNote``), because the sheet whose columns change is the only place
+    that sentence can be kept true. A sheet that states none prints none.
+    """
+    helper = scripts[HELPER]
+    for key in ("shiftsApprovedOnly", "shiftsSheetNote", "myHoursSheetNote",
+                "dashboardPeriodPrintNote"):
+        assert key not in helper, (
+            f"the frame mentions {key}: a sheet's own sentence may not live in the frame"
+        )
+    assert "const foot = note ||" not in helper, (
+        "a fallback here is how one sheet printed another sheet's note"
+    )

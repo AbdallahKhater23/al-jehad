@@ -9876,73 +9876,380 @@ ${sessionsFact}${statusFact}${moallemFact}
             category: { label: 'sitesCategory' },
             arrival: { label: 'shiftsArrival' },
             hours: { label: 'hours' },
-            awaiting: { label: 'shiftsPending' },
-            notes: { label: 'shiftsOpenNotes' }
+            // How many notes this worker has outstanding. It is about the *person* on the
+            // shift rather than about the shift, which is why it ships switched off: it is
+            // the column an administrator turns on when they are chasing somebody, not one
+            // to read every morning. The count is the server's own (``open_notes``), joined
+            // onto the row like the moallem is, so the cell cannot disagree with the Notes
+            // tab.
+            notes: { label: 'shiftsNotes' }
         };
     },
 
-    /** The order this tab was asked for, and the one Reset puts back. */
-    defaultShiftsColumns() {
-        return ['date', 'employee', 'role', 'moallem', 'id', 'site', 'category', 'arrival', 'hours', 'awaiting', 'notes'];
+    /**
+     * Every column, in the order they are read: the ones switched on and the ones switched
+     * off. This is the order a column returns to when it is switched back on, and the order
+     * the chooser lists them in.
+     *
+     * Read off the registry rather than written out again, so a column added above is in the
+     * list by construction instead of by somebody remembering a second array.
+     */
+    allShiftsColumns() {
+        return Object.keys(this.shiftsColumnDefs());
     },
 
     /**
-     * The order to render in: what the admin saved, repaired against the columns that
-     * exist.
+     * The clean default: the day, who worked it, whose crew they are, where, and how long.
      *
-     * A stored order is data written by an older version of this file, so it is treated
-     * as such: an unknown key is dropped and a known column it does not mention is
-     * appended, which means a release that adds a column shows it rather than hiding it
-     * until somebody clears their browser data. Junk under the key is not a reason to
-     * lose the table either - it falls back to the default order.
+     * Five columns. What is left out is what somebody asks occasionally rather than every
+     * morning - the role, the id, the site's kind, the arrival verdict, the notes count - and
+     * each is one tap away in the chooser. That is the difference between a timesheet
+     * somebody reads and one they scroll past.
+     *
+     * Reset puts exactly this back.
      */
-    shiftsColumns() {
-        let stored = null;
-        try {
-            stored = JSON.parse(localStorage.getItem('shiftsColumns') || 'null');
-        } catch (err) {
-            stored = null;
-        }
-        const known = this.shiftsColumnDefs();
-        const order = [];
-        const seen = new Set();
-        (Array.isArray(stored) ? stored : []).forEach((key) => {
-            if (known[key] && !seen.has(key)) {
-                seen.add(key);
-                order.push(key);
-            }
-        });
-        this.defaultShiftsColumns().forEach((key) => { if (!seen.has(key)) order.push(key); });
-        return order;
+    defaultShiftsColumns() {
+        return ['date', 'employee', 'moallem', 'site', 'hours'];
     },
 
-    /** Remember an order. A browser that refuses the write still renders the new one. */
-    setShiftsColumns(order) {
+    /**
+     * The sentence at the foot of a shifts sheet: this period's, and one worker's month -
+     * both are these rows under this total, so they are read under the same rule.
+     *
+     * It lives here, immediately under the columns, and that is the whole point of it being
+     * a method rather than a string in the print helper: the note says what the sheet above
+     * it holds, so a column added or removed here is a sentence to re-read in the same edit.
+     * The last time the two were apart - sentence in the frame, columns in this file - the
+     * paper went on describing an "Awaiting approval" column this sheet had stopped printing,
+     * and nobody editing the columns had a reason to look at it.
+     */
+    shiftsSheetNote() {
+        return I18n.__('shiftsSheetNote');
+    },
+
+    /**
+     * The whole stored choice, as written: data from an older version of this file.
+     *
+     * One reader for the one key, so "junk under it is not a reason to lose the table" is
+     * decided in one place rather than three. An array (v1) and an object (v2, v3) are both
+     * objects here; anything else - a string, a number, a truncated write - is *no store*,
+     * which is the same answer as a browser that has never chosen.
+     */
+    shiftsStore() {
         try {
-            localStorage.setItem('shiftsColumns', JSON.stringify(order));
+            const stored = JSON.parse(localStorage.getItem('shiftsColumns') || 'null');
+            return stored && typeof stored === 'object' ? stored : null;
+        } catch (err) {
+            return null;
+        }
+    },
+
+    /**
+     * One column choice - the reading order and the columns switched off - repaired.
+     *
+     * Unknown keys are dropped, duplicates collapse, and a column nobody mentioned is
+     * appended in reading position, so a release that adds one shows it instead of hiding it
+     * for ever. The order keeps every column, switched-off ones included: that is what makes
+     * a column come back where it belonged rather than at the end of the table.
+     *
+     * ``legacy`` is the v1 shape, a bare array, which was the whole table - every column in
+     * it was shown, because there was no way not to show one. It is read as what it was, so
+     * an existing browser's table does not change shape the moment a release ships; a column
+     * that array never mentioned (one added since) arrives switched off.
+     */
+    repairShiftsChoice(order, hidden, legacy) {
+        const known = this.shiftsColumnDefs();
+        const reading = [];
+        const seen = new Set();
+        const push = (key) => {
+            if (known[key] && !seen.has(key)) {
+                seen.add(key);
+                reading.push(key);
+            }
+        };
+        (Array.isArray(order) ? order : []).forEach(push);
+        const chosen = new Set(reading);
+        this.allShiftsColumns().forEach(push);
+        if (legacy) {
+            return { order: reading, hidden: reading.filter((key) => !chosen.has(key)) };
+        }
+        const off = (Array.isArray(hidden) ? hidden : []).filter((key) => known[key]);
+        return { order: reading, hidden: off };
+    },
+
+    /** The column choice, or null for "nobody has chosen": the tabs open on the default. */
+    shiftsColumnState() {
+        const stored = this.shiftsStore();
+        if (Array.isArray(stored)) return this.repairShiftsChoice(stored, null, true);
+        if (!stored || !Array.isArray(stored.order)) return null;
+        return this.repairShiftsChoice(stored.order, stored.hidden, false);
+    },
+
+    /**
+     * A name as this tab stores and shows it: one line, trimmed, capped.
+     *
+     * The cap is not what stops a reader typing a long name - the field's own ``maxlength``
+     * is - it is what keeps a store written by hand, or by a release with a different limit,
+     * from putting an unbounded string on a chip.
+     */
+    shiftsViewName(value) {
+        return String(value === null || value === undefined ? '' : value)
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, this.shiftsViewNameLimit());
+    },
+
+    /** Long enough for "Warehouse crew, week 3", short enough to sit on a chip. */
+    shiftsViewNameLimit() {
+        return 24;
+    },
+
+    /** How many views one browser holds. A reader's worth, not a filing cabinet. */
+    shiftsViewsLimit() {
+        return 12;
+    },
+
+    /**
+     * The saved views, repaired against the columns that exist.
+     *
+     * A view is a promise that pressing it gives a table, so one with no columns left is not
+     * returned at all rather than offered as a chip that refuses every press - and one naming
+     * a column this release dropped keeps the rest, through the same repair the live choice
+     * gets. Names are cleaned here, where they are read, so a hand-written store cannot put
+     * anything a chip cannot show on one. Two views called the same thing (however they are
+     * capitalised) are one view: the first wins, because a list of chips a reader cannot tell
+     * apart is a list nobody can use.
+     */
+    shiftsViews() {
+        const stored = this.shiftsStore();
+        const listed = stored && Array.isArray(stored.views) ? stored.views : [];
+        const views = [];
+        const seen = new Set();
+        listed.forEach((entry) => {
+            if (!entry || typeof entry !== 'object') return;
+            const name = this.shiftsViewName(entry.name);
+            if (!name || seen.has(name.toLowerCase())) return;
+            const choice = this.repairShiftsChoice(entry.order, entry.hidden, false);
+            if (choice.order.length === choice.hidden.length) return;
+            seen.add(name.toLowerCase());
+            views.push({ name: name, order: choice.order, hidden: choice.hidden });
+        });
+        return views;
+    },
+
+    /** The view the table is currently showing, or null: the name a chip is pressed for. */
+    shiftsViewsActive() {
+        const name = (this.shiftsStore() || {}).active;
+        const stored = typeof name === 'string' ? name : '';
+        return this.shiftsViews().filter((one) => one.name === stored)[0]
+            ? stored : null;
+    },
+
+    /** The full reading order - the chooser's list, hidden columns included. */
+    shiftsColumnOrder() {
+        const state = this.shiftsColumnState();
+        return state ? state.order : this.allShiftsColumns();
+    },
+
+    /** The columns switched off. A browser that has never chosen is on the clean default. */
+    hiddenShiftsColumns() {
+        const state = this.shiftsColumnState();
+        if (!state) {
+            const primary = this.defaultShiftsColumns();
+            return this.allShiftsColumns().filter((key) => primary.indexOf(key) < 0);
+        }
+        return state.hidden;
+    },
+
+    /**
+     * The columns on the table, in the reader's order.
+     *
+     * One definition for every reader of this tab - the table, the phone's cards, the sort
+     * picker, the printed sheet and the download - so none of them can show a column another
+     * one has already been told to leave out. A stored state that somehow hides everything is
+     * reported as empty rather than quietly repaired: the screen has an answer for that, and
+     * inventing a column here would put a name back on a table somebody emptied on purpose.
+     */
+    shiftsColumns() {
+        const hidden = this.hiddenShiftsColumns();
+        return this.shiftsColumnOrder().filter((key) => hidden.indexOf(key) < 0);
+    },
+
+    /**
+     * Remember a column choice, and which saved view it is.
+     *
+     * ``active`` is the name of the view this choice *is*, and it is left off by every caller
+     * that arrives from a tick-box or a move button - which is how a chip stops being pressed
+     * the moment the columns are edited by hand. The state is no longer that view, and a
+     * control that went on claiming otherwise would be a chip lying about what the table
+     * holds, one press away from putting the reader back on columns they had just changed.
+     *
+     * The saved views are carried through untouched: choosing columns is not editing the list
+     * of names. A refusing browser still renders the choice, it just does not outlive the page.
+     */
+    setShiftsColumnState(order, hidden, active) {
+        const views = this.shiftsViews();
+        const wanted = typeof active === 'string' ? active : null;
+        this.writeShiftsStore({
+            v: 3,
+            order: order,
+            hidden: hidden,
+            views: views,
+            // Only a name that is still a view: a chip left behind by a store somebody edited
+            // must not come back pressed on the next repaint.
+            active: wanted && views.some((one) => one.name === wanted) ? wanted : null
+        });
+    },
+
+    /** The one place that writes the key, so a refusing browser has one answer and not five. */
+    writeShiftsStore(store) {
+        try {
+            localStorage.setItem('shiftsColumns', JSON.stringify(store));
         } catch (err) {
             // Storage disabled (a private window, a hardened browser) is still a usable
-            // timesheet - the order just does not outlive the page.
+            // timesheet - the choice just does not outlive the page.
         }
+    },
+
+    /**
+     * Switch one column on or off, and repaint.
+     *
+     * The last column still on the table cannot be switched off: a row of nothing but its
+     * print button is not a timesheet, and a chooser is not a thing to leave somebody
+     * staring at. The panel disables that checkbox with the reason on it; this is the same
+     * rule, where it cannot be walked around.
+     */
+    setShiftsColumnVisible(key, visible) {
+        if (!this.shiftsColumnDefs()[key]) return undefined;
+        const order = this.shiftsColumnOrder();
+        const hidden = this.hiddenShiftsColumns().filter((one) => one !== key);
+        if (!visible) {
+            if (order.filter((one) => hidden.indexOf(one) < 0).length <= 1) return undefined;
+            hidden.push(key);
+        }
+        this.setShiftsColumnState(order, hidden);
+        return this.repaintShiftsFromCache();
+    },
+
+    /** The panel's checkbox: the column on the table, or not. */
+    toggleShiftsColumn(key) {
+        return this.setShiftsColumnVisible(key, this.shiftsColumns().indexOf(key) < 0);
     },
 
     /** One step earlier/later (-1/+1), then repaint from the rows already in hand. */
     moveShiftsColumn(key, delta) {
-        const order = this.shiftsColumns();
+        // The *full* order, so a column that is switched off can still be put where it belongs
+        // before it comes back - and so moving one column does not shuffle the hidden ones.
+        const order = this.shiftsColumnOrder();
         const from = order.indexOf(key);
         const to = from + delta;
         if (from < 0 || to < 0 || to >= order.length) return undefined;
         order.splice(to, 0, order.splice(from, 1)[0]);
-        this.setShiftsColumns(order);
+        this.setShiftsColumnState(order, this.hiddenShiftsColumns());
         return this.repaintShiftsFromCache();
     },
 
+    /**
+     * Put the columns back to the clean default - and keep the views.
+     *
+     * "Reset order" is about the table in front of the reader, not about the names they saved:
+     * a reset that also threw away somebody's Payroll view would be a control nobody could
+     * safely press, and the panel offers it one tap from a chip. So the column choice goes and
+     * the views are written back as they were - and a browser that has never saved one ends
+     * with no store at all, exactly as before there were views.
+     */
     resetShiftsColumns() {
-        try {
-            localStorage.removeItem('shiftsColumns');
-        } catch (err) {
-            // Nothing to remove where storage is unavailable.
+        const views = this.shiftsViews();
+        if (views.length === 0) {
+            try {
+                localStorage.removeItem('shiftsColumns');
+            } catch (err) {
+                // Nothing to remove where storage is unavailable.
+            }
+        } else {
+            this.writeShiftsStore({ v: 3, views: views });
         }
+        return this.repaintShiftsFromCache();
+    },
+
+    /**
+     * Put the table back to a saved view: its columns, its arrangement, in one press.
+     *
+     * The whole choice, the order included - a view is what the table looked like, and half of
+     * it (these columns, in somebody else's arrangement) would be a different table wearing its
+     * name. A name no longer in the store is a chip a repaint has left behind and does nothing;
+     * the panel and the toolbar both read the store, so this is only reachable that way.
+     */
+    applyShiftsView(name) {
+        const view = this.shiftsViews().filter((one) => one.name === name)[0];
+        if (!view) return undefined;
+        this.setShiftsColumnState(view.order, view.hidden, view.name);
+        return this.repaintShiftsFromCache();
+    },
+
+    /**
+     * Save the columns in front of the reader under a name of their choosing.
+     *
+     * Saving a name that is already taken *updates* that view, matched without regard to case:
+     * an administrator who types "payroll" when "Payroll" exists means the one they already
+     * have, and two chips differing only in capitalisation is a list nobody can read. The
+     * spelling they first chose is kept, so the chip they have been pressing stays the chip
+     * they press. A blank name is refused; so is a thirteenth view, with the number in the
+     * sentence rather than a Save button that does nothing.
+     */
+    saveShiftsView(name) {
+        const clean = this.shiftsViewName(name);
+        if (!clean) {
+            Toast.error(I18n.__('shiftsViewUnnamed'));
+            return undefined;
+        }
+        const views = this.shiftsViews();
+        const at = views.map((one) => one.name.toLowerCase()).indexOf(clean.toLowerCase());
+        if (at < 0 && views.length >= this.shiftsViewsLimit()) {
+            Toast.error(I18n.__('shiftsViewsFull').replace('{count}', String(this.shiftsViewsLimit())));
+            return undefined;
+        }
+        const entry = {
+            name: at < 0 ? clean : views[at].name,
+            order: this.shiftsColumnOrder(),
+            hidden: this.hiddenShiftsColumns()
+        };
+        if (at < 0) views.push(entry); else views[at] = entry;
+        // Saved *and* applied: the choice on the table is this view now, so the chip is pressed
+        // and the table cannot drift away from the name that describes it without saying so.
+        this.writeShiftsStore({
+            v: 3, order: entry.order, hidden: entry.hidden, views: views, active: entry.name
+        });
+        Toast.success(I18n.__(at < 0 ? 'shiftsViewSaved' : 'shiftsViewUpdated')
+            .replace('{name}', entry.name));
+        return this.repaintShiftsFromCache();
+    },
+
+    /**
+     * Forget a view. The columns on the table stay exactly as they are.
+     *
+     * The table is not the name: removing "Payroll" from the list is not a request to change
+     * what the reader is looking at, and a removal that also shuffled their columns would be
+     * the worse surprise of the two. Only the *pressed* chip is let go, because the thing it
+     * named is gone - and whether there was a column choice at all is preserved, so a reader
+     * who was on the default stays on the default rather than on a copy of it.
+     */
+    removeShiftsView(name) {
+        const views = this.shiftsViews();
+        const left = views.filter((one) => one.name !== name);
+        if (left.length === views.length) return undefined;
+        const state = this.shiftsColumnState();
+        const store = {
+            v: 3,
+            views: left,
+            active: this.shiftsViewsActive() === name ? null : this.shiftsViewsActive()
+        };
+        if (state) {
+            store.order = state.order;
+            store.hidden = state.hidden;
+        }
+        this.writeShiftsStore(store);
+        Toast.success(I18n.__('shiftsViewRemoved').replace('{name}', name));
         return this.repaintShiftsFromCache();
     },
 
@@ -10549,6 +10856,12 @@ ${sessionsFact}${statusFact}${moallemFact}
     onShiftsChange(event) {
         const target = event && event.target;
         if (!target || typeof target.getAttribute !== 'function') return undefined;
+        // The two selects and the chooser's checkboxes all fire on ``change``: one listener
+        // answers every control in the tab whose value is the thing it reports.
+        if (target.getAttribute('data-column-visible') !== null) {
+            return this.setShiftsColumnVisible(target.getAttribute('data-column-visible'), target.checked === true);
+        }
+        if (target.getAttribute('data-sort-column') !== null) return this.setShiftsSortColumn(target.value);
         if (target.getAttribute('data-shifts-category') === null) return undefined;
         return this.setShiftsCategory(target.value);
     },
@@ -10674,9 +10987,27 @@ ${sessionsFact}${statusFact}${moallemFact}
         if (!this.shiftsColumnDefs()[key]) return undefined;
         const current = this.shiftsSort();
         const first = this.shiftsSortFirst(key);
-        if (current.key !== key) State.shiftsSort = { key: key, direction: first };
-        else if (current.direction === first) State.shiftsSort = { key: key, direction: first === 'asc' ? 'desc' : 'asc' };
-        else State.shiftsSort = null;
+        if (current.key !== key) return this.applyShiftsSort(key, first);
+        if (current.direction === first) return this.applyShiftsSort(key, first === 'asc' ? 'desc' : 'asc');
+        // The third press: back to the order the server sent. That is a *state* here - no
+        // column - rather than a fourth thing anybody has to remember.
+        return this.applyShiftsSort('', 'asc');
+    },
+
+    /**
+     * The sort state, settled in one place.
+     *
+     * Three controls reach this: the table's headers, and - on a phone, where a card layout has
+     * no header to press - a column picker and a pair of direction buttons. Those are one choice
+     * drawn twice, so they meet here rather than each writing ``State.shiftsSort`` its own way;
+     * two writers is how the phone and the table come to disagree about what "sorted by hours"
+     * means. A key that is not a column on this screen is the period's own order, whatever
+     * direction came along with it.
+     */
+    applyShiftsSort(key, direction) {
+        State.shiftsSort = this.shiftsColumnDefs()[key]
+            ? { key: key, direction: direction === 'desc' ? 'desc' : 'asc' }
+            : null;
         return this.repaintShiftsFromCache();
     },
 
@@ -10684,10 +11015,10 @@ ${sessionsFact}${statusFact}${moallemFact}
      * Which way the first press on a column goes.
      *
      * A counted column starts at its biggest: nobody opens "Hours" to find the shortest shift of
-     * the month, and the same is true of the shift still waiting for them.
+     * the month.
      */
     shiftsSortFirst(key) {
-        return ['id', 'hours', 'awaiting', 'notes'].indexOf(key) >= 0 ? 'desc' : 'asc';
+        return ['id', 'hours', 'notes'].indexOf(key) >= 0 ? 'desc' : 'asc';
     },
 
     /** What one cell is worth as a sort key, in the same words the row shows it in. */
@@ -10698,15 +11029,20 @@ ${sessionsFact}${statusFact}${moallemFact}
             case 'hours':
                 return Number(row.hours) || 0;
             case 'notes':
+                // A count, so it sorts as one - like the id and the hours above, and unlike
+                // the columns whose cells are words. Zero is a real value here: "nobody is
+                // chasing this person" is an answer, and it sorts below somebody who is.
                 return Number(row.open_notes) || 0;
-            // A shift waiting for a decision is the top of this column read either way: the only
-            // question the column answers is which of these still needs somebody.
-            case 'awaiting':
-                return row.awaiting_approval ? 1 : 0;
             case 'employee':
                 return String(row.worker_name || row.worker_id || '');
             case 'role':
                 return this.roleLabel(row.role) || '';
+            case 'moallem':
+                // The words the cell shows, like the role above it: the supervisor's name, or the
+                // word for "nobody" when the row has no supervisor over it. A header that sorted
+                // by something other than what it displays would be lying about the order it put
+                // the rows in - and sorting this one by the date would look like it did nothing.
+                return row.moallem_name || I18n.__('moallemUnassigned');
             case 'site':
                 return String(row.site_name || '');
             case 'category':
@@ -10758,6 +11094,58 @@ ${sessionsFact}${statusFact}${moallemFact}
     },
 
     /**
+     * The phone's way to sort, drawn only on a phone.
+     *
+     * A card layout has no column headings, so the control the table carries in its own markup
+     * has to be drawn somewhere else - and the two shapes are the ones this console already puts
+     * on a phone for exactly this choice: a select for *which* (``liveOpsSortSelectHtml``) and a
+     * pressed-pair for the two directions (``liveOpsGroupToggleHtml``). Both write the same
+     * state through ``applyShiftsSort``, so the phone and the table cannot read one period two
+     * different ways.
+     *
+     * On a desk it draws nothing: there the headers *are* the control, and the same choice
+     * offered twice is a second place for the two to disagree.
+     */
+    shiftsSortControlHtml() {
+        if (!Device.isMobile) return '';
+        const sort = this.shiftsSort();
+        const option = (value, label) => `<option value="${this.escapeHtml(value)}"${sort.key === value ? ' selected' : ''}>${this.escapeHtml(label)}</option>`;
+        const direction = (value, label) => `<button type="button" class="ops-seg-btn" data-sort-direction="${value}" aria-pressed="${sort.key && sort.direction === value ? 'true' : 'false'}">${this.escapeHtml(label)}</button>`;
+        // The columns the reader can see, in the order they arranged them: the same set, in the
+        // same words, as the headers on a desk. A column that is not on the screen is not a
+        // column this list can be read by.
+        const columns = this.shiftsColumns();
+        return `
+            <div class="shifts-sort">
+                <label class="ui-label" for="shiftsSortColumn">${this.escapeHtml(I18n.__('shiftsSort'))}</label>
+                <select class="ui-field shifts-sort-select" id="shiftsSortColumn" data-sort-column>
+                    ${option('', I18n.__('shiftsSortPeriod'))}${columns.map((key) => option(key, this.shiftsColumnLabel(key))).join('')}
+                </select>
+                ${sort.key ? `<div class="ops-seg" role="group" aria-label="${this.escapeHtml(I18n.__('shiftsSortDirection'))}">${direction('asc', I18n.__('shiftsSortAscending'))}${direction('desc', I18n.__('shiftsSortDescending'))}</div>` : ''}
+            </div>`;
+    },
+
+    /** The phone's column picker: the same first press a header on that column gives. */
+    setShiftsSortColumn(key) {
+        const defs = this.shiftsColumnDefs();
+        if (!key || !defs[key]) return this.applyShiftsSort('', 'asc');
+        return this.applyShiftsSort(key, this.shiftsSortFirst(key));
+    },
+
+    /**
+     * The phone's direction pair: either way round, in one press.
+     *
+     * The header reaches the other direction by being pressed a second time, which a select
+     * cannot do - choosing the option it is already showing fires nothing at all. So the phone
+     * says which way the list is being read and lets either direction be asked for directly.
+     */
+    setShiftsSortDirection(direction) {
+        const sort = this.shiftsSort();
+        if (!sort.key) return undefined;
+        return this.applyShiftsSort(sort.key, direction === 'desc' ? 'desc' : 'asc');
+    },
+
+    /**
      * The class one cell carries, which is about how it is *read* rather than what it says.
      *
      * A counted column is set in tabular numerals and aligned to the end, so hours line up as a
@@ -10766,7 +11154,7 @@ ${sessionsFact}${statusFact}${moallemFact}
      * by eye. The class carries no text, so none of this reaches the file or the paper.
      */
     shiftsCellClass(key) {
-        return ['id', 'hours', 'awaiting', 'notes'].indexOf(key) >= 0 ? ' class="is-numeric is-end"' : '';
+        return ['id', 'hours'].indexOf(key) >= 0 ? ' class="is-numeric is-end"' : '';
     },
 
     /** Reads the search box and repaints the rows for it. */
@@ -10863,6 +11251,61 @@ ${sessionsFact}${statusFact}${moallemFact}
     },
 
     /**
+     * The saved views, as chips to press: one table, one press.
+     *
+     * Drawn on the toolbar rather than inside the chooser, because switching between the two
+     * views a reader works in all day is the frequent act and rearranging columns is the rare
+     * one - the frequent act is not worth a disclosure to open first. Nothing is drawn until
+     * somebody has saved a view, so a first-time reader sees no band at all.
+     */
+    shiftsViewsBandHtml(views, active) {
+        if (views.length === 0) return '';
+        return `
+            <div class="ui-row shifts-views">
+                <span class="ui-label">${this.escapeHtml(I18n.__('shiftsViews'))}</span>
+                ${views.map((view) => `<button type="button" class="ui-chip"
+                    data-view-apply="${this.escapeHtml(view.name)}"
+                    aria-pressed="${view.name === active ? 'true' : 'false'}">${this.escapeHtml(view.name)}</button>`).join('')}
+            </div>`;
+    },
+
+    /** The save row: the columns in front of the reader, under a name they type. */
+    shiftsViewSaveHtml() {
+        return `
+            <form id="shiftsViewForm" class="ui-row shifts-view-save">
+                <label class="ui-label" for="shiftsViewName">${this.escapeHtml(I18n.__('shiftsViewSaveLabel'))}</label>
+                <input type="text" id="shiftsViewName" class="ui-field" required
+                       maxlength="${this.shiftsViewNameLimit()}"
+                       placeholder="${this.escapeHtml(I18n.__('shiftsViewSavePlaceholder'))}">
+                <button type="submit" class="ui-btn ui-btn-primary">${this.escapeHtml(I18n.__('save'))}</button>
+            </form>`;
+    },
+
+    /**
+     * The saved views with the control that forgets one.
+     *
+     * Removal lives here, in the panel, and not on the toolbar chip: switching a view is a
+     * press a reader makes dozens of times a day, forgetting one is a press they make once,
+     * and the two are deliberately not one tap apart. Each row is the same chip as the band's
+     * (so a view can be tried while the panel is open) beside its own remove button.
+     */
+    shiftsViewListHtml(views, active) {
+        if (views.length === 0) return '';
+        return `
+            <div class="ui-row shifts-view-list" data-view-list data-views-count="${views.length}">
+                ${views.map((view) => `
+                    <span class="ui-chip${view.name === active ? ' is-active' : ''}" data-view="${this.escapeHtml(view.name)}">
+                        <button type="button" class="shifts-view-name" data-view-apply="${this.escapeHtml(view.name)}"
+                                aria-pressed="${view.name === active ? 'true' : 'false'}">${this.escapeHtml(view.name)}</button>
+                        <button type="button" class="shifts-view-remove" data-view-remove="${this.escapeHtml(view.name)}"
+                                title="${this.escapeHtml(I18n.__('shiftsViewRemove'))}"
+                                aria-label="${this.escapeHtml(`${I18n.__('shiftsViewRemove')}: ${view.name}`)}">&#215;</button>
+                    </span>`).join('')}
+                <p class="ui-section-note" style="margin:0">${this.escapeHtml(I18n.__('shiftsViewsHint'))}</p>
+            </div>`;
+    },
+
+    /**
      * The column editor: every column as a chip with a move-earlier / move-later button.
      *
      * Deliberately not drag-and-drop. This is a table an administrator rearranges once and
@@ -10872,28 +11315,45 @@ ${sessionsFact}${statusFact}${moallemFact}
      * closing the panel.
      */
     shiftsColumnsHtml() {
-        const order = this.shiftsColumns();
+        const order = this.shiftsColumnOrder();
+        const visible = this.shiftsColumns();
+        const views = this.shiftsViews();
+        const active = this.shiftsViewsActive();
+        const last = visible.length === 1;
         const chip = 'ui-chip';
         const step = 'ui-btn ui-btn-sm ui-btn-quiet';
+        const key = (name) => this.shiftsColumnLabel(name);
+        const on = (name) => visible.indexOf(name) >= 0;
         return `
+            ${this.shiftsViewsBandHtml(views, active)}
             <details id="shiftsColumns" class="ops-panel shifts-columns">
-                <summary>${this.OPS_ICONS.table}<span>${this.escapeHtml(I18n.__('shiftsColumns'))}</span></summary>
+                <summary>${this.OPS_ICONS.table}<span>${this.escapeHtml(I18n.__('shiftsColumns'))}</span>
+                    <span class="ui-note" data-columns-count>${this.escapeHtml(I18n.__('shiftsColumnsShown')
+                        .replace('{shown}', String(visible.length)).replace('{total}', String(order.length)))}</span>
+                </summary>
                 <div class="ops-panel-body">
                     <div class="ui-row" data-column-editor data-order="${order.join(',')}">
-                        ${order.map((key, index) => `
-                            <span class="${chip}" data-column="${key}">
-                                ${this.shiftsColumnLabel(key)}
+                        ${order.map((name, index) => `
+                            <span class="${chip}${on(name) ? '' : ' is-off'}" data-column="${name}">
+                                <label class="shifts-column-toggle"${last && on(name) ? ` title="${this.escapeHtml(I18n.__('shiftsColumnsLast'))}"` : ''}>
+                                    <input type="checkbox" data-column-visible="${name}"
+                                           ${on(name) ? 'checked' : ''}${last && on(name) ? ' disabled' : ''}>
+                                    ${this.escapeHtml(key(name))}
+                                </label>
                                 <button type="button" data-move-earlier title="${this.escapeHtml(I18n.__('shiftsColumnEarlier'))}"
-                                        aria-label="${this.escapeHtml(`${I18n.__('shiftsColumnEarlier')}: ${this.shiftsColumnLabel(key)}`)}"
+                                        aria-label="${this.escapeHtml(`${I18n.__('shiftsColumnEarlier')}: ${key(name)}`)}"
                                         class="${step}"
                                         ${index === 0 ? 'disabled' : ''}>&#8592;</button>
                                 <button type="button" data-move-later title="${this.escapeHtml(I18n.__('shiftsColumnLater'))}"
-                                        aria-label="${this.escapeHtml(`${I18n.__('shiftsColumnLater')}: ${this.shiftsColumnLabel(key)}`)}"
+                                        aria-label="${this.escapeHtml(`${I18n.__('shiftsColumnLater')}: ${key(name)}`)}"
                                         class="${step}"
                                         ${index === order.length - 1 ? 'disabled' : ''}>&#8594;</button>
                             </span>`).join('')}
                         <button type="button" data-columns-reset class="${chip}">${this.escapeHtml(I18n.__('shiftsColumnsReset'))}</button>
                     </div>
+                    ${this.shiftsViewSaveHtml()}
+                    ${this.shiftsViewListHtml(views, active)}
+                    <p class="ui-section-note" style="margin-top:8px">${this.escapeHtml(I18n.__('shiftsColumnsHint'))}</p>
                 </div>
             </details>`;
     },
@@ -10917,6 +11377,13 @@ ${sessionsFact}${statusFact}${moallemFact}
         document.getElementById('shiftsSearchForm').onsubmit = (event) => {
             event.preventDefault();
             return this.applyShiftsSearch();
+        };
+        // Saving a view is a form so that Enter works and the field's own ``required`` is the
+        // browser's, not a rule re-implemented here.
+        document.getElementById('shiftsViewForm').onsubmit = (event) => {
+            event.preventDefault();
+            const field = document.getElementById('shiftsViewName');
+            return this.saveShiftsView(field ? field.value : '');
         };
         // The row actions, delegated: rows are a string at paint time, so there is no node
         // to attach to - and a handler per row would be a handler per row per repaint.
@@ -10945,12 +11412,19 @@ ${sessionsFact}${statusFact}${moallemFact}
             ['[data-attention]', (node) => this.setShiftsAttention((node.dataset || {}).attention)],
             ['[data-shift-bucket]', (node) => this.applyShiftsBucket((node.dataset || {}).shiftBucket)],
             ['[data-sort]', (node) => this.sortShiftsBy((node.dataset || {}).sort)],
+            // The phone's direction pair, beside the header route above: the same choice, and
+            // the same state behind it.
+            ['[data-sort-direction]', (node) => this.setShiftsSortDirection((node.dataset || {}).sortDirection)],
             ['[data-shifts-more]', () => this.showMoreShifts()],
             ['[data-show-day]', (node) => this.applyShiftsDay((node.dataset || {}).showDay)],
             ['[data-clear-search]', () => this.clearShiftsSearch()],
             ['[data-copy-link]', () => this.copyShiftsLink()],
             ['[data-export-shifts]', () => this.downloadShiftsReport()],
             ['[data-columns-reset]', () => this.resetShiftsColumns()],
+            // The saved views: applying one is the press a reader makes all day, removing one
+            // is not - so removal is only inside the panel, and both go through one route.
+            ['[data-view-apply]', (node) => this.applyShiftsView((node.dataset || {}).viewApply)],
+            ['[data-view-remove]', (node) => this.removeShiftsView((node.dataset || {}).viewRemove)],
             // The two column steps live inside the chip they move, so the column is the button's
             // own parent rather than a value carried in an inline handler.
             ['[data-move-earlier]', (node) => this.moveShiftsColumn((node.parentElement.dataset || {}).column, -1)],
@@ -11048,6 +11522,10 @@ ${sessionsFact}${statusFact}${moallemFact}
                          quick search, so a long category name cannot scroll out of reach and the
                          chosen one is legible at a glance. -->
                     ${this.shiftsCategorySelectHtml(report)}
+                    <!-- Which order the list is read in. The desktop reads it off the table's
+                         own headers; a card layout has none, so the phone's control is drawn
+                         here, in the band that already answers "what am I looking at". -->
+                    ${this.shiftsSortControlHtml()}
                 </div>
                 <div class="shifts-bar-actions">
                     <button type="button" data-copy-link class="ui-chip">${this.OPS_ICONS.copy}${this.escapeHtml(I18n.__('copyLink'))}</button>
@@ -11059,6 +11537,8 @@ ${sessionsFact}${statusFact}${moallemFact}
                         <option value="csv">${this.escapeHtml(I18n.__('shiftsExportExcel'))}</option>
                         <option value="pdf">${this.escapeHtml(I18n.__('shiftsExportPdf'))}</option>
                     </select>
+                    <!-- What the file holds is the chooser's answer, not a second control:
+                         the download writes the columns on the table, in their order. -->
                     <button type="button" data-export-shifts class="ui-btn">${this.OPS_ICONS.download}${this.escapeHtml(I18n.__('shiftsExportDownload'))}</button>
                 </div>
             </form>`;
@@ -11155,12 +11635,24 @@ ${sessionsFact}${statusFact}${moallemFact}
                         ${hint ? `<span class="ops-stat-hint">${this.escapeHtml(I18n.__(hint))}</span>` : ''}
                     </div>`).join('')}
             </div>`;
-        const body = shown.length === 0
-            ? `<div class="ui-empty"${noMatches ? ' data-no-matches="true"' : ''}>
+        // Every column switched off. The panel stops the last one going, so this is the shape
+        // a hand-edited or half-written store leaves - and it needs an answer rather than a
+        // table of nothing but its print buttons: what happened, and the one tap that puts the
+        // defaults back. (``setShiftsColumnVisible`` refuses to hide the last one, so nothing
+        // in the product reaches this state.)
+        const noColumns = this.shiftsColumns().length === 0;
+        const body = noColumns
+            ? `<div class="ui-empty" data-no-columns="true">
+                    <span class="ui-empty-icon">${this.OPS_ICONS.table}</span>
+                    <p class="ui-empty-title">${this.escapeHtml(I18n.__('shiftsNoColumns'))}</p>
+                    <button type="button" data-columns-reset class="ui-btn ui-btn-primary">${this.escapeHtml(I18n.__('shiftsColumnsReset'))}</button>
+               </div>`
+            : shown.length === 0
+                ? `<div class="ui-empty"${noMatches ? ' data-no-matches="true"' : ''}>
                     <span class="ui-empty-icon">${this.OPS_ICONS.table}</span>
                     <p class="ui-empty-title">${this.escapeHtml(I18n.__(noMatches ? 'shiftsNoMatches' : 'shiftsEmpty'))}</p>
                </div>`
-            : this.shiftsRowsHtml(painted) + this.shiftsMoreHtml(shown, painted);
+                : this.shiftsRowsHtml(painted) + this.shiftsMoreHtml(shown, painted);
         return `
             <div class="ui-section-head" style="margin-bottom:12px">
                 <p class="ui-section-note">${this.escapeHtml(I18n.__('shiftsPeriod'))}:
@@ -11347,6 +11839,29 @@ ${sessionsFact}${statusFact}${moallemFact}
      * force-clock-out, or a shift closed with no arrival on file, is *unknown*, and a cell
      * that read "on time" there would be inventing punctuality out of missing data.
      */
+    /**
+     * The arrival in the words the cell shows: the verdict, and how far off it was.
+     *
+     * One sentence, written once, for the *value* of the column - the cell wraps it in the
+     * badge that says how it reads, and the file and the paper take it as it is. It is not
+     * ``arrivalWords``: that is the search haystack, which carries the verdict code and the
+     * bare number as well so "late 12" can be typed, and a cell that said all three would be
+     * a cell nobody wrote.
+     */
+    arrivalLabel(row) {
+        const minutes = String(Number(row.arrival_minutes) || 0);
+        if (row.arrival_verdict === 'late') {
+            return I18n.__('shiftsArrivalLate').replace('{minutes}', minutes);
+        }
+        if (row.arrival_verdict === 'early') {
+            return I18n.__('shiftsArrivalEarly').replace('{minutes}', minutes);
+        }
+        if (row.arrival_verdict === 'on_time') return I18n.__('shiftsArrivalOnTime');
+        // No clock-in on file is a gap, not a verdict: the cell says so in words, and the file
+        // leaves the cell empty like every other "nothing on file" - see ``shiftsCellText``.
+        return '';
+    },
+
     arrivalCellHtml(row) {
         const minutes = String(Number(row.arrival_minutes) || 0);
         const clocked = row.arrival_time ? ` title="${this.escapeHtml(row.arrival_time)}"` : '';
@@ -11388,20 +11903,64 @@ ${sessionsFact}${statusFact}${moallemFact}
     },
 
     /** One cell of one row. The only place a column's value is written. */
-    shiftsCellHtml(row, key) {
+    /**
+     * One cell's *text*: what the column says, with none of the markup that says how it looks.
+     *
+     * The file and the paper read this, so a column cannot say one thing on the screen and
+     * another in the csv. The arrival column's words, the moallem's "Unassigned" and the
+     * count of open notes are written once, here, and the cell wraps them rather than
+     * repeating them. An empty cell is the empty string: the dash the screen shows for
+     * "nothing on file" is a tone, not a value, and a file holding a page of dashes is not a
+     * record.
+     */
+    shiftsCellText(row, key) {
         switch (key) {
             case 'date':
-                return `<span class="ui-nowrap">${this.escapeHtml(row.date)}</span>`;
+                return String(row.date || '');
             case 'employee':
-                return `<span class="ui-strong">${this.escapeHtml(row.worker_name || row.worker_id)}</span>`;
+                return String(row.worker_name || row.worker_id || '');
+            case 'role':
+                return row.role ? String(this.roleLabel(row.role)) : '';
+            case 'moallem':
+                return String(row.moallem_name || I18n.__('moallemUnassigned'));
+            case 'id':
+                return String(row.worker_id || '');
+            case 'site':
+                return String(row.site_name || '');
+            case 'category':
+                return String(row.site_category || '');
+            case 'arrival':
+                return this.arrivalLabel(row);
+            case 'hours':
+                return String(this.hoursLabel(row.hours));
+            case 'notes':
+                return row.open_notes ? String(row.open_notes) : '';
+            default:
+                return '';
+        }
+    },
+
+    /**
+     * One cell as the table, the card and the printed sheet read it.
+     *
+     * The tone is the cell's own: a role that is gone, a site that is not on file and a shift
+     * with no notes counted are all gaps rather than zeroes, and an empty cell would read as
+     * "this row has no such column". The words come from ``shiftsCellText``.
+     */
+    shiftsCellHtml(row, key) {
+        const text = this.shiftsCellText(row, key);
+        const dash = `<span class="ui-tone-faint">\u2014</span>`;
+        switch (key) {
+            case 'date':
+                return `<span class="ui-nowrap">${this.escapeHtml(text)}</span>`;
+            case 'employee':
+                return `<span class="ui-strong">${this.escapeHtml(text)}</span>`;
             case 'role':
                 // In the reader's words, like every other role on this console. An account
                 // that no longer exists still has shifts here - deleting a login does not
                 // delete the days somebody worked - so the cell says the role is unknown
                 // rather than painting an empty cell the reader would take for "worker".
-                return row.role
-                    ? this.escapeHtml(this.roleLabel(row.role))
-                    : `<span class="ui-tone-faint">\u2014</span>`;
+                return text ? this.escapeHtml(text) : dash;
             case 'moallem':
                 // Read from the shift's own row rather than looked up in the roster: the server
                 // joined the assignment onto this row when it served it, and a second lookup
@@ -11409,51 +11968,32 @@ ${sessionsFact}${statusFact}${moallemFact}
                 // them says so - an empty cell reads as "no value", which is a different claim.
                 return this.moallemNameHtml(row);
             case 'id':
-                return `<span class="ui-tone-muted">${this.escapeHtml(row.worker_id)}</span>`;
+                return `<span class="ui-tone-muted">${this.escapeHtml(text)}</span>`;
             case 'site':
                 // An em dash, not an empty cell: a shift whose site is not on file is a gap
                 // in the record, and a blank reads as "this row has no site column".
-                return row.site_name
-                    ? this.escapeHtml(row.site_name)
-                    : `<span class="ui-tone-faint">\u2014</span>`;
+                return text ? this.escapeHtml(text) : dash;
             case 'category':
                 // The site's category as the server resolved it *on this row*, not a second
                 // lookup in the site list: the timesheet already decided which category each
                 // shift belongs to, and a lookup here could disagree with the chip that
                 // selected it. A site with no category reads as a gap, like a row with no site.
-                return row.site_category
-                    ? this.escapeHtml(row.site_category)
-                    : `<span class="ui-tone-faint">\u2014</span>`;
+                return text ? this.escapeHtml(text) : dash;
             case 'arrival':
                 return this.arrivalCellHtml(row);
             case 'hours':
                 // The number the server counted, not the raw clock: a shift somebody has
                 // signed off is worth exactly the hours they signed for.
-                return `<span class="ui-strong">${this.hoursLabel(row.hours)}</span>`;
-            case 'awaiting':
-                return this.awaitingHtml(row);
+                return `<span class="ui-strong">${this.escapeHtml(text)}</span>`;
             case 'notes':
-                return Number(row.open_notes) > 0
-                    ? `<span class="ui-strong ui-tone-warn">${Number(row.open_notes)}</span>`
-                    : `<span class="ui-tone-faint">0</span>`;
+                // A count of what is outstanding, so nought of them is the quiet state rather
+                // than a figure: a column of zeroes is a column nobody reads to the end.
+                return row.open_notes
+                    ? `<span class="ui-strong">${this.escapeHtml(text)}</span>`
+                    : dash;
             default:
                 return '';
         }
-    },
-
-    /**
-     * Awaiting approval, or the decision that was made.
-     *
-     * A waiting shift says so in the same amber the worker's own card uses for hours past
-     * the paid day. A decided one names the decision (approved, closed by the system,
-     * rejected) rather than a bare tick, because "rejected" and "approved" are not the
-     * same kind of nothing.
-     */
-    awaitingHtml(row) {
-        if (row.awaiting_approval) {
-            return `<span class="ui-badge is-warn">${I18n.__('shiftsPending')}</span>`;
-        }
-        return `<span class="ui-note">${this.escapeHtml(row.status || '')}</span>`;
     },
 
     /** Which file the Download button writes: the spreadsheet, or the report on paper. */
@@ -11466,6 +12006,7 @@ ${sessionsFact}${statusFact}${moallemFact}
         // nobody asked for.
         return chosen === 'pdf' ? 'pdf' : 'csv';
     },
+
 
     /**
      * The Download button: one control, two files, and exactly the rows on screen either
@@ -11516,9 +12057,9 @@ ${sessionsFact}${statusFact}${moallemFact}
      * The sheet: what period it covers, what it was filtered to, the rows, and the total.
      *
      * The columns are the administrator's own - the same order, the same cells as the table
-     * on screen - because this is the timesheet they are looking at, on paper. The four
-     * fixed columns of the CSV exist so two months of files can be compared; paper is read
-     * by the person who set the columns up.
+     * on screen - because this is the timesheet they are looking at, on paper. Which columns
+     * those are is the chooser's answer (``shiftsColumns``), and it is the same answer the csv
+     * beside it reads: the table, the paper and the file are one view of one period.
      *
      * What this builds is the *content*: which cells, what the total says, and what an empty
      * period reads. The frame around it - the title, the period line, the table, the note
@@ -11527,6 +12068,8 @@ ${sessionsFact}${statusFact}${moallemFact}
      * figures.
      */
     shiftsPrintHtml(report, range) {
+        // The administrator's own columns, in their order, and nothing decided here: the
+        // chooser says what this period is read by, and the paper agrees with the table.
         const columns = this.shiftsColumns();
         const shown = this.shiftsVisibleRows(report);
         const filtering = this.shiftsFiltering();
@@ -11547,6 +12090,7 @@ ${sessionsFact}${statusFact}${moallemFact}
             columns: columns.map((key) => this.shiftsColumnLabel(key)),
             rows: shown.map((row) => columns.map((key) => this.shiftsCellHtml(row, key))),
             totals: totalsLine,
+            note: this.shiftsSheetNote(),
             empty: I18n.__(filtering ? 'shiftsNoMatches' : 'shiftsEmpty')
         });
     },
@@ -11650,6 +12194,7 @@ ${sessionsFact}${statusFact}${moallemFact}
             columns: columns.map((key) => this.shiftsColumnLabel(key)),
             rows: rows.map((row) => columns.map((key) => this.shiftsCellHtml(row, key))),
             totals: facts.join(' · '),
+            note: this.shiftsSheetNote(),
             empty: I18n.__('shiftsEmpty')
         });
     },
@@ -11717,9 +12262,16 @@ ${sessionsFact}${statusFact}${moallemFact}
             Toast.error(I18n.__('shiftsNothingToExport'));
             return;
         }
+        const columns = this.shiftsColumns();
+        if (columns.length === 0) {
+            // Nothing chosen, so there is no honest file either: a csv with no columns, or one
+            // whose rows are empty, is a file somebody forwards as the period's record.
+            Toast.error(I18n.__('shiftsNoColumnsToExport'));
+            return;
+        }
         API.saveFile(
             this.shiftsExportName(range, this.shiftsExportFilter()),
-            this.shiftsCsv(this.shiftsRowsOnScreen())
+            this.shiftsCsv(this.shiftsRowsOnScreen(), columns)
         );
     },
 
@@ -11808,34 +12360,39 @@ ${sessionsFact}${statusFact}${moallemFact}
     },
 
     /**
-     * The rows as CSV: who, their id, where, and how long.
+     * The rows as CSV, in the columns the administrator chose for this table.
      *
-     * Four columns, and the same four in the same order as ``/admin/reports/export``
-     * writes, so a file downloaded here and one pulled from the API are the same sheet.
-     * The *screen's* column order deliberately does not travel into the file: a sheet whose
-     * columns move from day to day cannot be compared with last month's, and the person it
-     * is sent to did not rearrange anything.
+     * The file is the view: the columns on the screen, in the order they are read, with the
+     * words the cells show (``shiftsCellText``) and the reader's own labels as the header.
+     * So a payroll file is the table with the supervisor's column switched off, and nobody
+     * has to remember a second set of columns for the file - there is only one, and it is
+     * the one in front of them.
      *
-     * The hours are the figure on screen (an approved shift shows the approved hours); the
-     * API export writes the same figure at full precision. Quoting is minimal, like
-     * ``csv.writer``.
+     * The middleware file at ``/admin/reports/export`` keeps its own fixed shape on purpose:
+     * it is what a script pulls, a script cannot read this admin's screen, and a column that
+     * appears in a feed because somebody rearranged their table would be a feed that changes
+     * shape on its own. The two agree on *values*; a person reading a downloaded file gets
+     * their own columns and their own language.
+     *
+     * The hours are the figure on screen (an approved shift shows the approved hours).
+     * Quoting is minimal, like ``csv.writer``.
      */
-    shiftsCsv(rows) {
-        const columns = ['Employee', 'id', 'site', 'hours'];
+    shiftsCsv(rows, columns) {
+        // One row shape, chosen once: the header and the rows are written from the same list
+        // rather than from a conditional per cell, so the two cannot disagree about which
+        // columns are on the file. A key this build does not know is dropped here as it is
+        // everywhere else.
+        const keys = (columns || []).filter((key) => this.shiftsColumnDefs()[key]);
         const cell = (value) => {
             const text = value === null || value === undefined ? '' : String(value);
             return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
         };
         const line = (values) => values.map(cell).join(',');
-        const body = rows.map((row) => line([
-            row.worker_name || row.worker_id,
-            row.worker_id,
-            row.site_name || '',
-            this.hoursLabel(row.hours)
-        ]));
+        const body = rows.map((row) => line(keys.map((key) => this.shiftsCellText(row, key))));
+        const header = keys.map((key) => this.shiftsColumnLabel(key));
         // CRLF and a final break, matching csv.writer: the last row must not be lost to a
         // parser that reads lines.
-        return [line(columns)].concat(body).join('\r\n') + '\r\n';
+        return [line(header)].concat(body).join('\r\n') + '\r\n';
     },
 
     /**

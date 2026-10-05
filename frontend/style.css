@@ -3751,9 +3751,45 @@ button.dashboard-queue:focus-visible { outline: 2px solid var(--ops-primary); ou
 .shifts-presets { display: flex; flex-wrap: wrap; align-items: center; gap: var(--ui-2); }
 .shifts-bar-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--ui-2); margin-inline-start: auto; }
 .shifts-export-format { width: auto; min-width: 118px; }
+/* The phone's sort. A card layout has no header row to press, so the same choice is drawn as
+   a column picker and a pair of directions, in the band that already answers "what am I
+   looking at". The pair is the board's own segmented control, reused rather than restyled. */
+.shifts-sort { display: flex; flex-direction: column; gap: var(--ui-1); }
+.shifts-sort-select { width: auto; min-width: 150px; }
 
 .shifts-search { display: flex; flex-wrap: wrap; align-items: center; gap: var(--ui-2); margin-bottom: var(--ui-3); }
 .shifts-columns { margin-bottom: var(--ui-3); }
+/* The chooser's chips: a checkbox and the column's own name, with the two move buttons
+   beside it. A column switched off stays in the list, dimmed - the list is then the same
+   list whoever reads it, and switching a column back on puts it where it belongs. */
+.shifts-column-toggle { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.shifts-column-toggle input { margin: 0; }
+.shifts-columns .ui-chip.is-off { opacity: 0.55; }
+.shifts-columns .shifts-column-toggle input:disabled { cursor: not-allowed; }
+/* The saved views, on the toolbar: one press, one table. Nothing is drawn until somebody
+   has saved one, so a reader who has never saved a name sees no band at all. */
+.shifts-views { margin-bottom: var(--ui-3); }
+.shifts-views .ui-chip { max-width: 100%; overflow-wrap: anywhere; }
+/* The save row: the columns in front of the reader, under a name they type. */
+.shifts-view-save { gap: var(--ui-2); margin-top: var(--ui-2); }
+.shifts-view-save .ui-field { flex: 1 1 180px; width: auto; min-width: 0; }
+/* One saved view in the panel's list: the name is the press, the cross beside it forgets it.
+   The chip draws the border, the two children sit inside it, so a pressed view is one whole
+   pill rather than a name with a stray button hanging off it. */
+.shifts-view-list .ui-chip { padding: 0; gap: 0; }
+.shifts-view-name {
+    min-height: 30px; padding: 0 4px 0 var(--ui-3);
+    border: 0; background: transparent; color: inherit;
+    font-size: 13px; font-weight: 600; overflow-wrap: anywhere;
+}
+.shifts-view-name:focus-visible { outline: 2px solid var(--ops-primary); outline-offset: 2px; border-radius: 999px; }
+.shifts-view-remove {
+    min-height: 30px; padding: 0 var(--ui-2) 0 4px;
+    border: 0; background: transparent; color: inherit;
+    font-size: 14px; line-height: 1;
+}
+.shifts-view-remove:hover { opacity: 0.7; }
+.shifts-view-remove:focus-visible { outline: 2px solid var(--ops-primary); outline-offset: 2px; border-radius: 999px; }
 
 .shifts-custom { min-width: 0; }
 .shifts-custom > summary {

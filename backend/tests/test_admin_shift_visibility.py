@@ -330,14 +330,28 @@ function moallemOf(markup, id) {
 }
 
 /**
+ * The columns actually on the Shifts table, in the order they are read.
+ *
+ * The editor publishes the whole *reading* order - every column the tab can show - and the
+ * checkboxes on it say which of those are switched on. A row's cells line up with the second
+ * list, not the first: that is the whole point of the off-list, and reading the first is how a
+ * helper starts answering with the wrong column the moment one is switched off.
+ */
+function shiftsColumnsOn(markup) {
+    return (markup.match(/<input[^>]*data-column-visible="[a-z]+"[^>]*>/g) || [])
+        .filter((node) => node.indexOf('checked') >= 0)
+        .map((node) => /data-column-visible="([a-z]+)"/.exec(node)[1]);
+}
+
+/**
  * One cell of the Shifts table, found by the column's own key.
  *
  * By key rather than by position in the row: the columns are the administrator's to
- * rearrange, so the row's third cell is only the role until somebody moves it. The key
- * order is the one the table's own editor publishes.
+ * rearrange, and to switch off, so the row's third cell is only the role until somebody moves
+ * it - or drops it for the day.
  */
 function shiftsCell(markup, workerId, key) {
-    const order = ((/data-column-editor data-order="([^"]*)"/.exec(markup) || [])[1] || '').split(',');
+    const order = shiftsColumnsOn(markup);
     const cells = (shiftsRow(markup, workerId).match(/<td[^>]*>[\s\S]*?<\/td>/g) || [])
         .map((cell) => cell.replace(/<[^>]*>/g, '').trim());
     const at = order.indexOf(key);
@@ -442,9 +456,16 @@ const results = {};
 }
 
 // 4. the Shifts tab: the role is a column, and it filters
+//
+// The role is a *secondary* column since the chooser shipped: the clean table opens on
+// date, employee, moallem, site, hours, and a reader who wants to read rows by role switches
+// it on. So this scenario reads the table both ways - as it opens, and with the column on,
+// which is the state everything below is about.
 {
     const shifts = adminEnv();
     await shifts.evaluate("UI.renderAdminTab('Shifts')");
+    const opened = rendered(shifts);
+    shifts.evaluate("UI_MODULES.setShiftsColumnVisible('role', true)");
     const markup = rendered(shifts);
     const byLabel = await searchShifts(shifts, 'administrator');
     const byCode = await searchShifts(shifts, 'admin');
@@ -454,6 +475,9 @@ const results = {};
     const byMoallem = await searchShifts(shifts, 'karim');
     results.shifts = {
         headers: (markup.match(/<th>[\s\S]*?<\/th>/g) || []).map((cell) => cell.replace(/<[^>]*>/g, '').trim()),
+        default_headers: (opened.match(/<th>[\s\S]*?<\/th>/g) || [])
+            .map((cell) => cell.replace(/<[^>]*>/g, '').trim()),
+        default_columns: shiftsColumnsOn(opened),
         admin_cells: cellsOf(shiftsRow(markup, '1000')),
         worker_cells: cellsOf(shiftsRow(markup, '1')),
         moallem_admin: shiftsCell(markup, '1000', 'moallem'),
@@ -521,6 +545,10 @@ def test_the_moallem_is_next_to_the_name_on_both_views(board):
 
     shifts = board["shifts"]
     assert "Moallem" in shifts["headers"], shifts["headers"]
+    assert "Moallem" in shifts["default_headers"], (
+        "the supervisor is one of the clean default's five: it is the moallem's *own* crew"
+        " sheet that must not repeat it"
+    )
     assert shifts["moallem_worker"] == "Ustad Karim"
     assert shifts["moallem_admin"] == seen["unassigned_word"]
     assert shifts["moallem_rows"] == ["1"], (
@@ -546,6 +574,12 @@ def test_the_board_finds_the_administrator_by_the_word_on_it(board):
 @VM
 def test_the_shifts_tab_paints_the_role_and_filters_by_it(board):
     shifts = board["shifts"]
+    # The clean table does not carry it: the role is a secondary column, one tap away.
+    assert shifts["default_columns"] == ["date", "employee", "moallem", "site", "hours"], (
+        shifts["default_columns"]
+    )
+    assert "Role" not in shifts["default_headers"], shifts["default_headers"]
+    # Switched on, it is a column like any other - in the reading position it belongs to.
     assert "Role" in shifts["headers"], shifts["headers"]
     # Column order: date, employee, role, id, site, arrival, hours, awaiting, notes.
     assert shifts["admin_cells"][2] == "Administrator", shifts["admin_cells"]

@@ -42,7 +42,7 @@ import csv
 import io
 import sqlite3
 from datetime import date, datetime, timedelta
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -317,6 +317,43 @@ def _parse_stored_timestamp(value: Any) -> datetime | None:
     if isinstance(value, datetime):
         return value
     text = str(value).strip()
+    # ``fromisoformat`` rather than three ``strptime`` patterns. Measured at 0.38 us against
+    # 5.48 us per call, and this runs once per shift: at 9,900 shifts the three patterns were
+    # 172 ms of the report's 948 ms (docs/PERFORMANCE_AUDIT_2026-10-05.md). ``fromisoformat``
+    # reads both separators in one call. The original three patterns stay below as a fallback
+    # for the shapes it will not read, so this cannot quietly change what is readable.
+    #
+    # The length guard is what keeps a bare ``YYYY-MM-DD`` unreadable, exactly as it was: every
+    # pattern needed at least the minutes. Without it ``fromisoformat`` would answer midnight for
+    # a date whose time nobody wrote - the guess this function exists to refuse.
+    if len(text) < 16:
+        return None
+    for width in (19, 16):
+        head = text[:width]
+        # The fast path only ever answers what the fallback below would also answer, so it
+        # cannot widen the set of readable values: 'T' only ever meant a full stamp (its
+        # pattern carried seconds) and the minutes-only pattern was written with a space.
+        separator = head[10]
+        if separator not in (" ", "T"):
+            continue
+        if width == 16 and separator != " ":
+            # The minutes-only pattern was written with a space, so a 'T' there was
+            # never readable: 'YYYY-MM-DDTHH:MM' must stay None.
+            continue
+        if width == 19 and len(text) < 19:
+            continue
+        try:
+            moment = datetime.fromisoformat(head)
+        except ValueError:
+            continue
+        # An offset or a 'Z' in the slice would make this aware where the original always
+        # answered naive - and an aware value compared against a naive window boundary is a
+        # TypeError deep inside the report. Refuse it here and let the fallback decide.
+        if moment.tzinfo is None:
+            return moment
+    # The original implementation, verbatim. Reached only by values the fast path refuses -
+    # unpadded components, doubled separators, offsets - where reproducing the old answer
+    # matters more than the microseconds it costs.
     for pattern, width in (
         ("%Y-%m-%d %H:%M:%S", 19),
         ("%Y-%m-%dT%H:%M:%S", 19),
@@ -331,9 +368,7 @@ def _parse_stored_timestamp(value: Any) -> datetime | None:
 
 def _arrival_fields(
     clock_in: Any,
-    site_name: Any,
-    sites: Mapping[str, Any],
-    rules: Mapping[str, Any],
+    window: shift_windows.Window,
 ) -> tuple[str | None, int | None, str | None]:
     """``(verdict, minutes_off, clock_in_time)`` for one shift's arrival.
 
@@ -353,6 +388,12 @@ def _arrival_fields(
     window a punch was judged against - the recorded flag on the row is a sentence, not a
     number - so a site that has since changed its hours is judged by the new ones. That is
     also what the supervisor re-reading the sheet is looking at.
+
+    ``window`` is passed in rather than resolved here, because it is a property of the *site*
+    and this function runs once per *shift*: a quarter of a year at 150 workers asked
+    ``effective_window`` 9,900 times to produce twelve distinct answers, which was 153 ms of
+    the report's 948 ms (docs/PERFORMANCE_AUDIT_2026-10-05.md). The caller resolves it once per
+    site and holds the map.
     """
     if clock_in is None or clock_in == "":
         return None, None, None
@@ -360,7 +401,6 @@ def _arrival_fields(
     moment = _parse_stored_timestamp(clock_in)
     if moment is None:
         return None, None, stamp
-    window = shift_windows.effective_window(sites.get(str(site_name or "")), rules)
     arrival = window.arrival(moment)
     return arrival.verdict, int(arrival.minutes_off), stamp
 
@@ -531,6 +571,17 @@ def shift_timesheet_rows(
             # arrival is then judged by the global rule, which is what it was judged by.
             sites = {}
 
+    # The window every arrival below is judged against, resolved once per *site* instead of once
+    # per shift. Both of its inputs - the site's own columns and the global rule - are fixed for
+    # the whole period, so this is the same answer the per-shift call produced: twelve
+    # computations rather than 9,900 for a quarter of a year at 150 workers.
+    windows: dict[str, shift_windows.Window] = {
+        str(name): shift_windows.effective_window(row, rules) for name, row in sites.items()
+    }
+    # What a shift with no site row is graded by: a site that has been deleted, or a punch outside
+    # every geofence. Resolved once, for the same reason as the map above.
+    window_without_site = shift_windows.effective_window(None, rules)
+
     def category_of(site_name: Any) -> str | None:
         """The category name of the site a shift was worked at, or ``None`` when it has none.
 
@@ -551,7 +602,8 @@ def shift_timesheet_rows(
         code = str(record["status_code"] or "")
         awaiting = code in AWAITING_APPROVAL_CODES
         verdict, minutes_off, arrival_time = _arrival_fields(
-            record["clock_in_time"], record["site_name"], sites, rules
+            record["clock_in_time"],
+            windows.get(str(record["site_name"] or ""), window_without_site),
         )
         approved_total += approved
         break_total += float(record["break_hours"] or 0.0)
@@ -1303,6 +1355,13 @@ async def export_report(
     site: str | None = None,
     worker_id: str | None = None,
     limit: int = 5000,
+    # Whether the pulled sheet carries who each worker answers to. A *script's* file, not the
+    # administrator's: the console's own Download reads its columns from the chooser on the
+    # reader's screen, which no script can see, so this feed keeps its own fixed shape - and
+    # the supervisor is an option rather than part of it, which is the four columns this
+    # endpoint has always written. Asking for it adds the column beside the name; nothing
+    # else about the file moves.
+    moallem: bool = Query(default=False),
     current: CurrentUser = Depends(admin_only),
 ):
     """Stream a report as CSV (always) or XLSX (when ``openpyxl`` is installed)."""
@@ -1314,13 +1373,19 @@ async def export_report(
     # saved link or script must not start failing because a label was renamed.
     if kind in ("shifts", "payroll"):
         result = shift_timesheet_rows(start=first, end=second, site=site, worker_id=worker_id)
-        # Four columns, in this order, and the same four the admin console's own Download
-        # CSV button writes: who, their id, where, and how long. No rate, no estimate -
-        # this is a timesheet, and a sheet that carries a money column invites somebody to
-        # add it up and treat the answer as a payroll figure nobody computed.
-        header = ["Employee", "id", "site", "hours"]
+        # Four columns, in this order, and the same four this endpoint has always written:
+        # who, their id, where, and how long - with who they answer to beside the name only
+        # when the caller asks for it, because a feed whose columns follow somebody's screen
+        # is a feed that changes shape on its own. No rate, no estimate: this is a timesheet,
+        # and a sheet that carries a money column invites somebody to add it up and treat the
+        # answer as a payroll figure nobody computed.
+        header = ["Employee", "moallem", "id", "site", "hours"] if moallem else [
+            "Employee", "id", "site", "hours",
+        ]
         rows = [
-            [row["worker_name"] or row["worker_id"], row["worker_id"], row["site_name"], row["hours"]]
+            [row["worker_name"] or row["worker_id"]]
+            + ([row["moallem_name"] or ""] if moallem else [])
+            + [row["worker_id"], row["site_name"], row["hours"]]
             for row in result["rows"]
         ]
         filename = f"shifts_{stamp}"

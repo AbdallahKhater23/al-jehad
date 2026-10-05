@@ -915,6 +915,35 @@ def test_the_arrival_column_never_reaches_the_csv(client):
     assert "arrival" not in response.text.lower()
     assert "late" not in response.text.lower(), "no verdict column in the exported sheet"
 
+def test_the_export_can_carry_the_moallem_for_a_crew_sheet(client):
+    """A script's file keeps its own shape, and asks for the supervisor when it wants one.
+
+    The console's Download reads the columns from the chooser on the reader's screen, which
+    no script can see - so this feed does not follow anybody's table. What it does is offer
+    the one column a crew sheet needs: asked for, it is added beside the name, and nothing
+    else about the file moves. The default is the four columns this endpoint has always
+    written, because a feed that quietly grew a column is a feed whose readers' parsers
+    break on the day of the release.
+    """
+    plain = client.get(
+        "/api/v1/admin/reports/export?kind=shifts&start=2026-01-01&end=2026-12-31",
+        headers=bearer(ADMIN),
+    )
+    crew = client.get(
+        "/api/v1/admin/reports/export?kind=shifts&moallem=true&start=2026-01-01&end=2026-12-31",
+        headers=bearer(ADMIN),
+    )
+    assert plain.status_code == 200 and crew.status_code == 200, crew.text[:200]
+    assert plain.text.splitlines()[0] == "Employee,id,site,hours", "the default, as it was"
+    assert crew.text.splitlines()[0] == "Employee,moallem,id,site,hours"
+    # The same period at one column more: nothing else lost, nothing else added.
+    plain_rows = plain.text.strip().splitlines()[1:]
+    crew_rows = crew.text.strip().splitlines()[1:]
+    assert len(plain_rows) == len(crew_rows) > 0
+    for plain_row, crew_row in zip(plain_rows, crew_rows):
+        cells = crew_row.split(",")
+        assert plain_row == ",".join(cells[:1] + cells[2:]), plain_row
+
 
 def test_attendance_report_uses_the_configured_working_days(client):
     response = client.get("/api/v1/admin/reports/attendance", headers=bearer(ADMIN))
@@ -961,7 +990,7 @@ def test_csv_exports_stream_real_rows(client):
     assert "text/csv" in response.headers["content-type"]
     assert "attachment" in response.headers["content-disposition"]
     lines = response.text.strip().splitlines()
-    # Exactly the four columns the console's own Download CSV writes, in the same order.
+    # Exactly the four columns this endpoint has always written, in the same order.
     assert lines[0] == "Employee,id,site,hours"
     assert "hourly_rate" not in lines[0] and "gross_estimate" not in lines[0], (
         "a timesheet file has no money column to add up"

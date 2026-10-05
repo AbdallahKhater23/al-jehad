@@ -48,7 +48,8 @@ const TRANSLATIONS = {
         "shiftsArrivalLate": "Late {minutes} min",
         "shiftsArrivalEarly": "Early {minutes} min",
         "shiftsArrivalUnknown": "No clock-in",
-        "shiftsApprovedOnly": "One row per shift. Hours an admin has approved are counted in Approved hours; anything still waiting for a decision is marked Awaiting approval and left out of that figure.",
+        "shiftsApprovedOnly": "One row per shift. Hours an admin has approved are counted in Approved hours; anything still waiting for a decision is left out of that figure.",
+        "shiftsSheetNote": "One row per shift. The total counts every row above, including the hours of a shift that is still waiting for a decision.",
         "credentials": "Credentials",
 
         "notes": "Notes",

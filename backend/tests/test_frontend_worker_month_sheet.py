@@ -242,6 +242,10 @@ const results = {};
             title: printed.title || null,
             printing: printed.printing === true,
             sheet: sheet,
+            // This sheet's own sentence, and the self-hours one it must not be printing: the
+            // note belongs to the report whose columns it describes.
+            own_note: env.evaluate("I18n.__('shiftsSheetNote')"),
+            self_hours_note: env.evaluate("I18n.__('shiftsApprovedOnly')"),
             sheet_title: sheetTitle(sheet),
             meta: metaLines(sheet),
             headers: sheetHeaders(sheet),
@@ -495,25 +499,34 @@ def test_the_sheet_is_that_worker_s_month_and_nobody_else_s(results):
 def test_the_sheet_says_whose_it_is_once_and_the_identity_is_not_a_column(results):
     """Whose month it is belongs in the header, not repeated down every row.
 
-    The employee, the role, the id and the moallem are columns of the *tab* - four of its
-    eleven - and on a sheet about one person they would carry the same four facts on every
-    line. The first three are said once, above the table, and the columns that remain keep
-    the administrator's own order.
+    The employee, the role, the id and the moallem are columns of the *tab* - four of them -
+    and on a sheet about one person they would carry the same four facts on every line. All
+    four are said once, above the table, and the columns that remain keep the administrator's
+    own order and the administrator's own choices.
 
-    The seven that remain are the tab's own default order with those three taken out, which is
-    why *Category* is here: it sits between the site and the arrival on the tab, and a sheet
-    that dropped it would answer "which warehouse was this?" with a site name and no class.
+    So this sheet is the tab's *visible* columns with those four taken out: on a clean table
+    that is the day, the site and the hours, and a reader who switches the arrival on gets it
+    here too - the paper and the table are the same view of the same shifts.
     """
     month = results["month"]
     assert month["meta"][0] == "Seed Lead · Moallem · id 600", month["meta"]
     assert month["sheet"].count("Seed Lead") == 1, "the name is on the sheet once"
     assert month["headers"] == [
-        "Date", "Site", "Category", "Arrival", "Hours", "Awaiting approval", "Open notes"
-    ], "the tab's own columns, without the three that say whose rows these are"
+        "Date", "Site", "Hours"
+    ], "the tab's visible columns, without the four that say whose rows these are"
     assert "2026-08-01" in month["meta"][1] and "2026-08-31" in month["meta"][1], (
         f"the period line has to name the month that was requested: {month['meta'][1]!r}"
     )
     assert "data-print-worker" not in month["sheet"], "a sheet must carry no controls"
+
+
+def test_the_sheet_states_its_own_note(results):
+    """A sheet on paper says who it is and what it holds - including its own foot note."""
+    month = results["month"]
+    assert month["own_note"] in month["sheet"], month["sheet"][-300:]
+    assert month["self_hours_note"] not in month["sheet"], (
+        "the month sheet is printing the self-hours sentence"
+    )
 
 
 def test_the_sheet_totals_that_worker_s_month_and_keeps_the_waiting_hours_out(results):
@@ -528,11 +541,10 @@ def test_the_sheet_totals_that_worker_s_month_and_keeps_the_waiting_hours_out(re
     assert "Hours awaiting approval: 7.5 h" in totals, totals
     assert "2 Shifts worked" in totals, totals
     assert "0.5 h Unpaid break" in totals, totals
-    # The sixth column of the sheet's own seven: Date, Site, Category, Arrival, Hours,
-    # Awaiting, Notes. Read by index on purpose - the point is that the column is in that
-    # position, not that the word appears somewhere on the row.
-    awaiting = [row for row in results["month"]["rows"] if row[5] == "Awaiting approval"]
-    assert len(awaiting) == 1, f"the one undecided shift has to say so: {results['month']['rows']}"
+    # The undecided shift is no longer a column of this sheet: the waiting *hours* are a
+    # figure in the line above the table, and the row-by-row decision belongs to the shifts
+    # tab. Every line carries the same three cells the table is showing.
+    assert all(len(row) == 3 for row in results["month"]["rows"]), results["month"]["rows"]
 
 
 def test_the_dialog_offers_a_name_that_says_who_and_which_month(results):

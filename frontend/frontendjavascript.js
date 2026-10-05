@@ -653,8 +653,9 @@ const PrintReport = {
      * theirs - and the frame around it has to be identical, because it is the same piece
      * of paper to whoever is holding it. Hand-built twice, the frame is how one screen
      * ends up printing a sheet that says something subtly different about the same rule
-     * (the note at the foot, the arrow between two dates, the \"no rows\" sentence), and
-     * how a class the stylesheet knows about ends up on one sheet and not the other.
+     * (the arrow between two dates, the \"no rows\" sentence), and how a class the stylesheet
+     * knows about ends up on one sheet and not the other. The note at the foot is *not* part
+     * of it: that sentence is about what one report prints, so it is the report's own.
      *
      * ``title``, the ``meta`` lines, the ``columns`` and ``empty`` are plain text and are
      * escaped here. Each cell of ``rows`` is the opposite on purpose: HTML the caller has
@@ -672,15 +673,18 @@ const PrintReport = {
                     <tbody>${rows.map((cells) => `<tr>${cells.map((cell) => `<td>${cell}</td>`).join('')}</tr>`).join('')}</tbody>
                </table>`
             : (empty ? `<p class="print-sheet-empty">${UI.escapeHtml(empty)}</p>` : '');
-        // The note is not a parameter of the report: it is the rule both reports are read
-        // under - only approved hours count - and a sheet that stated it differently would
-        // be describing different arithmetic. The company's own name is the same kind of
-        // thing, and is drawn by the same rule: on every sheet, because a timesheet handed
-        // to payroll belongs to somebody.
-        const foot = note || I18n.__('shiftsApprovedOnly');
+        // The note at the foot is the *sheet's* own sentence about its own figures, and
+        // this frame has no default for it on purpose. It used to: a sheet that stated none
+        // inherited the console's, and when the console's Shifts sheet stopped printing the
+        // column that sentence named, the paper went on describing a marking that was not on
+        // it any more. Only the sheet whose columns change can keep such a sentence true, so
+        // every sheet states its own - beside the columns it describes - and a frame that
+        // invented one would be the same bug waiting for the next column. The company's own
+        // name is still drawn here, because on every sheet it is the same answer.
+        const foot = String(note === null || note === undefined ? '' : note);
         return `${this.brandHtml()}<p class="print-sheet-title">${UI.escapeHtml(title)}</p>${lines}${body}
             ${totals ? `<p class="print-sheet-totals">${totals}</p>` : ''}
-            <p class="print-sheet-note">${UI.escapeHtml(foot)}</p>`;
+            ${foot ? `<p class="print-sheet-note">${UI.escapeHtml(foot)}</p>` : ''}`;
     },
 
     /**

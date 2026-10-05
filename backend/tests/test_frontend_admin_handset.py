@@ -308,6 +308,10 @@ const results = {};
         title: printed.title || null,
         printing: printed.printing === true,
         sheet: printed.sheet || '',
+        // This sheet's own sentence, and the console sheet's - which is about another report's
+        // figures and must not be printed here.
+        own_note: env.evaluate("I18n.__('shiftsApprovedOnly')"),
+        console_note: env.evaluate("I18n.__('shiftsSheetNote')"),
         files_written: env.blobs.length - beforePrint.files,
         requests_added: env.requests.length - beforePrint.requests,
         period: REPORT.period
@@ -696,6 +700,15 @@ def test_the_download_is_the_report_on_screen(results):
     assert lines[1] == "2026-09-12,New Capital Zone B,07:12 late 12 min,0.50,9.50,,Awaiting approval", lines[1]
     assert lines[2] == "2026-09-10,Downtown Tower A,04:55 on time,0.00,8.00,8.00,Approved by Admin", lines[2]
     assert download["filename"] == "my_hours_2026-09-01_2026-09-19.csv", download["filename"]
+
+
+def test_the_paper_states_this_sheet_s_own_note(results):
+    """The foot of this sheet is the sentence about *its* figures, not the console's."""
+    printed = results["print"]
+    assert printed["own_note"] in printed["sheet"], printed["sheet"][-300:]
+    assert printed["console_note"] not in printed["sheet"], (
+        "the self-hours sheet is printing the console sheet's note"
+    )
 
 
 def test_the_pdf_button_prints_the_same_rows_and_totals(results):

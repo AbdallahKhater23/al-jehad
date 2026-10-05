@@ -975,6 +975,21 @@ const WORKER_MODULES = {
         ];
     },
 
+    /**
+     * The sentence at the foot of the self-hours sheet.
+     *
+     * Beside the columns it describes, for the reason the console keeps its own note beside
+     * its own columns (see ``shiftsSheetNote``): the note says what the sheet above it holds,
+     * so the two are read and changed together. This is the sheet that prints an approved
+     * figure and a waiting figure side by side, which is what the sentence is about - and it
+     * is deliberately *this* sheet's sentence rather than a default borrowed from the
+     * console, which is how the console's own paper ended up describing a column it no
+     * longer printed.
+     */
+    myHoursSheetNote() {
+        return I18n.__('shiftsApprovedOnly');
+    },
+
     /** What an account that has never chosen gets: the file this screen has always written. */
     myHoursDefaultColumns() {
         return ['date', 'site', 'arrival', 'break', 'hours', 'approved', 'status'];
@@ -1192,7 +1207,8 @@ const WORKER_MODULES = {
             meta: [who.join(' · '), PrintReport.periodLine(period)],
             columns: defs.map((def) => I18n.__(def.key)),
             rows: cells,
-            totals: this.escapeHtml(totalsLine)
+            totals: this.escapeHtml(totalsLine),
+            note: this.myHoursSheetNote()
         });
     },
 

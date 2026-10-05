@@ -25,18 +25,29 @@ behaviour the screen depends on:
    ``#payroll=`` keeps working, because those links are already out in the world;
 4. one row is one shift, with its own date, site and hours, and a shift waiting for
    an administrator is marked as such and kept out of ``approved_hours``;
-4b. the columns are the administrator's to rearrange - the default order is
-   date, employee, role, id, site, arrival, hours, awaiting approval, open notes -
-   the choice is remembered in ``localStorage``, and a stored order that is stale or
-   junk cannot take the table down;
-5. the CSV button writes exactly the rows on screen - same set, same order as the
-   table, filtered or not - in the four columns ``Employee,id,site,hours`` and in
-   that order whatever the screen's own column order has been changed to;
+4b. the columns are the administrator's to choose and to rearrange. The clean default is
+   five of them - date, employee, moallem, site, hours - the chooser offers the secondary
+   ones (the role, the id, the site's kind, the arrival, the notes count) and puts the
+   defaults back on a reset, the choice is remembered in ``localStorage``, and a stored
+   choice that is stale, junk, or in the older bare-array shape cannot take the table down;
+4c. a set of columns worth keeping is saved under a name - Payroll, a crew sheet - and comes
+   back in one press from the toolbar, which is where the act a reader makes dozens of times
+   a day belongs. A hand-edit lets the pressed chip go rather than leaving it claiming the
+   table is a view it is not; saving a name that is already taken updates that view and keeps
+   the spelling it was given; a blank name is refused with a sentence; and a reset puts the
+   columns back on the default without throwing the saved names away;
+5. the CSV button writes exactly the rows on screen, in exactly the columns on screen, in
+   the order they are read there - the table, the paper and the file are one view, so a
+   payroll table (the supervisor switched off in the chooser) downloads the payroll file;
 5b. the same button, with the format set to PDF, prints the same report through the
    browser's print dialog - the rows on screen, the columns the administrator
    arranged, the period in the file name the dialog offers - and puts the console
    back when the dialog closes. Nothing is sent to the server to make a PDF, and no
    PDF library is involved: the dialog writes the file.
+5c. the phone's card layout, which has no header row to press, carries the same choice
+   drawn twice - a column picker and a pair of direction buttons - both writing the one
+   ``State.shiftsSort`` the headers write, so one period cannot be read two ways; and
+   that control is drawn on a phone only, where the headers are not there to sort by;
 
 The search box has its own contract (name / worker id / site / day): a day is an
 ordinary filter here, because a timesheet row *has* a date; see the ``3g`` block.
@@ -55,6 +66,7 @@ Node is optional; without it these skip rather than fail.
 
 from __future__ import annotations
 
+import json
 import re
 
 import pytest
@@ -468,12 +480,36 @@ function adminEnv(options) {
     return env;
 }
 
-const DEFAULT_COLUMNS = 'date,employee,role,moallem,id,site,category,arrival,hours,awaiting,notes';
+// The columns the tab opens with: the clean default the chooser ships and puts back on a
+// reset. Five of them, and no more - what is left off is what somebody asks occasionally
+// rather than every morning, and each of those is one tap away in the chooser.
+const DEFAULT_COLUMNS = 'date,employee,moallem,site,hours';
 // The labels those columns are painted with, in English (the harness boots in the default
 // language). Written out here so a renamed translation cannot pass unnoticed. The moallem
-// column sits beside the role because it answers the same kind of question the role does -
+// column sits beside the name because it answers the same kind of question the name does -
 // whose row this is - and it is painted with the role's own word (``roleMoallem``).
-const DEFAULT_HEADERS = ['Date', 'Employee', 'Role', 'Moallem', 'User ID', 'Site', 'Category', 'Arrival', 'Hours', 'Awaiting approval', 'Open notes'];
+const DEFAULT_HEADERS = ['Date', 'Employee', 'Moallem', 'Site', 'Hours'];
+// Every column this tab can show, in the registry's reading order: the default five plus the
+// secondary ones the chooser offers - the role, the id, the site's kind, the arrival and the
+// count of open notes.
+const ALL_COLUMNS = ['date', 'employee', 'role', 'moallem', 'id', 'site', 'category', 'arrival', 'hours', 'notes'];
+// The secondary columns the shipped default leaves switched off.
+const DEFAULT_HIDDEN = ['role', 'id', 'category', 'arrival', 'notes'];
+// Every column but the notes count. The count is the one cell whose *tone* is part of what it
+// says - a nought is drawn as a gap and written as nothing - so a file can be compared with
+// the screen cell for cell on these nine and not on that tenth.
+const READABLE_COLUMNS = ['date', 'employee', 'role', 'moallem', 'id', 'site', 'category', 'arrival', 'hours'];
+
+// Show an explicit set of columns, through the same store the chooser writes, for the
+// scenarios whose subject is a *secondary* column - an arrival, a role, a site's kind - rather
+// than the chooser itself. Those read the full set, so a column's own behaviour is pinned on a
+// table that actually shows it; the chooser's own scenarios (4a to 4h) and the export ones
+// (5, 5b) stay on the five the tab opens with, because that is what they are about.
+function showColumns(env, keys) {
+    const all = env.evaluate('UI_MODULES.allShiftsColumns()');
+    const store = { v: 2, order: all, hidden: all.filter((key) => keys.indexOf(key) < 0) };
+    env.evaluate(`localStorage.setItem('shiftsColumns', ${JSON.stringify(JSON.stringify(store))})`);
+}
 
 // The scenarios. ``results`` is printed by the epilogue in ``frontend_vm``.
 const results = {};
@@ -481,6 +517,8 @@ const results = {};
     // 1. the tab opens on the current month and asks the server for that window
     {
         const env = adminEnv();
+        // The full set, because the arrival test reads its cell off this scenario's rows.
+        showColumns(env, ALL_COLUMNS);
         await env.evaluate("UI.renderAdminTab('Shifts')");
         const html = env.evaluate("document.getElementById('adminContent').innerHTML");
         results.initial = Object.assign(cardValues(html), {
@@ -632,6 +670,10 @@ const results = {};
     // 3g. the search box: name, id, site, several terms - and a day
     {
         const env = adminEnv();
+        // The full set: this scenario reads the role and the arrival off the rows it filtered
+        // to, and a filter whose value cannot be read on the row it selected is a filter the
+        // reader has to take on trust.
+        showColumns(env, ALL_COLUMNS);
         await env.evaluate("UI.renderAdminTab('Shifts')");
         const requestsBefore = env.requests.length;
         const search = async (query) => {
@@ -696,6 +738,8 @@ const results = {};
     // 3h. a number in the box is somebody's id, not a digit of the day they worked
     {
         const env = adminEnv();
+        // The id column has to be on the table for "the row is that worker's" to be readable.
+        showColumns(env, ALL_COLUMNS);
         await env.evaluate("UI_MODULES.setShiftsRange('2003-01-01', '2003-01-31')");
         await env.evaluate("UI.renderAdminTab('Shifts')");
         const read = () => cardValues(env.evaluate("document.getElementById('adminContent').innerHTML"));
@@ -719,13 +763,23 @@ const results = {};
         };
     }
 
-    // 4a. the columns the tab opens with, in the order it was asked for
+    // 4a. the columns the tab opens with: the clean default, and the reading order behind it
     {
         const env = adminEnv();
         await env.evaluate("UI.renderAdminTab('Shifts')");
         const html = env.evaluate("document.getElementById('adminContent').innerHTML");
         results.columns_default = Object.assign(cardValues(html), {
             columns: env.evaluate("UI_MODULES.shiftsColumns().join(',')"),
+            order: env.evaluate("UI_MODULES.shiftsColumnOrder().join(',')"),
+            hidden: env.evaluate("UI_MODULES.hiddenShiftsColumns().join(',')"),
+            // Which columns the chooser's own checkboxes are ticked for, read off the control
+            // the administrator reads rather than only off the module's answer.
+            checked: env.evaluate(`(function () {
+                const html = document.getElementById('adminContent').innerHTML;
+                return (html.match(/<input[^>]*data-column-visible="[a-z]+"[^>]*>/g) || [])
+                    .filter((node) => node.indexOf('checked') >= 0)
+                    .map((node) => /data-column-visible="([a-z]+)"/.exec(node)[1]);
+            })()`),
             stored: env.evaluate("localStorage.getItem('shiftsColumns')")
         });
     }
@@ -736,9 +790,13 @@ const results = {};
         await env.evaluate("UI.renderAdminTab('Shifts')");
         const steps = env.evaluate(`(function () {
             const seen = [];
-            // All the way to the front, whatever the table is made of: one press, one swap.
-            for (let i = 0; i < UI_MODULES.shiftsColumns().length - 1; i += 1) {
-                UI_MODULES.moveShiftsColumn('awaiting', -1);
+            // All the way to the front of the *reading* order, the columns the table is not
+            // showing included, because that is the list a step walks. One press, one swap -
+            // and the first step here crosses a hidden column, which leaves the visible table
+            // exactly as it was. That is worth pinning rather than stepping around.
+            const steps = UI_MODULES.shiftsColumnOrder().indexOf('hours');
+            for (let i = 0; i < steps; i += 1) {
+                UI_MODULES.moveShiftsColumn('hours', -1);
                 seen.push(UI_MODULES.shiftsColumns().join(','));
             }
             return seen;
@@ -747,6 +805,10 @@ const results = {};
         results.columns_moved = Object.assign(cardValues(html), {
             steps: steps,
             stored: env.evaluate("localStorage.getItem('shiftsColumns')"),
+            hidden: env.evaluate("UI_MODULES.hiddenShiftsColumns().join(',')"),
+            // The columns on the table, which is not the same list as the reading order the
+            // panel lists: that is the whole point of the off-list.
+            columns: env.evaluate("UI_MODULES.shiftsColumns().join(',')"),
             // The whole tab is repainted, so the figures have to survive the reorder. (The
             // period comes from the module, not ``State``: a first render is on the default
             // window, which is chosen by ``shiftsRange()`` and never written to State.)
@@ -758,24 +820,43 @@ const results = {};
     {
         const env = adminEnv();
         await env.evaluate("UI.renderAdminTab('Shifts')");
-        // Two steps towards the front of the table, which is where that tab is read from.
-        await env.evaluate("UI_MODULES.moveShiftsColumn('notes', -1)");
-        await env.evaluate("UI_MODULES.moveShiftsColumn('notes', -1)");
+        // Three steps towards the front of the reading order - the first two cross the
+        // hidden arrival and the hidden category, the third crosses the visible site, so this
+        // is a step that really does rearrange the table it is remembered for.
+        await env.evaluate("UI_MODULES.moveShiftsColumn('hours', -1)");
+        await env.evaluate("UI_MODULES.moveShiftsColumn('hours', -1)");
+        await env.evaluate("UI_MODULES.moveShiftsColumn('hours', -1)");
         const before = env.evaluate("UI_MODULES.shiftsColumns().join(',')");
         await env.evaluate("UI.renderAdminTab('Shifts')");
         const htmlAfter = env.evaluate("document.getElementById('adminContent').innerHTML");
         results.columns_persist = Object.assign(cardValues(htmlAfter), {
             before: before,
+            hidden: env.evaluate("UI_MODULES.hiddenShiftsColumns().join(',')"),
+            columns: env.evaluate("UI_MODULES.shiftsColumns().join(',')"),
             stored: env.evaluate("localStorage.getItem('shiftsColumns')")
         });
     }
 
-    // 4d. a stored order that is stale or junk must not take the table down
+    // 4d. a stored choice that is stale or junk must not take the table down - and the older
+    //     shape of it is read as what it was, so a browser that chose before this shipped does
+    //     not find its table changed under it
     {
-        const stale = adminEnv();
-        stale.evaluate(`localStorage.setItem('shiftsColumns', JSON.stringify(['notes', 'banana', 'notes', 'date']))`);
-        await stale.evaluate("UI.renderAdminTab('Shifts')");
-        const staleHtml = stale.evaluate("document.getElementById('adminContent').innerHTML");
+        // v1: a bare array. Before a column could be switched off the array *was* the table, so
+        // every column it names is shown and every column it does not is one added since.
+        const legacy = adminEnv();
+        legacy.evaluate(`localStorage.setItem('shiftsColumns', JSON.stringify(['hours', 'banana', 'hours', 'date']))`);
+        await legacy.evaluate("UI.renderAdminTab('Shifts')");
+        const legacyHtml = legacy.evaluate("document.getElementById('adminContent').innerHTML");
+
+        // v2: the reading order and the columns switched off. Read exactly as it says - the
+        // columns it names as off are off, and the ones it does not name are on, which is how
+        // the next release's new column arrives without a migration.
+        const chosen = adminEnv();
+        chosen.evaluate(`localStorage.setItem('shiftsColumns', JSON.stringify({
+            v: 2, order: ['hours', 'not_a_column', 'date'], hidden: ['hours']
+        }))`);
+        await chosen.evaluate("UI.renderAdminTab('Shifts')");
+        const chosenHtml = chosen.evaluate("document.getElementById('adminContent').innerHTML");
 
         const junk = adminEnv();
         junk.evaluate("localStorage.setItem('shiftsColumns', '{not json')");
@@ -787,11 +868,18 @@ const results = {};
         await wrongType.evaluate("UI.renderAdminTab('Shifts')");
 
         results.columns_repair = {
-            stale: Object.assign(cardValues(staleHtml), {
-                order: stale.evaluate("UI_MODULES.shiftsColumns().join(',')")
+            legacy: Object.assign(cardValues(legacyHtml), {
+                order: legacy.evaluate("UI_MODULES.shiftsColumnOrder().join(',')"),
+                columns: legacy.evaluate("UI_MODULES.shiftsColumns().join(',')"),
+                hidden: legacy.evaluate("UI_MODULES.hiddenShiftsColumns().join(',')")
+            }),
+            chosen: Object.assign(cardValues(chosenHtml), {
+                order: chosen.evaluate("UI_MODULES.shiftsColumnOrder().join(',')"),
+                columns: chosen.evaluate("UI_MODULES.shiftsColumns().join(',')"),
+                hidden: chosen.evaluate("UI_MODULES.hiddenShiftsColumns().join(',')")
             }),
             junk: Object.assign(cardValues(junkHtml), {
-                order: junk.evaluate("UI_MODULES.shiftsColumns().join(',')")
+                order: junk.evaluate("UI_MODULES.shiftsColumnOrder().join(',')")
             }),
             wrong_type: wrongType.evaluate("UI_MODULES.shiftsColumns().join(',')")
         };
@@ -810,13 +898,16 @@ const results = {};
         };
         const edges = {
             first_cannot_go_earlier: /<button[^>]*data-move-earlier[^>]*disabled/.test(chip('date')),
+            // The last column in the *reading* order, which is the order the panel lists: the
+            // notes count, not the hours - the table shows five columns and the list ten.
             last_cannot_go_later: /<button[^>]*data-move-later[^>]*disabled/.test(chip('notes'))
         };
-        await env.evaluate("UI_MODULES.moveShiftsColumn('notes', -1)");
+        await env.evaluate("UI_MODULES.moveShiftsColumn('hours', -1)");
         const beforeReset = env.evaluate("UI_MODULES.shiftsColumns().join(',')");
         await env.evaluate("UI_MODULES.resetShiftsColumns()");
         const afterHtml = env.evaluate("document.getElementById('adminContent').innerHTML");
         results.columns_reset = Object.assign(cardValues(afterHtml), {
+            columns: env.evaluate("UI_MODULES.shiftsColumns().join(',')"),
             at_start: atStart,
             edges: edges,
             before_reset: beforeReset,
@@ -827,6 +918,8 @@ const results = {};
     // 4f. a shift whose clock-in is not on file: unknown, not punctual
     {
         const env = adminEnv();
+        // The arrival column is not on the clean table: this scenario is about that column.
+        showColumns(env, ALL_COLUMNS);
         await env.evaluate("UI.renderAdminTab('Shifts')");
         // A force-clock-out, or a shift closed with no arrival recorded: the row is real,
         // the arrival is not. The server sends null for all three fields.
@@ -853,33 +946,350 @@ const results = {};
         });
     }
 
+    // 4g. the chooser: one checkbox per column, the last one protected, nothing to save -
+    //     and every reader of the tab following the one answer
+    {
+        const env = adminEnv();
+        await env.evaluate("UI.renderAdminTab('Shifts')");
+        const read = () => Object.assign(
+            cardValues(env.evaluate("document.getElementById('adminContent').innerHTML")),
+            { visible: env.evaluate("UI_MODULES.shiftsColumns().join(',')") }
+        );
+        const markup = () => env.evaluate("document.getElementById('adminContent').innerHTML");
+        const sheetHeaders = (sheet) => (sheet.match(/<th[^>]*>[\s\S]*?<\/th>/g) || [])
+            .map((cell) => cell.replace(/<[^>]*>/g, '').trim());
+        const sheetRows = (sheet) => (sheet.match(/<tr>/g) || []).length;
+        const lastSheet = () => (env.printed[env.printed.length - 1] || {}).sheet || '';
+        // The chooser's checkbox, driven through the tab's *own* delegated change listener
+        // rather than by calling the setter: what is pinned is that the control reaches the
+        // state. The stand-in node is because this environment reads no attributes off a
+        // string - the route's own condition and the value it reads are what is exercised.
+        const setVisible = (key, visible) => env.evaluate(`(function () {
+            document.getElementById('adminContent').onchange({
+                target: { getAttribute: (name) => (name === 'data-column-visible' ? ${JSON.stringify(key)} : null),
+                          checked: ${visible} }
+            });
+        })()`);
+
+        const shipped = read();
+        // The supervisor, switched off: a payroll table.
+        setVisible('moallem', false);
+        const payroll = read();
+        env.evaluate('UI_MODULES.downloadShiftsCsv()');
+        const payrollCsv = await env.lastBlobText();
+        env.evaluate("document.getElementById('shiftsExportFormat').value = 'pdf'");
+        env.evaluate('UI_MODULES.downloadShiftsReport()');
+        const payrollSheet = lastSheet();
+        env.fireWindowEvent('afterprint');
+        // ...and back on, by the same control. This is the table's choice rather than the
+        // download's, so switching it back restores every reader of the tab at once.
+        setVisible('moallem', true);
+        const crew = read();
+        env.evaluate("document.getElementById('shiftsExportFormat').value = 'csv'");
+        env.evaluate('UI_MODULES.downloadShiftsCsv()');
+        const crewCsv = await env.lastBlobText();
+        env.evaluate("document.getElementById('shiftsExportFormat').value = 'pdf'");
+        env.evaluate('UI_MODULES.downloadShiftsReport()');
+        const crewSheet = lastSheet();
+        env.fireWindowEvent('afterprint');
+        // The id, switched on: a column that is off by default comes back where it belongs
+        // rather than at the end of the table.
+        setVisible('id', true);
+        const withId = read();
+        const storedWithId = env.evaluate("localStorage.getItem('shiftsColumns')");
+        // Every column but one is switched off, and then the last one is asked to go too.
+        env.evaluate(`(function () {
+            UI_MODULES.shiftsColumns().slice(0, -1)
+                .forEach((key) => UI_MODULES.setShiftsColumnVisible(key, false));
+        })()`);
+        const oneLeft = read();
+        const lastMarkup = markup();
+        const refused = env.evaluate(`(function () {
+            UI_MODULES.setShiftsColumnVisible(UI_MODULES.shiftsColumns()[0], false);
+            return UI_MODULES.shiftsColumns().join(',');
+        })()`);
+        const afterRefusal = read();
+
+        results.chooser = {
+            shipped: shipped,
+            payroll: payroll,
+            crew: crew,
+            with_id: withId,
+            one_left: oneLeft,
+            one_left_markup: lastMarkup,
+            refused: refused,
+            after_refusal: afterRefusal,
+            payroll_csv: payrollCsv,
+            crew_csv: crewCsv,
+            payroll_headers: sheetHeaders(payrollSheet),
+            crew_headers: sheetHeaders(crewSheet),
+            payroll_rows: sheetRows(payrollSheet),
+            crew_rows: sheetRows(crewSheet),
+            payroll_sheet: payrollSheet,
+            crew_sheet: crewSheet,
+            stored_with_id: storedWithId,
+            stored: env.evaluate("localStorage.getItem('shiftsColumns')")
+        };
+    }
+
+    // 4h. the secondary columns, switched on: the cells a clean table is not showing
+    {
+        const env = adminEnv();
+        await env.evaluate("UI.renderAdminTab('Shifts')");
+        env.evaluate(`(function () {
+            ['role', 'id', 'category', 'arrival', 'notes'].forEach(
+                (key) => UI_MODULES.setShiftsColumnVisible(key, true));
+        })()`);
+        const html = env.evaluate("document.getElementById('adminContent').innerHTML");
+        env.evaluate('UI_MODULES.downloadShiftsCsv()');
+        const csv = await env.lastBlobText();
+        results.columns_shown = Object.assign(cardValues(html), {
+            csv: csv,
+            hidden: env.evaluate("UI_MODULES.hiddenShiftsColumns().join(',')")
+        });
+    }
+
+    // 4i. the saved views: the columns in front of the reader, under a name, one press back
+    {
+        const env = adminEnv();
+        await env.evaluate("UI.renderAdminTab('Shifts')");
+        const markup = () => env.evaluate("document.getElementById('adminContent').innerHTML");
+        const visible = () => env.evaluate("UI_MODULES.shiftsColumns().join(',')");
+        const hidden = () => env.evaluate("UI_MODULES.hiddenShiftsColumns().join(',')");
+        const names = () => env.evaluate("UI_MODULES.shiftsViews().map((one) => one.name)");
+        const active = () => env.evaluate("UI_MODULES.shiftsViewsActive()");
+        const stored = () => JSON.parse(env.evaluate("localStorage.getItem('shiftsColumns')") || 'null');
+        // Every chip the toolbar band and the panel's list draw, with whether it is pressed.
+        // The two are one state rendered twice, so a suite can pin that they agree - a chip
+        // pressed on the toolbar and unpressed in the panel is one screen telling two stories.
+        const chips = (html) => (html.match(/data-view-apply="[^"]*"\s{0,60}aria-pressed="(?:true|false)"/g) || [])
+            .map((found) => ({
+                name: (found.match(/data-view-apply="([^"]*)"/) || [])[1],
+                pressed: found.indexOf('"true"') >= 0
+            }));
+        const pressed = (html) => chips(html).filter((one) => one.pressed).map((one) => one.name);
+        // The controls are driven through the tab's *own* delegated listeners rather than by
+        // calling the methods, so what is pinned is that the control reaches the state. The
+        // stand-in nodes are because this environment reads no attributes off a string: the
+        // route's own condition, and the value it reads, are what is exercised.
+        const press = (name) => env.evaluate(`(function () {
+            document.getElementById('adminContent').onclick({
+                target: { closest: (selector) => (selector === '[data-view-apply]'
+                    ? { dataset: { viewApply: ${JSON.stringify(name)} } } : null) }
+            });
+        })()`);
+        const forget = (name) => env.evaluate(`(function () {
+            document.getElementById('adminContent').onclick({
+                target: { closest: (selector) => (selector === '[data-view-remove]'
+                    ? { dataset: { viewRemove: ${JSON.stringify(name)} } } : null) }
+            });
+        })()`);
+        // Saving goes through the form's own submit handler, so the field, Enter and the
+        // button are one path - and the field's own ``required`` is the browser's rule, with
+        // this tab's sentence behind it.
+        const save = (name) => env.evaluate(`(function () {
+            document.getElementById('shiftsViewName').value = ${JSON.stringify(name)};
+            return document.getElementById('shiftsViewForm').onsubmit({ preventDefault: () => {} });
+        })()`);
+        // The chooser's own checkbox: the hand-edit that has to let a pressed chip go.
+        const setVisible = (key, on) => env.evaluate(`(function () {
+            document.getElementById('adminContent').onchange({
+                target: { getAttribute: (name) => (name === 'data-column-visible' ? ${JSON.stringify(key)} : null),
+                          checked: ${on} }
+            });
+        })()`);
+
+        const band = (html) => ({
+            band: html.indexOf('shifts-views') >= 0,
+            apply: html.indexOf('data-view-apply') >= 0,
+            list: html.indexOf('data-view-list') >= 0,
+            form: html.indexOf('id="shiftsViewForm"') >= 0
+        });
+
+        const emptyBand = band(markup());
+        // The supervisor off, and then saved under a name: a payroll view.
+        await setVisible('moallem', false);
+        const payrollColumns = visible();
+        await save('Payroll');
+        const saved = Object.assign(band(markup()), {
+            html: markup(), names: names(), active: active(), pressed: pressed(markup()),
+            stored: stored(), visible: visible()
+        });
+        env.evaluate('UI_MODULES.downloadShiftsCsv()');
+        const savedCsv = await env.lastBlobText();
+        // A hand-edit is not that view any more: the chip has to let go, or it is one press
+        // away from putting back the columns the reader has just changed.
+        await setVisible('category', true);
+        const edited = { active: active(), pressed: pressed(markup()), visible: visible() };
+        // ...and one press puts the whole choice back, the arrangement included.
+        await press('Payroll');
+        const reapplied = { active: active(), pressed: pressed(markup()), visible: visible(), hidden: hidden() };
+        // A second view, so switching between the two a reader works in is what is exercised.
+        await setVisible('moallem', true);
+        await save('Crew sheet');
+        const second = { names: names(), active: active(), chips: chips(markup()), visible: visible() };
+        await press('Payroll');
+        const switched = { active: active(), pressed: pressed(markup()), visible: visible(), chips: chips(markup()) };
+        // A name that is already taken updates that view rather than making a second chip that
+        // differs only in capitalisation - and keeps the spelling the reader first chose, so
+        // the chip they have been pressing stays the chip they press.
+        await setVisible('id', true);
+        await save('payroll');
+        const caseUpdate = {
+            names: names(), active: active(), pressed: pressed(markup()), visible: visible(),
+            stored: stored(), toasts: toasts(env)
+        };
+        // A name is one line: a run of spaces and a tab is stored as one readable name,
+        // because that is what a chip can show.
+        await save('  Night \t crew  ');
+        const collapsed = { names: names(), active: active(), chips: chips(markup()) };
+        // A name that is not a name is refused with a sentence, not saved as a blank chip.
+        await save('   ');
+        const unnamed = { names: names(), active: active(), toasts: toasts(env) };
+        // A name is text, never markup: it goes into an attribute and onto a chip, and both
+        // are escaped where they are written.
+        await save('<b>Pay</b>');
+        const hostile = { names: names(), active: active(), html: markup() };
+        // The twelfth view is the last: the list is a reader's worth, not a filing cabinet.
+        for (let index = names().length; index < 12; index += 1) await save('View ' + (index + 1));
+        const twelve = { names: names(), count: env.evaluate('UI_MODULES.shiftsViews().length') };
+        await save('View 13');
+        const full = { names: names(), active: active(), toasts: toasts(env), html: markup() };
+        // Forgetting a name is not a request to change the table: the columns stay exactly as
+        // they are, and only a chip naming the view that went is let go. The view stood on
+        // here is deliberately not the default five, so "the table did not move" is a claim
+        // with something to be wrong about.
+        await press('Night crew');
+        const beforeForget = { visible: visible(), active: active() };
+        await forget('Payroll');
+        const forgotOther = {
+            names: names(), visible: visible(), active: active(), toasts: toasts(env)
+        };
+        await forget('Night crew');
+        const forgotActive = {
+            names: names(), visible: visible(), active: active(), pressed: pressed(markup())
+        };
+        // The reset is about the table, and the views are somebody's saved names: it must not
+        // throw them away - the panel offers it one tap from a chip.
+        await press('View 12');
+        await env.evaluate('UI_MODULES.resetShiftsColumns()');
+        const afterReset = Object.assign(band(markup()), {
+            visible: visible(), names: names(), stored: stored(), html: markup()
+        });
+        // A chip a repaint has left behind: the name is no longer a view, and the press is a
+        // no-op rather than a table put back to something that does not exist.
+        const missing = env.evaluate("UI_MODULES.applyShiftsView('Nothing like this'); UI_MODULES.shiftsColumns().join(',')");
+
+        // A store written by hand, which is what an older release, a restored profile or an
+        // edited key amounts to: a view naming a column this release no longer has keeps the
+        // rest of its columns, a view with nothing left is not offered as a chip that refuses
+        // every press, a nameless one is not a chip, and two spellings that are the same view
+        // are one view - the first one wins.
+        const hand = adminEnv();
+        hand.evaluate(`localStorage.setItem('shiftsColumns', JSON.stringify({
+            v: 3,
+            views: [
+                { name: 'Legacy', order: ['ghost', 'date', 'hours'],
+                  hidden: ['ghost', 'date', 'employee', 'role', 'moallem', 'id', 'site', 'category', 'arrival', 'notes'] },
+                { name: 'Empty', order: ['date'],
+                  hidden: ['date', 'employee', 'role', 'moallem', 'id', 'site', 'category', 'arrival', 'hours', 'notes'] },
+                { name: '', order: ['date'], hidden: [] },
+                { name: 'legacy', order: ['hours'], hidden: ['date'] }
+            ]
+        }))`);
+        await hand.evaluate("UI.renderAdminTab('Shifts')");
+        const handHtml = hand.evaluate("document.getElementById('adminContent').innerHTML");
+        const handNames = hand.evaluate("UI_MODULES.shiftsViews().map((one) => one.name)");
+        // A store that names no standing view presses nothing, and pressing one presses it.
+        const handBefore = pressed(handHtml);
+        await hand.evaluate("UI_MODULES.applyShiftsView('Legacy')");
+        const handView = {
+            names: handNames,
+            visible: hand.evaluate("UI_MODULES.shiftsColumns().join(',')"),
+            order: hand.evaluate("UI_MODULES.shiftsColumnOrder().join(',')"),
+            html: handHtml,
+            pressed_before: handBefore,
+            pressed: pressed(hand.evaluate("document.getElementById('adminContent').innerHTML"))
+        };
+
+        // A store from before the views existed: the columns it holds are still the columns,
+        // and it has no views because it never had any - a screen with no band, not an error.
+        const older = adminEnv();
+        showColumns(older, ALL_COLUMNS);
+        await older.evaluate("UI.renderAdminTab('Shifts')");
+        const olderHtml = older.evaluate("document.getElementById('adminContent').innerHTML");
+        const v2 = {
+            names: older.evaluate("UI_MODULES.shiftsViews().join(',')"),
+            visible: older.evaluate("UI_MODULES.shiftsColumns().join(',')"),
+            active: older.evaluate('UI_MODULES.shiftsViewsActive()'),
+            band: band(olderHtml)
+        };
+
+        const bare = adminEnv();
+        bare.evaluate("localStorage.setItem('shiftsColumns', JSON.stringify(['date', 'employee', 'hours']))");
+        await bare.evaluate("UI.renderAdminTab('Shifts')");
+        const bareHtml = bare.evaluate("document.getElementById('adminContent').innerHTML");
+        const v1 = {
+            names: bare.evaluate("UI_MODULES.shiftsViews().join(',')"),
+            visible: bare.evaluate("UI_MODULES.shiftsColumns().join(',')"),
+            band: band(bareHtml)
+        };
+
+        results.views = {
+            empty_band: emptyBand,
+            payroll_columns: payrollColumns,
+            saved: saved,
+            saved_csv: savedCsv,
+            edited: edited,
+            reapplied: reapplied,
+            second: second,
+            switched: switched,
+            case_update: caseUpdate,
+            collapsed: collapsed,
+            unnamed: unnamed,
+            hostile: hostile,
+            twelve: twelve,
+            full: full,
+            before_forget: beforeForget,
+            forgot_other: forgotOther,
+            forgot_active: forgotActive,
+            after_reset: afterReset,
+            missing_visible: missing,
+            hand: handView,
+            v2: v2,
+            v1: v1
+        };
+    }
+
     // 5. the CSV button writes exactly the rows on screen
     {
         const env = adminEnv();
         await env.evaluate("UI.renderAdminTab('Shifts')");
         const requestsBefore = env.requests.length;
+        const html = env.evaluate("document.getElementById('adminContent').innerHTML");
         env.evaluate('UI_MODULES.downloadShiftsCsv()');
         const csv = await env.lastBlobText();
         const anchor = env.lastAnchor();
-        results.download = {
+        results.download = Object.assign(cardValues(html), {
             csv: csv,
             filename: anchor ? anchor.download : null,
             clicked: anchor ? anchor.__clicked === true : null,
             requests_added: env.requests.length - requestsBefore,
             expected_range: expectedDefaultRange()
-        };
+        });
 
         // The same button, with a search on: the file has to hold the rows on screen.
         await env.evaluate(`(async () => {
             document.getElementById('shiftsQuery').value = 'harbour';
             await UI_MODULES.applyShiftsSearch();
         })()`);
+        const filteredHtml = env.evaluate("document.getElementById('adminContent').innerHTML");
         env.evaluate('UI_MODULES.downloadShiftsCsv()');
-        results.download.filtered = {
+        results.download.filtered = Object.assign(cardValues(filteredHtml), {
             csv: await env.lastBlobText(),
             filename: env.lastAnchor().download,
             requests_added: env.requests.length - requestsBefore
-        };
+        });
 
         // A search that matches nobody matches nobody in the file either.
         await env.evaluate(`(async () => {
@@ -899,16 +1309,41 @@ const results = {};
             blobs_added: stale.blobs.length - blobsBefore,
             toasts: toasts(stale)
         };
+
+        // Every column switched off: the state the panel refuses and a hand-edited store can
+        // still hold. There is no honest file then - a csv with no columns, or one whose rows
+        // are empty, is a file somebody forwards as the period's record - so the screen has an
+        // answer for it and the button has a sentence instead of a file.
+        const bare = adminEnv();
+        // Every column switched off, written the way the store holds it: the panel will not
+        // let anybody get here, so it is written by hand - an older release, or a hand-edited
+        // store, which is exactly the case the screen has to answer for.
+        bare.evaluate(`(function () {
+            const all = UI_MODULES.allShiftsColumns();
+            localStorage.setItem('shiftsColumns', JSON.stringify({ v: 2, order: all, hidden: all }));
+        })()`);
+        await bare.evaluate("UI.renderAdminTab('Shifts')");
+        const bareHtml = bare.evaluate("document.getElementById('adminContent').innerHTML");
+        const bareBlobs = bare.blobs.length;
+        bare.evaluate('UI_MODULES.downloadShiftsCsv()');
+        results.download.no_columns = {
+            blobs_added: bare.blobs.length - bareBlobs,
+            toasts: toasts(bare),
+            has_empty_state: bareHtml.indexOf('data-no-columns="true"') >= 0,
+            has_table: cardValues(bareHtml)["has_table"],
+            has_reset: bareHtml.indexOf('data-columns-reset') >= 0
+        };
     }
 
-    // 5b. the file's columns are the file's, whatever the screen has been rearranged to
+    // 5b. the file is the table's own columns, in the order they are read there
     {
         const env = adminEnv();
         await env.evaluate("UI.renderAdminTab('Shifts')");
         // All the way to the front, so "the screen really was rearranged" cannot be
         // satisfied by a table that was never repainted.
         await env.evaluate(`(function () {
-            for (let i = 0; i < UI_MODULES.shiftsColumns().length; i += 1) UI_MODULES.moveShiftsColumn('notes', -1);
+            const steps = UI_MODULES.shiftsColumnOrder().indexOf('hours');
+            for (let i = 0; i < steps; i += 1) UI_MODULES.moveShiftsColumn('hours', -1);
         })()`);
         env.evaluate('UI_MODULES.downloadShiftsCsv()');
         results.download.reordered = {
@@ -931,6 +1366,10 @@ const results = {};
             title: printed.title || null,
             printing: printed.printing === true,
             sheet: printed.sheet || '',
+            // The two sentences, read off the page's own tables rather than typed here twice:
+            // this sheet's own, and the self-hours sheet's, which must not be on this paper.
+            own_note: env.evaluate("I18n.__('shiftsSheetNote')"),
+            self_hours_note: env.evaluate("I18n.__('shiftsApprovedOnly')"),
             screen_hours: cardValues(html).hours,
             screen_headers: headerLabels(html),
             files_written: env.blobs.length - before.blobs,
@@ -1018,9 +1457,114 @@ const results = {};
         });
     }
 
+    // 7c. the phone's sort: the card layout has no headers, so the control is drawn
+    {
+        const read = (env) => {
+            const html = env.evaluate("document.getElementById('adminContent').innerHTML");
+            // The sort select's own markup, so its options are read rather than the export
+            // format's and the category picker's beside it.
+            const select = (/<select class="ui-field shifts-sort-select"[^>]*>([\s\S]*?)<\/select>/.exec(html) || [, ''])[1];
+            return {
+                // The row order as painted: a card carries the worker it belongs to, and so
+                // does a table row - one reader answers for both layouts.
+                workers: (html.match(/data-worker="(\d+)"/g) || []).map((m) => m.replace(/\D/g, '')),
+                sort: env.evaluate('JSON.stringify(UI_MODULES.shiftsSort())'),
+                has_control: html.indexOf('data-sort-column') >= 0,
+                selected: (/<option value="([^"]*)" selected>/.exec(select) || [, null])[1],
+                options: (select.match(/<option value="[^"]*"/g) || [])
+                    .map((one) => (one.match(/value="([^"]*)"/) || [])[1]),
+                pressed: (html.match(/data-sort-direction="([a-z]+)"[^>]*aria-pressed="true"/g) || [])
+                    .map((one) => (one.match(/data-sort-direction="([a-z]+)"/) || [])[1])
+            };
+        };
+        // The picker is driven through the tab's *own* delegated listener rather than by
+        // calling the setter, so what is pinned is that the control reaches the state. The
+        // stand-in node is because this environment reads no attributes off a string: the
+        // route's own condition and the value it reads are what is exercised.
+        const pick = (env, value) => env.evaluate(`(function () {
+            document.getElementById('adminContent').onchange({
+                target: { getAttribute: (name) => (name === 'data-sort-column' ? '' : null),
+                          value: ${JSON.stringify(value)} }
+            });
+        })()`);
+        const press = (env, direction) => env.evaluate(`(function () {
+            document.getElementById('adminContent').onclick({
+                target: { closest: (selector) => (selector === '[data-sort-direction]'
+                    ? { dataset: { sortDirection: ${JSON.stringify(direction)} } } : null) }
+            });
+        })()`);
+
+        const desk = adminEnv();
+        await desk.evaluate("UI.renderAdminTab('Shifts')");
+        const deskInitial = read(desk);
+        await desk.evaluate("UI_MODULES.sortShiftsBy('employee')");
+        const deskByEmployee = read(desk);
+
+        const env = adminEnv();
+        env.evaluate("localStorage.setItem('layoutOverride', 'mobile')");
+        await env.evaluate("UI.renderAdminTab('Shifts')");
+        const initial = read(env);
+        pick(env, 'employee');
+        const byEmployee = read(env);
+        press(env, 'desc');
+        const byEmployeeDesc = read(env);
+        pick(env, '');
+        const restored = read(env);
+        results.phone_sort = {
+            initial: initial,
+            by_employee: byEmployee,
+            by_employee_desc: byEmployeeDesc,
+            restored: restored,
+            // The same list, on a desk, through the header's own three-press cycle: the two
+            // layouts have one state behind them or they have two answers.
+            desk_initial: deskInitial,
+            desk_by_employee: deskByEmployee
+        };
+    }
+
+    // 7d. one row, every field its own marker: which field a column's sort case reads
+    // becomes answerable by looking at the answer, and the date is the one that matters
+    // - the fallback branch returns it, so a column with no case of its own returns it too.
+    {
+        const env = adminEnv();
+        await env.evaluate("UI.renderAdminTab('Shifts')");
+        const row = {
+            date: '1901-01-01',
+            worker_id: '777001',
+            worker_name: 'PROBE NAME',
+            role: 'worker',
+            moallem_name: 'PROBE MOALLEM',
+            site_name: 'PROBE SITE',
+            site_category: 'PROBE CATEGORY',
+            hours: 7654,
+            // A real arrival, so the column's own words are available to be read.
+            arrival_time: '1901-01-01 00:07:00',
+            arrival_verdict: 'late',
+            arrival_minutes: 765
+        };
+        env.evaluate(`window.__probeRow = ${JSON.stringify(row)}`);
+        const keys = env.evaluate("Object.keys(UI_MODULES.shiftsColumnDefs())");
+        const values = {};
+        keys.forEach((key) => {
+            values[key] = env.evaluate(
+                `String(UI_MODULES.shiftsSortValue(window.__probeRow, ${JSON.stringify(key)}))`);
+        });
+        results.sort_cases = {
+            column_keys: keys,
+            values: values,
+            date: env.evaluate("String(UI_MODULES.shiftsSortValue(window.__probeRow, 'date'))"),
+            // The fallback, asked for by a key that is not a column at all: this is what a
+            // column with no case of its own comes back as.
+            unknown: env.evaluate(
+                "String(UI_MODULES.shiftsSortValue(window.__probeRow, 'not_a_column'))")
+        };
+    }
+
     // 7b. a shift with no site on file still gets a row, and the row says so
     {
         const env = adminEnv();
+        // The full set: this scenario reads the site cell by its position on the row.
+        showColumns(env, ALL_COLUMNS);
         await env.evaluate("UI_MODULES.setShiftsRange('2002-01-01', '2002-01-31')");
         await env.evaluate("UI.renderAdminTab('Shifts')");
         const html = env.evaluate("document.getElementById('adminContent').innerHTML");
@@ -1180,7 +1724,9 @@ const results = {};
         }
         await env.evaluate("UI_MODULES.setShiftsAttention('awaiting')");
         const awaiting = read();
-        const note = textOf(env.evaluate("document.getElementById('adminContent').innerHTML"), 'data-filter-note');
+        const awaitingHtml = env.evaluate("document.getElementById('adminContent').innerHTML");
+        const note = textOf(awaitingHtml, 'data-filter-note');
+        const awaitingCsvRows = allRows(awaitingHtml);
         env.evaluate('UI_MODULES.downloadShiftsCsv()');
         const csv = await env.lastBlobText();
         await env.evaluate("UI_MODULES.setShiftsAttention('late')");
@@ -1210,6 +1756,7 @@ const results = {};
             awaiting: awaiting,
             note: note,
             csv: csv,
+            csv_screen_rows: awaitingCsvRows,
             late: late,
             cleared: Object.assign(cleared, { state: clearedState }),
             both: both,
@@ -1221,6 +1768,9 @@ const results = {};
     // 12. sorting a column - and the third press, which puts the period's own order back
     {
         const env = adminEnv();
+        // Every column but the notes count: the file is compared with the screen cell for cell
+        // below, and the notes count is the one cell whose tone is part of what it says.
+        showColumns(env, READABLE_COLUMNS);
         await env.evaluate("UI.renderAdminTab('Shifts')");
         const read = () => {
             const html = env.evaluate("document.getElementById('adminContent').innerHTML");
@@ -1239,16 +1789,28 @@ const results = {};
         const restored = read();
         await env.evaluate("UI_MODULES.sortShiftsBy('employee')");
         const byName = read();
-        // The file follows the screen: a sorted table exports in the order it is being read in.
+        // The file follows the screen: a sorted table exports in the order it is being read in,
+        // in the screen's own columns.
+        const sortedHtml = env.evaluate("document.getElementById('adminContent').innerHTML");
         env.evaluate('UI_MODULES.downloadShiftsCsv()');
         const csv = await env.lastBlobText();
+        // The moallem column, both ways: it sorts by the words its cells show - a supervisor's
+        // name, and "Unassigned" where there is none - rather than by the date a missing case
+        // would fall back to.
+        await env.evaluate("UI_MODULES.sortShiftsBy('moallem')");
+        const byMoallem = read();
+        await env.evaluate("UI_MODULES.sortShiftsBy('moallem')");
+        const byMoallemDesc = read();
         results.sorting = {
             initial: initial,
             by_hours: byHours,
             by_hours_asc: byHoursAsc,
             restored: restored,
             by_name: byName,
+            by_moallem: byMoallem,
+            by_moallem_desc: byMoallemDesc,
             csv: csv,
+            screen_first_row: allRows(sortedHtml)[0] || [],
             // A sort is how one reader is holding the page, not a setting: nothing is written
             // to storage for it, unlike the column order.
             stored: env.evaluate("localStorage.getItem('shiftsSort')")
@@ -1355,105 +1917,162 @@ def test_a_shift_waiting_for_an_administrator_is_marked_and_not_counted_as_appro
     initial = results["initial"]
     assert initial["awaiting_rows"] == 1, "the one pending shift is marked in the markup"
     assert initial["approved_hours"] != initial["hours"], "waiting hours are not counted hours"
-    # The third fixture row is the pending one (3 h of the period's 15) and its awaiting cell
-    # says so, where an approved row names the decision that was made instead.
-    assert initial["first_row"][9] == "Approved by Admin", initial["first_row"]
-    assert initial["rows"][2][9] == "Awaiting approval", initial["rows"][2]
+    # The decision is no longer a *column*: the third fixture row is the pending one (3 h of
+    # the period's 15) and the row still says so - it carries ``data-awaiting``, and the amber
+    # chip above the table selects exactly it. The cell that used to say it is gone.
 
 
-def test_the_default_column_order_is_the_one_the_tab_was_asked_for(results):
+def test_the_default_column_order_is_the_clean_five_the_chooser_ships(results):
+    """Five columns: the day, who worked it, whose crew they are, where and how long.
+
+    What is left off is what somebody asks occasionally rather than every morning - the role,
+    the id, the site's kind, the arrival verdict, the notes count - and every one of those is
+    one tap away in the chooser.
+    """
     default = results["columns_default"]
-    assert default["columns"] == "date,employee,role,moallem,id,site,category,arrival,hours,awaiting,notes"
-    assert default["column_order"] == [
-        "date", "employee", "role", "moallem", "id", "site", "category", "arrival", "hours",
-        "awaiting", "notes"
-    ]
-    assert default["headers"] == [
-        "Date", "Employee", "Role", "Moallem", "User ID", "Site", "Category", "Arrival", "Hours",
-        "Awaiting approval", "Open notes", PRINT_ACTION_HEADER
-    ], "the data columns, then the row action - which is not one of them"
+    assert default["columns"] == ",".join(DEFAULT_COLUMNS)
+    assert default["headers"] == DEFAULT_HEADERS + [PRINT_ACTION_HEADER], (
+        "the data columns, then the row action - which is not one of them"
+    )
+    assert default["checked"] == DEFAULT_COLUMNS, (
+        "the chooser's own checkboxes agree with the table"
+    )
+    assert default["order"] == ",".join(ALL_COLUMNS), (
+        "the reading order still holds every column: one that is switched off keeps its place"
+    )
+    assert default["hidden"] == ",".join(DEFAULT_HIDDEN)
     assert default["has_columns_panel"] is True, "the admin needs a way to change it"
     assert default["stored"] is None, "a default order is not a choice anybody made"
 
 
 def test_the_first_row_carries_the_column_values_in_that_order(results):
-    """Date, name, role, id, site, arrival, hours, approval - the row lines up with its header."""
+    """Date, name, moallem, site, hours - the row lines up with its header."""
     cells = results["columns_default"]["first_row"]
-    # Twelve cells: the eleven data columns and the action, which carries no text of its own -
+    # Six cells: the five data columns and the action, which carries no text of its own -
     # its label is its ``aria-label``, and what is inside it is an icon.
-    assert cells is not None and len(cells) == 12, cells
-    assert cells[11] == "", cells
+    assert cells is not None and len(cells) == 6, cells
+    assert cells[5] == "", cells
     assert cells[0] == "2026-08-07"
     assert cells[1] == "Seed Lead"
-    # The role, in the reader's words: the wire says "moallem", the table says "Moallem".
-    assert cells[2] == "Moallem"
     # Their own row has no moallem over it - a moallem answers to nobody - and the cell says so
     # rather than going blank, which is what an administrator reads as "nobody is assigned".
-    assert cells[3] == "Unassigned", cells
-    assert cells[4] == "600"
-    assert cells[5] == "Downtown Tower A"
-    # The site's category, resolved by the server on this row: the value the chip filter
-    # above the table selects by, and now a column of its own.
-    assert cells[6] == "Warehouse"
-    assert cells[7] == "On time"
-    assert cells[8] == "8"
-    assert cells[9] == "Approved by Admin"
-    assert cells[10] == "1", "this worker has one note open"
+    assert cells[2] == "Unassigned", cells
+    assert cells[3] == "Downtown Tower A"
+    assert cells[4] == "8"
     # ...and a shift that *was* worked under somebody names them: the column is not a permanent
     # "Unassigned" the test could not tell from a broken read.
-    assert results["columns_default"]["rows"][1][3] == "Ustad Karim"
+    assert results["columns_default"]["rows"][1][2] == "Ustad Karim"
+
+
+def test_switching_a_column_on_shows_its_cells_and_puts_them_in_the_file(results):
+    """The secondary columns are one tap from the clean table, and the file grows with them.
+
+    Every value is read off the cell: the role in the reader's own words, the id, the kind of
+    site the server resolved on this row, the arrival verdict, and the count of outstanding
+    notes - which is a gap rather than a zero when there are none.
+    """
+    shown = results["columns_shown"]
+    assert shown["hidden"] == "", "every column is on"
+    assert shown["headers"] == ALL_HEADERS + [PRINT_ACTION_HEADER]
+    cells = shown["first_row"]
+    assert cells is not None and len(cells) == 11, cells
+    assert cells[2] == "Moallem", "the role, in the reader's words"
+    assert cells[3] == "Unassigned", "whose crew this row is - their own row has nobody over it"
+    assert cells[4] == "600", "the id"
+    assert cells[6] == "Warehouse", "the site's kind, as the server resolved it on this row"
+    assert cells[7] == "On time", "the arrival"
+    assert cells[8] == "8"
+    # The count is the server's own (``open_notes``): Seed Lead has one note outstanding,
+    # Bilal two, and Ana none - and none is a gap on the row rather than a zero, because a
+    # column of zeroes is a column nobody reads to the end.
+    assert cells[9] == "1", cells
+    assert shown["rows"][1][9] == shown["em_dash"], shown["rows"][1]
+    assert shown["rows"][2][9] == "2", shown["rows"][2]
+    header, rows = csv_rows(shown["csv"])
+    assert header == ",".join(ALL_HEADERS), header
+    assert len(rows) == 3, "the same three shifts, at the wider width"
 
 
 def test_moving_a_column_moves_it_in_the_header_the_panel_and_every_row(results):
     moved = results["columns_moved"]
-    # One step per button press, all the way to the front of the table. One step swaps a
-    # column with its neighbour and nothing else - no reshuffle, no jump.
-    assert len(moved["steps"]) == 10
-    assert moved["steps"][0] == "date,employee,role,moallem,id,site,category,arrival,awaiting,hours,notes"
-    assert moved["steps"][1] == "date,employee,role,moallem,id,site,category,awaiting,arrival,hours,notes"
-    assert moved["steps"][-1] == "awaiting,date,employee,role,moallem,id,site,category,arrival,hours,notes"
-    assert moved["column_order"][0] == "awaiting"
-    assert moved["headers"][0] == "Awaiting approval"
-    # The cells follow the header: the newest shift is signed off, the one below it is not.
-    assert moved["first_row"][0] == "Approved by Admin", moved["first_row"]
-    assert moved["rows"][2][0] == "Awaiting approval", moved["rows"][2]
+    # One step per button press, all the way to the front of the *reading* order. One step
+    # swaps a column with its neighbour and nothing else - no reshuffle, no jump - and a step
+    # that crosses a column the table is not showing leaves the visible table as it was, which
+    # is what the first two steps here do.
+    assert len(moved["steps"]) == 8
+    assert moved["steps"][0] == "date,employee,moallem,site,hours", (
+        "hours stepped past the hidden arrival: nothing on the table moved"
+    )
+    assert moved["steps"][1] == "date,employee,moallem,site,hours", (
+        "nor past the hidden category"
+    )
+    assert moved["steps"][2] == "date,employee,moallem,hours,site", (
+        "the third step crosses the site, and the table follows it"
+    )
+    assert moved["steps"][-1] == "hours,date,employee,moallem,site"
+    assert moved["columns"] == "hours,date,employee,moallem,site"
+    assert moved["column_order"][0] == "hours"
+    assert moved["headers"][0] == "Hours"
+    # The cells follow the header: the newest shift is 8 h, the pending one below is 3 h.
+    assert moved["first_row"][0] == "8", moved["first_row"]
+    assert moved["rows"][2][0] == "3", moved["rows"][2]
     assert moved["first_row"][1] == "2026-08-07"
     assert moved["first_row"][2] == "Seed Lead"
-    assert sorted(moved["column_order"]) == sorted([
-        "date", "employee", "role", "moallem", "id", "site", "category", "arrival", "hours",
-        "awaiting", "notes"
-    ]), "reordering must never lose or add a column"
+    assert sorted(moved["column_order"]) == sorted(ALL_COLUMNS), (
+        "reordering must never lose or add a column, on the table or off it"
+    )
+    assert sorted(moved["columns"].split(",")) == sorted(DEFAULT_COLUMNS), (
+        "and it must not change which of them are switched on"
+    )
+    assert moved["hidden"] == ",".join(DEFAULT_HIDDEN), "and it must not switch one on either"
     assert moved["hours"] == "15", "and the figures survive the repaint"
 
 
 def test_the_chosen_order_is_remembered_in_the_browser(results):
     moved = results["columns_moved"]
-    assert moved["stored"] == (
-        '["awaiting","date","employee","role","moallem","id","site","category","arrival","hours","notes"]'
-    ), "the order has to outlive the repaint that follows the click"
-    persist = results["columns_persist"]
-    assert persist["before"] == "date,employee,role,moallem,id,site,category,arrival,notes,hours,awaiting"
-    assert persist["column_order"] == persist["before"].split(","), "a re-render keeps it"
-    assert persist["headers"][8] == "Open notes", "and the header follows the stored order"
-
-
-def test_a_stale_or_junk_stored_order_cannot_break_the_table(results):
-    """A stored order is data from an older version of the file, and is treated as such."""
-    repair = results["columns_repair"]
-    # Unknown keys are dropped, duplicates collapse, and a column the stored order forgets is
-    # appended - so a release that adds a column shows it instead of hiding it for ever.
-    assert repair["stale"]["order"] == "notes,date,employee,role,moallem,id,site,category,arrival,hours,awaiting"
-    assert repair["stale"]["headers"][0] == "Open notes"
-    assert repair["stale"]["has_table"] is True
-    assert repair["junk"]["order"] == "date,employee,role,moallem,id,site,category,arrival,hours,awaiting,notes", (
-        "junk under the key falls back to the default order, it does not empty the table"
+    stored = json.loads(moved["stored"])
+    assert stored["v"] == 3, "the stored choice carries its shape, so the next release can read it"
+    assert stored["views"] == [], "a hand-move saves no view: it is a choice, not a name"
+    assert stored["active"] is None, "and nothing is standing when nobody saved a name"
+    assert stored["order"] == ["hours"] + [key for key in ALL_COLUMNS if key != "hours"], (
+        "the reading order, with hours at the front, has to outlive the repaint after the click"
     )
-    assert repair["junk"]["headers"] == [
-        "Date", "Employee", "Role", "Moallem", "User ID", "Site", "Category", "Arrival", "Hours",
-        "Awaiting approval", "Open notes", PRINT_ACTION_HEADER
-    ]
-    assert repair["wrong_type"] == "date,employee,role,moallem,id,site,category,arrival,hours,awaiting,notes", (
-        "a stored value that is not a list is not an order"
+    assert stored["hidden"] == DEFAULT_HIDDEN, "the columns the chooser left off are stored too"
+    persist = results["columns_persist"]
+    assert persist["before"] == "date,employee,moallem,hours,site"
+    assert persist["columns"] == persist["before"], "a re-render keeps the table as it was"
+    assert persist["headers"][3] == "Hours", "and the header follows the stored order"
+    assert persist["hidden"] == ",".join(DEFAULT_HIDDEN), "the off-list survives the repaint too"
+
+
+def test_a_stale_or_junk_stored_choice_cannot_break_the_table(results):
+    """A stored choice is data from an older version of the file, and is treated as such."""
+    repair = results["columns_repair"]
+    # v1, a bare array: before a column could be switched off the array *was* the table, so
+    # exactly the columns it names are shown, in its order - this release does not change the
+    # shape of a table somebody already chose. Unknown keys are dropped, duplicates collapse,
+    # and a column the array never mentioned (one added since) is appended switched off.
+    assert repair["legacy"]["columns"] == "hours,date", (
+        "the array's own set: nothing it did not name is on the table"
+    )
+    assert repair["legacy"]["order"] == "hours,date,employee,role,moallem,id,site,category,arrival,notes"
+    assert repair["legacy"]["hidden"] == "employee,role,moallem,id,site,category,arrival,notes"
+    assert repair["legacy"]["headers"][0] == "Hours"
+    assert repair["legacy"]["has_table"] is True, "and it is still a table"
+    # v2: read exactly as it says - the columns it names as off are off, and the ones it does
+    # not name are on, which is how the next release's new column arrives without a migration.
+    assert repair["chosen"]["columns"] == (
+        "date,employee,role,moallem,id,site,category,arrival,notes"
+    )
+    assert repair["chosen"]["hidden"] == "hours"
+    assert repair["chosen"]["order"] == "hours,date,employee,role,moallem,id,site,category,arrival,notes", (
+        "the order keeps the column that is switched off, so it can come back where it was"
+    )
+    # Junk under the key is not a reason to lose the table: it falls back to the default.
+    assert repair["junk"]["order"] == ",".join(ALL_COLUMNS)
+    assert repair["junk"]["headers"] == DEFAULT_HEADERS + [PRINT_ACTION_HEADER]
+    assert repair["wrong_type"] == ",".join(DEFAULT_COLUMNS), (
+        "a stored value that is neither a list nor a state is not an order"
     )
 
 
@@ -1461,14 +2080,16 @@ def test_the_ends_of_the_column_list_are_ends_and_reset_puts_the_default_back(re
     reset = results["columns_reset"]
     assert reset["at_start"] == "no-move", "the first column cannot move further left"
     assert reset["edges"]["first_cannot_go_earlier"] is True, "and the button says so"
-    assert reset["edges"]["last_cannot_go_later"] is True
-    assert reset["before_reset"] == "date,employee,role,moallem,id,site,category,arrival,hours,notes,awaiting", (
-        "one step left puts Open notes beside the hours it explains"
+    assert reset["edges"]["last_cannot_go_later"] is True, (
+        "the last column of the reading order, which is the order the panel lists"
     )
-    assert reset["column_order"] == [
-        "date", "employee", "role", "moallem", "id", "site", "category", "arrival", "hours",
-        "awaiting", "notes"
-    ]
+    assert reset["before_reset"] == "date,employee,moallem,site,hours", (
+        "one step left moved hours past a hidden column: nothing on the table moved"
+    )
+    assert reset["column_order"] == ALL_COLUMNS, (
+        "reset puts the clean default back - five on the table, and the reading order whole"
+    )
+    assert reset["headers"] == DEFAULT_HEADERS + [PRINT_ACTION_HEADER]
     assert reset["stored_after_reset"] is None, "reset forgets the choice, it does not store the default"
 
 
@@ -1699,7 +2320,22 @@ def csv_rows(csv):
     return lines[0], [line for line in lines[1:-1] if line]
 
 
-CSV_HEADER = "Employee,id,site,hours"
+#: The columns the tab opens with, and the labels they are painted with: the clean default
+#: the chooser ships. Written out here so a change to the default - a sixth column, a
+#: reordered pair - fails here rather than passing quietly.
+DEFAULT_COLUMNS = ["date", "employee", "moallem", "site", "hours"]
+DEFAULT_HEADERS = ["Date", "Employee", "Moallem", "Site", "Hours"]
+#: The header of the file for the clean default: the visible columns, in their own labels.
+DEFAULT_CSV_HEADER = "Date,Employee,Moallem,Site,Hours"
+#: Every column the tab can show, in the registry's reading order, and the labels it paints.
+ALL_COLUMNS = [
+    "date", "employee", "role", "moallem", "id", "site", "category", "arrival", "hours", "notes"
+]
+ALL_HEADERS = [
+    "Date", "Employee", "Role", "Moallem", "User ID", "Site", "Category", "Arrival", "Hours", "Notes"
+]
+#: The secondary columns the shipped default leaves switched off.
+DEFAULT_HIDDEN = ["role", "id", "category", "arrival", "notes"]
 
 #: The header of the row action - the screen's own last cell, and no part of the stored
 #: column order, because a control is not a column. One word, and deliberately without an
@@ -1715,7 +2351,8 @@ def test_the_timesheet_says_who_arrived_late_and_by_how_much(results):
     """One row's arrival is the shift's own clock-in against the window its site applies."""
     initial = results["initial"]
     assert initial["late_arrivals"] == "1", "one of the three shifts walked in late"
-    # Column order: date, employee, role, moallem, id, site, category, arrival, hours, awaiting, notes.
+    # Column order, the full set: date, employee, role, moallem, id, site, category, arrival,
+    # hours, notes.
     assert initial["rows"][0][7] == "On time", initial["rows"][0]
     assert initial["rows"][2][7] == "Late 42 min", initial["rows"][2]
 
@@ -1742,32 +2379,41 @@ def test_a_shift_with_no_arrival_on_file_is_not_called_punctual(results):
     )
 
 
-def test_the_printed_sheet_carries_the_arrival_but_the_csv_does_not(results):
-    """The screen gained a column; the file did not, and paper follows the screen.
+def test_the_file_is_the_columns_on_the_screen_in_their_order(results):
+    """The file is the view: the columns the reader has on the table, in the order they read.
 
-    The CSV is the four fixed columns on purpose: two months of sheets have to line up
-    column for column, and a column that appears in one month's file and not the other's is
-    a spreadsheet nobody can compare. The printed sheet is the table on screen, which is
-    what the person holding it has been reading.
+    A file carrying a column the table beside it does not show is a file that cannot be
+    compared with what was on the screen when it was written; a file whose columns ignored a
+    rearrangement is a third shape neither reader asked for. So the screen decides both, and
+    the printed sheet - the same download's other half - decides nothing of its own.
     """
     download = results["download"]
     header, rows = csv_rows(download["csv"])
-    assert header == CSV_HEADER, "still who, their id, where and how long"
-    assert len(header.split(",")) == 4
-    assert len(rows) == 3, "the file is the whole period, arrival column or not"
-    assert "late" not in download["csv"].lower()
-    assert "on time" not in download["csv"].lower()
-    # ...and the column really is on screen, so this is about the file rather than about a
-    # column that was never added.
-    assert "Arrival" in results["columns_default"]["headers"]
-    assert "Arrival" in results["print"]["screen_headers"]
-    assert "Late 42 min" in results["print"]["sheet"], "paper keeps the arrival column"
+    assert header == DEFAULT_CSV_HEADER, header
+    assert len(rows) == 3, "the file is the whole period"
+    assert "late" not in download["csv"].lower(), (
+        "the arrival is a secondary column, and this table was never touched"
+    )
+    assert "Arrival" not in results["print"]["screen_headers"], "and it is off the paper too"
+    # Row for row and cell for cell, the file is the table: read off the table rather than
+    # typed here twice, so a change to either side has to change both.
+    assert rows == [",".join(cells[:5]) for cells in download["rows"]]
+    assert rows[0] == "2026-08-07,Seed Lead,Unassigned,Downtown Tower A,8", rows[0]
+
+    reordered = download["reordered"]
+    header, rows = csv_rows(reordered["csv"])
+    assert reordered["screen_headers"][0] == "Hours", "the screen really was rearranged"
+    assert header == ",".join(reordered["screen_headers"][:-1]), (
+        "the header is the screen's own, minus the row action - which is not a column"
+    )
+    assert header == "Hours,Date,Employee,Moallem,Site", header
+    assert rows[0].startswith("8,"), rows[0]
 
 
-def test_the_csv_holds_only_who_their_id_where_and_how_long(results):
-    """Four columns, and the four the API's own export writes: a sheet with no money in it."""
+def test_the_csv_holds_the_columns_on_screen_and_no_money(results):
+    """The clean five, and no money in them: a timesheet with no rate and no estimate."""
     header, rows = csv_rows(results["download"]["csv"])
-    assert header == CSV_HEADER
+    assert header == DEFAULT_CSV_HEADER
     assert len(rows) == 3, "the three shifts of the period"
     assert "hourly_rate" not in header and "gross_estimate" not in header
 
@@ -1775,9 +2421,9 @@ def test_the_csv_holds_only_who_their_id_where_and_how_long(results):
 def test_the_csv_button_writes_every_row_of_the_period(results):
     download = results["download"]
     _, rows = csv_rows(download["csv"])
-    assert rows[0] == "Seed Lead,600,Downtown Tower A,8"
-    assert rows[1] == "Ana Torres,601,Harbour Depot,4"
-    assert rows[2] == "Bilal Khan,602,Harbour Depot,3"
+    assert rows == [",".join(cells[:5]) for cells in download["rows"]]
+    assert rows[0] == "2026-08-07,Seed Lead,Unassigned,Downtown Tower A,8"
+    assert len(rows) == 3, "one row per shift"
     expected = download["expected_range"]
     assert download["filename"] == f"shifts_{expected['start']}_{expected['end']}.csv"
     assert download["clicked"] is True
@@ -1788,33 +2434,343 @@ def test_the_csv_button_writes_only_the_rows_a_search_shows(results):
     """The bug this guards: a search narrowed the table and the file ignored it."""
     filtered = results["download"]["filtered"]
     header, rows = csv_rows(filtered["csv"])
-    assert header == CSV_HEADER
-    assert rows == ["Ana Torres,601,Harbour Depot,4", "Bilal Khan,602,Harbour Depot,3"], (
-        "the two Harbour Depot shifts"
+    assert header == DEFAULT_CSV_HEADER
+    assert rows == [",".join(cells[:5]) for cells in filtered["rows"]], (
+        "the two Harbour Depot shifts, exactly as the table is showing them"
     )
-    assert "600," not in filtered["csv"], "the shift the search excluded must not be in the file"
+    assert "Seed Lead" not in filtered["csv"], "the shift the search excluded must not be in the file"
     assert filtered["requests_added"] == 0, "still no request: the same rows, narrowed"
     assert filtered["filename"].endswith("_harbour.csv"), "two downloads of one period must not clash"
 
 
 def test_a_csv_for_a_search_that_matches_nobody_holds_no_rows(results):
     header, rows = csv_rows(results["download"]["no_match"]["csv"])
-    assert header == CSV_HEADER
+    assert header == DEFAULT_CSV_HEADER
     assert rows == [], "an empty table downloads an empty file, not the whole period"
 
 
-def test_the_file_columns_do_not_follow_the_screen_order(results):
-    """A sheet whose columns move from day to day cannot be compared with last month's."""
-    reordered = results["download"]["reordered"]
-    header, rows = csv_rows(reordered["csv"])
-    assert reordered["screen_headers"][0] == "Open notes", "the screen really was rearranged"
-    assert header == CSV_HEADER, "the file keeps its own order regardless"
-    assert rows[0] == "Seed Lead,600,Downtown Tower A,8"
+def test_the_chooser_moves_a_column_on_the_table_the_paper_and_the_file(results):
+    """One answer, one store: the table, the printed sheet and the download are one view.
+
+    The supervisor is the column an administrator is most likely to want gone - a payroll file
+    is the same rows without it - so it is the one this drives, through the chooser's own
+    checkbox rather than through a second control on the toolbar.
+    """
+    chooser = results["chooser"]
+    assert chooser["shipped"]["headers"] == DEFAULT_HEADERS + [PRINT_ACTION_HEADER]
+    assert chooser["shipped"]["visible"] == ",".join(DEFAULT_COLUMNS)
+
+    # Switched off: the table, the paper and the file all lose the column at once.
+    payroll = chooser["payroll"]
+    assert payroll["headers"] == ["Date", "Employee", "Site", "Hours", PRINT_ACTION_HEADER]
+    assert "Moallem" not in payroll["headers"]
+    assert payroll["visible"] == "date,employee,site,hours"
+    assert chooser["payroll_headers"] == ["Date", "Employee", "Site", "Hours"], (
+        "the printed sheet put the same column down"
+    )
+    assert csv_rows(chooser["payroll_csv"])[0] == "Date,Employee,Site,Hours"
+    assert "Ustad Karim" not in chooser["payroll_csv"], "no supervisor in a payroll file"
+    assert "Ustad Karim" not in chooser["payroll_sheet"], "nor on the payroll paper"
+    assert chooser["payroll_rows"] == chooser["crew_rows"] == 4, (
+        "one header row and the period's three shifts: the width moved, not the rows"
+    )
+
+    # ...and back on by the same control: the choice is the table's, not the download's, so a
+    # payroll export cannot leave the table - or the next download - missing the column.
+    assert chooser["crew"]["headers"] == DEFAULT_HEADERS + [PRINT_ACTION_HEADER]
+    assert chooser["crew_headers"] == DEFAULT_HEADERS, "the crew sheet carries it again"
+    assert csv_rows(chooser["crew_csv"])[0] == DEFAULT_CSV_HEADER
+    assert "Ustad Karim" in chooser["crew_csv"] and "Ustad Karim" in chooser["crew_sheet"]
+
+    # A column that is off by default comes back where it belongs rather than at the end: the
+    # reading order keeps the places, and the off-list only says which of them are switched off.
+    assert chooser["with_id"]["visible"] == "date,employee,moallem,id,site,hours", (
+        "a column that is off by default comes back where it belongs, not at the end"
+    )
+    assert chooser["with_id"]["headers"][3] == "User ID"
+
+    stored = json.loads(chooser["stored_with_id"])
+    assert stored["v"] == 3, stored
+    assert stored["views"] == [], "and the chooser saved no name, only the columns"
+    assert stored["order"] == ALL_COLUMNS, "the reading order, whole, with its places intact"
+    assert stored["hidden"] == [key for key in DEFAULT_HIDDEN if key != "id"], (
+        "the id is on, and the rest of the secondary columns are still off"
+    )
+
+
+def test_the_last_column_cannot_be_switched_off_and_leaves_the_default_one_tap_away(results):
+    """At least one column stays on the table, and the chooser says so where it refuses."""
+    chooser = results["chooser"]
+    assert chooser["one_left"]["headers"] == ["Hours", PRINT_ACTION_HEADER], (
+        "every other column was switched off first"
+    )
+    assert chooser["one_left"]["has_columns_panel"] is True, "the chooser stays reachable"
+    assert "1 of 10 shown" in chooser["one_left_markup"], chooser["one_left_markup"]
+    last = re.search(r'<input[^>]*data-column-visible="hours"[^>]*>', chooser["one_left_markup"])
+    assert last is not None, "the last column's own checkbox is on the panel"
+    assert "disabled" in last.group(0), "it is disabled, not silently ignored"
+    assert "At least one column has to stay on the table." in chooser["one_left_markup"], (
+        "and the reason is on the control, where somebody looking for it will be"
+    )
+    assert chooser["refused"] == "hours", "the rule holds where it cannot be walked around"
+    assert chooser["after_refusal"]["headers"] == ["Hours", PRINT_ACTION_HEADER]
+    assert chooser["after_refusal"]["has_columns_panel"] is True
+
+
+def test_a_store_with_no_columns_leaves_an_answer_and_no_file(results):
+    """The panel prevents it; a hand-edited store can still hold it, so it has an answer.
+
+    A table of nothing but its print buttons is not a timesheet, and a csv with no columns, or
+    one whose rows are empty, is a file somebody forwards as the period's record.
+    """
+    none = results["download"]["no_columns"]
+    assert none["has_empty_state"] is True, "the screen says what happened"
+    assert none["has_table"] is False, "not a table with the columns taken out of it"
+    assert none["has_reset"] is True, "and offers the one tap that puts the defaults back"
+    assert none["blobs_added"] == 0, "no file is written"
+    assert none["toasts"], "and the button says why rather than doing nothing"
+
+
+# ---------------------------------------------------------------------------
+# 4c. the saved views: a name for the columns in front of the reader
+# ---------------------------------------------------------------------------
+def test_nothing_is_saved_until_a_view_is_saved(results):
+    """A reader who has never named a set of columns sees no band - and the field is there.
+
+    The frequent act (switching between the two tables an administrator works in all day) is
+    on the toolbar; saving one is inside the chooser, where rearranging columns already lives.
+    """
+    views = results["views"]
+    assert views["empty_band"]["band"] is False, "no band before there is a name to press"
+    assert views["empty_band"]["apply"] is False, "and no chip"
+    assert views["empty_band"]["list"] is False, "nor a list of names to forget"
+    assert views["empty_band"]["form"] is True, "but the field that saves one is in the chooser"
+    assert views["saved"]["form"] is True
+
+
+def test_a_saved_view_is_the_columns_on_the_table_under_that_name(results):
+    """Saving keeps the whole choice - the order and the off-list - and presses its own chip."""
+    views = results["views"]
+    saved = views["saved"]
+    assert views["payroll_columns"] == "date,employee,site,hours", (
+        "the table that was saved: the default five with the supervisor off"
+    )
+    assert saved["names"] == ["Payroll"], "one name, the one that was typed"
+    assert saved["active"] == "Payroll", "saving a view is also standing on it"
+    assert saved["pressed"] == ["Payroll", "Payroll"], (
+        "pressed on the toolbar and in the panel: two renderings of one state"
+    )
+    assert saved["visible"] == views["payroll_columns"]
+
+    stored = saved["stored"]
+    assert stored["v"] == 3, "the shape the views arrived in"
+    assert [one["name"] for one in stored["views"]] == ["Payroll"]
+    assert stored["views"][0]["order"] == ALL_COLUMNS, (
+        "the view holds the reading order, whole, so pressing it can put a column back "
+        "where it belonged"
+    )
+    assert stored["views"][0]["hidden"] == DEFAULT_HIDDEN + ["moallem"]
+    assert stored["active"] == "Payroll"
+    assert stored["order"] == ALL_COLUMNS and stored["hidden"] == DEFAULT_HIDDEN + ["moallem"], (
+        "and the choice on the table is that view's own choice"
+    )
+
+    # The download reads the same one answer, so a payroll view downloads the payroll file.
+    assert csv_rows(views["saved_csv"])[0] == "Date,Employee,Site,Hours"
+    assert "Ustad Karim" not in views["saved_csv"], "no supervisor in a payroll file"
+
+
+def test_a_chip_puts_the_table_back_and_a_hand_edit_lets_it_go(results):
+    """One press restores the columns *and* the arrangement; a tick lets the chip go."""
+    views = results["views"]
+    edited = views["edited"]
+    assert edited["active"] is None, "an edited table is not the view it started from"
+    assert edited["pressed"] == [], "so no chip may still say it is"
+    assert edited["visible"] == "date,employee,site,category,hours", (
+        "the tick took effect on top of the columns the view had left"
+    )
+
+    reapplied = views["reapplied"]
+    assert reapplied["active"] == "Payroll"
+    assert reapplied["pressed"] == ["Payroll", "Payroll"]
+    assert reapplied["visible"] == "date,employee,site,hours"
+    assert reapplied["hidden"] == ",".join(DEFAULT_HIDDEN + ["moallem"]), (
+        "the off-list came back too, not only the columns that were on"
+    )
+
+
+def test_switching_between_two_saved_views_presses_exactly_one_chip(results):
+    """Two names, two chips, one table: the band and the panel agree on which is on."""
+    views = results["views"]
+    second = views["second"]
+    assert second["names"] == ["Payroll", "Crew sheet"]
+    assert second["active"] == "Crew sheet"
+    assert [(one["name"], one["pressed"]) for one in second["chips"]] == [
+        ("Payroll", False), ("Crew sheet", True),
+        ("Payroll", False), ("Crew sheet", True)
+    ], "the band and the list draw the same state, chip for chip"
+
+    switched = views["switched"]
+    assert switched["active"] == "Payroll"
+    assert switched["pressed"] == ["Payroll", "Payroll"], "one chip pressed, and it is the one"
+    assert switched["visible"] == "date,employee,site,hours", "the press moved the columns"
+
+
+def test_typing_a_name_that_is_taken_updates_that_view_and_keeps_its_spelling(results):
+    """``payroll`` is the Payroll view, not a second chip a reader cannot tell apart."""
+    views = results["views"]
+    update = views["case_update"]
+    assert update["names"] == ["Payroll", "Crew sheet"], (
+        "an update, not a third name differing only in capitalisation"
+    )
+    assert update["active"] == "Payroll", "and the pressed chip is spelled as it was"
+    assert update["pressed"] == ["Payroll", "Payroll"]
+    assert update["toasts"][-1] == "Updated: Payroll"
+    assert "id" not in update["stored"]["views"][0]["hidden"], (
+        "the update stored the columns that were on the table"
+    )
+    assert update["visible"] == "date,employee,id,site,hours"
+    assert update["stored"]["views"][0]["name"] == "Payroll", "the original spelling survives"
+
+
+def test_a_name_is_one_line_and_a_blank_one_is_refused(results):
+    """The name a chip shows is the name that was stored - and no name is no view."""
+    views = results["views"]
+    collapsed = views["collapsed"]
+    assert collapsed["names"][2] == "Night crew", collapsed["names"]
+    assert [one["name"] for one in collapsed["chips"] if one["name"] == "Night crew"], (
+        "the chip is drawn with the collapsed name"
+    )
+    assert collapsed["active"] == "Night crew"
+
+    unnamed = views["unnamed"]
+    assert unnamed["toasts"][-1] == "Give this view a name first."
+    assert len(unnamed["names"]) == 3, "and nothing was saved under no name"
+    assert unnamed["active"] == "Night crew", "nor did it stand on one"
+
+
+def test_a_view_name_is_text_and_never_markup(results):
+    """A name somebody typed goes into an attribute and onto a chip: both are escaped."""
+    views = results["views"]
+    hostile = views["hostile"]
+    assert hostile["names"][3] == "<b>Pay</b>", "stored as it was typed"
+    assert "&lt;b&gt;Pay&lt;/b&gt;" in hostile["html"], "and escaped where it is written"
+    assert "<b>Pay</b>" not in hostile["html"], "never as markup"
+
+
+def test_the_list_of_views_stops_at_the_twelfth_and_says_so(results):
+    """A reader's worth of names, not a filing cabinet: the limit is a sentence, not a no-op."""
+    views = results["views"]
+    assert views["twelve"]["count"] == 12
+    assert len(views["twelve"]["names"]) == 12
+
+    full = views["full"]
+    assert len(full["names"]) == 12, "the thirteenth is not saved"
+    assert "View 13" not in full["html"], "and it is not offered as a chip either"
+    assert full["toasts"][-1] == "There is room for 12 saved views.", (
+        "the number is in the sentence rather than a Save button that does nothing"
+    )
+    assert full["active"] == views["twelve"]["names"][-1], "the standing view is untouched"
+
+
+def test_forgetting_a_view_leaves_the_columns_on_the_table_alone(results):
+    """Removing a name is not a request to change what the reader is looking at."""
+    views = results["views"]
+    before = views["before_forget"]
+    other = views["forgot_other"]
+    assert before["active"] == "Night crew"
+    assert before["visible"] == "date,employee,id,site,hours", (
+        "the standing view is not the default five, so the assertions below have teeth"
+    )
+    assert other["active"] == "Night crew", "forgetting another view is not letting this one go"
+    assert "Payroll" not in other["names"] and len(other["names"]) == 11
+    assert other["visible"] == before["visible"], "the table did not move"
+    assert other["toasts"][-1] == "Removed: Payroll"
+
+    gone = views["forgot_active"]
+    assert len(gone["names"]) == 10
+    assert gone["active"] is None, "the chip naming the view that went is let go"
+    assert gone["pressed"] == []
+    assert gone["visible"] == before["visible"], "and the columns stay exactly as they were"
+
+
+def test_a_reset_puts_the_columns_back_and_keeps_the_views(results):
+    """The reset is about the table; the names somebody saved are not the table."""
+    views = results["views"]
+    reset = views["after_reset"]
+    assert reset["visible"] == "date,employee,moallem,site,hours", "the clean default is back"
+    assert reset["names"] == views["forgot_active"]["names"], "and the views are still there"
+    assert reset["band"] is True, "the band is still offered"
+    stored = reset["stored"]
+    assert stored is not None and [one["name"] for one in stored["views"]] == reset["names"]
+    assert "order" not in stored and "hidden" not in stored, (
+        "there is no column choice to remember: the tab opens on the default again"
+    )
+    assert stored.get("active") is None
+
+    assert views["missing_visible"] == "date,employee,moallem,site,hours", (
+        "pressing a chip a repaint has left behind leaves the table alone"
+    )
+
+
+def test_a_view_naming_a_column_this_release_dropped_keeps_the_rest(results):
+    """A hand-written store is repaired the same way the live choice is."""
+    views = results["views"]
+    hand = views["hand"]
+    assert hand["names"] == ["Legacy"], (
+        "the view with every column off, the nameless one and the second spelling are "
+        "not views"
+    )
+    assert "Empty" not in hand["html"], "a view with nothing left is not offered"
+    assert hand["visible"] == "hours", (
+        "the column the release no longer has is gone, and the rest of the view is intact"
+    )
+    order = hand["order"].split(",")
+    assert "ghost" not in order, "the column this release no longer has is gone"
+    assert sorted(order) == sorted(ALL_COLUMNS), (
+        "and every column this release has is in the arrangement exactly once"
+    )
+    assert order[:2] == ["date", "hours"], (
+        "the view's own arrangement is kept at the front, as the live choice's is"
+    )
+    assert hand["pressed_before"] == [], "a store naming no standing view presses no chip"
+    assert hand["pressed"] == ["Legacy", "Legacy"], "and the view that survived can be pressed"
+
+
+def test_a_store_from_before_the_views_still_opens_on_its_own_columns(results):
+    """A browser that has never seen a view has no views - not an error, and not a band."""
+    views = results["views"]
+    v2 = views["v2"]
+    assert v2["names"] == "" and v2["active"] is None
+    assert v2["band"] == {
+        "band": False, "apply": False, "list": False, "form": True
+    }, "no band, but the field that saves the first view"
+    assert v2["visible"] == ",".join(ALL_COLUMNS), "the stored choice is still the choice"
+
+    v1 = views["v1"]
+    assert v1["names"] == "", "the bare-array shape has no views either"
+    assert v1["band"]["apply"] is False
+    assert v1["visible"] == "date,employee,hours", "and it is read as what it was"
 
 
 # ---------------------------------------------------------------------------
 # 5b. the PDF choice: the same report, printed by the browser
 # ---------------------------------------------------------------------------
+def test_the_printed_sheet_states_its_own_note(results):
+    """The note at the foot is this sheet's own sentence, not another sheet's.
+
+    The bug this pins: the paper inherited whatever the print frame defaulted to, so when the
+    Shifts sheet stopped printing its "Awaiting approval" column the sentence went on
+    describing it. The note a sheet prints now travels with the columns that sheet prints -
+    see ``shiftsSheetNote``, and the same arrangement in the self-hours screen.
+    """
+    printed = results["print"]
+    assert printed["own_note"] in printed["sheet"], printed["sheet"][-300:]
+    assert printed["self_hours_note"] not in printed["sheet"], (
+        "the console's sheet is printing the self-hours sentence, which is about other figures"
+    )
+
+
 def test_the_report_is_downloaded_as_a_spreadsheet_or_printed_as_a_pdf(results):
     """One button, two files, and the page's own rows either way."""
     printed = results["print"]
@@ -1928,14 +2884,69 @@ def test_the_phone_layout_shows_one_card_per_shift_with_the_same_columns(results
     assert mobile["shift_rows"] == 3
     assert mobile["has_table"] is False
     assert mobile["hours"] == "15"
-    # The same columns, in the same order - a card is a row that had to fold.
-    assert mobile["labels"][:11] == [
-        "Date", "Employee", "Role", "Moallem", "User ID", "Site", "Category", "Arrival", "Hours",
-        "Awaiting approval", "Open notes"
-    ]
+    # The same columns, in the same order - a card is a row that had to fold. The clean
+    # default, because the phone reads the same table the desk does.
+    assert mobile["labels"] == DEFAULT_HEADERS * 3, (
+        "five labels on each of the three cards, in the table's own order"
+    )
     assert mobile["site_names"] == ["Downtown Tower A", "Harbour Depot", "Harbour Depot"], (
         "a phone card names the same site the desktop row does"
     )
+
+
+def test_a_phone_sorts_the_timesheet_by_column(results):
+    """The card layout has no column headings, so the same choice is drawn beside it.
+
+    A phone that could not sort was not a missing affordance but a changed contract: the
+    same period read one way on a desk and another on a phone. The picker offers the
+    columns the reader can actually see, in the order they arranged them, plus the period's
+    own order - which is the header's third press, reachable here in one step.
+    """
+    phone = results["phone_sort"]
+    desk = results["phone_sort"]["desk_initial"]
+    assert desk["has_control"] is False, "on a desk the headers are the control, and only those"
+    assert phone["initial"]["has_control"] is True
+    assert phone["initial"]["selected"] == "", "nothing is sorted until somebody sorts it"
+    assert phone["initial"]["pressed"] == [], "and no direction is claimed"
+    assert phone["initial"]["options"][0] == ""
+    assert phone["initial"]["options"][1:] == DEFAULT_COLUMNS, (
+        "the columns on the screen, in the order they were arranged"
+    )
+    server_order = phone["initial"]["workers"]
+    assert server_order == ["600", "601", "602"], "the order the server sent"
+    # Choosing a column is the header's first press: that column, its natural direction.
+    assert phone["by_employee"]["sort"] == '{"key":"employee","direction":"asc"}'
+    assert phone["by_employee"]["workers"] == ["601", "602", "600"], "Ana, Bilal, Seed Lead"
+    assert phone["by_employee"]["selected"] == "employee"
+    assert phone["by_employee"]["pressed"] == ["asc"]
+    # The other direction is one press here, where a header needs two - and a select could
+    # not give it at all, because re-choosing what it already shows fires nothing.
+    assert phone["by_employee_desc"]["sort"] == '{"key":"employee","direction":"desc"}'
+    assert phone["by_employee_desc"]["workers"] == ["600", "602", "601"]
+    assert phone["by_employee_desc"]["pressed"] == ["desc"]
+    # ...and the period's own order is back, which is the third press on a header.
+    assert phone["restored"]["sort"] == '{"key":"","direction":"asc"}'
+    assert phone["restored"]["workers"] == server_order
+    assert phone["restored"]["pressed"] == []
+
+
+def test_the_phone_and_the_table_read_the_period_one_way(results):
+    """One state behind both layouts - two writers is how the two come to disagree.
+
+    The claim is not that the phone has a sort but that it has *the same* sort: the picker
+    and the header meet in ``applyShiftsSort``, so the column chosen on a phone is the
+    column a desk would be reading by, and the rows come out in one order.
+    """
+    phone = results["phone_sort"]
+    assert phone["desk_by_employee"]["sort"] == phone["by_employee"]["sort"], (
+        "one period, one sort state"
+    )
+    assert phone["desk_by_employee"]["workers"] == phone["by_employee"]["workers"], (
+        "the header and the picker put the same rows in the same order"
+    )
+    # The desk never draws the phone's control, so nothing on a desk is offered the same
+    # choice twice.
+    assert phone["desk_by_employee"]["has_control"] is False
 
 
 def test_a_shift_with_no_site_on_file_still_gets_a_row(results):
@@ -2109,10 +3120,13 @@ def test_the_amber_figures_become_filters_carrying_the_count_they_will_show(resu
     assert attention["cleared"]["state"] == ""
     assert attention["cleared"]["hours"] == "15"
 
-    # The attention filter travels into the file, like every other narrowing on this tab.
+    # The attention filter travels into the file, like every other narrowing on this tab -
+    # and the file is the row on the screen, in the screen's own columns.
     lines = attention["csv"].strip().split("\r\n")
     assert len(lines) == 2, lines
-    assert lines[1] == "Strip Two,611,Downtown Tower A,3", lines
+    assert lines[0] == DEFAULT_CSV_HEADER, lines[0]
+    assert lines[1] == ",".join(attention["csv_screen_rows"][0][:5]), lines[1]
+    assert lines[1].endswith("Strip Two,Unassigned,Downtown Tower A,3"), lines[1]
 
     # Search, category and attention narrow the same rows rather than cancelling out.
     assert attention["both"]["shift_rows"] == 1
@@ -2156,17 +3170,96 @@ def test_a_column_can_be_sorted_and_the_third_press_puts_the_period_back(results
     # A different column, sorted by what the cell shows rather than by the wire value.
     assert [row[1] for row in sorting["by_name"]["rows"]] == ["Ana Torres", "Bilal Khan", "Seed Lead"]
 
+    # The moallem column sorts by the words in its cells, not by the date a missing case would
+    # fall through to. The first row has no supervisor over it, so its cell reads "Unassigned"
+    # and sorts before a name; the two rows under one supervisor keep the server's own order.
+    assert sorting["by_moallem"]["sort"] == '{"key":"moallem","direction":"asc"}', sorting["by_moallem"]["sort"]
+    assert [row[1] for row in sorting["by_moallem"]["rows"]] == [
+        "Seed Lead", "Ana Torres", "Bilal Khan"
+    ], sorting["by_moallem"]["rows"]
+    assert len(sorting["by_moallem"]["sorted_headers"]) == 1, sorting["by_moallem"]["sorted_headers"]
+    assert 'aria-sort="ascending"' in sorting["by_moallem"]["sorted_headers"][0]
+    # ...and the header that carries it is the Moallem one, fourth in the tab's own order.
+    assert sorting["by_moallem"]["headers"][3] == "Moallem", sorting["by_moallem"]["headers"]
+    # The other way: the supervised rows first and the unassigned one last, which is neither the
+    # server's order nor the date's - so this cannot pass by not sorting at all.
+    assert [row[1] for row in sorting["by_moallem_desc"]["rows"]] == [
+        "Ana Torres", "Bilal Khan", "Seed Lead"
+    ], sorting["by_moallem_desc"]["rows"]
+
     # The header's *text* is still exactly the column's name: the arrow is drawn, not written,
     # because the printed sheet and the file read this same text.
     assert sorting["by_name"]["headers"] == sorting["initial"]["headers"]
     assert sorting["by_name"]["headers"][0] == "Date"
 
-    # The file follows the screen: a table being read in a sorted order exports in that order.
+    # The file follows the screen: a table being read in a sorted order exports in that order,
+    # in the columns the reader is reading it by, cell for cell.
     lines = sorting["csv"].strip().split("\r\n")
-    assert lines[1] == "Ana Torres,601,Harbour Depot,4", lines
+    assert lines[1] == ",".join(sorting["screen_first_row"][:9]), lines[1]
+    assert "Ana Torres" in lines[1], lines[1]
 
     # And none of this is a setting: a sort is how one reader is holding the page.
     assert sorting["stored"] is None
+
+
+def test_no_shifts_column_sorts_by_the_date_fallback(results):
+    """Every column carries its own case, and the probe proves the fallback is the date.
+
+    The bug this closes: ``shiftsSortValue`` had a case for every column but the moallem, so
+    pressing that header marked the header sorted and reordered the rows by *date* - which,
+    over a period the server already sends newest-first, often looked like nothing happening.
+    A missing case is not a failure here, it is the date, and that is what makes it silent.
+
+    So the guard asks the row, not the source: one row whose every field is its own marker,
+    handed to each column in turn. A column that reads its own field cannot answer with the
+    date. The last assertion is the probe's own licence - if the fallback ever stopped being
+    the date, this guard would be checking nothing, and it must say so rather than pass.
+    """
+    probe = results["sort_cases"]
+    keys = probe["column_keys"]
+    assert keys, "the registry has to have columns in it to guard anything"
+    assert probe["unknown"] == probe["date"], (
+        "the fallback is not the date any more, so this guard is checking nothing: a column "
+        "with no case of its own came back as %r" % probe["unknown"]
+    )
+    for key in keys:
+        if key == "date":
+            continue
+        assert probe["values"][key] != probe["date"], (
+            f"the {key} column sorts by the date: no case of its own in shiftsSortValue"
+        )
+
+
+def test_every_shifts_column_has_its_own_sort_case(results):
+    """The same claim, read off the shipped source: one ``case`` per column key, no more.
+
+    The behavioural guard above catches a case that reads the wrong field; this one catches a
+    column with no case at all *before* anybody presses its header, and catches a case left
+    behind for a column that no longer exists - unreachable, since the sort refuses a key the
+    registry does not define. Together they fail for different reasons, so a red test names
+    the fix: add the case, or stop the column falling through to the date.
+    """
+    keys = results["sort_cases"]["column_keys"]
+    source = (frontend_vm.FRONTEND / "admin_modules.js").read_text(encoding="utf-8")
+    start = source.index("shiftsSortValue(row, key) {")
+    body = source[start:]
+    body = body[: body.index("\n    },")]
+    cases = re.findall(r"case '([a-z_]+)':", body)
+    assert cases, "no case labels found: the guard is looking at the wrong function"
+    assert "default:" in body, "the fallback is what a missing case falls through to"
+    # The date column needs no case of its own: the fallback *is* its case - which is exactly
+    # why a column without one sorts by the date rather than failing. Every other key has to
+    # name itself, and a case for a key the registry does not define is unreachable.
+    missing = sorted(set(keys) - set(cases) - {"date"})
+    dead = sorted(set(cases) - set(keys))
+    assert not missing and not dead, (
+        "one case per column key - the date is the fallback's own - and nothing else\n"
+        f"  keys with no case: {missing}\n"
+        f"  cases with no key: {dead}"
+    )
+    assert re.search(r"default:\s+return String\(row\.date", body), (
+        "the fallback has to be the date, or a missing case sorts by something else"
+    )
 
 
 def test_a_month_that_fills_more_than_one_page_is_painted_one_page_at_a_time(results):
