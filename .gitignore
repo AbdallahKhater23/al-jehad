@@ -19,6 +19,16 @@ times.db
 # SQLite sidecar files created by WAL mode while the server runs
 times.db-wal
 times.db-shm
+# Scratch copies (``*.bak``). Two of the five that were tracked here until 2026-10-05 were
+# full SQLite dumps taken before a password reset, so they carry the whole ``users`` table
+# with its bcrypt hashes and every email address and phone number in it - credentials
+# sitting in history, where no reset or audit rule in the app can reach them. A ``.bak`` is
+# by construction a second copy of something already in the tree, so it is never the
+# artifact to commit.
+*.bak
+# A pre-reset dump does not have to carry the suffix: ``times.db.pre-reset-<stamp>`` is the
+# live database with its credentials in it, and the ``times.db`` line above does not match it.
+times.db.*
 .env
 # The Railway service variables an operator applies by hand (VAPID key pair, trusted proxies).
 # Same class as .env above: VAPID_PRIVATE_KEY signs pushes as this deployment to every endpoint
