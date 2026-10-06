@@ -1005,11 +1005,6 @@ PAGE_ROUTES: frozenset[str] = frozenset(
         "GET /q/{token}",
         "GET /register",
         "GET /register/{token}",
-        # The visual geofence editor: an HTML file and nothing else. Like the four above it
-        # parses no request and answers no data - the fence it draws is read from
-        # ``GET /api/v1/geofence`` with the session's token, and the save it offers is
-        # refused unless that session is an administrator's.
-        "GET /geofence",
         # The visual site-creation page, the same shape for the same reason: it draws the map
         # a site's fence is set on, and every call it makes - ``POST /api/v1/sites``,
         # ``POST /api/v1/resolve-maps-link`` - is administrator-only.

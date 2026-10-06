@@ -12,9 +12,11 @@ pinned here rather than asserted in a docstring:
    (``< 1 ms``, the requirement) is measured rather than described.
 2. **an out-of-fence fix is refused before anything is written.** The 403 is asserted, and
    so is the absence of a row: a refusal that still filed a punch is not a refusal.
-3. **the legacy endpoint and the modern one are the same fence.** They write one row, one
-   cache entry and one answer shape, so an old microservice and the console cannot hold two
-   different boundaries.
+3. **the deployment fence is read-only, and it is still read.** Its editor, its page, its
+   two write endpoints and its legacy alias are gone - asserted here as an *absence*, because
+   a route that survives a teardown is indistinguishable from one nobody removed. What is kept
+   is the read and the row it reports: a punch that names no site is judged against the last
+   fence an administrator saved, so removing the read would have moved a live boundary.
 
 The arithmetic itself is pinned against known distances (the equator degree, a meridian
 degree, the antipode) and against the *domain* cases that used to be a ``ValueError``: a
@@ -26,6 +28,7 @@ from __future__ import annotations
 import math
 import sqlite3
 import time
+from pathlib import Path
 
 import pytest
 
@@ -154,22 +157,31 @@ def test_the_decision_is_under_a_millisecond():
     assert average_ms < 1.0, f"the in-memory decision averaged {average_ms:.3f} ms"
 
 
-def test_an_edit_moves_the_cache_and_the_database_together(client):
-    """The write the requirement asks for: SQLite *and* the cache, in the same request."""
-    response = client.post(
-        MODERN,
-        headers=bearer(ADMIN),
-        json={"latitude": 29.98, "longitude": 31.75, "radius_meters": 250.0},
-    )
-    assert response.status_code == 200, response.text
-    assert response.json()["geofence"]["radius_meters"] == 250.0
+def test_the_deployment_fence_is_read_only_under_a_running_process(client, app_module):
+    """The teardown, seen from the cache: no request moves the deployment fence any more.
 
-    # The cache the next punch reads.
-    assert geofence.CACHE.fence.latitude == pytest.approx(29.98)
-    assert geofence.CACHE.fence.radius_meters == pytest.approx(250.0)
-    # And the durable copy.
-    assert db_scalar("SELECT latitude FROM geofence_settings ORDER BY id DESC LIMIT 1") == pytest.approx(29.98)
-    assert db_scalar("SELECT COUNT(*) FROM geofence_settings") == 1
+    ``refresh_cache()`` is the only thing that writes ``CACHE``, and it runs at startup and in
+    the test reset - never on a request path. A row inserted straight into
+    ``geofence_settings`` is exactly what the deleted write endpoint used to insert, and it is
+    asserted here to be *inert* until a restart re-reads it: that is what "read-only" means for
+    a fence the punch path reads out of memory.
+    """
+    assert geofence.CACHE.fence.latitude == pytest.approx(geofence.DEFAULT_LATITUDE)
+    with app_module.db(write=True) as conn:
+        conn.execute(
+            "INSERT INTO geofence_settings (latitude, longitude, radius_meters, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            (29.98, 31.75, 250.0, "2026-10-05 09:00:00"),
+        )
+    # The running process does not see it, so neither does a punch.
+    assert geofence.CACHE.fence.latitude == pytest.approx(geofence.DEFAULT_LATITUDE)
+    assert geofence.evaluate(29.98, 31.75).radius_meters == pytest.approx(
+        geofence.DEFAULT_RADIUS_METERS
+    )
+    # A restart is what picks it up, which is the only way it moves now.
+    assert geofence.refresh_cache().radius_meters == pytest.approx(250.0)
+    assert geofence.evaluate(29.98, 31.75).radius_meters == pytest.approx(250.0)
+    assert _punch(client, latitude=29.98, longitude=31.75, accuracy_meters=5.0).status_code == 200
 
 
 def test_the_newest_row_is_the_active_fence(app_module):
@@ -332,114 +344,86 @@ def test_a_refusal_is_answered_before_the_face_check_would_run(client, face):
 
 
 # ---------------------------------------------------------------------------
-# 4. the two ways of setting the fence
+# 4. the teardown: no writer, no editor
 # ---------------------------------------------------------------------------
-def test_the_legacy_payload_is_normalised_into_the_modern_one(client):
-    """Strings, integers and whitespace - the three shapes the old caller sends."""
-    response = client.post(
-        LEGACY,
-        headers=bearer(HEAD_ADMIN),
-        json={"lat": " 29.98 ", "lng": "31.75", "rad": 150},
-    )
+def test_the_deployment_fence_has_no_writer(client, app_module):
+    """Both write endpoints: absent from the router, and refused to every caller.
+
+    The router walk is the exact half. A status code alone cannot carry this claim, because
+    the *static* mount answers a POST to any path the API does not route with a 405 - the
+    same answer a deleted endpoint and a guarded one would give a caller who is not allowed
+    to write. So the enumeration is what is asserted, and the HTTP probes below are the
+    client-visible half of the same fact.
+    """
+    import readiness
+
+    routes = [
+        (method, path)
+        for path, route in readiness.iter_api_routes(app_module.app)
+        for method in sorted(route.methods or [])
+    ]
+    assert ("POST", MODERN) not in routes, "the modern write is still routed"
+    assert not [url for _, url in routes if url == LEGACY], "the legacy alias is still routed"
+    # The read that shares the modern path is still there: that is what makes the 405 below a
+    # *method* refusal rather than a path that went missing.
+    assert ("GET", MODERN) in routes
+
+    modern_write = {"latitude": 29.98, "longitude": 31.75, "radius_meters": 250.0}
+    legacy_write = {"lat": "29.98", "lng": "31.75", "rad": "250"}
+    for headers in (bearer(ADMIN), bearer(HEAD_ADMIN), bearer(WORKER)):
+        assert client.post(MODERN, headers=headers, json=modern_write).status_code == 405
+        assert client.post(LEGACY, headers=headers, json=legacy_write).status_code in (404, 405)
+
+    # Nothing was recorded on the way past, and the fence in force is still the default.
+    assert db_scalar("SELECT COUNT(*) FROM geofence_settings") == 0
+    assert geofence.CACHE.fence.latitude == pytest.approx(geofence.DEFAULT_LATITUDE)
+    assert geofence.CACHE.fence.radius_meters == pytest.approx(geofence.DEFAULT_RADIUS_METERS)
+
+
+def test_the_module_no_longer_carries_the_write_half():
+    """The names the two endpoints were built from went with them.
+
+    ``GeofenceConfig`` was the modern write payload, ``LegacyGeofenceConfig`` its alias and
+    ``_audit`` the record a fence change used to leave behind. Any of them left in place is
+    dead code a reader would take for a live path.
+    """
+    for name in ("store_geofence", "GeofenceConfig", "LegacyGeofenceConfig", "_audit", "MAP_PAGE"):
+        assert not hasattr(geofence, name), name
+
+
+def test_the_editor_document_and_its_assets_are_not_served(client):
+    """The page, its document and its script, from the server: absent, not a stale copy."""
+    for path in ("/geofence", "/geofence.js", "/admin_geofence.html"):
+        assert client.get(path).status_code == 404, path
+
+
+def test_the_editor_files_are_gone_from_the_frontend():
+    for name in ("admin_geofence.html", "geofence.js"):
+        assert not (Path(harness.PROJECT_ROOT) / "frontend" / name).exists(), name
+
+
+def test_the_shared_stylesheet_survives_for_the_page_that_still_uses_it(client):
+    """``geofence.css`` is *shared*, and deleting it with the editor would have unstyled the
+    site-creation page - which draws the same map, pin and radius circle. Only the
+    editor-only rules were pruned, and the page still links what is left."""
+    response = client.get("/geofence.css")
     assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["normalized"] is True
-    assert body["geofence"]["latitude"] == pytest.approx(29.98)
-    assert body["geofence"]["radius_meters"] == pytest.approx(150.0)
-    # The answer speaks the legacy dialect too, with the values that were actually stored.
-    assert body["legacy"] == {"lat": "29.98", "lng": "31.75", "rad": "150.0"}
-    # And it is the *same* fence the modern read answers with.
-    assert geofence.CACHE.fence.latitude == pytest.approx(29.98)
-    assert client.get(MODERN, headers=bearer(ADMIN)).json()["geofence"]["radius_meters"] == pytest.approx(150.0)
+    assert "css" in response.headers["content-type"]
+    # The page stamps its assets with a content hash, so the URL it serves is
+    # ``/geofence.css?v=<hash>`` rather than the literal in the file.
+    assert "/geofence.css" in client.get("/sites/new").text
 
 
-def test_a_comma_decimal_is_read_as_a_decimal(client):
-    """A locale-formatted number is what a template-rendered legacy request sends."""
-    response = client.post(
-        LEGACY, headers=bearer(ADMIN), json={"lat": "29,98", "lng": "31,75", "rad": "120"}
-    )
-    assert response.status_code == 200, response.text
-    assert response.json()["geofence"]["latitude"] == pytest.approx(29.98)
-
-
-def test_the_legacy_radius_defaults_when_it_is_absent(client):
-    response = client.post(LEGACY, headers=bearer(ADMIN), json={"lat": "29.98", "lng": "31.75"})
-    assert response.status_code == 200, response.text
-    assert response.json()["geofence"]["radius_meters"] == geofence.DEFAULT_RADIUS_METERS
-
-
-def test_a_legacy_radius_that_is_absurd_is_clamped_and_says_so(client):
-    """A bound is *clamped* where the clamp is a real policy, and the answer reports the stored value."""
-    response = client.post(
-        LEGACY, headers=bearer(ADMIN), json={"lat": "29.98", "lng": "31.75", "rad": "99999"}
-    )
-    assert response.status_code == 200, response.text
-    assert response.json()["geofence"]["radius_meters"] == geofence.MAX_RADIUS_METERS
-
-
-def test_a_legacy_coordinate_outside_wgs84_is_refused_not_clamped(client):
-    """A latitude of 999 is a typo, and clamping it would put a fence nobody surveyed."""
-    response = client.post(
-        LEGACY, headers=bearer(ADMIN), json={"lat": "999", "lng": "31.75", "rad": "100"}
-    )
-    assert response.status_code == 422, response.text
-    assert geofence.CACHE.fence.latitude == geofence.DEFAULT_LATITUDE
-
-
-def test_a_legacy_radius_of_zero_is_refused(client):
-    """A fence of radius 0 admits nobody - a site nobody can clock into."""
-    response = client.post(
-        LEGACY, headers=bearer(ADMIN), json={"lat": "29.98", "lng": "31.75", "rad": "0"}
-    )
-    assert response.status_code == 422, response.text
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        {"lat": "not-a-number", "lng": "31.75", "rad": "100"},
-        {"lat": "", "lng": "31.75", "rad": "100"},
-        {"lat": "29.98", "lng": "31.75", "rad": "wide"},
-    ],
-)
-def test_a_legacy_payload_that_is_not_numeric_is_a_422(client, payload):
-    response = client.post(LEGACY, headers=bearer(ADMIN), json=payload)
-    assert response.status_code == 422, response.text
-
-
-def test_the_modern_payload_validates_its_ranges(client):
-    for payload in (
-        {"latitude": 91.0, "longitude": 31.23, "radius_meters": 100},
-        {"latitude": 30.05, "longitude": 181.0, "radius_meters": 100},
-        {"latitude": 30.05, "longitude": 31.23, "radius_meters": 0},
-        {"latitude": 30.05, "longitude": 31.23, "radius_meters": -5},
-    ):
-        response = client.post(MODERN, headers=bearer(ADMIN), json=payload)
-        assert response.status_code == 422, (payload, response.status_code)
-
-
-def test_the_modern_endpoint_refuses_null_island(client):
-    response = client.post(
-        MODERN, headers=bearer(ADMIN), json={"latitude": 0.0, "longitude": 0.0, "radius_meters": 100}
-    )
-    assert response.status_code == 422, response.text
+def test_the_creation_page_no_longer_offers_the_deleted_editor(client):
+    """The button that led to the editor, gone from the one page that carried it."""
+    body = client.get("/sites/new").text
+    assert 'href="/geofence"' not in body
+    assert "Deployment fence" not in body
 
 
 # ---------------------------------------------------------------------------
 # 5. who may do what
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("endpoint", [MODERN, LEGACY])
-def test_a_worker_cannot_move_the_fence(client, endpoint):
-    payload = (
-        {"latitude": 29.98, "longitude": 31.75, "radius_meters": 100}
-        if endpoint == MODERN
-        else {"lat": "29.98", "lng": "31.75", "rad": "100"}
-    )
-    response = client.post(endpoint, headers=bearer(WORKER), json=payload)
-    assert response.status_code == 403, response.text
-    assert geofence.CACHE.fence.latitude == geofence.DEFAULT_LATITUDE
-
-
 def test_an_administrator_may_read_the_fence(client):
     response = client.get(MODERN, headers=bearer(ADMIN))
     assert response.status_code == 200, response.text
@@ -451,19 +435,28 @@ def test_an_administrator_may_read_the_fence(client):
 def test_a_worker_cannot_read_the_fence(client):
     """The path is the administrator's, so this is a refusal rather than a smaller answer."""
     assert client.get(MODERN, headers=bearer(WORKER)).status_code == 403
+    assert client.get(MODERN).status_code in (401, 403)
 
 
-def test_an_edit_is_audited_with_both_geometries(client):
-    client.post(
-        MODERN, headers=bearer(ADMIN), json={"latitude": 29.98, "longitude": 31.75, "radius_meters": 175.0}
-    )
-    row = sqlite3.connect(str(harness.DB_PATH)).execute(
-        "SELECT before_json, after_json, actor_id FROM audit_log "
-        "WHERE action = 'geofence_update' ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    assert row is not None, "the edit was not audited"
-    assert row[2] == ADMIN
-    assert "30.05" in row[0] and "175.0" in row[1]
+def test_the_stored_row_is_what_a_siteless_punch_is_judged_by(client, app_module):
+    """The kept half, end to end: the last stored fence still decides a punch that names no
+    site - which is why the teardown stopped at the writers instead of deleting the row."""
+    with app_module.db(write=True) as conn:
+        conn.execute(
+            "INSERT INTO geofence_settings (latitude, longitude, radius_meters, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            (29.98, 31.75, 250.0, "2026-10-05 09:00:00"),
+        )
+    assert geofence.refresh_cache().radius_meters == pytest.approx(250.0)
+
+    response = _punch(client, latitude=29.98, longitude=31.75, accuracy_meters=5.0)
+    assert response.status_code == 200, response.text
+    assert response.json()["radius_meters"] == pytest.approx(250.0)
+
+    # And the same row refuses a fix outside it, which is the boundary doing its job.
+    refused = _punch(client, latitude=51.5074, longitude=-0.1278, accuracy_meters=5.0)
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["reason"] == "outside_geofence"
 
 
 # ---------------------------------------------------------------------------
@@ -517,13 +510,17 @@ def test_the_tables_are_what_the_requirements_name(app_module):
 
 
 def test_the_migration_is_registered_and_the_version_is_current(app_module):
+    """The migration this suite covers is still registered, and the database is at the head
+    the code declares - stated against ``migrations.SCHEMA_VERSION`` rather than a literal, so
+    a later migration cannot leave this suite asserting a version nobody is on."""
     import migrations
 
-    assert migrations.SCHEMA_VERSION == 33
     names = {version: name for version, name, _ in migrations.MIGRATIONS}
     assert names[32] == "visual_geofence", "the migration this suite covers is still registered"
-    assert names[33] == "worker_moallem_assignments"
-    assert migrations.current_version(sqlite3.connect(str(harness.DB_PATH))) == 33
+    assert (
+        migrations.current_version(sqlite3.connect(str(harness.DB_PATH)))
+        == migrations.SCHEMA_VERSION
+    )
 
 
 def test_the_punch_path_still_reads_the_construction_site_fence(client):
@@ -542,15 +539,26 @@ def test_the_punch_path_still_reads_the_construction_site_fence(client):
 
 
 # ---------------------------------------------------------------------------
-# 7. the page and its policy
+# 7. the page that is left, and its policy
 # ---------------------------------------------------------------------------
-def test_the_editor_page_is_served_with_a_map_policy(client):
-    """The one document allowed to load a map library, and it says so for itself."""
-    response = client.get("/geofence")
+def test_the_surviving_map_page_keeps_the_relaxed_policy(client):
+    """``MAP_PAGES`` lost its editor entry and kept the one page that still draws a map.
+
+    The relaxed policy is the exception in this deployment and it is one page wide, so the
+    entry is asserted by name: dropping the wrong one would leave the site-creation page
+    unable to load Leaflet, and keeping the wrong one would leave the deleted editor's name
+    as a page a stray request could still inherit the policy from.
+    """
+    import netguard
+
+    assert geofence.MAP_PAGES == frozenset({"admin_add_site.html"})
+    assert geofence.map_policy_for("admin_add_site.html") == netguard.CSP_HTML_MAPS
+    assert geofence.map_policy_for("admin_geofence.html") is None
+
+    response = client.get("/sites/new")
     assert response.status_code == 200, response.text
-    assert "text/html" in response.headers["content-type"]
     policy = response.headers["content-security-policy"]
-    assert policy == __import__("netguard").CSP_HTML_MAPS
+    assert policy == netguard.CSP_HTML_MAPS
     assert "https://unpkg.com" in policy
     assert "https://tile.openstreetmap.org" in policy
 
@@ -565,24 +573,29 @@ def test_every_other_page_keeps_the_strict_policy(client, link_paths):
         assert "unpkg.com" not in response.headers["content-security-policy"], path
 
 
-def test_the_page_names_its_own_assets_with_content_hashes(client):
-    """The editor is served like every other document: revalidated, with stamped assets."""
-    response = client.get("/geofence")
+def test_the_surviving_page_names_its_own_assets_with_content_hashes(client):
+    """The page that is left is served like every other document: revalidated, stamped."""
+    response = client.get("/sites/new")
     assert response.headers["cache-control"] == "no-cache, must-revalidate"
-    assert 'geofence.js?v=' in response.text
-    assert 'geofence.css?v=' in response.text
+    assert "/add_site.js?v=" in response.text
+    assert "/geofence.css?v=" in response.text
 
 
-def test_the_editor_script_and_stylesheet_are_served(client):
-    for asset, kind in (("geofence.js", "javascript"), ("geofence.css", "css")):
+def test_the_surviving_pages_assets_are_served(client):
+    for asset, kind in (("add_site.js", "javascript"), ("geofence.css", "css")):
         response = client.get(f"/{asset}")
         assert response.status_code == 200, asset
         assert kind in response.headers["content-type"], asset
+        assert response.headers["content-type"] != "application/json", asset
 
 
-def test_the_page_route_is_declared_a_page_not_a_public_endpoint():
-    """``PAGE_ROUTES`` rather than ``PUBLIC_ROUTES``: a document, not an endpoint."""
+def test_the_deleted_page_route_is_not_declared_anywhere():
+    """A route left in the declaration is a document the gate still believes is served."""
     import readiness
 
-    assert "GET /geofence" in readiness.PAGE_ROUTES
+    assert "GET /geofence" not in readiness.PAGE_ROUTES
     assert "GET /geofence" not in readiness.PUBLIC_ROUTES
+    assert "GET /sites/new" in readiness.PAGE_ROUTES
+    assert "GET /sites/new" not in readiness.PUBLIC_ROUTES
+
+

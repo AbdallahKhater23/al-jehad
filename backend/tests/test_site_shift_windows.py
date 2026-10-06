@@ -500,8 +500,12 @@ def test_the_schema_version_names_the_newest_migration():
     # (which moallem a worker answers to, joined onto the roster, the timesheet and the live
     # board) and ``users.name_i18n`` (the same name in each language the app reads, so an
     # applicant who typed it in Hindi is not read as a blank name by an English screen), plus
-    # the two indexes those reads go through.)
-    assert migrations.SCHEMA_VERSION == 33
+    # the two indexes those reads go through. 34 adds no column and no table: it is the index
+    # the timesheet's Clock Out/Clock In pairing had none of - ``attendance_logs(worker_id,
+    # action, id)`` - without which the pairing walked backward over every *other* worker's
+    # punches, so the report's cost grew with the worker count rather than with the period
+    # (docs/PERFORMANCE_AUDIT_2026-10-05.md).
+    assert migrations.SCHEMA_VERSION == 34
 
 
 def test_the_migration_is_replayable_and_idempotent():

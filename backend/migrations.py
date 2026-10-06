@@ -35,7 +35,7 @@ from security import hash_password
 #: ``MIGRATIONS``. ``readiness`` refuses to start a deployment whose database is older, so a
 #: migration added without bumping this is a server that will not boot; the invariant is
 #: asserted in ``tests/test_site_shift_windows.py`` rather than left to memory.
-SCHEMA_VERSION = 33
+SCHEMA_VERSION = 34
 
 #: Magic number stamped into the SQLite header so we can recognise "this is our
 #: database" - cheap protection against pointing DATABASE_PATH at some other file.
@@ -2000,6 +2000,56 @@ def migration_33_worker_moallem_assignments(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_users_moallem_id ON users(moallem_id)")
 
 
+def migration_34_attendance_timesheet_pairing_index(conn: sqlite3.Connection) -> None:
+    """The index the timesheet's shift pairing needs, in place of the scan it was doing.
+
+    WHY ONE INDEX FIXES WHAT LOOKED LIKE A QUADRATIC QUERY
+    ------------------------------------------------------
+    ``reports.SHIFT_TIMESHEET_SQL`` pairs every Clock Out with the Clock In that started it:
+
+        LEFT JOIN attendance_logs ci ON ci.id = (
+            SELECT MAX(prev.id) FROM attendance_logs prev
+            WHERE prev.worker_id = l.worker_id
+              AND prev.action = 'Clock In'
+              AND prev.id < l.id)
+
+    That subquery runs once per reported shift, and the only index the planner could use was
+    ``idx_attendance_worker_ts(worker_id, timestamp)``: it answers ``worker_id = ?`` and nothing
+    about ``action`` or ``id``, so the search walked *backward from the shift's own row id over
+    every other worker's punches* until it found one of this worker's Clock Ins. The work per
+    reported shift therefore grew with the number of workers rather than with the size of the
+    period. Measured over a quarter of shifts: 288 ms at 151 workers, 711 ms at 302 and 1,546 ms
+    at 604, against 43 ms, 98 ms and 202 ms with this index
+    (``docs/PERFORMANCE_AUDIT_2026-10-05.md``).
+
+    ``(worker_id, action, id)`` is the subquery's three predicates in its own order, so the
+    pairing becomes a single seek to the last matching entry, and the plan changes from
+    ``SEARCH prev USING INDEX idx_attendance_worker_ts (worker_id=?)`` to ``SEARCH prev USING
+    COVERING INDEX idx_attendance_worker_action_id (worker_id=? AND action=? AND id<?)``.
+
+    WHAT IT COSTS
+    -------------
+    One more index to maintain on every punch. Measured: 0.702 ms to 0.708 ms per
+    insert-plus-commit at 53,405 rows - about a microsecond, inside the noise of a single punch.
+    Building it took 38 ms at 53k rows and 177 ms at 214k rows.
+
+    WHY NOT ``(action, timestamp)`` AS WELL
+    ---------------------------------------
+    That index was measured too. It does give the outer ``action = 'Clock Out' AND timestamp
+    BETWEEN`` filter a real range search and removes the ORDER BY sort, but it loses badly at
+    scale - 204 ms against 98 ms at 302 workers, 396 ms against 202 ms at 604 - because scanning a
+    low-cardinality column in timestamp order becomes random table access. It is deliberately not
+    created here.
+
+    Additive and idempotent: no column, row or query changes, and a database that already has the
+    index - a redeploy over an already-migrated file - simply does nothing.
+    """
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_attendance_worker_action_id "
+        "ON attendance_logs(worker_id, action, id)"
+    )
+
+
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "audit_notifications_shift_rules", migration_1_audit_notifications_shift_rules),
     (2, "provenance_columns_status_code", migration_2_provenance_columns),
@@ -2037,6 +2087,10 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     # Who works for whom, and a name per language. Two columns on ``users``: the roster, the
     # timesheet and the live board all show an assignment without a second table to join.
     (33, "worker_moallem_assignments", migration_33_worker_moallem_assignments),
+    # The timesheet's Clock Out/Clock In pairing, which had no index behind it and whose cost grew
+    # with the worker count rather than the period. Measured at 6.7x-7.7x on the query, for about
+    # a microsecond more work per punch insert.
+    (34, "attendance_timesheet_pairing_index", migration_34_attendance_timesheet_pairing_index),
     # (28, "attendance_timestamps_to_utc", migration_28_attendance_timestamps_to_utc),
     #
     # NOT REGISTERED YET, ON PURPOSE. Migration 28 and its column contract

@@ -12,19 +12,20 @@ design:
   microseconds, before a face is matched, before a frame is written and before a webhook
   is called - which is what makes a refusal cost nothing at the gate and keeps the
   expensive work for the punches that can actually be recorded;
-* an administrator's edit writes SQLite **and** the cache in the same request, so the new
-  fence is in force for the next punch rather than after a restart. The row is the durable
-  copy and the cache is the one the punch reads, and both are written under one lock so
-  they cannot disagree inside a worker;
+* a *site's* fence is written the same way - SQLite **and** the cache in the same request,
+  so a site an administrator just created or edited is in force for the next punch rather
+  than after a restart. The row is the durable copy and the cache is the one the punch
+  reads, and both are written under one lock so they cannot disagree inside a worker;
 * the *schema of attendance history is untouched*. This module owns two tables of its own
   (``geofence_settings``, ``attendance_punches``) and writes nothing into
   ``attendance_logs``, ``active_sessions`` or any other table the existing pipeline reads.
 
 THE LIMIT WORTH STATING: ONE CACHE PER PROCESS
 ----------------------------------------------
-A deployment running several ASGI workers has one cache per worker, and an edit refreshes
-the worker that served the request. The others keep the fence they loaded at startup until
-they restart. That is a real limitation and it is the price of the zero-latency read the
+A deployment running several ASGI workers has one cache per worker, and a site edit
+refreshes the worker that served the request. The others keep the fence they loaded at
+startup until they restart - and the deployment's own fence, which nothing writes any
+more, is the same in every worker until each one is restarted. That is a real limitation and it is the price of the zero-latency read the
 punch path is built on; the alternatives are a database read per punch (which is the cost
 this design exists to remove) or a shared cache server (a dependency this deployment does
 not have). ``CACHE.generation`` and the ``updated_at`` stamp travel with every fence so a
@@ -56,9 +57,8 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-import audit
 import clock
 import notifications
 from database import db
@@ -457,121 +457,6 @@ def refresh_cache() -> Geofence:
 # ---------------------------------------------------------------------------
 # validation schemas
 # ---------------------------------------------------------------------------
-class GeofenceConfig(BaseModel):
-    """The modern payload: numbers, and only numbers.
-
-    ``radius_meters`` must be strictly positive - a fence of radius 0 admits nobody, which
-    is a site that cannot be clocked into (the same refusal ``main._validate_site_radius``
-    makes for a construction site).
-    """
-
-    model_config = ConfigDict(extra="ignore")
-
-    latitude: float = Field(..., ge=-90.0, le=90.0)
-    longitude: float = Field(..., ge=-180.0, le=180.0)
-    radius_meters: float = Field(..., gt=0.0, le=MAX_RADIUS_METERS)
-
-    @field_validator("latitude", "longitude", "radius_meters")
-    @classmethod
-    def _finite(cls, value: float) -> float:
-        if not math.isfinite(value):
-            raise ValueError("must be a finite number")
-        return value
-
-    def to_fence(self, *, source: str) -> Geofence:
-        return Geofence(
-            latitude=float(self.latitude),
-            longitude=float(self.longitude),
-            radius_meters=float(self.radius_meters),
-            updated_at=clock.now(),
-            source=source,
-        )
-
-
-class LegacyGeofenceConfig(BaseModel):
-    """The legacy payload: ``lat`` / ``lng`` / ``rad``, as strings, integers or floats.
-
-    The old microservice sent form-encoded numbers, so ``"30.05"``, ``30.05`` and ``30`` are
-    all values this has to accept; ``"  31.23  "`` arrives with the whitespace a hand-typed
-    or template-rendered request leaves in it. Each is normalised into the modern schema's
-    shape (``normalized()``), which is what keeps one row, one cache and one code path for
-    both callers.
-
-    Deliberately *not* permissive about meaning: a latitude of 999 is refused rather than
-    clamped, because clamping it would put a fence somewhere nobody surveyed while
-    answering 200. Numeric *bounds* are clamped where the clamp is a real policy - the
-    radius, into (0, ``MAX_RADIUS_METERS``] - and the response says which value was stored.
-    """
-
-    model_config = ConfigDict(extra="ignore")
-
-    lat: str | float | int = Field(
-        ...,
-        validation_alias=AliasChoices("lat", "latitude", "Lat", "LAT"),
-    )
-    lng: str | float | int = Field(
-        ...,
-        validation_alias=AliasChoices("lng", "lon", "long", "longitude", "Lng", "LNG"),
-    )
-    rad: str | float | int | None = Field(
-        default=None,
-        validation_alias=AliasChoices("rad", "radius", "radius_meters", "Rad", "RAD"),
-    )
-
-    @field_validator("lat", "lng", "rad", mode="before")
-    @classmethod
-    def _number(cls, value: Any, info) -> Any:
-        """Accept the string shapes a legacy caller sends; refuse anything else by name."""
-        if value is None:
-            return None
-        if isinstance(value, bool):
-            raise ValueError("must be a number, not a boolean")
-        if isinstance(value, (int, float)):
-            if not math.isfinite(float(value)):
-                raise ValueError("must be a finite number")
-            return float(value)
-        text = str(value).strip().replace(",", ".")
-        if not text:
-            return None
-        try:
-            number = float(text)
-        except ValueError:
-            raise ValueError(f"must be a number; got {str(value)!r}") from None
-        if not math.isfinite(number):
-            raise ValueError("must be a finite number")
-        return number
-
-    def normalized(self) -> GeofenceConfig:
-        """The legacy triple, as the modern schema. Raises ``HTTPException(422)`` if unusable."""
-        latitude = self.lat
-        longitude = self.lng
-        if latitude is None or longitude is None:
-            raise HTTPException(
-                status_code=422,
-                detail="Legacy geofence requires lat and lng; neither may be empty.",
-            )
-        if not within_wgs84(float(latitude), float(longitude)):
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "Legacy geofence coordinates are outside WGS84 (latitude -90..90, "
-                    "longitude -180..180) or are the (0,0) mock-location reading."
-                ),
-            )
-        radius = DEFAULT_RADIUS_METERS if self.rad is None else float(self.rad)
-        if radius <= 0:
-            raise HTTPException(
-                status_code=422,
-                detail="Legacy geofence radius must be greater than 0 metres.",
-            )
-        # The one place a bound is *clamped* rather than refused: a legacy caller sending a
-        # radius of 50000 meant "very large", and the largest fence this API will store is a
-        # real one - so it is clamped, and the stored value is what the answer reports.
-        radius = min(radius, MAX_RADIUS_METERS)
-        return GeofenceConfig(
-            latitude=float(latitude), longitude=float(longitude), radius_meters=radius
-        )
-
 
 class PunchRequest(BaseModel):
     """A punch as the client sends it.
@@ -717,33 +602,6 @@ def evaluate(
 # ---------------------------------------------------------------------------
 # persistence
 # ---------------------------------------------------------------------------
-def _audit(
-    conn: sqlite3.Connection,
-    *,
-    action: str,
-    actor: CurrentUser | None,
-    before: Any,
-    after: Any,
-    request: Request | None,
-) -> None:
-    """Append the edit to ``audit_log``. Never raises - a fence change is not worth a 500.
-
-    One row per save against the single settings row, with both geometries: the fence is not
-    versioned, so the two together are the only record of what moved. The editor is a browser
-    console, so the caller's user agent is recorded with the change.
-    """
-    audit.record(
-        conn,
-        action=action,
-        actor=actor,
-        entity="geofence_settings",
-        entity_id="1",
-        before=before,
-        after=after,
-        request=request,
-        user_agent=True,
-        created_at=clock.now().strftime(clock.TS_FORMAT),
-    )
 
 
 def store_site_fence(
@@ -757,8 +615,7 @@ def store_site_fence(
     """Put one site's boundary into the cache, from the row that was just written.
 
     Called by ``sites.store_site`` inside the request that wrote SQLite, so the punch that
-    follows reads the new fence rather than the one this process loaded at startup - the
-    same write-through rule ``store_geofence`` follows for the deployment fence. The window
+    follows reads the new fence rather than the one this process loaded at startup. The window
     columns are *not* re-read here: the caller has just written them, and a second query
     inside the write lock would be a query for a value already in hand.
     """
@@ -782,58 +639,6 @@ def refresh_site_cache() -> "SiteCache":
     answering punches with the boundary it had before.
     """
     return SITE_CACHE.load()
-
-
-def store_geofence(
-    config: GeofenceConfig,
-    *,
-    source: str,
-    actor: CurrentUser | None = None,
-    request: Request | None = None,
-) -> Geofence:
-    """Write the fence to SQLite, put it in force, and return what is now in force.
-
-    Both writes happen inside this call, in this order, so a request that returns 200 has a
-    fence in the database *and* in the cache the next punch will read. The insert is a new
-    row rather than an update of the old one: the table keeps the history of a site's
-    boundary, which is the thing an administrator asking "when did this fence move?" is
-    looking for, and ``ORDER BY id DESC LIMIT 1`` is the active row.
-    """
-    before = CACHE.fence.as_dict()
-    stamp = clock.now()
-    with db(write=True) as conn:
-        conn.execute(
-            "INSERT INTO geofence_settings (latitude, longitude, radius_meters, updated_at) "
-            "VALUES (?, ?, ?, ?)",
-            (
-                float(config.latitude),
-                float(config.longitude),
-                float(config.radius_meters),
-                stamp.strftime("%Y-%m-%d %H:%M:%S"),
-            ),
-        )
-        _audit(
-            conn,
-            action="geofence_update",
-            actor=actor,
-            before=before,
-            after={
-                "latitude": float(config.latitude),
-                "longitude": float(config.longitude),
-                "radius_meters": float(config.radius_meters),
-                "source": source,
-            },
-            request=request,
-        )
-    return CACHE.store(
-        Geofence(
-            latitude=float(config.latitude),
-            longitude=float(config.longitude),
-            radius_meters=float(config.radius_meters),
-            updated_at=stamp,
-            source=source,
-        )
-    )
 
 
 def record_punch(
@@ -884,65 +689,20 @@ def record_punch(
 async def read_geofence(current: CurrentUser = Depends(admin_only)):
     """The active fence, straight off the cache - no database read.
 
+    Kept, and deprecated. It has no editor any more and nothing writes it: the fence it
+    reports is the last one an administrator saved, and it is still the boundary a punch
+    that names no site is judged by (``evaluate``). Deleting the row would therefore change
+    what a worker's punch is measured against - a fence that is read-only is a fence that
+    still answers.
+
     Administrator-only, on purpose. The audience matrix (``tests/test_role_audience.py``)
     derives a path's audience from its *shape* and is deliberately method-blind, so a path
     that is readable by everybody and writable by one role cannot be expressed there
     without weakening the check that catches ``any_authenticated`` standing in for
-    ``admin_only``. Rather than widen that matrix, the whole ``/geofence`` path is the
-    administrator's - which is also the honest description: this endpoint exists for the
-    editor, and a worker's phone learns its own standing from the *punch* answer
+    ``admin_only``. A worker's phone learns its own standing from the *punch* answer
     (``distance_meters`` and ``radius_meters``), not from reading the deployment's fence.
     """
     return {"geofence": CACHE.fence.as_dict(), "slider": _slider_bounds()}
-
-
-@router.post("/geofence")
-async def update_geofence(
-    payload: GeofenceConfig,
-    request: Request,
-    current: CurrentUser = Depends(admin_only),
-):
-    """Replace the fence: SQLite first, then the cache the punch reads. Administrator only.
-
-    The write is the same call the legacy endpoint makes (``store_geofence``), so a fence set
-    here and one set through ``/api/legacy/set-geofence`` are the same row, the same cache
-    entry and the same distance for the next punch.
-    """
-    if not within_wgs84(payload.latitude, payload.longitude):
-        raise HTTPException(
-            status_code=422,
-            detail="Coordinates must be a real WGS84 position, not the (0,0) mock reading.",
-        )
-    fence = store_geofence(payload, source="modern", actor=current, request=request)
-    return {"geofence": fence.as_dict(), "slider": _slider_bounds()}
-
-
-@router.post("/legacy/set-geofence")
-async def set_geofence_legacy(
-    payload: LegacyGeofenceConfig,
-    request: Request,
-    current: CurrentUser = Depends(admin_only),
-):
-    """The old microservice's endpoint, kept working: ``lat`` / ``lng`` / ``rad`` as strings.
-
-    It normalises into the modern schema and then takes the *same* path as
-    ``POST /api/v1/geofence`` - one row, one cache, one code path - so a legacy caller and
-    the console cannot end up holding two different fences. The answer carries both shapes
-    (``geofence`` and ``legacy``) because a legacy caller is reading it, and because the
-    normalised values are what actually got stored.
-    """
-    config = payload.normalized()
-    fence = store_geofence(config, source="legacy", actor=current, request=request)
-    return {
-        "geofence": fence.as_dict(),
-        "legacy": {
-            "lat": str(fence.latitude),
-            "lng": str(fence.longitude),
-            "rad": str(fence.radius_meters),
-        },
-        "normalized": True,
-        "slider": _slider_bounds(),
-    }
 
 
 @router.post("/attendance/punch")
@@ -1107,18 +867,14 @@ def _slider_bounds() -> dict[str, float]:
 
 #: The pages that draw a map, and the only ones allowed to have the map origins. Named here
 #: rather than in ``netguard`` because this module owns the feature: an operator reading
-#: ``netguard.CSP_HTML_MAPS`` follows this function back to the pages it exists for.
+#: ``netguard.CSP_HTML_MAPS`` follows this function back to the page it exists for.
 #:
-#: Two pages, and they are the same exception twice for the same reason. ``admin_geofence``
-#: draws the deployment's fence; ``admin_add_site`` draws a site being created. Both are
-#: administrator screens reached from the console, both draw a draggable pin and a radius
-#: circle on OpenStreetMap tiles, and neither is a page a worker's phone loads - so the
-#: strict baseline still covers the punch screen, the link pages and the enrollment page.
-MAP_PAGES: frozenset[str] = frozenset({"admin_geofence.html", "admin_add_site.html"})
-
-#: The one page, kept as a name because ``tests/test_geofence.py`` and any reader looking
-#: for "where does the map policy come from" both want the original.
-MAP_PAGE = "admin_geofence.html"
+#: The one page that draws a map. ``admin_add_site`` creates a site: a draggable pin and a
+#: radius circle on OpenStreetMap tiles, reached from the console's Sites screen. It is not a
+#: page a worker's phone loads - so the strict baseline still covers the punch screen, the
+#: link pages and the enrollment page. (The deployment fence's own editor was the second entry
+#: here, and is gone; its page, its script and its write API were removed with it.)
+MAP_PAGES: frozenset[str] = frozenset({"admin_add_site.html"})
 
 
 def map_policy_for(page: str) -> str | None:
@@ -1129,7 +885,7 @@ def map_policy_for(page: str) -> str | None:
 
 
 def map_sources() -> dict[str, Any]:
-    """The three origins the editor may load from, for the page to check itself against."""
+    """The origins the map page may load from, for the page to check itself against."""
     import netguard
 
     policy = netguard.CSP_HTML_MAPS

@@ -363,13 +363,39 @@ PAGES: tuple[Page, ...] = (
             "on a page whose own script loads Leaflet from a CDN: a script that did not "
             "execute, or a stylesheet the browser refused, leaves a form nobody can use"
         ),
-        # The two ways in have to be *there*: a tab list with its panels, and the fields the "
+        # The two ways in have to be *there*: a tab list with its panels, and the fields the
         # resolver writes. This is the requirement's dual-option UI, read off the live DOM.
+        #
+        # The rest is the shape the page was overhauled into, and it is measured rather than
+        # declared: the pill row the category is chosen from, the action footer that owns both
+        # buttons and is *actually* sticky (a computed style, not the word in a stylesheet),
+        # the parse HUD as a status region, every ``label[for]`` resolving to a control that
+        # exists - a label pointing at nothing is a form nobody can read - and the split pane
+        # itself: two columns at desktop width with the form on the left, one column at phone
+        # width with the form above the map.
         answered=(
             "document.querySelectorAll('.geo-tab').length === 2"
             " && !!document.getElementById('site-maps-url')"
             " && !!document.getElementById('site-lat')"
             " && !!document.getElementById('site-radius')"
+            " && document.querySelectorAll('#site-category-pills .geo-pill').length >= 1"
+            " && !!document.querySelector('.geo-footer #site-save')"
+            " && !!document.querySelector('.geo-footer #site-reset')"
+            " && !!document.querySelector('.geo-footer #site-mode')"
+            " && document.getElementById('site-mode').checked"
+            " && getComputedStyle(document.querySelector('.geo-footer')).position === 'sticky'"
+            " && document.getElementById('site-link-hud').getAttribute('role') === 'status'"
+            # A map that fetched its tiles into a zero-height box is a page with no map,
+            # and the stylesheet can say that in a way no unit test can see.
+            " && document.getElementById('site-map').getBoundingClientRect().height > 200"
+
+            " && Array.prototype.every.call(document.querySelectorAll('label[for]'),"
+            " (node) => !!document.getElementById(node.getAttribute('for')))"
+            " && (window.innerWidth < 960"
+            " ? document.querySelector('.geo-pane').getBoundingClientRect().bottom"
+            "   <= document.querySelector('.geo-map-wrap').getBoundingClientRect().top + 1"
+            " : document.querySelector('.geo-pane').getBoundingClientRect().left"
+            "   < document.querySelector('.geo-map-wrap').getBoundingClientRect().left)"
         ),
     ),
 )

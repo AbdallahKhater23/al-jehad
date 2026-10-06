@@ -63,11 +63,12 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 import audit
 import clock
 import geofence
+import shift_windows
 import textguard
 from database import db
 from security import CurrentUser, admin_only
@@ -128,6 +129,17 @@ def _plausible(latitude: float, longitude: float) -> bool:
     return geofence.within_wgs84(latitude, longitude)
 
 
+def _strip_loc_prefix(value: str) -> str:
+    """``loc:29.351234,47.984712`` -> ``29.351234,47.984712``.
+
+    The mobile app's share sheet writes the pair behind that prefix, so a link copied from a
+    phone carries a coordinate the anchored query rule would otherwise refuse. Stripped
+    rather than matched with a second pattern: one shape with an optional prefix is one rule,
+    and two patterns are how the browser's parser and this one drift apart.
+    """
+    return re.sub(r"^\s*loc\s*:\s*", "", str(value), flags=re.IGNORECASE).strip()
+
+
 def coordinates_from_text(text: str) -> tuple[float, float] | None:
     """The first plausible ``(latitude, longitude)`` in ``text``, or ``None``.
 
@@ -158,7 +170,7 @@ def coordinates_from_text(text: str) -> tuple[float, float] | None:
         query = {}
     for key in ("q", "query", "ll", "center", "daddr", "destination", "sll"):
         for value in query.get(key, []):
-            match = _QUERY_PAIR.match(str(value).strip())
+            match = _QUERY_PAIR.match(_strip_loc_prefix(value))
             if match and _plausible(float(match.group(1)), float(match.group(2))):
                 return float(match.group(1)), float(match.group(2))
 
@@ -378,8 +390,17 @@ class SiteCreate(BaseModel):
     location_input: str | None = None
     #: The same three window fields ``/admin/sites/add`` takes, so the creation page can set
     #: a site's hours in the same request it sets its pin.
-    clock_in_window_start: str | None = None
-    clock_in_window_end: str | None = None
+    #:
+    #: ``shift_start_time`` / ``shift_end_time`` are accepted as the same field under the
+    #: name the requirement uses for a 24-hour boundary. The columns are the ones the shift
+    #: pipeline already reads (``clock_in_window_start`` / ``clock_in_window_end``), so the
+    #: alias is a spelling of one stored value rather than a second place hours can live.
+    clock_in_window_start: str | None = Field(
+        default=None, validation_alias=AliasChoices("clock_in_window_start", "shift_start_time")
+    )
+    clock_in_window_end: str | None = Field(
+        default=None, validation_alias=AliasChoices("clock_in_window_end", "shift_end_time")
+    )
     site_timezone: str | None = None
     category_id: int | None = None
 
@@ -389,6 +410,53 @@ class SiteCreate(BaseModel):
         return textguard.identifier(
             value, field="Site name", max_length=textguard.MAX_SITE_NAME
         )
+
+    @field_validator("clock_in_window_start", "clock_in_window_end")
+    @classmethod
+    def _validate_window_time(cls, value: str | None) -> str | None:
+        """The site's own hours, by the same rule ``/admin/sites/add`` applies.
+
+        The two routes write the same two columns, so they have to agree about what a time is.
+        This one used to accept anything: ``25:00`` posted here was stored, and a stored window
+        ``shift_windows`` cannot parse degrades to the company hours at the gate - a fence that
+        makes nobody late, arriving through a door nobody was watching.
+
+        Blank is "inherit", which is what a form's empty time box means, so it is read as
+        ``None`` rather than refused.
+        """
+        if value is None:
+            return None
+        candidate = str(value).strip()
+        if not candidate:
+            return None
+        if not shift_windows.is_valid_hhmm(candidate):
+            raise ValueError(
+                "Site clock-in window must be a 24-hour time in HH:MM form (for example "
+                f"04:00, 22:00, 00:00); '{value}' is not. "
+                "Minutes are 00-59 and hours are 00-23."
+            )
+        return candidate
+
+    @field_validator("site_timezone")
+    @classmethod
+    def _validate_timezone(cls, value: str | None) -> str | None:
+        """Refuse a zone ``zoneinfo`` cannot resolve, exactly as the console route does.
+
+        A typo like ``Africa/Cario`` would otherwise be stored and then degrade to the default
+        zone at every punch, which moves that site's window by an hour or two and presents as
+        "the wrong people are late" rather than as a typo.
+        """
+        if value is None:
+            return None
+        candidate = str(value).strip()
+        if not candidate:
+            return None
+        if not shift_windows.is_known_timezone(candidate):
+            raise ValueError(
+                f"'{value}' is not a timezone this server knows. Use an IANA name such as "
+                "Asia/Kuwait or Asia/Riyadh."
+            )
+        return candidate
 
     def coordinates(self) -> tuple[float, float]:
         """The site's position, from the modern pair or from the pasted input.

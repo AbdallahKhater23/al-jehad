@@ -6899,27 +6899,6 @@ async def registration_page(request: Request):
     return frontend_page_response("register.html", request)
 
 
-@app.get("/geofence", include_in_schema=False)
-async def admin_geofence_page(request: Request):
-    """Serve the visual geofence editor.
-
-    Its own page rather than a tab inside the console bundle, because it is the one screen
-    that pulls in a third-party map library: a phone at a gate must not download Leaflet to
-    clock in, and the console's own bundle is already 255 KB that a worker never fetches.
-    Serving it is not authorising it - the page asks for ``GET /api/v1/geofence`` with the
-    session's token, and the write it offers is refused unless the session is an
-    administrator's (see ``geofence.update_geofence``).
-
-    Deliberately *not* under ``/admin/``: that prefix is the administrator API's, and the
-    startup gate refuses to serve while any ``/admin/`` route answers without a role guard
-    (``auth_enforced_on_admin_routes``) or exists outside the versioned API
-    (``no_unprefixed_duplicate_routes``). This is a document, not an endpoint - the same
-    shape as ``/enroll/{token}``, ``/q/{token}`` and ``/register`` - so it lives at the
-    root beside them and the guard that matters is on the data it reads.
-    """
-    return frontend_page_response("admin_geofence.html", request)
-
-
 @app.get("/sites/new", include_in_schema=False)
 async def admin_add_site_page(request: Request):
     """Serve the visual site-creation page.
@@ -6964,8 +6943,8 @@ async def lifespan(application: FastAPI):
     #
     # It runs before the readiness gate because the gate's report is where an operator reads
     # what this deployment came up with, and a cache loaded after the verdict would be
-    # invisible to it. An edit refreshes it through ``geofence.store_geofence``; a restart
-    # re-reads it here.
+    # invisible to it. Nothing writes it any more - the fence editor and its two write
+    # endpoints were removed - so a restart is what re-reads it here.
     application.state.geofence_cache = geofence.CACHE
     geofence.refresh_cache()
     # Every site's fence, read once, in the same breath. ``app.state.sites_cache`` is what

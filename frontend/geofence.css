@@ -1,23 +1,71 @@
 /*
- * The geofence editor's stylesheet.
+ * The site-creation page's stylesheet.
  *
- * Deliberately standalone rather than a section of ``style.css``: the page is its own
- * document with its own single job, and the console's stylesheet is 2,000 lines of screens
- * this one never draws. It is still served from the same folder with the same cache-busting
- * token, so it costs nothing to keep apart.
+ * Deliberately standalone rather than a section of ``style.css``: the page is its own document
+ * with its own single job - name a place, set its hours, take its coordinates off a Maps link,
+ * size the fence - and the console's stylesheet is 2,000 lines of screens this one never draws.
+ * It is still served from the same folder with the same cache-busting token, so it costs nothing
+ * to keep apart. The two classes it does borrow, ``.ui-field`` and ``.ui-label``, come from the
+ * console so the fields look like the console's fields.
  *
- * The map needs a real height in a 50,000-libraries-in-one is what the stylesheet is for.
+ * THE SHAPE
+ * ---------
+ * A split pane: the form on the left, the map on the right, and an action footer that sticks to
+ * the bottom of the form's column so Save is never something to scroll back to. Below 960px the
+ * two panes stack and the map follows the form.
+ *
+ * The palette is the console's own slate-and-blue, not a new one: this page is reached from the
+ * console's Sites screen and is the same product. Flat by design - 1px borders and a single
+ * soft shadow on the cards, no gradients - and every interactive state has a visible focus ring,
+ * because half of this form is one tab stop from being unusable without one.
+ *
+ * Dark mode is a token swap, and the pairs are checked for 4.5:1 text contrast in both themes.
  */
-:root { color-scheme: light dark; }
+:root {
+    color-scheme: light dark;
+
+    --geo-page: #f1f5f9;
+    --geo-card: #ffffff;
+    --geo-sunken: #f8fafc;
+    --geo-border: #e2e8f0;
+    --geo-ink: #0f172a;
+    --geo-body: #334155;
+    --geo-muted: #64748b;
+    --geo-primary: #2563eb;
+    --geo-primary-soft: #93c5fd;
+    --geo-on-primary: #ffffff;
+    /*: The disabled fill is a light tint of the primary, so the label has to be dark to stay
+       readable - a disabled control is exempt from the 4.5:1 rule, but a button whose name
+       cannot be read is not a button the admin can plan around. The pair is inverted below. */
+    --geo-on-primary-soft: #1e3a8a;
+    --geo-ok: #047857;
+    --geo-info: #1d4ed8;
+    --geo-danger: #b91c1c;
+    --geo-shadow: 0 1px 3px rgba(15, 23, 42, 0.18);
+    /*: Transitions are short and only ever on colour or a transform, so a hover costs no
+       layout. The reduced-motion query at the foot of this file turns them off wholesale. */
+    --geo-ease: 160ms ease;
+}
 
 .geofence-page {
     margin: 0;
     min-height: 100vh;
-    background: #f1f5f9;
-    color: #0f172a;
+    /* The action footer is sticky over the bottom of the page, so a browser scrolling a
+       focused field into view has to leave room for it - otherwise the field the caret
+       was just put in (``Pages.focus``) can arrive underneath the buttons. */
+    scroll-padding-bottom: 160px;
+    background: var(--geo-page);
+    color: var(--geo-ink);
     font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 
+.geo-shell {
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+}
+
+/* ------------------------------------------------------------------ the header */
 .geo-header {
     display: flex;
     flex-wrap: wrap;
@@ -28,110 +76,365 @@
     background: #0f172a;
     color: #f8fafc;
 }
-
 .geo-brand { display: flex; align-items: center; gap: 12px; }
 .geo-brand h1 { font-size: 17px; margin: 0; }
 .geo-sub { margin: 2px 0 0; font-size: 12px; color: #cbd5e1; }
 
 .geo-engine { display: flex; gap: 6px; }
 .geo-engine-btn {
+    display: inline-block;
     border: 1px solid #334155;
     background: #1e293b;
     color: #e2e8f0;
     border-radius: 6px;
-    padding: 7px 11px;
+    padding: 8px 11px;
     font-size: 12.5px;
+    text-decoration: none;
     cursor: pointer;
+    transition: background var(--geo-ease), border-color var(--geo-ease);
 }
-.geo-engine-btn.is-active { background: #2563eb; border-color: #2563eb; color: #fff; }
+a.geo-engine-btn { display: inline-block; }
+.geo-engine-btn:hover { background: #273548; border-color: #475569; }
 .geo-engine-btn:focus-visible { outline: 2px solid #93c5fd; outline-offset: 2px; }
 
+/* ------------------------------------------------------------------ the split pane */
 .geo-main {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 340px;
-    gap: 14px;
-    padding: 14px;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr);
+    gap: 16px;
+    padding: 16px;
+    width: 100%;
+    max-width: 1440px;
+    margin: 0 auto;
+    box-sizing: border-box;
     align-items: start;
+    flex: 1 1 auto;
 }
 
-.geo-map-wrap { position: relative; }
+.geo-panel {
+    background: var(--geo-card);
+    border-radius: 10px;
+    padding: 16px;
+    box-shadow: var(--geo-shadow);
+}
+.geo-pane { position: relative; }
+.geo-pane-title {
+    margin: 0 0 14px;
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--geo-muted);
+}
+
+/* One labelled section of the form. A hairline between groups is what makes a long form
+   scannable; the first group has none, so the card does not open with a rule under its title. */
+.geo-group {
+    margin-top: 16px;
+    padding-top: 14px;
+    border-top: 1px solid var(--geo-border);
+}
+.geo-group:first-of-type { margin-top: 0; padding-top: 0; border-top: none; }
+
+/* Every control a script can move the caret to, for the same reason as the padding
+   above: ``scroll-margin`` is what the browser honours when it brings the element into
+   view, and the footer is 110-odd pixels of it. */
+.geo-pane input,
+.geo-pane .ui-label,
+.geo-pane .geo-sublabel,
+.geo-primary,
+.geo-secondary { scroll-margin-bottom: 140px; }
+
+.geo-sublabel {
+    display: block;
+    margin-bottom: 4px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #475569;
+}
+
+.geo-times,
+.geo-coords { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+
+.geo-radius { margin-top: 14px; }
+/* The timezone sits under the hint about the hours, so it needs a little air of its own: it
+   is a separate answer (where the clock is) from the window it is measured against. */
+.geo-tz { margin-top: 12px; }
+
+.geo-radius input[type="range"] { width: 100%; margin: 4px 0 2px; }
+
+.geo-hint { font-size: 11.5px; color: var(--geo-muted); margin: 6px 0 0; }
+.geo-hint code {
+    font-size: 11px;
+    background: var(--geo-sunken);
+    border-radius: 4px;
+    padding: 1px 4px;
+}
+
+/*
+  A field's own complaint, directly under it and referenced by the input through
+  ``aria-describedby``. Empty is invisible, so the rule costs no layout when nothing is wrong -
+  which matters, because a reserved gap under all eight fields is a form that looks broken.
+*/
+.geo-field-error {
+    margin: 6px 0 0;
+    font-size: 12.5px;
+    line-height: 1.4;
+    color: var(--geo-danger);
+}
+.geo-field-error:empty { display: none; }
+
+/* ------------------------------------------------------------------ the pills */
+/*
+  The category selector. Native radios inside a ``role="radiogroup"`` wrapper, styled as pills:
+  one tab stop for the row, arrow keys between the options, and the browser's own checked state
+  doing the work. ``.is-checked`` is set by the page's script as well, because ``:has()`` is
+  recent and the selected pill has to be unmistakable in every browser this is used from.
+*/
+.geo-pills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 2px;
+}
+.geo-pill {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+    padding: 0 14px;
+    border: 1px solid var(--geo-border);
+    border-radius: 999px;
+    background: var(--geo-card);
+    color: var(--geo-body);
+    font-size: 13.5px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background var(--geo-ease), border-color var(--geo-ease), color var(--geo-ease);
+}
+.geo-pill:hover { border-color: var(--geo-primary); color: var(--geo-ink); }
+.geo-pill input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: 0;
+    opacity: 0;
+    pointer-events: none;
+}
+.geo-pill:focus-within { outline: 2px solid var(--geo-primary); outline-offset: 2px; }
+.geo-pill.is-checked,
+.geo-pill:has(input:checked) {
+    background: var(--geo-primary);
+    border-color: var(--geo-primary);
+    color: var(--geo-on-primary);
+}
+/* The placeholder pill while the categories are being fetched: text, not a control. */
+.geo-pill.is-placeholder { color: var(--geo-muted); cursor: default; border-style: dashed; }
+
+/* ------------------------------------------------------------------ the switches */
+/*
+  Two checkboxes wear this: "runs past midnight", which decides how the two time boxes are read,
+  and "create & add another", which decides what the buttons do after a save. A 44px row with a
+  visible track, because the target is a finger on a phone.
+*/
+.geo-switch {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 44px;
+    cursor: pointer;
+}
+.geo-switch input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: 0;
+    opacity: 0;
+    pointer-events: none;
+}
+.geo-switch-track {
+    position: relative;
+    flex: none;
+    width: 40px;
+    height: 22px;
+    border-radius: 999px;
+    background: #cbd5e1;
+    transition: background var(--geo-ease);
+}
+.geo-switch-track::after {
+    content: "";
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: #ffffff;
+    transition: transform var(--geo-ease);
+}
+.geo-switch input:checked + .geo-switch-track { background: var(--geo-primary); }
+.geo-switch input:checked + .geo-switch-track::after { transform: translateX(18px); }
+.geo-switch input:focus-visible + .geo-switch-track {
+    outline: 2px solid var(--geo-primary);
+    outline-offset: 2px;
+}
+.geo-switch input:disabled + .geo-switch-track { opacity: 0.5; }
+.geo-switch-text { font-size: 13.5px; font-weight: 600; }
+
+/* What the two time boxes add up to, in the words ``shift_windows`` itself uses. */
+.geo-shift-summary {
+    margin: 6px 0 0;
+    font-size: 12.5px;
+    font-variant-numeric: tabular-nums;
+    color: var(--geo-body);
+}
+.geo-shift-summary:empty { display: none; }
+
+/* ------------------------------------------------------------------ the parse HUD */
+/*
+  "Did that paste work?" answered where the eye already is. It is hidden until there is something
+  to say, and it never says *no* while a link is still being typed: the complaint is on the error
+  row below, on blur or after a failed resolve.
+*/
+.geo-link-hud {
+    display: none;
+    align-items: center;
+    gap: 6px;
+    margin: 8px 0 0;
+    font-size: 12.5px;
+    font-weight: 600;
+}
+.geo-link-hud.is-ok { display: flex; color: var(--geo-ok); }
+.geo-link-hud.is-info { display: flex; color: var(--geo-info); }
+.geo-link-hud .geo-check { flex: none; }
+
+/* ------------------------------------------------------------------ the map */
+.geo-map-wrap {
+    position: sticky;
+    top: 16px;
+    min-width: 0;
+}
+/*
+  The map's own box, and the only place its height is set.
+
+  This stylesheet used to restate Leaflet's own convention under it -
+  ``.leaflet-container { height: 100% }``. Same specificity, later in the file, so it
+  won: a percentage against a parent whose height is auto, which is a map that loads
+  its tiles and draws them into a zero-pixel box. Nothing about that is visible in a
+  unit test; it took a browser measuring the container to find it.
+*/
 .geo-map {
-    height: min(72vh, 720px);
+    height: clamp(320px, 62vh, 720px);
     min-height: 320px;
     border-radius: 10px;
     overflow: hidden;
     background: #dbeafe;
-    box-shadow: 0 1px 3px rgba(15, 23, 42, .18);
+    box-shadow: var(--geo-shadow);
 }
-.geo-map-note { margin: 8px 2px 0; font-size: 12.5px; color: #334155; }
+/* Leaflet's panes and tiles paint into whatever box the above gives them. */
+.leaflet-container { width: 100%; background: #dbeafe; }
+.geo-map-note { margin: 8px 2px 0; font-size: 12.5px; color: var(--geo-body); }
 
-.geo-fallback {
-    margin-top: 10px;
-    padding: 12px;
-    border: 1px solid #cbd5e1;
-    border-radius: 8px;
-    background: #fff;
-    font-size: 13px;
+/* ------------------------------------------------------------------ the tabs */
+.geo-tabs {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 10px;
+    border-bottom: 1px solid var(--geo-border);
 }
-.geo-fallback label { display: block; font-weight: 600; margin-bottom: 4px; }
-.geo-fallback input { width: 100%; padding: 7px 8px; border: 1px solid #cbd5e1; border-radius: 6px; }
-.geo-fallback p { margin: 8px 0 0; color: #475569; }
-
-.geo-panel {
-    background: #fff;
-    border-radius: 10px;
-    padding: 14px;
-    box-shadow: 0 1px 3px rgba(15, 23, 42, .18);
+.geo-tab {
+    border: none;
+    background: none;
+    padding: 10px 10px;
+    font: inherit;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--geo-muted);
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: color var(--geo-ease), border-color var(--geo-ease);
 }
-.geo-panel h2 { margin: 0 0 10px; font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: #475569; }
+.geo-tab:hover { color: var(--geo-ink); }
+.geo-tab.is-active { color: var(--geo-primary); border-bottom-color: var(--geo-primary); }
+.geo-tab:focus-visible { outline: 2px solid var(--geo-primary); outline-offset: 2px; }
+.geo-tabpanel { padding-top: 4px; }
 
+/* A field and the button that goes with it, on one line. */
+.geo-row { display: flex; gap: 6px; align-items: stretch; }
+.geo-row .ui-field { flex: 1 1 auto; width: auto; min-width: 0; }
+
+/* ------------------------------------------------------------------ the HUD */
 .geo-hud {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 8px;
-    margin-bottom: 12px;
+    margin-top: 16px;
 }
-.geo-hud > div { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px; }
-.geo-hud span { display: block; font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: .03em; }
+.geo-hud > div {
+    background: var(--geo-sunken);
+    border: 1px solid var(--geo-border);
+    border-radius: 8px;
+    padding: 8px;
+}
+.geo-hud span {
+    display: block;
+    font-size: 11px;
+    color: var(--geo-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
 .geo-hud strong { font-size: 15px; font-variant-numeric: tabular-nums; }
 
-.geo-field { display: block; font-size: 12px; color: #475569; margin: 8px 0 3px; }
-.geo-field output { font-variant-numeric: tabular-nums; color: #0f172a; font-weight: 600; }
-
-.geo-panel input[type="number"],
-.geo-panel input[type="text"] {
-    width: 100%;
-    box-sizing: border-box;
-    padding: 7px 8px;
-    border: 1px solid #cbd5e1;
-    border-radius: 6px;
-    font: inherit;
-    font-variant-numeric: tabular-nums;
+/* ------------------------------------------------------------------ the action footer */
+/*
+  Stuck to the bottom of the form's column: the panel is several screens tall on a phone, and the
+  two buttons that finish the job must not be something to scroll back to. The background is
+  opaque because the form scrolls underneath it.
+*/
+.geo-footer {
+    position: sticky;
+    bottom: 0;
+    z-index: 5;
+    margin: 18px -16px -16px;
+    padding: 12px 16px 14px;
+    background: var(--geo-card);
+    border-top: 1px solid var(--geo-border);
+    border-radius: 0 0 10px 10px;
 }
-
-.geo-panel input[type="range"] { width: 100%; margin: 4px 0 2px; }
-
-.geo-hint { font-size: 11.5px; color: #64748b; margin: 6px 0 0; }
-
-.geo-actions { display: flex; gap: 8px; margin-top: 14px; }
-.geo-primary, .geo-secondary {
+.geo-actions { display: flex; gap: 8px; margin-top: 10px; }
+.geo-primary,
+.geo-secondary {
     flex: 1;
+    min-height: 44px;
     border-radius: 8px;
     padding: 10px 12px;
-    font-size: 13px;
+    font-size: 13.5px;
     font-weight: 600;
     cursor: pointer;
     border: 1px solid transparent;
+    transition: background var(--geo-ease), border-color var(--geo-ease), color var(--geo-ease);
 }
-.geo-primary { background: #2563eb; color: #fff; }
-.geo-primary:disabled { background: #93c5fd; cursor: progress; }
-.geo-secondary { background: #fff; color: #1e293b; border-color: #cbd5e1; }
+.geo-primary { background: var(--geo-primary); color: var(--geo-on-primary); }
+.geo-primary:hover:not(:disabled) { background: #1d4ed8; }
+.geo-primary:disabled { background: var(--geo-primary-soft); color: var(--geo-on-primary-soft); cursor: not-allowed; }
+.geo-secondary { background: var(--geo-card); color: var(--geo-ink); border-color: #cbd5e1; }
+.geo-secondary:hover:not(:disabled) { background: var(--geo-sunken); border-color: var(--geo-muted); }
+.geo-secondary:disabled { opacity: 0.6; cursor: not-allowed; }
+.geo-primary:focus-visible,
+.geo-secondary:focus-visible { outline: 2px solid var(--geo-primary); outline-offset: 2px; }
 
-.geo-check { display: flex; gap: 8px; align-items: flex-start; margin: 14px 0 6px; font-size: 12.5px; }
-.geo-check input { margin-top: 2px; }
-
+/* ------------------------------------------------------------------ detail panels */
+/*
+  The two JSON blobs - what the resolver answered, what the server stored - are evidence rather
+  than interface, so they are folded away behind a summary instead of pushing the buttons down.
+*/
+.geo-detail { margin-top: 8px; font-size: 12.5px; }
+.geo-detail > summary { cursor: pointer; color: var(--geo-muted); font-weight: 600; }
+.geo-detail > summary:focus-visible { outline: 2px solid var(--geo-primary); outline-offset: 2px; }
+.geo-detail[open] > summary { margin-bottom: 6px; }
 .geo-legacy-preview {
-    margin: 6px 0 0;
+    margin: 0;
     padding: 8px;
     background: #0f172a;
     color: #e2e8f0;
@@ -139,10 +442,9 @@
     font-size: 11.5px;
     overflow-x: auto;
 }
+.geo-legacy-preview:empty { display: none; }
 
-.geo-details { margin-top: 14px; font-size: 12.5px; }
-.geo-details summary { cursor: pointer; font-weight: 600; color: #1e293b; }
-
+/* ------------------------------------------------------------------ the toasts */
 .geo-toasts {
     position: fixed;
     right: 14px;
@@ -154,87 +456,88 @@
     z-index: 9999;
 }
 .geo-toast {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
     padding: 10px 12px;
     border-radius: 8px;
     background: #1e293b;
     color: #f8fafc;
     font-size: 12.5px;
-    box-shadow: 0 4px 14px rgba(15, 23, 42, .3);
-    transition: opacity .5s ease, transform .5s ease;
+    line-height: 1.4;
+    box-shadow: 0 4px 14px rgba(15, 23, 42, 0.3);
+    transition: opacity 250ms ease, transform 250ms ease;
 }
+.geo-toast .geo-check { flex: none; margin-top: 1px; }
 .geo-toast.is-ok { background: #047857; }
 .geo-toast.is-error { background: #b91c1c; }
 .geo-toast.is-info { background: #1d4ed8; }
 .geo-toast.is-leaving { opacity: 0; transform: translateY(6px); }
 
-/* The map fills its own box; Leaflet and Google both need the container to have a size. */
-.leaflet-container { height: 100%; width: 100%; background: #dbeafe; }
-
-/* -- the site-creation page's own two controls ---------------------------- */
-/* The engine toggle doubles as a link on that page ("Back to the console"), so the anchor
-   has to carry the button's own box: an <a> is inline by default and would collapse. */
-a.geo-engine-btn { display: inline-block; text-decoration: none; }
-
-/* The two ways to set a location. A real tab list rather than two buttons: the panels are
-   alternatives, and aria-selected is what tells a screen reader which one is on screen. */
-.geo-tabs {
-    display: flex;
-    gap: 4px;
-    margin-bottom: 10px;
-    border-bottom: 1px solid #e2e8f0;
-}
-.geo-tab {
-    border: none;
-    background: none;
-    padding: 8px 10px;
-    font: inherit;
-    font-size: 12.5px;
-    font-weight: 600;
-    color: #64748b;
-    cursor: pointer;
-    border-bottom: 2px solid transparent;
-}
-.geo-tab.is-active { color: #1d4ed8; border-bottom-color: #2563eb; }
-.geo-tab:focus-visible { outline: 2px solid #93c5fd; outline-offset: 2px; }
-.geo-tabpanel { padding-top: 4px; }
-
-/* A field and the button that goes with it, on one line. */
-.geo-row { display: flex; gap: 6px; align-items: stretch; }
-.geo-row .ui-field { flex: 1 1 auto; min-width: 0; }
-.geo-row .geo-secondary { flex: 0 0 auto; padding: 7px 12px; }
-
-/* The name and the two coordinates: a name on its own line, the pair side by side. */
-.geo-field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
-.geo-field-grid > div:first-child { grid-column: 1 / -1; }
-.geo-field-grid .ui-label { display: block; font-size: 12px; color: #475569; margin-bottom: 3px; }
-.geo-field-grid .ui-label output { font-variant-numeric: tabular-nums; color: #0f172a; font-weight: 600; }
-.geo-field-grid .ui-field {
-    width: 100%;
-    box-sizing: border-box;
-    font-variant-numeric: tabular-nums;
-}
-
+/* ------------------------------------------------------------------ dark mode */
 @media (prefers-color-scheme: dark) {
-    .geo-tabs { border-bottom-color: #1e293b; }
-    .geo-tab { color: #94a3b8; }
-    .geo-tab.is-active { color: #93c5fd; border-bottom-color: #3b82f6; }
-    .geo-field-grid .ui-label { color: #94a3b8; }
-    .geo-field-grid .ui-label output { color: #f8fafc; }
-}
-
-@media (max-width: 900px) {
-    .geo-main { grid-template-columns: minmax(0, 1fr); }
-    .geo-map { height: 58vh; }
-}
-
-@media (prefers-color-scheme: dark) {
-    .geofence-page { background: #0b1220; color: #e2e8f0; }
-    .geo-panel { background: #111a2b; }
-    .geo-hud > div { background: #0f172a; border-color: #1e293b; }
-    .geo-hud strong, .geo-field output { color: #f8fafc; }
-    .geo-secondary { background: #0f172a; color: #e2e8f0; border-color: #334155; }
-    .geo-panel input[type="number"], .geo-panel input[type="text"] {
-        background: #0f172a; color: #e2e8f0; border-color: #334155;
+    :root {
+        --geo-page: #0b1220;
+        --geo-card: #111a2b;
+        --geo-sunken: #0f172a;
+        --geo-border: #1e293b;
+        --geo-ink: #e2e8f0;
+        --geo-body: #cbd5e1;
+        --geo-muted: #94a3b8;
+        --geo-primary: #3b82f6;
+        --geo-primary-soft: #1e3a8a;
+        --geo-on-primary: #0b1220;
+        --geo-on-primary-soft: #93c5fd;
+        --geo-ok: #34d399;
+        --geo-info: #93c5fd;
+        --geo-danger: #fca5a5;
+        --geo-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
     }
-    .geo-fallback { background: #111a2b; border-color: #334155; }
+    .geo-sublabel { color: var(--geo-body); }
+    .geo-hint code { background: #0f172a; }
+    .geo-switch-track { background: #334155; }
+    .geo-switch-track::after { background: #e2e8f0; }
+    .geo-secondary { border-color: #334155; }
+    .geo-secondary:hover:not(:disabled) { background: #16223a; }
+    .geo-map { background: #0f172a; }
+    .leaflet-container { background: #0f172a; }
+    .geo-toast { background: #1e293b; }
+}
+
+/* ------------------------------------------------------------------ responsive */
+@media (max-width: 960px) {
+    .geo-main { grid-template-columns: minmax(0, 1fr); }
+    /* The map is no longer beside the form, so sticking it to the viewport top would cover the
+       fields it is supposed to mirror. */
+    .geo-map-wrap { position: static; }
+    .geo-map { height: 52vh; min-height: 300px; }
+}
+
+@media (max-width: 560px) {
+    .geo-main { padding: 12px; gap: 12px; }
+    .geo-panel { padding: 12px; }
+    .geo-times,
+    .geo-coords { grid-template-columns: minmax(0, 1fr); }
+    .geo-footer { margin: 16px -12px -12px; padding: 12px 12px 14px; }
+    /* Save first: on a phone the primary action should be the one under the thumb. */
+    .geo-actions { flex-direction: column-reverse; }
+    .geo-hud { grid-template-columns: 1fr 1fr; }
+}
+
+/*
+  No motion, on request. The switches and the pills are the only things on this page that move,
+  and with the preference set they simply arrive at the new state - nothing here is decorative.
+*/
+@media (prefers-reduced-motion: reduce) {
+    .geo-pill,
+    .geo-switch-track,
+    .geo-switch-track::after,
+    .geo-toast,
+    .geo-primary,
+    .geo-secondary,
+    .geo-engine-btn,
+    .geo-tab {
+        transition: none;
+    }
+    .geo-toast.is-leaving { transform: none; }
 }

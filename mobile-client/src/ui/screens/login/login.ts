@@ -13,6 +13,10 @@ import { esc, on } from '../../dom.js';
 import { icon } from '../../icons.js';
 import { serverGearButton, openServerSheet } from '../../components/server-url.js';
 import { toastError, toastOk } from '../../components/toast.js';
+import {
+  loginRequestBody,
+  validateCredentials,
+} from '../../credentials.js';
 
 interface LoginResponse {
   status?: string;
@@ -22,23 +26,6 @@ interface LoginResponse {
   access_token?: string;
   token?: string;
   expires_at?: string;
-}
-
-/** Local validation, so an obviously wrong entry does not cost a bcrypt round trip. */
-export function validateCredentials(input: {
-  userId: string;
-  emailOrPhone: string;
-  password: string;
-}): Record<string, string> {
-  const errors: Record<string, string> = {};
-  if (!input.userId.trim()) errors.user_id = 'Enter your worker ID.';
-  else if (input.userId.trim().length > 64) errors.user_id = 'That ID is too long.';
-  if (!input.emailOrPhone.trim()) errors.email_or_phone = 'Enter your email or phone number.';
-  else if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(input.emailOrPhone.trim()) && !/^[+\d][\d\s()-]{5,}$/.test(input.emailOrPhone.trim())) {
-    errors.email_or_phone = 'That is not an email address or a phone number.';
-  }
-  if (!input.password) errors.password = 'Enter your password.';
-  return errors;
 }
 
 export function createLoginScreen(onSignedIn: () => void): Screen {
@@ -68,8 +55,8 @@ export function createLoginScreen(onSignedIn: () => void): Screen {
             <div class="hand-field-group">
               <label class="hand-field-label" for="login-identity">Email or phone</label>
               <input class="ui-field" id="login-identity" name="email_or_phone" type="text"
-                     autocomplete="username" autocapitalize="off" spellcheck="false"
-                     enterkeyhint="next" />
+                     autocomplete="username" autocapitalize="off" autocorrect="off"
+                     spellcheck="false" enterkeyhint="next" />
               <span class="ui-field-error" data-error="email_or_phone" hidden></span>
             </div>
 
@@ -163,9 +150,11 @@ export function createLoginScreen(onSignedIn: () => void): Screen {
 
       async function submitForm(): Promise<void> {
         clearErrors();
+        // Raw, untrimmed: normalization belongs to ``credentials.ts``, so the validator and
+        // the request body cannot disagree about what the field actually holds.
         const values = {
-          userId: fields.user_id.value.trim(),
-          emailOrPhone: fields.email_or_phone.value.trim(),
+          userId: fields.user_id.value,
+          emailOrPhone: fields.email_or_phone.value,
           password: fields.password.value,
         };
         const errors = validateCredentials(values);
@@ -180,11 +169,7 @@ export function createLoginScreen(onSignedIn: () => void): Screen {
             method: 'POST',
             path: '/auth/login',
             auth: false,
-            body: {
-              user_id: values.userId,
-              email_or_phone: values.emailOrPhone,
-              password: values.password,
-            },
+            body: loginRequestBody(values),
           });
 
           if (!body.access_token && !body.token) {

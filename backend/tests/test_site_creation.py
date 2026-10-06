@@ -585,3 +585,125 @@ def test_the_worker_punch_screen_keeps_the_strict_policy(client):
     import netguard
 
     assert client.get("/").headers["content-security-policy"] == netguard.CSP_HTML
+
+
+# ---------------------------------------------------------------------------
+# 4. the window fields, which this route accepts and used to write unvalidated
+#
+# ``POST /sites`` writes the same two columns ``/admin/sites/add`` writes, so it has to apply
+# the same rule to them. It used to accept anything: ``25:00`` posted here was stored, and a
+# stored window ``shift_windows`` cannot parse degrades to the company hours at the gate.
+# ---------------------------------------------------------------------------
+def test_the_site_window_is_stored_as_written(client):
+    response = _create(
+        client,
+        site_name="Hourly Villa",
+        clock_in_window_start="07:00",
+        clock_in_window_end="15:30",
+        site_timezone="Asia/Kuwait",
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["site"]["clock_in_window_start"] == "07:00"
+    stored = db_scalar(
+        "SELECT clock_in_window_start || '-' || clock_in_window_end || ' ' || site_timezone "
+        "FROM construction_sites WHERE site_name = 'Hourly Villa'"
+    )
+    assert stored == "07:00-15:30 Asia/Kuwait"
+
+
+@pytest.mark.parametrize("value", ["25:00", "07:60", "7:00", "07:00:00", "banana", "07", "-1:00"])
+def test_a_window_that_is_not_hhmm_is_refused(client, value):
+    response = _create(client, site_name="Bad Hours Villa", clock_in_window_start=value)
+    assert response.status_code == 422, response.text
+    assert "HH:MM" in response.text
+    assert db_scalar(
+        "SELECT COUNT(*) FROM construction_sites WHERE site_name = 'Bad Hours Villa'"
+    ) == 0, "a refused window still created the site"
+
+
+def test_a_blank_window_means_inherit_rather_than_an_error(client):
+    """An empty time box is what a form sends for "nobody set this": NULL, not a refusal."""
+    response = _create(
+        client,
+        site_name="Inheriting Villa",
+        clock_in_window_start="",
+        clock_in_window_end="",
+        site_timezone="",
+    )
+    assert response.status_code == 200, response.text
+    assert db_scalar(
+        "SELECT COUNT(*) FROM construction_sites WHERE site_name = 'Inheriting Villa' "
+        "AND clock_in_window_start IS NULL AND clock_in_window_end IS NULL "
+        "AND site_timezone IS NULL"
+    ) == 1
+
+
+def test_a_timezone_this_server_cannot_resolve_is_refused(client):
+    response = _create(client, site_name="Zoned Villa", site_timezone="Africa/Cario")
+    assert response.status_code == 422, response.text
+    assert "timezone" in response.text.lower()
+    assert db_scalar("SELECT COUNT(*) FROM construction_sites WHERE site_name = 'Zoned Villa'") == 0
+
+
+def test_the_two_site_routes_refuse_a_bad_window_the_same_way(client):
+    """The console's route and the requirement's route write one table, so they agree."""
+    console = client.post(
+        "/api/v1/admin/sites/add",
+        headers=bearer(ADMIN),
+        json={
+            "site_name": "Console Bad Hours",
+            "location_input": "29.9,31.9",
+            "radius": 80.0,
+            "clock_in_window_start": "25:00",
+        },
+    )
+    requirement = _create(client, site_name="Requirement Bad Hours", clock_in_window_start="25:00")
+    assert console.status_code == requirement.status_code == 422
+    assert "HH:MM" in console.text and "HH:MM" in requirement.text
+
+
+def test_the_shift_time_names_the_requirement_uses_are_accepted(client):
+    """``shift_start_time`` / ``shift_end_time``: the same two fields, spelled as the
+    requirement spells them. One stored value under two accepted names - the alias is read
+    into the columns the shift pipeline already reads, so hours cannot live in two places."""
+    response = _create(
+        client, site_name="Aliased Villa", shift_start_time="06:15", shift_end_time="14:45"
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["site"]["clock_in_window_start"] == "06:15"
+    assert (
+        db_scalar(
+            "SELECT clock_in_window_start || '-' || clock_in_window_end "
+            "FROM construction_sites WHERE site_name = 'Aliased Villa'"
+        )
+        == "06:15-14:45"
+    )
+
+
+def test_the_aliased_shift_time_is_validated_the_same_way(client):
+    """The alias is a name for the field, not a way around its rule."""
+    for payload in ({"shift_start_time": "25:00"}, {"shift_end_time": "7:00"}):
+        response = _create(client, site_name="Aliased Bad Hours", **payload)
+        assert response.status_code == 422, response.text
+        assert "HH:MM" in response.text
+    assert (
+        db_scalar(
+            "SELECT COUNT(*) FROM construction_sites "
+            "WHERE site_name = 'Aliased Bad Hours'"
+        )
+        == 0
+    ), "a refused window still created the site"
+
+
+def test_a_category_that_does_not_exist_is_refused(client):
+    response = _create(client, site_name="Homeless Villa", category_id=987654)
+    assert response.status_code == 404, response.text
+    assert "category" in response.json()["detail"].lower()
+
+
+def test_a_shared_place_link_with_a_loc_prefix_is_read(client):
+    """``?q=loc:29.351234,47.984712`` is the shape the mobile app's share sheet writes."""
+    found = sites.coordinates_from_text(
+        "https://www.google.com/maps?q=loc:29.351234,47.984712&z=16"
+    )
+    assert found == pytest.approx((29.351234, 47.984712))

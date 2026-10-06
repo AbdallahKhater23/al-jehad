@@ -67,11 +67,11 @@ AUDIENCE_EXCEPTIONS: dict[str, tuple[str, ...]] = {
     # deployment rather than a rota, so there is no punch card and no template to need
     # (see ``SELF_ENROLL_ROLES`` in main.py).
     "/api/v1/worker/me/enroll": ("admin",),
-    # The geofence is an administrator's, read and written: moving the fence moves where
-    # every worker is allowed to clock in, which is an administrative act and not a thing a
-    # signed-in account should be able to do to its own geofence.
+    # What is left of the geofence is a *read*, and it stays an administrator's: it reports
+    # the boundary a punch that names no site is judged against. Its two write endpoints -
+    # the modern one and the legacy alias - went with the console editor, so there is no
+    # write left to declare an audience for.
     "/api/v1/geofence": ADMIN_ROLES,
-    "/api/v1/legacy/set-geofence": ADMIN_ROLES,
     # The site-creation pair, and for the same reason: the path does not say which verb it
     # is. ``POST /api/v1/sites`` creates a boundary every punch at that site is measured
     # against, and ``POST /api/v1/resolve-maps-link`` makes this deployment fetch a URL the

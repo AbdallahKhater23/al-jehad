@@ -274,14 +274,26 @@ def test_a_column_the_code_writes_is_never_declared_inside_an_older_migration():
         r"^\s{8,}(\w+)\s+(?:TEXT|INTEGER|DATETIME|REAL|BLOB|FLOAT|NUMERIC|BOOLEAN)\b", re.M
     )
     mentions: dict[str, set[str]] = {}
+    texts: dict[str, str] = {}
     for name, body in zip(bodies[1::2], bodies[2::2]):
+        texts[name] = body
         mentions[name] = set(_quoted.findall(body)) | set(_declared.findall(body))
 
     latest_version = max(version for version, _, _ in migrations.MIGRATIONS)
     latest_functions = [function.__name__ for version, _, function in migrations.MIGRATIONS if version == latest_version]
     for function_name in latest_functions:
-        assert mentions.get(function_name), (
-            f"the latest migration ({function_name}) names no column; if it needs none, it is the wrong place for one"
+        # A migration may legitimately introduce no column at all: 34 creates the index behind the
+        # timesheet's Clock Out/Clock In pairing and touches no table. Requiring a column of it
+        # would make this guard fail on a correct migration, and the fix a false alarm like that
+        # invites is the one the comment above warns about. The canary's real job is showing these
+        # two scanners read real bodies - which the ``punch_frame`` check below also does - so an
+        # index-only migration counts, because ``CREATE INDEX`` is work visible in its body even
+        # though it contributes no column name. A migration with no visible work either way still
+        # fails, which is the case this canary is meant to catch.
+        creates_index = "CREATE INDEX" in texts.get(function_name, "")
+        assert mentions.get(function_name) or creates_index, (
+            f"the latest migration ({function_name}) neither names a column nor creates an index; "
+            f"if it needs neither, it is the wrong place for one"
         )
     # The rule: a column may be *named* only by the migration that introduces it. Mentioned
     # anywhere older means it is inside a migration existing databases have already recorded
