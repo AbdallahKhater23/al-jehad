@@ -74,21 +74,6 @@
   overflow-wrap: anywhere;
 }
 
-/* The gear sits in the header, which the shell renders; this is the
-   server-URL row inside the settings sheet. */
-.auth__server {
-  display: flex;
-  flex-direction: column;
-  gap: var(--ui-1);
-}
-
-.auth__server-value {
-  font-family: var(--ops-mono);
-  font-size: 13px;
-  color: var(--ops-muted);
-  word-break: break-all;
-}
-
 /* The welcome a brand-new account is handed at sign-in: the id it was hired
    under, in the server's own words. */
 .auth__welcome {

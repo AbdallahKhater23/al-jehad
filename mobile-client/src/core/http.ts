@@ -1,5 +1,6 @@
 import { Preferences } from '@capacitor/preferences';
 import { resolveApiBaseUrl } from './config.js';
+import { acceptLanguage } from './locale.js';
 import { store } from './store.js';
 
 const TOKEN_KEY = 'auth_token';
@@ -12,15 +13,6 @@ export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 export interface RequestOptions {
   method?: HttpMethod;
   path: string;
-  /**
-   * Talk to this base instead of the one this device is configured with.
-   *
-   * Only for asking a *candidate* server whether it is there, before anything is saved:
-   * the server-address sheet probes the address the worker typed, not the one the app is
-   * still configured with. Regular calls never pass it, so an override cannot be bypassed
-   * by accident.
-   */
-  base?: string;
   query?: Record<string, string | number | boolean | null | undefined>;
   body?: unknown;
   formData?: FormData;
@@ -140,6 +132,9 @@ async function refreshToken(): Promise<string | null> {
         method: 'POST',
         headers: {
           Accept: 'application/json',
+          // The worker's language, on the refresh as on every other call: a refusal
+          // refreshes a session the same person is about to read.
+          'Accept-Language': acceptLanguage(),
           Authorization: `Bearer ${token}`,
         },
         signal: controller.signal,
@@ -174,7 +169,7 @@ function isNetworkFailure(err: unknown): boolean {
 }
 
 export async function request<T = unknown>(opts: RequestOptions): Promise<T> {
-  const base = opts.base ?? (await resolveApiBaseUrl());
+  const base = await resolveApiBaseUrl();
   const url = buildUrl(base, opts.path, opts.query);
   const needsAuth = opts.auth !== false;
   let token: string | null = null;
@@ -186,6 +181,10 @@ export async function request<T = unknown>(opts: RequestOptions): Promise<T> {
 
   const headers: Record<string, string> = {
     Accept: 'application/json',
+    // The language the screen is drawn in. Safe to send unconditionally: it is a
+    // CORS-safelisted header, so it adds no preflight, and a server that does not
+    // localize anything reads past it.
+    'Accept-Language': acceptLanguage(),
     ...(opts.headers ?? {}),
   };
   if (token) headers['Authorization'] = `Bearer ${token}`;

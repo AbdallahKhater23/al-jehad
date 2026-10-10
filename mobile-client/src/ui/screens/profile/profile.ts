@@ -10,7 +10,7 @@
 
 import { request } from '../../../core/http.js';
 import { store } from '../../../core/store.js';
-import { getApiBaseOverride, resolveApiBaseUrl } from '../../../core/config.js';
+import { resolveApiBaseUrl } from '../../../core/config.js';
 import { clearPersistedSession } from '../../../core/http.js';
 import { ensureDevice, anchorState, rotateDevice } from '../../../offline/device.js';
 import { pendingCount } from '../../../offline/queue.js';
@@ -19,8 +19,7 @@ import type { Screen, ScreenContext } from '../../shell.js';
 import { el, esc, on, fmtDateTime, fmtAgo, parseServerTs } from '../../dom.js';
 import { icon } from '../../icons.js';
 import { openSheet, confirmDialog } from '../../components/sheet.js';
-import { isDarkTheme, saveTheme } from '../../theme.js';
-import { openServerSheet } from '../../components/server-url.js';
+import { isDarkTheme, onThemeChange, saveTheme } from '../../theme.js';
 import { toastError, toastOk } from '../../components/toast.js';
 
 interface DeviceInfo {
@@ -42,15 +41,6 @@ export function createProfileScreen(onSignedOut: () => void): Screen {
   return {
     title: () => 'Profile',
     subtitle: () => store.getState().session?.user.name ?? '',
-    actions: () => [
-      (() => {
-        const node = el(
-          `<button class="ui-btn ui-btn-quiet is-icon" type="button" aria-label="Server settings">${icon('gear', 22)}</button>`,
-        ) as HTMLButtonElement;
-        on(node, 'click', () => openServerSheet({ onSaved: () => document.dispatchEvent(new CustomEvent('hand:profile-refresh')) }));
-        return node;
-      })(),
-    ],
     mount(host: HTMLElement, ctx: ScreenContext): () => void {
       let device: DeviceInfo = { device_id: null, key_epoch: null, registered_at: null };
       let anchor: AnchorInfo | null = null;
@@ -59,7 +49,6 @@ export function createProfileScreen(onSignedOut: () => void): Screen {
       let deviceState: 'ready' | 'attention' | 'unknown' = 'unknown';
       let deviceNote = 'Checking…';
       let lastSyncAt: string | null = null;
-      let darkTheme = isDarkTheme();
       const disposers: Array<() => void> = [];
 
       host.innerHTML = `<div id="profile-root"></div>`;
@@ -228,20 +217,19 @@ export function createProfileScreen(onSignedOut: () => void): Screen {
       }
 
       function renderActions(): string {
-        // ``aria-label`` on both: a button whose content is ``<dt>``/``<dd>`` has no
-        // accessible name in Chrome -- the term markup defeats name-from-content, so
-        // without the label a screen reader announces these two rows as just "button".
+        // ``aria-label``: a button whose content is ``<dt>``/``<dd>`` has no accessible
+        // name in Chrome -- the term markup defeats name-from-content, so without the
+        // label a screen reader announces this row as just "button".
+        //
+        // The "Server address" row that used to sit under this one is gone with the
+        // gear: the API base is fixed at build time (``core/config.ts``), so there is
+        // nothing for a worker to set here.
         return `
           <div class="hand-card">
             <dl class="hand-dl">
               <button class="hand-dl-row is-action" type="button" data-action="password"
                       aria-label="Change password">
                 <dt aria-hidden="true">${icon('key', 16)} Change password</dt>
-                <dd aria-hidden="true">${icon('chevron', 16)}</dd>
-              </button>
-              <button class="hand-dl-row is-action" type="button" data-action="server"
-                      aria-label="Server address">
-                <dt aria-hidden="true">${icon('gear', 16)} Server address</dt>
                 <dd aria-hidden="true">${icon('chevron', 16)}</dd>
               </button>
             </dl>
@@ -264,7 +252,7 @@ export function createProfileScreen(onSignedOut: () => void): Screen {
               <h2 class="hand-section-title">Screen</h2>
             </div>
             <button class="hand-switch" type="button" role="switch"
-                    aria-checked="${darkTheme ? 'true' : 'false'}" data-action="theme">
+                    aria-checked="${isDarkTheme() ? 'true' : 'false'}" data-action="theme">
               <span class="hand-switch__text">
                 <span class="hand-switch__label">Dark screen</span>
                 <span class="hand-switch__hint">Easier at night, harder in direct sunlight.</span>
@@ -437,26 +425,20 @@ export function createProfileScreen(onSignedOut: () => void): Screen {
               await loadDevice();
             })();
           } else if (action === 'rotate') void rotate();
-          else if (action === 'theme') {
-            darkTheme = !darkTheme;
-            void saveTheme(darkTheme);
-            paint();
-          } else if (action === 'password') void changePassword();
-          else if (action === 'server') {
-            openServerSheet({ onSaved: () => void loadDevice() });
-          } else if (action === 'signout') void signOut();
+          else if (action === 'theme') void saveTheme(!isDarkTheme());
+          else if (action === 'password') void changePassword();
+          else if (action === 'signout') void signOut();
         }),
       );
 
-      const onRefresh = (): void => {
-        void loadDevice();
-      };
-      document.addEventListener('hand:profile-refresh', onRefresh);
-      disposers.push(() => document.removeEventListener('hand:profile-refresh', onRefresh));
+      // The header's toggle and this switch are the same switch, so whichever one is
+      // used, the other follows: the theme store tells every listener, and the state is
+      // read from the document rather than kept in a variable that could drift.
+      disposers.push(onThemeChange(() => paint()));
 
       void (async () => {
         try {
-          serverUrl = (await getApiBaseOverride()) ?? (await resolveApiBaseUrl());
+          serverUrl = await resolveApiBaseUrl();
         } catch {
           serverUrl = 'not configured';
         }

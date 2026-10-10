@@ -568,6 +568,21 @@ class UserAddRequest(BaseModel):
     phone: str = ""
     password: str
     role: str
+
+    @field_validator("role")
+    @classmethod
+    def _canonical_role(cls, value: str) -> str:
+        """Trim and lower-case the role before anything compares it.
+
+        Normalisation only. *Which* roles exist stays ``security``'s answer and is asked in
+        ``_validate_id_and_role``, so a role this deployment does not define is refused in
+        one place for both creation paths rather than in two that can drift. Doing it here
+        is what makes the escalation check below compare the same string the guard will:
+        ``"HEAD_ADMIN"`` must reach ``req.role in ("admin", "head_admin")`` as
+        ``"head_admin"``, not as itself.
+        """
+        return security.normalise_role(value)
+
     #: May this account open a paid shift away from every site and have it authorised on
     #: arrival? Off unless the administrator creating it says otherwise - the privilege is
     #: granted one account at a time, never by role, because two workers can share a role and
@@ -839,11 +854,13 @@ class UserEditRequest(BaseModel):
     * the **id**. It is the key every attendance row, punch, device key and audit entry is
       written against, so rewriting it would orphan a person's history rather than correct
       their record;
-    * the **role**. Writing it in place would promote a working account into a tier that
-      reads the audit trail - from this form, with no new credential and no account of its
-      own; the promotion would be indistinguishable from what the account always was. A
-      promotion is a new account - created in the console, or approved from the walk-up
-      queue - and the old account keeps the hours, which are the part that must not move.
+    * the **role**. A role is a privilege, and one this form could grant in passing is one
+      nobody decided to grant: every other field here is something *about* a person, while
+      the role decides which surfaces they can reach at all. It moves through
+      ``POST /admin/users/role``, which asks the escalation rules, records the change and
+      revokes the sessions the account was holding under the old role - so what stays true
+      of this model is that a name, a contact detail, a rate or a transit grant is not a
+      way round the privilege decision.
     """
 
     user_id: str
@@ -905,6 +922,29 @@ class UserDeleteRequest(BaseModel):
 class UserStatusRequest(BaseModel):
     user_id: str
     active: bool = True
+
+
+class UserRoleRequest(BaseModel):
+    """An existing account's role, changed in place.
+
+    The **id** is the subject of every attendance row, punch, device key and audit entry the
+    account owns, so this names the account and keeps it: the hours stay with the person who
+    worked them, which is the whole reason a promotion used to cost a second account.
+
+    The **role** is normalised before anything compares it, exactly as ``UserAddRequest`` does
+    and for the same reason - ``"HEAD_ADMIN"`` has to reach the escalation check as the string
+    the guard would compare, or casing is the way past it. *Which* roles exist stays
+    ``security``'s answer (``validate_assignable_role``), so a role this deployment does not
+    define is refused in one place rather than re-derived here.
+    """
+
+    user_id: str
+    role: str
+
+    @field_validator("role")
+    @classmethod
+    def _canonical_role(cls, value: str) -> str:
+        return security.normalise_role(value)
 
 
 class PasswordChangeRequest(BaseModel):
@@ -1486,11 +1526,12 @@ def send_whatsapp_alert(worker_id: str, worker_name: str, site_name: str, score:
 
 
 def _validate_id_and_role(user_id: str, role: str) -> None:
-    # One rule, one implementation. ``security`` owns the list of roles no API may create,
-    # and the refusal is explicit and by name rather than an accident of a range that
-    # happens not to include the root band - an administrator who could create a developer
-    # account could promote themselves into the tier that reads the audit trail.
-    security.refuse_developer_role(role)
+    # One rule, one implementation. ``security`` owns both lists - the roles no API may
+    # create, and the roles that exist at all - and it answers in the order the reasons are
+    # true: the root tier is refused *by name* (an administrator who could create a
+    # developer account could promote themselves into the tier that reads the audit trail),
+    # and anything that is not a role here is refused as a bad value.
+    security.validate_assignable_role(role)
     # The per-role id bands are gone: an id no longer decides a role, and no id is refused
     # for falling outside a block. What is left of that rule is the part every allocator in
     # this application depends on - an account id is a whole number.
@@ -4209,6 +4250,155 @@ async def set_user_status(
             f"User {user_id} reactivated. They cannot clock in until a face is enrolled again."
             if wanted
             else f"User {user_id} deactivated: no access, history kept."
+        ),
+    }
+
+
+@router.post("/admin/users/role")
+async def change_user_role(
+    request: Request, req: UserRoleRequest, current: CurrentUser = Depends(admin_only)
+):
+    """Move an existing account to another role, and keep the account.
+
+    WHAT THIS REPLACES. ``UserEditRequest`` has no ``role`` field, and the reason it gives is
+    that a promotion "is a new account". That reasoning is sound about the *history* - the
+    hours belong to whoever worked them - and until now it was also the only way to express a
+    promotion at all, so the console's answer to "this worker runs the crew now" was to create
+    a second account and leave the attendance on the first. This is the operation that was
+    missing: the id, and with it the history, the device keys and the audit trail, stay with
+    the account.
+
+    WHAT IT DELIBERATELY DOES NOT DO:
+
+    * **the root tier is not a role anybody changes.** ``security.validate_assignable_role``
+      refuses ``developer`` as a *new* role by name, from every caller including the root tier
+      itself - an administrator who could grant it could grant it to themselves, which is the
+      one escalation this deployment is built to make impossible. The refusal is repeated
+      against the *account* as well, because demoting the root tier out of its role removes the
+      account that reads the audit trail, which is the same escalation arrived at backwards;
+    * **no administrator reaches over a peer.** A standard admin may move an account among the
+      tiers they may already create in - ``worker``, ``moallem``, ``off_office`` - and is
+      refused both when the *new* role is an administrator's and when the *account* already is
+      one. Those are the two rules ``add_user`` applies, asked again here because granting a
+      role and creating an account in it are the same authority wearing a different verb;
+    * **nobody changes their own role.** Demoting yourself out of the console mid-session is
+      the lockout ``_refuse_self_account`` exists for, and it is also why no separate "last
+      head admin" case is needed - the only account that could be the last one is the account
+      you are signed in as.
+
+    SESSIONS ARE REVOKED, NOT REINTERPRETED.
+
+    ``get_current_user`` re-reads the role from ``users`` on every request, so the new role
+    governs the account's very next call with no cache to clear. A token already minted is a
+    different thing: it was issued while the account held the *wider* role, and it carries the
+    ``ver`` claim this write invalidates by bumping ``token_version`` - the same revocation a
+    password reset performs, and the only one that reaches a token already in flight. The
+    person signs in again and is issued a token for the role they actually have.
+
+    Device keys and open enrollment links are deliberately left alone: they are credentials for
+    a *punch* and for a *face*, and neither is a function of the role. Stripping them is what
+    deactivation does (``_revoke_user_access``), and a promotion is not a departure.
+    """
+    user_id = str(req.user_id).strip()
+    wanted = req.role
+    # One rule, one implementation. ``security`` owns both lists - the roles that exist and the
+    # roles no API may mint - and it answers in the order the reasons are true: the root tier is
+    # refused *by name* (403), and anything that is not a role here is refused as a bad value
+    # (400). Asked before the database is read, because it is a decision about the request.
+    security.validate_assignable_role(wanted)
+    _refuse_self_account(current, user_id, "change the role of")
+
+    with db(write=True) as conn:
+        target = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        if target is None:
+            raise HTTPException(status_code=404, detail="User ID not found.")
+        _guard_standard_admin(current, target, "change the role of")
+        if current.role == "admin" and wanted in ("admin", "head_admin"):
+            raise HTTPException(
+                status_code=403,
+                detail="Standard Admins cannot grant the admin or head admin role.",
+            )
+        if security.normalise_role(target["role"]) == security.DEVELOPER_ROLE:
+            # The root tier is provisioned by ``tools/seed_developer.py`` and by nothing else,
+            # so its role is not an administrator's to change either way round.
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "The developer account's role is not managed from the console. It is "
+                    "provisioned by the deployment's own seed tool."
+                ),
+            )
+
+        before = _user_snapshot(target)
+        was = security.normalise_role(target["role"])
+        if was == wanted:
+            # Idempotent, and the no-op must not bump ``token_version``: a repeated click would
+            # sign the person out and write a ``role_change`` row saying the role changed to
+            # what it already was. Reads as one answer either way, so a caller cannot tell a
+            # retried request from a fresh one.
+            return {
+                "status": "success",
+                "user_id": user_id,
+                "previous_role": was,
+                "role": was,
+                "workers_released": [],
+                "message": f"User {user_id} is already a {was}.",
+            }
+
+        # The assignment rule, on both sides of the change. Only a worker carries a
+        # ``moallem_id`` (``_moallem_assignment``), so an account moved out of ``worker``
+        # releases its own; and an account that stops being a moallem stops being anybody's
+        # supervisor. The second is what ``delete_user`` does when a supervisor's account goes,
+        # for the same reason - an assignment resolving to an account that cannot hold it is a
+        # roster row with no answer - and the ids are named in the trail, because "who lost
+        # their moallem when this happened" is a question a payroll week later cannot answer
+        # any other way.
+        own_assignment = str(target["moallem_id"] or "")
+        if own_assignment and wanted != "worker":
+            conn.execute("UPDATE users SET moallem_id = NULL WHERE id = ?", (user_id,))
+        released: list[str] = []
+        if was == "moallem" and wanted != "moallem":
+            released = [
+                str(row["id"])
+                for row in conn.execute(
+                    "SELECT id FROM users WHERE moallem_id = ? ORDER BY CAST(id AS INTEGER) ASC",
+                    (user_id,),
+                ).fetchall()
+            ]
+            if released:
+                conn.execute("UPDATE users SET moallem_id = NULL WHERE moallem_id = ?", (user_id,))
+
+        conn.execute(
+            "UPDATE users SET role = ?, token_version = COALESCE(token_version, 0) + 1 "
+            "WHERE id = ?",
+            (wanted, user_id),
+        )
+        _audit(
+            conn,
+            action="role_change",
+            actor=current,
+            entity="users",
+            entity_id=user_id,
+            before=before,
+            after={
+                **before,
+                "role": wanted,
+                "moallem_id": None if wanted != "worker" else target["moallem_id"],
+                "workers_released": released,
+            },
+            request=request,
+        )
+
+    return {
+        "status": "success",
+        "user_id": user_id,
+        "previous_role": was,
+        "role": wanted,
+        "workers_released": released,
+        "assignment_cleared": bool(own_assignment) and wanted != "worker",
+        "message": (
+            f"User {user_id} is now a {wanted}. They must sign in again before the change "
+            "applies to their session."
         ),
     }
 

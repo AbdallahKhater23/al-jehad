@@ -122,10 +122,12 @@ Three things that are easy to get wrong and silent when you do:
   lighter than it was, and a first start is still slower than a restart while the models load.
   `healthcheckTimeout` is 300s in `railway.json` for that reason - a shorter one marks a healthy
   deploy unhealthy.
-- **Onnxruntime is a runtime dependency** (`requirements.txt`), so face *matching* works on any
-  host built from this repository. The MiniFASNet liveness model is a separate download
-  (`backend/models/README.md`): absent, the API says so and liveness degrades while matching is
-  unaffected. Readiness names each as a check rather than as a broken deploy.
+- **Onnxruntime is a runtime dependency** (`requirements.txt`), and the three models it runs —
+  the YuNet detector, the facenet embedding and the MiniFASNet liveness gate — are committed
+  under `backend/models/`, so face matching *and* anti-spoofing work on any host built from this
+  repository. `backend/models/README.md` says where each came from and what contract it must be
+  fed. A deployment that is missing one still starts: the API reports which check is degraded,
+  and readiness names each as a check rather than as a broken deploy.
 
 Verify the host's own address before pointing anything at it - this deployment's is
 `https://al-jehad-production.up.railway.app`, so
@@ -2101,6 +2103,23 @@ That is the point of a reset, and the panel says so before the button. A standar
 cannot change an administrator's password - the server answers 403, and the button is
 hidden for the same reason rather than shown and then refused.
 
+### The head administrator's own credential
+
+The one credential the console cannot set is the head administrator's. `POST /admin/admins/add`
+is itself gated on `head_admin` and `POST /admin/users/edit_password` needs a session, so the
+first head administrator is circular to create from inside the app: it is written by the first-run
+bootstrap (`migrations.ensure_bootstrap_admin`), which generates a password, prints it once to
+stderr and stores only its hash. That printed line is the only place the value ever existed - so
+if it was not kept, or the credential has to be replaced, `backend/tools/seed_head_admin.py` sets
+it on a deployment that is already running: the value comes from `$HEAD_ADMIN_PASSWORD` or is
+generated (`--generate`, 24 characters, printed once), never from a flag that would land in shell
+history, and an existing credential is replaced only when `--rotate-password` says so - which
+bumps `token_version`, so every live session holding the old one dies. It refuses to add a second
+head administrator (the console owns that decision) and refuses to promote an account that already
+exists in another role. What it writes is the credential plus one row in `audit_log` naming the
+operator; it deliberately raises no alert, because the alert vocabulary is a published contract
+(`kinds.*` in `tests/api_response_shapes.json`) and a seeder is not a reason to grow it.
+
 ### The root tier (`developer`)
 
 One role sits above the administrators, and one account holds it. It is not a business role: it
@@ -2311,6 +2330,46 @@ action was capturing an enrollment photo) and the never-wired **Pass** and **Enr
 which only ever rendered "module coming soon". `/api/v1/admin/enroll` itself is untouched
 and still documented above.
 
+### Changing an account's role
+
+The role is not a field on the account form, and that is deliberate: a role is a privilege, and
+one an edit form could grant in passing is one nobody decided to grant. It has its own
+operation. `POST /api/v1/admin/users/role` moves an existing account to another role and
+**keeps the account** - the id, the shifts, the device keys and the audit trail stay with it -
+so promoting the person who already has the attendance no longer means creating a second
+account and leaving the first one holding the hours.
+
+```
+POST /api/v1/admin/users/role                   user_id, role
+```
+
+The rules mirror account creation rather than being invented beside it. A standard admin may
+move an account among the tiers they may create in (`worker`, `moallem`, `off_office`) and no
+further: handing out `admin` or `head_admin` is a head administrator's decision, and a standard
+admin is refused both when the *new* role is an administrator's and when the *account* already
+holds one. Nobody changes their own role - demoting yourself out of the console mid-session is
+a lockout, not a feature - which is also why no separate "last head admin" rule is needed:
+the only account that could be the last one is the account you are signed in as. `developer` is
+not assignable by anybody, the root tier included, and the root account's own role is not
+changeable from the console either - the account that reads the audit trail must not be
+grantable *or* revocable from inside the application.
+
+The console's **Credentials** tab offers this on the account's own panel: the role is a control
+there rather than a read-only line, with a button of its own and a confirmation of its own, and
+it is *absent* wherever the server would refuse it - your own account, and an administrator's
+account seen by a standard admin - because an action that always answers 403 is a trap rather
+than an affordance. The options are the server's rules said in the rail: a standard admin is
+offered `worker`, `moallem` and `off_office`, a head admin the administrator tiers as well, and
+`developer` is in nobody's list. The **Save** button on that panel never carries a role: a
+privilege that rode along with a rename is one nobody decided to grant.
+
+The change is recorded as `role_change`, with the role before and after beside each other, and
+it bumps `token_version`: a token minted while the account held the wider role stops working
+immediately, and the person signs in again for the role they actually have. That is the
+security-relevant half - a promotion that took effect only when the holder chose to sign out
+would be a privilege change the holder controls. Repeating a change to the role an account
+already has is a no-op: nobody is signed out and nothing is written.
+
 ### Your own face
 
 An administrator who works a site as well as running it needs a face reference like anybody
@@ -2468,6 +2527,19 @@ stay pinned in `requirements.txt` (and test-only packages stay out of it), the h
 a real route that answers 200 without a session, the start command in `railway.json` still parses
 and still means plain HTTP behind the host's TLS, and a `PORT` that is not a port number falls
 back to 8000 instead of failing the start.
+
+`backend/tests/test_api_read_drift.py` is the other half of that: it reads **every** readable GET
+route three times - twice at one held-still instant, and once with the clock stepped a minute
+forward - and fails unless every field that moved is declared, in one of two tables, beside the
+mechanism that produces it. A clock claim is verified rather than asserted (a value that is a
+function of the clock cannot move while the clock stands still, and one that did is a counter),
+the routes it cannot address are declared with the reason, and a new parameterised read fails
+until it is listed. It exists because that class of flake used to surface as somebody else's
+assertion: the scope check in `test_ownership_matrix.py` failed as
+"/api/v1/worker/me/stats answered differently when handed worker_id=600" because a live shift
+counter ticked between two requests.
+
+`backend/tests/test_api_response_shapes.py` closes the gap the drift sweep leaves by design: it compares *values*, so renaming a field moves nothing, fails nothing, and the handset, the console and the Cloudflare frontend start reading `undefined` in silence. So each readable GET route's answer is recorded in `backend/tests/api_response_shapes.json` as a status and its sorted dotted field names, and the suite fails on any difference - a rename, an addition, a removal, a route that arrived, went, or started refusing - naming the route and, when exactly one name went out and one came in, saying out loud that it is a rename. No value is recorded, so no worker's name, hours or token can end up in git history, and the record cannot churn on a fixture's rows. Every status is also compared with the readiness gate's own tables, which is what catches an access change that moves no bytes of an answer: the liveness probe starting to demand a session, a metrics mount answering without its scrape token, or an administrator read refusing the administrators its guard advertises is a failure even though no field name and no value changed. Re-recording is a deliberate act (`cd backend && python -m tools.response_shapes --record`) rather than something a failing check does to itself, because the diff *is* the review; the same command without `--record` verifies from a shell and exits 1 with the differences,  A route whose answer depends on a feature switch declares every state it may legitimately be in - the branding mark with and without one, the two metrics mounts served, switched off by `METRICS_ENABLED=0`, or missing their optional extra - as a status and the field names inside it, with a reason beside each. A toggled-off endpoint is therefore one of that route's declared states rather than a re-record: the suite passes while the record holds any one of them, the shell verify names the state that moved instead of staying silent about the 404 an operator's scrape just saw, an entry outside its route's declared states fails in both the comparison and the declaration check, and every declared state is reproduced by flipping its switch rather than believed. That declaration lives in the readiness gate (`readiness.SWITCHED_STATES`) rather than in the test suite, because a deployment is the thing that can be in a state nobody wrote down and only a module the server imports can say so about the host it is running on: `readiness._check_feature_switch_states` asks the running process which of a switched route's declared states it is in - through observers that read the same sources the handlers read, in the same order, so a deployment with neither `prometheus_client` nor `METRICS_ENABLED` is reported as missing its optional extra rather than as switched off - and reports a state the declaration does not name, a declared route no observer asks about, and a switch it could not read (a note rather than a failure, since an unreadable database is the fatal checks' to report). It is advisory and it never refuses to serve: a switch is configuration, not breakage. So `GET /api/v1/readiness` and the startup log say *which* state this host is in (`GET /api/v1/metrics is switched_off`) instead of leaving the operator to work out whether a 404 on their scrape is a setting or a regression. `docs/API_READ_ACCESS.md` is the same surface for a person rather than a check: every readable route, the audience the readiness gate declares for it in the gate's own words, the status the record holds, and every declared feature-switch state with its reason - rendered from those declarations by `cd backend && python -m tools.route_readers --write` and held to them by `backend/tests/test_read_access_document.py`, so the page cannot become a second, softer copy of the truth.so a release can ask whether any answer's shape has changed without running pytest.
 
 ```bash
 cd backend

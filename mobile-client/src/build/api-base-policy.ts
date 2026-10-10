@@ -22,14 +22,15 @@
  * produced the assets, so the Android release build can refuse a debug ``dist`` too (see
  * android/app/build.gradle).
  *
- * The app may still *discover* a LAN server at runtime - that is the "Find on network" flow -
- * and ``setApiBaseOverride()`` may point it at one. This module is only about what is compiled
- * in, never about what the worker chooses later on the phone.
+ * Nothing at runtime can redirect the app either: the "Server address" sheet, the LAN sweep and
+ * the per-device override it wrote were removed, and ``src/core/config.ts`` falls back to the
+ * public deployment when no ``VITE_API_BASE_URL`` was baked in. So this module is now the whole
+ * story: what is compiled in is what the app talks to.
  */
 
 /** How an API base URL fares against the release rule. */
 export type ApiBaseKind =
-  /** Nothing configured: the shipped app is expected to find its server (or be pointed at one). */
+  /** Nothing configured: the app falls back to the built-in public deployment. */
   | 'none'
   /** https on a public host: shippable. */
   | 'secure'

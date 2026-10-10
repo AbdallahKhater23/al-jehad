@@ -8,12 +8,20 @@ and what it sends:
    this administrator may not touch (an administrator's row is somebody else's job) or for
    their own (they cannot deactivate or delete themselves, so there is no button to press);
 2. the edit form is the record read back from the server, not a guess at it - including the
-   hourly rate, which the roster payload deliberately does not carry - and it says why the
-   id and the role are not editable instead of showing fields that cannot work;
-3. a refusal from the server reaches the administrator as the reason it gave. Deleting an
+   hourly rate, which the roster payload deliberately does not carry - and it says why the id
+   is not a field on it rather than showing one that cannot work;
+3. **the role is changed from that panel but never by that form.** It has its own control, its
+   own question and its own endpoint (``/admin/users/role``), and the edit body carries no role
+   at all: a privilege that rode along with a rename would be one nobody decided to grant. The
+   control is *absent* wherever the server would refuse it - your own account, and an
+   administrator's account seen by a standard admin - and its options are the server's rules
+   said in the rail, so the developer tier, which no API may assign, is not among them. It is
+   bound from a ``data-`` hook by the tab's own binder, and one test taps it there rather than
+   calling the method, so a control that rendered but was never wired fails here;
+4. a refusal from the server reaches the administrator as the reason it gave. Deleting an
    account with shifts is the case that matters: it is not an error, it is the endpoint
    saying no, with the count, and offering the thing that can be done instead;
-4. the **reference photo** is here too, because it is the one part of a person that is not a
+5. the **reference photo** is here too, because it is the one part of a person that is not a
    field on their row: a first photo is what makes the account able to clock in at all and a
    replacement silently stops the template on file working, so the panel says which of the
    two it is about to do and the file travels to the endpoint that takes files.
@@ -87,6 +95,20 @@ const DETAILS = {
         // for the other two - and who this worker answers to.
         names: { en: 'Seed Worker', ar: '\u0639\u0627\u0645\u0644 \u0627\u0644\u0628\u0630\u0648\u0631' },
         moallem_id: '600', moallem_name: 'Ana Torrez'
+    },
+    // The two administrative accounts, so their own panels can be opened. What the console has
+    // to get right there is what it does *not* offer, and a response that fell back to the
+    // moallem above would be answering for the wrong role entirely - the self and peer rules
+    // are both decided from this field.
+    '1001': {
+        id: '1001', name: 'Second Admin', email: 'ops2@example.test', phone: '',
+        role: 'admin', status: 'active', hourly_rate: null, face_enrolled: true,
+        enrolled_at: null, transit_enabled: false, names: {}, moallem_id: null
+    },
+    '5000': {
+        id: '5000', name: 'Head Admin', email: 'head@example.test', phone: '',
+        role: 'head_admin', status: 'active', hourly_rate: null, face_enrolled: true,
+        enrolled_at: null, transit_enabled: false, names: {}, moallem_id: null
     }
 };
 const DETAIL = DETAILS['600'];
@@ -94,6 +116,9 @@ const DETAIL = DETAILS['600'];
 const edits = [];
 const statuses = [];
 const deletes = [];
+//: The role change, which has an endpoint of its own: it is a privilege grant rather than a
+//: correction to a record, so it is not a field on the edit body above.
+const roles = [];
 //: The reference-photo write, which is a different endpoint because it is a different
 //: content type: ``/admin/enroll`` takes multipart, the account's own fields are JSON.
 const enrolls = [];
@@ -101,6 +126,11 @@ let enrollFails = false;
 let deleteStatus = 200;
 let deleteReply = { status: 'success', message: 'User 600 deleted.', deleted: true };
 let statusFails = false;
+let roleStatus = 200;
+let roleReply = {
+    status: 'success', user_id: '1', previous_role: 'worker', role: 'moallem',
+    message: 'User 1 is now a moallem.'
+};
 
 function responders(url, init) {
     const method = (init && init.method) || 'GET';
@@ -112,6 +142,14 @@ function responders(url, init) {
             return { status: 422, body: { detail: 'No face detected. Please ensure good lighting and clear view.' } };
         }
         return { status: 200, body: { status: 'success', message: 'Facial data for worker 600 successfully enrolled.' } };
+    }
+    // Matched before the two arms below, and by its own path: ``/admin/users/role`` is a
+    // different endpoint from ``/admin/users/edit`` (role is not one of its fields), and the
+    // generic ``/admin/users`` fallback answers a *list* - which is what a missing arm would
+    // hand back here as though it were a success.
+    if (url.indexOf('/admin/users/role') >= 0) {
+        roles.push({ body: JSON.parse(init.body), headers: init.headers });
+        return { status: roleStatus, body: roleReply };
     }
     if (url.indexOf('/admin/users/edit') >= 0) {
         edits.push({ body: JSON.parse(init.body), headers: init.headers });
@@ -165,10 +203,29 @@ function valueOf(markup, id) {
     return match ? match[1] : null;
 }
 
+// The options of one select, read off the markup rather than off the element: this harness's
+// stub DOM has no ``options`` collection, and the rendered list is what the reader is handed
+// anyway. One parser for every select on the panel, because two of them disagreeing about what
+// "selected" looks like is how a form shows one thing and sends another.
+function optionsOf(markup, id) {
+    const select = (new RegExp('<select id="' + id + '"[\\s\\S]*?</select>').exec(markup) || [''])[0];
+    return (select.match(/<option value="[^"]*"[^>]*>[^<]*<\/option>/g) || []).map((tag) => ({
+        value: (/value="([^"]*)"/.exec(tag) || [])[1],
+        selected: /\sselected/.test(tag),
+        label: tag.replace(/<[^>]*>/g, '')
+    }));
+}
+
+function chosenOf(markup, id) {
+    return (optionsOf(markup, id).filter((option) => option.selected)[0] || {}).value || null;
+}
+
 async function credentialsEnv(actor) {
     edits.length = 0;
     statuses.length = 0;
     deletes.length = 0;
+    roles.length = 0;
+    roleStatus = 200;
     deleteStatus = 200;
     statusFails = false;
     enrolls.length = 0;
@@ -216,11 +273,160 @@ const results = {};
         phone: valueOf(markup, 'userEditPhone'),
         rate: valueOf(markup, 'userEditRate'),
         role_shown: (/data-user-edit-role="([^"]*)"/.exec(markup) || [])[1],
-        role_editable: markup.indexOf('id="userEditRole"') >= 0,
+        // The role control, and the roles it offers. The account here is a moallem opened by a
+        // head admin, so the control is offered - and *which* options it carries is the whole
+        // of the rule the console mirrors from the server.
+        role_control: markup.indexOf('id="userEditRole"') >= 0,
+        role_options: optionsOf(markup, 'userEditRole').map((option) => option.value),
+        role_selected: chosenOf(markup, 'userEditRole'),
+        role_button: (/data-change-role="([^"]*)"/.exec(markup) || [])[1] || null,
+        role_hint: markup.indexOf(env.evaluate("I18n.__('credentialsRoleChangeHint')")) >= 0,
         transit_present: markup.indexOf('id="userEditTransit"') >= 0,
         transit_checked: /id="userEditTransit"[^>]*checked/.test(markup),
         explains_id: markup.indexOf(env.evaluate("I18n.__('credentialsEditIdNote')")) >= 0,
         closes: env.evaluate("(UI_MODULES.closeUserEdit(), document.getElementById('adminContent').innerHTML.indexOf('data-user-edit=') < 0)")
+    };
+}
+
+// 3c. the role control: which roles it offers, and to whom
+{
+    const env = await credentialsEnv(HEAD);
+    await env.evaluate("UI_MODULES.openUserEdit('1')");
+    const markup = render(env);
+    const options = optionsOf(markup, 'userEditRole');
+    results.role_control = {
+        options: options.map((option) => option.value),
+        labels: options.map((option) => option.label),
+        selected: chosenOf(markup, 'userEditRole'),
+        // The root tier is not assignable through any API, so no select may offer it: a value
+        // the server refuses by name is not an option, it is a trap.
+        developer_offered: options.some((option) => option.value === 'developer'),
+        // The control carries the account's own role too, the way the read-only line did - so
+        // "what role is this account" has one answer wherever it is read.
+        role_shown: (/data-user-edit-role="([^"]*)"/.exec(markup) || [])[1],
+        button_for: (/data-change-role="([^"]*)"/.exec(markup) || [])[1] || null,
+        hint: markup.indexOf(env.evaluate("I18n.__('credentialsRoleChangeHint')")) >= 0
+    };
+}
+
+// 3d. a standard admin is offered the tiers they may create in, and no others
+{
+    const env = await credentialsEnv(OPS);
+    await env.evaluate("UI_MODULES.openUserEdit('1')");
+    results.role_as_standard_admin = optionsOf(render(env), 'userEditRole')
+        .map((option) => option.value);
+}
+
+// 3e. an administrator's account gets no control at all - the peer rule, said by absence
+{
+    const env = await credentialsEnv(OPS);
+    await env.evaluate("UI_MODULES.openUserEdit('1001')");
+    const markup = render(env);
+    results.role_protected = {
+        control: markup.indexOf('id="userEditRole"') >= 0,
+        button: markup.indexOf('data-change-role=') >= 0,
+        role_shown: (/data-user-edit-role="([^"]*)"/.exec(markup) || [])[1],
+        reason: markup.indexOf(env.evaluate("I18n.__('credentialsRoleProtected')")) >= 0
+    };
+}
+
+// 3f. your own account gets no control either: the server answers 400, so it is not offered
+{
+    const env = await credentialsEnv(HEAD);
+    await env.evaluate("UI_MODULES.openUserEdit('5000')");
+    const markup = render(env);
+    results.role_own_account = {
+        control: markup.indexOf('id="userEditRole"') >= 0,
+        button: markup.indexOf('data-change-role=') >= 0,
+        role_shown: (/data-user-edit-role="([^"]*)"/.exec(markup) || [])[1],
+        reason: markup.indexOf(env.evaluate("I18n.__('credentialsRoleSelf')")) >= 0
+    };
+}
+
+// 3g. cancelling the question sends nothing and leaves the panel where it was
+{
+    const env = await credentialsEnv(HEAD);
+    await env.evaluate("UI_MODULES.openUserEdit('1')");
+    env.evaluate("document.getElementById('userEditRole').value = 'moallem'");
+    env.evaluate("globalThis.__asked = null; globalThis.confirm = function (question) { globalThis.__asked = question; return false; }");
+    await env.evaluate("UI_MODULES.changeUserRole()");
+    results.role_cancelled = {
+        asked: env.evaluate('globalThis.__asked'),
+        role_word: env.evaluate("I18n.__('roleMoallem')"),
+        calls: roles.length,
+        still_open: render(env).indexOf('data-user-edit=') >= 0
+    };
+}
+
+// 3h. changing the role: its own endpoint and body, and the edit endpoint untouched
+{
+    const env = await credentialsEnv(HEAD);
+    await env.evaluate("UI_MODULES.openUserEdit('1')");
+    env.evaluate("document.getElementById('userEditRole').value = 'moallem'");
+    await env.evaluate("UI_MODULES.changeUserRole()");
+    results.role_changed = {
+        calls: roles.length,
+        body: roles[0] ? roles[0].body : null,
+        authorized: roles[0] ? roles[0].headers.Authorization : null,
+        // ``/admin/users/edit`` is not the endpoint this travels on, and never sees the field.
+        edits_sent: edits.length,
+        toast: toasts(env).slice(-1)[0],
+        sentence: env.evaluate("I18n.__('credentialsRoleChanged').replace('{role}', I18n.__('roleMoallem'))"),
+        panel_closed: render(env).indexOf('data-user-edit=') < 0
+    };
+}
+
+// 3i. choosing the role the account already holds: no request, and the console says so
+{
+    const env = await credentialsEnv(HEAD);
+    await env.evaluate("UI_MODULES.openUserEdit('1')");
+    await env.evaluate("UI_MODULES.changeUserRole()");   // the select still shows 'worker'
+    results.role_unchanged = {
+        calls: roles.length,
+        toast: toasts(env).slice(-1)[0],
+        sentence: env.evaluate("I18n.__('credentialsRoleUnchanged').replace('{role}', I18n.__('roleWorker'))")
+    };
+}
+
+// 3j. the server's refusal is the message the admin gets, and the panel stays
+{
+    const env = await credentialsEnv(HEAD);
+    roleStatus = 403;
+    roleReply = { detail: "Standard Admins cannot grant the admin or head admin role." };
+    await env.evaluate("UI_MODULES.openUserEdit('1')");
+    env.evaluate("document.getElementById('userEditRole').value = 'admin'");
+    await env.evaluate("UI_MODULES.changeUserRole()");
+    results.role_refused = {
+        toast: toasts(env).slice(-1)[0],
+        still_open: render(env).indexOf('data-user-edit=') >= 0
+    };
+}
+
+// 3k. the role button is driven through the tab's own binder, not by calling the method
+//
+// The panel's own controls bind from ``data-`` hooks in ``bindCredentialsControls`` rather than
+// from inline attributes - the per-file inline allowance is pinned and may only fall - so a
+// button drawn with a hook and never bound is a button that renders and does nothing. This taps
+// it the way the tab does and asserts the request, not the method.
+{
+    const env = await credentialsEnv(HEAD);
+    await env.evaluate("UI_MODULES.openUserEdit('1')");
+    env.evaluate("document.getElementById('userEditRole').value = 'off_office'");
+    await env.evaluate(`(async () => {
+        const button = { addEventListener: (type, handler) => { if (type === 'click') button.handler = handler; } };
+        UI_MODULES.bindCredentialsControls({ querySelectorAll: (selector) => (selector === '[data-change-role]' ? [button] : []) });
+        await button.handler({ preventDefault: () => {} });
+        // A listener returns nothing (the sibling bindings in this binder are the same shape), so
+        // awaiting the tap resolves before the request it started does. One macrotask turn lets
+        // that chain finish, which is what "and then the panel closes" is about.
+        await new Promise((resolve) => setTimeout(resolve, 10));
+    })()`);
+    results.role_tapped = {
+        calls: roles.length,
+        body: roles[0] ? roles[0].body : null,
+        toast: toasts(env).slice(-1)[0],
+        sentence: env.evaluate("I18n.__('credentialsRoleChanged').replace('{role}', I18n.__('roleOffOffice'))"),
+        panel_closed: render(env).indexOf('data-user-edit=') < 0
     };
 }
 
@@ -318,14 +524,7 @@ const results = {};
     const env = await credentialsEnv(HEAD);
     await env.evaluate("UI_MODULES.openUserEdit('1')");
     const markup = render(env);
-    // Read off the markup rather than the element: this harness's stub DOM has no ``options``
-    // collection, and the rendered option list is what the reader is handed anyway.
-    const select = (/<select id="userEditMoallem"[\s\S]*?<\/select>/.exec(markup) || [''])[0];
-    const options = (select.match(/<option value="[^"]*"[^>]*>[^<]*<\/option>/g) || []).map((tag) => ({
-        value: (/value="([^"]*)"/.exec(tag) || [])[1],
-        selected: /\sselected/.test(tag),
-        label: tag.replace(/<[^>]*>/g, '')
-    }));
+    const options = optionsOf(markup, 'userEditMoallem');
     const chosen = options.filter((option) => option.selected)[0] || {};
     results.moallem_form = {
         select_present: markup.indexOf('id="userEditMoallem"') >= 0,
@@ -589,11 +788,88 @@ def test_the_edit_form_is_the_account_read_back_from_the_server(results):
     assert form["name"] == "Ana Torrez" and form["email"] == "ana@example.test"
     assert form["rate"] == "9.5", "the hourly rate is not on the roster, so it comes from here"
     assert form["role_shown"] == "moallem"
-    assert form["role_editable"] is False, "the role is chosen when the account is created"
+    assert form["role_control"] is True, "a head admin is offered the role control"
+    assert form["role_options"] == ["worker", "moallem", "off_office", "admin", "head_admin"]
+    assert form["role_selected"] == "moallem", "the control opens on the role the account holds"
+    assert form["role_button"] == "600", "the button names the account it would change"
+    assert form["role_hint"] is True, "and it says the change signs the account out"
     assert form["transit_present"] is True, "the grant is offered on the account's own form"
     assert form["transit_checked"] is False, "a fresh account does not hold the privilege"
     assert form["explains_id"] is True, "the form says why instead of showing a dead field"
     assert form["closes"] is True
+
+
+def test_the_role_control_offers_the_roles_this_reader_may_grant(results):
+    """The server's rule, said in the rail: an option that would answer 403 is a trap."""
+    control = results["role_control"]
+    assert control["role_shown"] == "worker", "the control carries the account's own role"
+    assert control["selected"] == "worker", "and opens on it"
+    assert "developer" not in control["options"], (
+        "the root tier is not assignable through any API, so no select may offer it"
+    )
+    assert control["developer_offered"] is False
+    assert all(label for label in control["labels"]), (
+        "every option carries the console's own word for the role, not the stored string"
+    )
+
+
+def test_a_standard_admin_is_offered_only_the_tiers_they_may_create_in(results):
+    assert results["role_as_standard_admin"] == ["worker", "moallem", "off_office"]
+
+
+def test_the_role_control_is_absent_where_the_server_would_refuse_it(results):
+    """Absent rather than present-and-refused - and the panel says which rule applies."""
+    protected = results["role_protected"]
+    assert protected["control"] is False and protected["button"] is False
+    assert protected["role_shown"] == "admin", "the account's role is still read on its panel"
+    assert protected["reason"] is True, "and the panel names who may change it"
+
+    mine = results["role_own_account"]
+    assert mine["control"] is False and mine["button"] is False
+    assert mine["role_shown"] == "head_admin"
+    assert mine["reason"] is True, "your own role is not yours to change"
+
+
+def test_changing_the_role_is_its_own_request_to_its_own_endpoint(results):
+    changed = results["role_changed"]
+    assert changed["calls"] == 1
+    assert changed["body"] == {"user_id": "1", "role": "moallem"}
+    assert changed["authorized"], "the change carries the reader's own session"
+    assert changed["edits_sent"] == 0, "the edit endpoint is not how a role travels"
+    assert changed["toast"] == changed["sentence"], "the console says it in its own words"
+    assert changed["panel_closed"] is True, "the account's sessions died with the change"
+
+
+def test_the_question_names_the_account_and_the_role_before_anything_is_sent(results):
+    cancelled = results["role_cancelled"]
+    assert cancelled["calls"] == 0, "a cancelled confirmation sends nothing"
+    assert cancelled["still_open"] is True
+    asked = cancelled["asked"] or ""
+    assert "Seed Worker (1)" in asked, "the question names who is being changed"
+    assert cancelled["role_word"] in asked, "and which role they are being moved to"
+
+
+def test_choosing_the_role_the_account_already_holds_sends_nothing(results):
+    unchanged = results["role_unchanged"]
+    assert unchanged["calls"] == 0, "a no-op change is not a round trip"
+    assert unchanged["toast"] == unchanged["sentence"], "the console says so in its own words"
+
+
+def test_the_role_button_is_bound_by_the_tab_and_a_tap_changes_the_role(results):
+    """Bound from its data-change-role hook: a control drawn and never bound is a dead button."""
+    tapped = results["role_tapped"]
+    assert tapped["calls"] == 1, "the button is bound by the tab's own binder"
+    assert tapped["body"] == {"user_id": "1", "role": "off_office"}
+    assert tapped["toast"] == tapped["sentence"], "the whole flow ran from the tap"
+    assert tapped["panel_closed"] is True
+
+
+def test_a_refused_role_change_reaches_the_admin_as_the_reason(results):
+    refused = results["role_refused"]
+    assert "Standard Admins cannot grant" in refused["toast"], (
+        "the escalation rules belong to the server, and its sentence is what is shown"
+    )
+    assert refused["still_open"] is True, "a refusal leaves the panel where the admin was"
 
 
 def test_the_transit_grant_reflects_who_holds_it_and_is_sent_on_save(results):

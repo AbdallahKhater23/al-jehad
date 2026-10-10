@@ -150,6 +150,67 @@ def refuse_developer_role(role: str) -> None:
         )
 
 
+#: Every role this deployment defines, in one place: the five business tiers plus the root
+#: tier. This is the *vocabulary*, not a permission - who may act on whom is ``ADMIN_ROLES``
+#: and the guards. It exists so that "is this a role at all" is answered from one list rather
+#: than by silence.
+KNOWN_ROLES: frozenset[str] = frozenset(
+    {"worker", "moallem", "off_office", "admin", "head_admin", DEVELOPER_ROLE}
+)
+
+#: The roles an API may create: the whole vocabulary minus the ones no caller may mint.
+#:
+#: WHY THIS EXISTS. Every guard in this application compares a role that is *already
+#: stored*; nothing asked whether the role being *written* was a role at all. ``users.role``
+#: is ``TEXT NOT NULL`` with no ``CHECK`` constraint, the creation models carried a bare
+#: ``str``, and ``refuse_developer_role`` refuses exactly one value - so an administrator
+#: could create an account in a role no part of the application knows. It was written, it
+#: appeared in the roster, and it then reached nothing at all, because every guard refuses a
+#: role that is in no allow-list: a person locked out of every screen by a mistake nobody
+#: could read.
+#:
+#: Derived from ``KNOWN_ROLES`` and ``UNASSIGNABLE_ROLES`` rather than spelled out a second
+#: time, so adding a role to the vocabulary is one edit and cannot leave two lists to
+#: drift.
+ASSIGNABLE_ROLES: frozenset[str] = KNOWN_ROLES - UNASSIGNABLE_ROLES
+
+
+def normalise_role(role: str) -> str:
+    """A role as this application spells and stores it: trimmed and lower-cased.
+
+    Casing is not a distinction made anywhere else - every guard compares exactly, so
+    ``"Worker"`` is not a worker and never has been - and normalising on the way in is what
+    stops ``"HEAD_ADMIN"`` from being one string to the standard-admin escalation check and
+    a different one to the guard that would enforce it. The walk-up registration queue has
+    always done this (``registrations.py``).
+    """
+    return str(role or "").strip().lower()
+
+
+def validate_assignable_role(role: str) -> str:
+    """Refuse a role this deployment does not define. Returns the canonical spelling.
+
+    Callers are the paths that write a ``users`` row with a role a caller chose, so the rule
+    is asked in one place instead of being re-derived by each of them.
+
+    The root tier is refused **first and by name** (``refuse_developer_role``, a 403), because
+    ``developer`` is one of the six roles and the reason it cannot be created is its own - not
+    an accident of a list it happens to be missing from. Everything else that is not a role
+    here is a 400: it is a bad value, not a forbidden one.
+    """
+    canonical = normalise_role(role)
+    refuse_developer_role(canonical)
+    if canonical not in ASSIGNABLE_ROLES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{role!r} is not a role this deployment defines. It must be one of: "
+                f"{', '.join(sorted(ASSIGNABLE_ROLES))}."
+            ),
+        )
+    return canonical
+
+
 def validate_password_strength(password: str) -> None:
     if not password:
         raise HTTPException(status_code=400, detail="Password must not be empty.")

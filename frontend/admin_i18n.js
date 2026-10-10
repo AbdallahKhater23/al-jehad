@@ -181,7 +181,17 @@ Object.assign(TRANSLATIONS.en, {
         "credentialsDeactivate": "Deactivate",
         "credentialsReactivate": "Reactivate",
         "credentialsEditFor": "Editing",
-        "credentialsEditIdNote": "The user id and the role cannot be changed here. Every attendance record, punch and device key is written against the id, so to correct either, delete the account and create it again.",
+        "credentialsEditIdNote": "The user id cannot be changed here: every attendance record, punch and device key is written against it, so to correct it, delete the account and create it again. The role is not a field on this form - it is changed by its own button, because a privilege that travelled along with a rename is one nobody decided to grant.",
+        // The role control. Its own words rather than sharing the password ones: a password is
+        // replaced and a role is *granted*, and the sentence a reader needs is different because
+        // the question is.
+        "credentialsRoleChange": "Change role",
+        "credentialsRoleChangeHint": "The role is changed by this button, not by Save, and it signs this account out on every device: a session issued under the old role must not outlive it. Their hours stay with the account.",
+        "credentialsRoleConfirm": "Move {account} to {role}? They are signed out everywhere and must sign in again. Their shifts, their hours and their face reference stay with the account.",
+        "credentialsRoleChanged": "Role changed to {role}. They must sign in again.",
+        "credentialsRoleUnchanged": "This account is already a {role}.",
+        "credentialsRoleSelf": "This is your own account: your role is not yours to change.",
+        "credentialsRoleProtected": "Only a head administrator can change an administrator's role.",
         "credentialsHourlyRate": "Hourly rate (0 clears it)",
         "credentialsHourlyRateHint": "Leave the rate empty to keep it unchanged. 0 clears it: an agreed rate of zero and no agreed rate are different records, and this keeps them different.",
         "credentialsTransit": "Allow off-site shift start (transit worker)",

@@ -22,10 +22,11 @@
  *       a Capacitor WebView is edge-to-edge behind the cutout and the gesture
  *       bar. The web reads the same variables but never has a nonzero inset.
  *    2. The dark theme is kept as a *token swap* (the web's ``html.dark`` /
- *       ``[data-theme='dark']`` block) rather than as ``prefers-color-scheme``.
- *       The web ships light, so this build ships light: Android reporting a dark
- *       system theme must not silently change what the worker sees. The only
- *       thing that sets ``html.dark`` is the Profile switch in ``ui/theme.ts``.
+ *       ``[data-theme='dark']`` block). ``ui/theme.ts`` is the only thing that
+ *       sets either -- the header toggle and Profile's switch are one switch --
+ *       and with nothing stored it follows the device's own preference.
+ *       ``index.html`` applies the stored choice before the first paint, which is
+ *       why that switch is an attribute rather than a second stylesheet.
  *    3. Three values are added for contrast, measured on the handset's own
  *       combinations (see the notes on each): a darker ``--ops-live-ink``, a
  *       ``--ops-warn-ink``, and the ``--ops-primary-fill`` pair that keeps a
@@ -147,11 +148,11 @@
 }
 
 /* The dark theme, as the web writes it: a token swap, applied only when
-   something sets ``html.dark`` or ``data-theme="dark"``. The one thing that
-   sets it is the Profile switch (``ui/theme.ts``), i.e. only when the worker
-   asks -- Android reporting a dark system theme must not change the screen a
-   worker was trained on. Kept as a token swap so that switch is one attribute,
-   not a second stylesheet. */
+   something sets ``html.dark`` or ``data-theme="dark"``. ``ui/theme.ts`` is the
+   only thing that does -- from the worker's own choice, which is the device's own
+   preference until they make one -- and ``index.html`` applies what is stored
+   before the first frame. Kept as a token swap so the switch is one attribute, not
+   a second stylesheet. */
 html.dark,
 [data-theme='dark'] {
   --ops-surface: #1f2937;

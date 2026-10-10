@@ -1,17 +1,22 @@
 /**
  * Sign-in.
  *
- * The form is the whole screen: three fields, one button. The gear in the header opens the
- * server-address sheet, because a worker whose baked-in URL is wrong cannot reach anything
- * else in the app — this is the one screen that has to be able to fix its own transport.
+ * The form is the whole screen: three fields, one button. The header carries the
+ * theme toggle and the language picker and nothing else -- there is no server to
+ * point this app at, because the address is baked into the build and falls back to
+ * the public deployment (``core/config.ts``).
+ *
+ * Every sentence here comes from ``core/strings.ts``, so the screen a worker signs
+ * in on is drawn in the language they chose -- which is the one screen where the
+ * picker has to be reachable before anybody is signed in.
  */
 
 import { request, persistSessionFromLoginResponse } from '../../../core/http.js';
 import { store } from '../../../core/store.js';
+import { t } from '../../../core/strings.js';
 import type { Screen, ScreenContext } from '../../shell.js';
 import { esc, on } from '../../dom.js';
 import { icon } from '../../icons.js';
-import { serverGearButton, openServerSheet } from '../../components/server-url.js';
 import { toastError, toastOk } from '../../components/toast.js';
 import {
   loginRequestBody,
@@ -31,21 +36,22 @@ interface LoginResponse {
 export function createLoginScreen(onSignedIn: () => void): Screen {
   return {
     fullHeight: true,
-    title: () => 'Sign in',
-    subtitle: () => 'Attendance',
-    actions: () => [serverGearButton(() => openServerSheet({ onSaved: () => onSignedIn() }))],
+    // The frame names its main landmark from this, so it is the screen's own sentence
+    // rather than a second copy of the heading.
+    title: () => t('auth.signIn'),
+    subtitle: () => t('app.name'),
     mount(host: HTMLElement, ctx: ScreenContext): () => void {
       host.innerHTML = `
         <div class="auth">
           <div class="auth__brand">
             <div class="auth__mark">${icon('shield', 30, 'auth__mark-icon')}</div>
-            <h1 class="auth__title">Site attendance</h1>
-            <p class="auth__subtitle">Sign in with the ID and details your administrator gave you.</p>
+            <h1 class="auth__title">${esc(t('app.name'))}</h1>
+            <p class="auth__subtitle">${esc(t('auth.subtitle'))}</p>
           </div>
 
           <form class="auth__form" id="login-form" novalidate>
             <div class="hand-field-group">
-              <label class="hand-field-label" for="login-id">Worker ID</label>
+              <label class="hand-field-label" for="login-id">${esc(t('auth.userId'))}</label>
               <input class="ui-field" id="login-id" name="user_id" type="text"
                      inputmode="numeric" autocomplete="username" autocapitalize="off"
                      spellcheck="false" enterkeyhint="next" />
@@ -53,7 +59,7 @@ export function createLoginScreen(onSignedIn: () => void): Screen {
             </div>
 
             <div class="hand-field-group">
-              <label class="hand-field-label" for="login-identity">Email or phone</label>
+              <label class="hand-field-label" for="login-identity">${esc(t('auth.emailOrPhone'))}</label>
               <input class="ui-field" id="login-identity" name="email_or_phone" type="text"
                      autocomplete="username" autocapitalize="off" autocorrect="off"
                      spellcheck="false" enterkeyhint="next" />
@@ -61,7 +67,7 @@ export function createLoginScreen(onSignedIn: () => void): Screen {
             </div>
 
             <div class="hand-field-group">
-              <label class="hand-field-label" for="login-password">Password</label>
+              <label class="hand-field-label" for="login-password">${esc(t('auth.password'))}</label>
               <input class="ui-field" id="login-password" name="password" type="password"
                      autocomplete="current-password" enterkeyhint="go" />
               <span class="ui-field-error" data-error="password" hidden></span>
@@ -70,20 +76,15 @@ export function createLoginScreen(onSignedIn: () => void): Screen {
             <div id="login-notice" hidden></div>
 
             <button class="ui-btn ui-btn-primary is-block" type="submit" id="login-submit">
-              <span class="ui-btn__label">Sign in</span>
+              <span class="ui-btn__label">${esc(t('auth.signIn'))}</span>
             </button>
           </form>
-
-          <div class="auth__footer">
-            <span id="login-server">—</span>
-          </div>
         </div>
       `;
 
       const form = host.querySelector('#login-form') as HTMLFormElement;
       const submit = host.querySelector('#login-submit') as HTMLButtonElement;
       const notice = host.querySelector('#login-notice') as HTMLElement;
-      const serverLine = host.querySelector('#login-server') as HTMLElement;
 
       const fields = {
         user_id: host.querySelector('#login-id') as HTMLInputElement,
@@ -122,8 +123,8 @@ export function createLoginScreen(onSignedIn: () => void): Screen {
       function setBusy(value: boolean): void {
         busy = value;
         submit.innerHTML = value
-          ? '<span class="hand-spinner"></span><span class="ui-btn__label">Signing in…</span>'
-          : '<span class="ui-btn__label">Sign in</span>';
+          ? `<span class="hand-spinner"></span><span class="ui-btn__label">${esc(t('auth.signingIn'))}</span>`
+          : `<span class="ui-btn__label">${esc(t('auth.signIn'))}</span>`;
         submit.toggleAttribute('disabled', value);
       }
 
@@ -188,9 +189,9 @@ export function createLoginScreen(onSignedIn: () => void): Screen {
 
           const approval = String(body.approval_status ?? '').toLowerCase();
           if (approval === 'pending_approval') {
-            toastOk('Signed in. Your account is waiting for approval before you can record attendance.');
+            toastOk(t('auth.pendingApproval'));
           } else {
-            toastOk(`Welcome, ${store.getState().session?.user.name ?? ''}`.trim());
+            toastOk(t('auth.welcome', { name: store.getState().session?.user.name ?? '' }).trim());
           }
           onSignedIn();
         } catch (e) {
@@ -198,44 +199,32 @@ export function createLoginScreen(onSignedIn: () => void): Screen {
           if (err.offline) {
             notice.hidden = false;
             notice.className = 'hand-alert';
-            notice.textContent =
-              'No connection to the server. Check the address under the gear, or your signal, and try again.';
+            notice.textContent = t('auth.offline');
           } else if (err.status === 401) {
             notice.hidden = false;
             notice.className = 'hand-alert is-danger';
-            notice.textContent = 'That ID, email or password was not accepted.';
+            notice.textContent = t('auth.rejected');
           } else if (err.status === 403) {
             notice.hidden = false;
             notice.className = 'hand-alert is-danger';
-            notice.textContent = err.message ?? 'This account cannot sign in.';
+            notice.textContent = err.message ?? t('auth.forbidden');
           } else if (err.status === 429) {
             notice.hidden = false;
             notice.className = 'hand-alert';
-            notice.textContent = 'Too many attempts. Wait a minute and try again.';
+            notice.textContent = t('auth.tooMany');
           } else {
             notice.hidden = false;
             notice.className = 'hand-alert is-danger';
-            notice.textContent = err.message ?? 'Sign-in failed.';
+            notice.textContent = err.message ?? t('auth.failed');
           }
-          toastError('Sign-in failed.');
+          toastError(t('auth.failed'));
         } finally {
           setBusy(false);
         }
       }
-
-      void (async () => {
-        try {
-          const { resolveApiBaseUrl } = await import('../../../core/config.js');
-          serverLine.textContent = await resolveApiBaseUrl();
-        } catch (e) {
-          serverLine.textContent = (e as Error).message;
-        }
-      })();
 
       ctx.main.scrollTop = 0;
       return () => disposers.forEach((off) => off());
     },
   };
 }
-
-void esc;

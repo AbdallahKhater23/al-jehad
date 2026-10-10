@@ -147,7 +147,7 @@ Decomposing what a worker's tap costs, from the measurements above:
 ## 6. Findings & risks
 
 1. **No geofenced sites were configured on the deployment** (resolved during the test). Every punch from anywhere on Earth was refused `403 Location Rejected`. In production this would have been discovered by the first worker standing at a real site. *Recommendation: make "zero sites registered" a readiness warning — the readiness endpoint already has the machinery for it.*
-2. **Liveness is inactive on the deployment**: the punch response reports `liveness: {"verdict": "unavailable", "available": false}` — `backend/models/minifasnet.onnx` is missing, so the app runs in `advisory` mode and never blocks a spoof. A printed photo held to the camera would pass face matching today. *Recommendation: install the model (see `backend/models/README.md`) or consciously accept the risk; readiness already reports it — surface that to admins.*
+2. **Liveness is inactive on the deployment**: the punch response reports `liveness: {"verdict": "unavailable", "available": false}` — `backend/models/minifasnet.onnx` is missing, so the app runs in `advisory` mode and never blocks a spoof. A printed photo held to the camera would pass face matching today. *Recommendation: install the model (see `backend/models/README.md`) or consciously accept the risk; readiness already reports it — surface that to admins.* **Resolved (2026-10-06):** the artifact is now committed with the measurements behind it — see `backend/models/README.md` §2 and `backend/tests/test_liveness_model.py`. Note that installing it exposed four wrong assumptions in `liveness.py` (crop, scale, channel order, class order), every one of which failed by reading a spoof as genuine, so the model alone was not the fix.
 3. **The 15/minute per-IP attendance limit will collide with real shared networks.** A site where 20+ workers share one office NAT/consumer connection and punch within a minute will see 429s. The limit is right for defending the endpoint from scripts; consider a per-token (per-account) bucket *in addition to* the per-IP one so a legitimate shared network doesn't shed real workers.
 4. **Legacy scripts are stale and misleading**: `backend/test_load.py` posts a password field the endpoint no longer accepts, to the bare tunnel URL (not an API path), with credentials that no longer work; `backend/test_login.py` likewise. They should be deleted or replaced by `backend/tools/load_test.py` (which is what this report used).
 5. **The face engine did its job under load**: zero refusals at 15 concurrent, zero errors, clean 503-with-Retry-After policy available had the queue filled. No tuning needed at this scale.
@@ -157,7 +157,7 @@ Decomposing what a worker's tap costs, from the measurements above:
 
 ## 7. Recommendations (priority order)
 
-1. **Deploy the liveness model** (finding 2) — it is the only security control in the punch path that is currently off.
+1. ~~**Deploy the liveness model** (finding 2)~~ — **done** (2026-10-06). It was the only security control in the punch path that was off, and shipping it also required correcting the preprocessing and the class order in `liveness.py`.
 2. **Add a per-account rate bucket** alongside the per-IP one (finding 3) before rolling out to a site with shared internet.
 3. **Alert on "zero sites"** in readiness (finding 1) so a fresh deployment can't silently refuse every punch.
 4. **Delete or rewrite the legacy load/login scripts** (finding 4) so nobody presents numbers from a script that measures the wrong endpoint.

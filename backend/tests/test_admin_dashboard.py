@@ -1074,7 +1074,18 @@ def test_a_period_that_cannot_be_counted_answers_null_and_takes_nothing_with_it(
     assert body["people"] == whole["people"], body["people"]
     assert body["places"] == whole["places"]
     assert body["now"] == whole["now"]
-    assert body["waiting"] == whole["waiting"]
+    # Every *stored* figure in the waiting block survived the period's failure untouched, and the
+    # one field that is an age rather than a stored figure moved by as much as the clock did.
+    # ``oldest_seconds`` is recomputed from ``now`` on every read, so comparing the whole block
+    # made this a statement about how long the two reads took: under ``-n auto`` a second can pass
+    # between them and it failed by exactly one (``463419 != 463418``) without anything having
+    # changed. The age is asserted as an age, the way the rest of this file does it
+    # (``test_the_oldest_thing_waiting_is_the_one_reported``), and it may only have *grown*.
+    assert {key: value for key, value in body["waiting"].items() if key != "oldest_seconds"} == {
+        key: value for key, value in whole["waiting"].items() if key != "oldest_seconds"
+    }, (body["waiting"], whole["waiting"])
+    age_drift = body["waiting"]["oldest_seconds"] - whole["waiting"]["oldest_seconds"]
+    assert 0 <= age_drift <= 5, (age_drift, body["waiting"], whole["waiting"])
     assert body["as_of"], body
 
 

@@ -5945,6 +5945,20 @@ const UI_MODULES = {
                 this.useSuggestedCredentialsId();
             });
         }
+        // The role change, which the edit panel offers beside Save. A ``data-`` hook and not an
+        // inline attribute: this one grants or revokes access to the audit trail, so it has more
+        // reason than most to be the kind of handler an injected ``<img onerror>`` cannot be.
+        // The id it carries is the account the panel was opened on, which is also the account in
+        // state - the control is on the panel that is drawn only while that account is open.
+        const roleChanges = scope.querySelectorAll('[data-change-role]');
+        for (let i = 0; i < roleChanges.length; i += 1) {
+            const roleChange = roleChanges[i];
+            if (typeof roleChange.addEventListener !== 'function') continue;
+            roleChange.addEventListener('click', (event) => {
+                event.preventDefault();
+                this.changeUserRole();
+            });
+        }
         // The intake switch, when the link panel is the pane on screen. The Registrations tab
         // binds the same attribute on its own card; the two never render into one scope, and
         // both go through the same handler, so the switch cannot mean two things in two places.
@@ -6945,6 +6959,94 @@ ${sessionsFact}${statusFact}${moallemFact}
         return parts.join('');
     },
 
+    /**
+     * The roles *this reader* may put an account into, in the order the console lists roles.
+     *
+     * The server is the authority (``security.validate_assignable_role`` plus the two
+     * escalation rules on ``change_user_role``) and this is the same rule said in the rail, for
+     * the reason ``mayActOnAccount`` states: a control that always answers 403 is a trap rather
+     * than an affordance. The list is therefore derived from the actor's own role, not from the
+     * account's:
+     *
+     *   - a **standard admin** may move an account among the tiers they may already create in -
+     *     ``worker``, ``moallem``, ``off_office`` - and no further, so granting an
+     *     administrator's role is not theirs to offer;
+     *   - a **head admin** may grant the administrator tiers as well, which is what the role
+     *     exists to decide;
+     *   - ``developer`` appears in nobody's list. It is not a business role and is not assignable
+     *     through any API (``security.UNASSIGNABLE_ROLES``): the console would only be offering a
+     *     value the server refuses by name.
+     */
+    changeableRoles(actorRole) {
+        const actor = String(actorRole || '').trim();
+        if (actor === 'head_admin' || actor === 'developer') {
+            return ['worker', 'moallem', 'off_office', 'admin', 'head_admin'];
+        }
+        if (actor === 'admin') return ['worker', 'moallem', 'off_office'];
+        return [];
+    },
+
+    /**
+     * Whether the edit panel offers a role control for this account at all.
+     *
+     * Three refusals, each one a rule the server already enforces, and each one the reason the
+     * control is *absent* rather than present-and-refused:
+     *
+     *   - **nobody changes their own role.** The server answers 400 - demoting yourself out of the
+     *     console mid-session is a lockout, not a feature - so the panel shows the role and no
+     *     control, exactly as it shows no Delete on your own row;
+     *   - **no administrator reaches over a peer.** ``mayActOnAccount`` is the same rule the rest
+     *     of the rail uses, and it is asked here rather than re-derived;
+     *   - **the root tier's own account is not managed from the console**, from either direction:
+     *     the account is provisioned by the deployment's own seed tool and its role is not a
+     *     thing an administrator grants or revokes.
+     *
+     * The current role also has to be one the reader could have chosen. It always is - the two
+     * lists above cover every role an account may hold - but asking is what stops a future role
+     * from being drawn as a select whose selected option the reader is not allowed to pick.
+     */
+    mayChangeRoleOf(user) {
+        const actor = State.user || {};
+        if (!user) return false;
+        if (String(user.id) === String(actor.id || '')) return false;
+        if (String(user.role || '').trim() === 'developer') return false;
+        if (!this.mayActOnAccount(user)) return false;
+        const allowed = this.changeableRoles(actor.role);
+        return allowed.indexOf(String(user.role || '').trim()) >= 0;
+    },
+
+    /**
+     * The select's options: the roles this reader may grant, with the account's own role chosen.
+     *
+     * The labels are the console's own words for the roles (``roleLabel``), so a reader who
+     * chose Arabic reads the same five role names here as on every other screen. The values are
+     * the strings the server stores, which is the whole reason they are spelled out rather than
+     * taken from a label.
+     */
+    roleOptionsHtml(user) {
+        const current = String((user && user.role) || '').trim();
+        return this.changeableRoles((State.user || {}).role).map((role) =>
+            `<option value="${this.escapeHtml(role)}"${role === current ? ' selected' : ''}>${this.escapeHtml(this.roleLabel(role))}</option>`
+        ).join('');
+    },
+
+    /**
+     * Why the role is shown and not offered, as the key of the sentence that says so.
+     *
+     * A reader who cannot change a role is owed the reason, and the two reasons are different
+     * sentences: your own account is a lockout (the server answers 400), while an
+     * administrator's account seen by a standard admin is the peer rule (403). The root account
+     * has no key because it has no screen: a concealed account reads as a missing one
+     * (``developer.hides``), so this panel cannot be opened on it by anybody below the root tier.
+     */
+    roleFixedReason(user) {
+        const actor = State.user || {};
+        if (!user) return '';
+        if (String(user.id) === String(actor.id || '')) return 'credentialsRoleSelf';
+        if (!this.mayActOnAccount(user)) return 'credentialsRoleProtected';
+        return '';
+    },
+
     credentialsEditPanelHtml() {
         const user = this._credentialsEdit;
         if (!user) return '';
@@ -6965,9 +7067,22 @@ ${sessionsFact}${statusFact}${moallemFact}
                            placeholder="${I18n.__('emailOrPhone')}" class="${field}">
                     <input type="text" id="userEditPhone" value="${this.escapeHtml(draft.phone)}"
                            placeholder="${I18n.__('phone')}" class="${field}">
-                    <p class="ui-note is-panel" data-user-edit-role="${this.escapeHtml(user.role || '')}">
+                    <!-- The role, which is two things depending on who is reading: the account's
+                         current role, and - for a reader who may decide it - the control that
+                         changes it. One block rather than two fields, because they answer one
+                         question; and the control is *absent* where the server would refuse it
+                         (see mayChangeRoleOf). The data-user-edit-role hook is on both forms, so
+                         "what role does this account hold" is read the same way wherever it is
+                         asked. The role change is sent by its own button to its own endpoint:
+                         this form has no role field, and must not grow one. -->
+                    ${this.mayChangeRoleOf(user) ? `<label class="ui-stack is-flush ui-span-all" data-user-edit-role-change="true">
+                        <span class="${label}">${I18n.__('role')}</span>
+                        <select id="userEditRole" class="${field}" data-user-edit-role="${this.escapeHtml(user.role || '')}">${this.roleOptionsHtml(user)}</select>
+                    </label>
+                    <p class="ui-note">${I18n.__('credentialsRoleChangeHint')}</p>` : `<p class="ui-note is-panel" data-user-edit-role="${this.escapeHtml(user.role || '')}">
                         ${I18n.__('role')}: <b>${this.escapeHtml(this.roleLabel(user.role))}</b>
                     </p>
+                    ${this.roleFixedReason(user) ? `<p class="ui-note">${I18n.__(this.roleFixedReason(user))}</p>` : ''}`}
                     <!-- The assignment, for the one role that has one: a worker answers to a
                          moallem, a moallem answers to nobody, and the server refuses an
                          assignment from any other role - so the control is not drawn where it
@@ -7036,6 +7151,13 @@ ${sessionsFact}${statusFact}${moallemFact}
                 <div class="ui-row">
                     <button type="button" onclick="UI_MODULES.saveUserEdit()" class="ui-btn ui-btn-primary">${I18n.__('save')}</button>
                     <button type="button" onclick="UI_MODULES.closeUserEdit()" class="${quiet}">${I18n.__('cancel')}</button>
+                    <!-- Its own action rather than a field the Save button carries: changing a
+                         role hands out (or takes away) access to the audit trail, and it signs
+                         the person out - so it is asked, confirmed and audited on its own. Bound
+                         from its data-change-role hook by bindCredentialsControls rather than by
+                         an inline attribute, because the per-file inline allowance is pinned and
+                         may only fall (the switch on the link panel is bound the same way). -->
+                    ${this.mayChangeRoleOf(user) ? `<button type="button" data-change-role="${this.escapeHtml(user.id)}" class="${quiet}">${I18n.__('credentialsRoleChange')}</button>` : ''}
                 </div>
             </div>`;
     },
@@ -7137,6 +7259,11 @@ ${sessionsFact}${statusFact}${moallemFact}
         const draft = this.readUserEditDraft();
         // Exactly the fields the server accepts, and no id or role among them: see the
         // section comment above. Sending either would be ignored at best.
+        //
+        // The role is not an exception left out of that sentence, it is a different operation:
+        // it travels on its own button, to its own endpoint, with its own confirmation
+        // (``changeUserRole``). What this form must never grow is a *role field*, because a
+        // privilege that rides along with a rename is one nobody decided to grant.
         const body = {
             user_id: user.id,
             name: draft.name,
@@ -7190,6 +7317,63 @@ ${sessionsFact}${statusFact}${moallemFact}
             if (!uploaded) return;
         }
         Toast.success(I18n.__('credentialsUserSaved'));
+        this.closeUserEdit();
+        await this.loadCredentials(document.getElementById('adminContent'));
+    },
+
+    /**
+     * Move an account to another role: ``POST /admin/users/role``, its own request.
+     *
+     * WHY THIS IS NOT A FIELD THE SAVE ABOVE CARRIES. The two operations look alike - both are
+     * "this account, changed" - and they are not the same act. A name is a correction to a
+     * record; a role is access to the audit trail, and changing it signs the person out
+     * everywhere. One of those is worth a sentence before it happens and the other is not, so
+     * the role travels on its own button, and the confirmation can name the role being granted.
+     *
+     * The confirmation is the console's own words rather than the server's, for the reason the
+     * delete and deactivate ones are: a reader who chose Arabic must not be asked the question
+     * that matters in English. The *refusal*, by contrast, is shown exactly as the server
+     * phrased it - the escalation rules it enforces are the authority, and a second copy of them
+     * here is a second copy to drift.
+     *
+     * Choosing the role the account already holds sends nothing and says so. The server answers
+     * that as a no-op (success, no write, no revoked session), so a request would be a round trip
+     * to learn what the screen already knew - and a confirmation for a change that is not a
+     * change is worse than no request at all, because a dialog that guards nothing is how people
+     * learn to click through the one that does.
+     */
+    async changeUserRole() {
+        const user = this._credentialsEdit;
+        if (!user) return;
+        const select = document.getElementById('userEditRole');
+        const wanted = select ? String(select.value || '').trim() : '';
+        const held = String(user.role || '').trim();
+        // Nothing chosen, or the role it already holds: one answer and no request. An empty value
+        // could not be sent anyway - the server refuses a value that is not a role
+        // (``validate_assignable_role``) - so it is read as "nothing to do" here rather than
+        // answered with a 400 nobody asked for.
+        if (!wanted || wanted === held) {
+            Toast.info(I18n.__('credentialsRoleUnchanged').replace('{role}', this.roleLabel(held)));
+            return;
+        }
+        const named = `${user.name || user.id} (${user.id})`;
+        const label = this.roleLabel(wanted);
+        const question = I18n.__('credentialsRoleConfirm')
+            .replace('{account}', named)
+            .replace('{role}', label);
+        if (!confirm(question)) return;
+        try {
+            await API.request('/admin/users/role', {
+                method: 'POST', body: { user_id: user.id, role: wanted }
+            });
+        } catch (err) {
+            Toast.error(err.message);
+            return;
+        }
+        Toast.success(I18n.__('credentialsRoleChanged').replace('{role}', label));
+        // The panel closes and the roster is re-read: the account's sessions died with the change
+        // (the server bumps ``token_version``), and the role is printed on the row and counted by
+        // the chips, so the list on screen is now wrong by one.
         this.closeUserEdit();
         await this.loadCredentials(document.getElementById('adminContent'));
     },

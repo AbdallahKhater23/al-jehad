@@ -32,6 +32,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 import config
 import uploads
@@ -62,11 +63,45 @@ def _punch(client, monkeypatch, app_module, **punch):
     return response, queue
 
 
-def _spooled() -> set[str]:
+def _spooled(directory: str) -> set[str]:
+    """What is in a spool directory right now.
+
+    The caller passes its own - the fixture below - never ``uploads.SPOOL_DIR``: a listing of the
+    shared directory is not evidence about one request, and the reason is in that fixture.
+    """
     try:
-        return set(os.listdir(uploads.SPOOL_DIR))
+        return set(os.listdir(directory))
     except FileNotFoundError:
         return set()
+
+
+@pytest.fixture()
+def own_spool(monkeypatch, tmp_path) -> str:
+    """A spool directory this test owns, for the tests that read the directory back.
+
+    ``uploads.SPOOL_DIR`` is one directory for the whole machine, and that is deliberate for the
+    application: a punch is spooled by the request that discards it, and what a crash leaves is
+    collected by the next start's sweep - same directory, whichever process runs it. What it is
+    not is something a *test* may read as evidence about a single request. ``-n auto`` runs the
+    eleven tests in this file across a worker per core, every one of them that punches spools into
+    that directory, and every other suite's punches do too - so a listing taken before a request
+    cannot be compared with a listing taken after it. The difference is somebody else's upload,
+    not this request's failure, which is exactly how the three tests below failed under ``-n auto``
+    while passing serially.
+
+    Pointing the module at a directory pytest made for this test makes the same claim about the
+    same code and makes it deterministically: the listing is this request's alone, so "a refused
+    punch wrote nothing" can be asserted exactly (the directory is empty) rather than as a set
+    difference against a directory several processes are writing to. Both shipped readers resolve
+    the constant per call - ``spool_dir()`` for the write, ``sweep_spool_dir()`` for the pass - so
+    one patch covers them, and pytest removes the directory afterwards: nothing to clean up.
+
+    A test that asserts about the *shipped* constant rather than about what a request wrote takes
+    no fixture and says so where it reads it (see the last test in this file).
+    """
+    directory = str(tmp_path / "attendance-spool")
+    monkeypatch.setattr(uploads, "SPOOL_DIR", directory)
+    return directory
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +184,7 @@ def test_a_photo_that_will_not_decode_is_refused_with_its_own_code(client, app_m
 
 
 def test_a_selfie_above_the_ingestion_boundary_is_refused_with_the_code_a_client_acts_on(
-    client, app_module
+    client, app_module, own_spool
 ):
     """The ingestion boundary, where a worker actually meets it: a punch.
 
@@ -167,7 +202,6 @@ def test_a_selfie_above_the_ingestion_boundary_is_refused_with_the_code_a_client
     buffer = io.BytesIO()
     Image.new("RGB", (2048, 2048), (120, 130, 140)).save(buffer, format="JPEG", quality=85)
 
-    before = _spooled()
     response = clock_in(client, MOALLEM, headers=bearer(MOALLEM), image=buffer.getvalue())
 
     assert response.status_code == 422, response.text[:300]
@@ -175,36 +209,38 @@ def test_a_selfie_above_the_ingestion_boundary_is_refused_with_the_code_a_client
     assert detail["error_code"] == uploads.ERR_RESOLUTION_TOO_HIGH, detail
     assert "4 MP" in detail["message"], detail
     assert (detail["width"], detail["height"]) == (2048, 2048), detail
-    assert _spooled() == before, "the refused upload stayed on disk"
+    assert _spooled(own_spool) == set(), "the refused upload stayed on disk"
 
 
 # ---------------------------------------------------------------------------
 # 2. the refusals that never reach the file
 # ---------------------------------------------------------------------------
-def test_an_oversized_upload_is_refused_while_reading_and_leaves_nothing(client, app_module):
+def test_an_oversized_upload_is_refused_while_reading_and_leaves_nothing(client, app_module, own_spool):
     """The size ceiling is enforced chunk by chunk, before the rest of the body arrives."""
-    before = _spooled()
     response = clock_in(
         client, MOALLEM, headers=bearer(MOALLEM), image=b"\xff\xd8\xff" * 512 + b"x" * (6 * 1024 * 1024)
     )
 
     assert response.status_code == 413, response.text[:300]
     assert response.json()["detail"]["error_code"] == "photo_too_large"
-    assert _spooled() <= before, "an upload that was refused for its size was left on disk"
+    assert _spooled(own_spool) == set(), "an upload that was refused for its size was left on disk"
 
 
-def test_a_punch_refused_outside_the_geofence_never_writes_the_photo(client):
+def test_a_punch_refused_outside_the_geofence_never_writes_the_photo(client, own_spool):
     """Cheap refusals stay cheap, and that includes not writing the body down.
 
     The geofence is checked before the upload is read - which is why the spool cannot live in a
     dependency: a request that is about to be refused for where it is must not spend disk on the
-    way, or a phone that keeps retrying from the wrong place writes a file per attempt.
+    way, or a phone that keeps retrying from the wrong place writes a file per attempt. The
+    directory is this test's own, so "nothing was written" is the whole listing, not a comparison
+    against a listing other workers were adding to.
     """
-    before = _spooled()
     response = clock_in(client, MOALLEM, headers=bearer(MOALLEM), coordinates=OUTSIDE_ALL_SITES)
 
     assert response.status_code == 403, response.text[:300]
-    assert _spooled() <= before, "a punch refused for its location wrote the upload to disk anyway"
+    assert _spooled(own_spool) == set(), (
+        "a punch refused for its location wrote the upload to disk anyway"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -290,14 +326,20 @@ def test_a_spool_writes_the_body_in_chunks_and_keeps_only_the_header():
         spool.discard()
 
 
-def test_a_crashed_request_leaves_a_file_that_the_next_start_sweeps():
+def test_a_crashed_request_leaves_a_file_that_the_next_start_sweeps(own_spool):
     """The one leftover a request cannot clean up after, and the pass that collects it.
 
     A file whose request died between spooling and discarding has no owner left, so the sweep is
-    the second half of the cleanup. It is age-gated on purpose: several processes share this
-    directory (a test run is several), and a sweep that took *everything* could delete the upload
-    of a punch being verified in another process.
+    the second half of the cleanup. It is age-gated on purpose: in a deployment several processes
+    share this directory - several workers, and a restart sweeping under a running one - so a
+    sweep that took *everything* could delete the upload of a punch being verified beside it.
+
+    The directory here is this test's own, which is what makes the count exact: the sweep's answer
+    is the one stale file it was given, not that file plus however many a concurrent worker
+    happened to be writing.
     """
+    # The fixture's own directory, through the function the request path itself uses - so the pass
+    # is exercised against a file planted exactly where a spooled upload lands.
     directory = uploads.spool_dir()
     stale = os.path.join(directory, "punch-left-by-a-crash.jpg")
     live = os.path.join(directory, "punch-in-flight.jpg")
@@ -309,17 +351,21 @@ def test_a_crashed_request_leaves_a_file_that_the_next_start_sweeps():
 
     removed = uploads.sweep_spool_dir()
 
-    assert removed >= 1
+    assert removed == 1, f"the sweep removed {removed} file(s) out of the one stale file it had"
     assert not os.path.exists(stale), "a file from an interrupted request survived the sweep"
     assert os.path.exists(live), "the sweep removed a file a live request could still need"
-    os.remove(live)
-    # A request is seconds long; the floor has to be far above it for that safety to mean
-    # anything.
+    # ``live`` is left where it is: the directory belongs to this test and pytest removes it with
+    # the test. A request is seconds long; the floor has to be far above it for that safety to
+    # mean anything.
     assert uploads.SPOOL_STALE_SECONDS > 60
 
 
 def test_the_spool_is_not_a_directory_this_application_keeps_faces_in():
     """A temporary upload must not be mistakable for a stored one.
+
+    This one takes no spool fixture on purpose: what it asserts is about the directory the
+    application ships with, so redirecting that constant would make it assert about the test's
+    own scratch directory instead.
 
     Biometric templates, enrollment photos, punch evidence and quick-link photos all live in
     configured directories that ``retention`` sweeps and an operator inspects. The spool is the

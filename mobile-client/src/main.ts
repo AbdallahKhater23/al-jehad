@@ -26,8 +26,9 @@ import './styles/screens/notes.css';
 import './styles/screens/profile.css';
 
 import { Preferences } from '@capacitor/preferences';
-import { resolveApiBaseUrl } from './core/config.js';
+import { purgeLegacyApiBaseOverrides, resolveApiBaseUrl } from './core/config.js';
 import { clearPersistedSession } from './core/http.js';
+import { loadLocale, onLocaleChange } from './core/locale.js';
 import { store } from './core/store.js';
 import { runSync, syncForCurrentWorker, refreshWorkerState } from './core/sync-loop.js';
 import { ensureDevice, refreshAnchor } from './offline/device.js';
@@ -41,6 +42,8 @@ import {
   setBadges,
   installBackHandler,
   buildHeaderInner,
+  isShellMounted,
+  refreshScreen,
 } from './ui/shell.js';
 import { createLoginScreen } from './ui/screens/login/login.js';
 import { createClockScreen } from './ui/screens/clock/clock.js';
@@ -264,19 +267,45 @@ export async function start(): Promise<void> {
     throw new Error('The app root element is missing.');
   }
 
-  // The worker's theme choice, applied before the first frame the shell paints.
-  await loadTheme();
+  // Nothing points this app at a server but the build itself: a per-device address a
+  // previous version wrote (or one an older APK still remembers) is discarded here,
+  // before the first request, so a stale office LAN address cannot outlive the
+  // control that has been removed from the UI.
+  purgeLegacyApiBaseOverrides();
+  // The worker's theme and language, applied before the first frame: the theme is
+  // already on the document from the boot script in index.html, and this is what
+  // carries the choice into the shell; the language sets ``lang``/``dir``.
+  await Promise.all([loadTheme(), loadLocale()]);
   installBackHandler();
   const result = await bootstrap();
   await wireListeners();
   await renderEntry();
 
   if (result.error) {
-    toastError(`Server address is not configured: ${result.error}`);
+    toastError(`The app is not configured: ${result.error}`);
   } else if (result.hasSession && !result.anchorReady) {
     toastError('Could not reach the server. Offline punches will be available once it answers.');
   }
 }
+
+// ---------------------------------------------------------------------------
+// the language switch
+// ---------------------------------------------------------------------------
+// Choosing a language is a repaint, not a reload: the document's ``lang``/``dir`` are
+// set by ``core/locale.ts`` the moment the choice is made, and the two frames that
+// draw themselves from ``t()`` -- the shell (its header and tab bar, and the screen
+// inside it) and the sign-in frame -- are redrawn from the new table here.
+//
+// Deferred by a task on purpose: the picker is a native ``select`` inside the header
+// this repaint replaces, and a header rebuilt while its own ``change`` event is still
+// being dispatched is a control that can be torn out from under the tap that used it.
+onLocaleChange(() => {
+  window.setTimeout(() => {
+    if (!root) return;
+    if (store.getState().session && isShellMounted()) refreshScreen();
+    else mountLoginScreen();
+  }, 0);
+});
 
 // ---------------------------------------------------------------------------
 // the sign-out / session-loss path

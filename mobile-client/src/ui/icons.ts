@@ -25,8 +25,13 @@ const PATHS: Record<string, string> = {
     '<circle cx="12" cy="8.5" r="3.6"/><path d="M4.8 20c0-3.7 3.2-6.2 7.2-6.2s7.2 2.5 7.2 6.2"/>',
   camera:
     '<path d="M3.5 8.5h3l1.5-2.2h8L17.5 8.5h3v10.5h-17z"/><circle cx="12" cy="13.5" r="3.4"/>',
-  gear:
-    '<circle cx="12" cy="12" r="3"/><path d="M12 2.8v2.4M12 18.8v2.4M4.5 12H2.1M21.9 12h-2.4M6.7 6.7 5 5M19 19l-1.7-1.7M6.7 17.3 5 19M19 5l-1.7 1.7"/>',
+  // The theme toggle's two glyphs, drawn with the console's own moon (its
+  // ``ADMIN_ICONS.theme``) so the desk's dark-mode button and the handset's are the
+  // same picture. The gear the header used to carry is gone with the server sheet.
+  moon:
+    '<path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5Z"/>',
+  sun:
+    '<circle cx="12" cy="12" r="4"/><path d="M12 3.2v2.2M12 18.6v2.2M3.2 12h2.2M18.6 12h2.2M5.8 5.8l1.6 1.6M16.6 16.6l1.6 1.6M5.8 18.2l1.6-1.6M16.6 7.4l1.6-1.6"/>',
   refresh:
     '<path d="M20 11.5a8 8 0 1 0-2.4 6.2"/><path d="M20.3 4.5v4.2h-4.2"/>',
   logout:

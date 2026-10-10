@@ -77,9 +77,9 @@ function apiBaseGuard(mode: string): Plugin {
       );
       if (release && apiBase.kind === 'none') {
         this.warn(
-          'no VITE_API_BASE_URL was set for a release build: the shipped app will only reach ' +
-            'a server it finds on the local network, or one the worker enters on the sign-in ' +
-            'screen. Set VITE_API_BASE_URL to the public https deployment to bake one in.',
+          'no VITE_API_BASE_URL was set for a release build: the app will fall back to the ' +
+            'built-in public deployment (DEFAULT_API_BASE in src/core/config.ts). Export ' +
+            'VITE_API_BASE_URL to point this deployment somewhere else.',
         );
       }
     },

@@ -115,6 +115,32 @@
   background: transparent;
 }
 
+/* The header's language picker. A native ``select`` -- one tap, the platform's own
+   list, no menu to build or trap focus in -- wearing the header's surface so it
+   needs no new palette, and the same 40px control height and radius as the icon
+   button beside it. The chevron the platform draws is left alone: it is the one
+   affordance a phone user already reads as "a list opens here". */
+.hand-lang {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+}
+.hand-lang__select {
+  min-height: 40px;
+  max-width: 32vw;
+  padding: 0 var(--ui-2);
+  border-radius: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: var(--ops-surface);
+  color: var(--ops-text);
+  font-size: 13px;
+  font-weight: 700;
+}
+.hand-lang__select:focus-visible {
+  outline: 2px solid var(--ops-primary);
+  outline-offset: 2px;
+}
+
 /* The header's icon button, as the console draws it. */
 .icon-button {
   display: inline-flex;

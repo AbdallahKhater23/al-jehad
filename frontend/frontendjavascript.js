@@ -59,6 +59,55 @@ const SESSION_MAX_MS = 31 * 24 * 3600 * 1000;
 //: worker wondering whether the app forgot them.
 let SESSION_DROPPED = false;
 
+//: The session *generation*. ``/auth/refresh`` runs in the background while the worker keeps
+//: tapping, so a refresh that was already in flight when the session ended can resolve
+//: *after* it: the answer describes the credential that was just given up, and writing it back
+//: would resurrect a session the worker (or an administrator) had ended - on a shared phone,
+//: handing the next person the previous account's token. Every sign-out and every
+//: rejected-session clear bumps this; ``confirmRestoredSession`` re-reads it after each
+//: ``await`` and drops an answer whose generation has moved. ``Cache-Control: no-store``
+//: cannot help here: the problem is not a cached copy but a late one.
+let SESSION_EPOCH = 0;
+//: The in-flight session-maintenance request (``/auth/refresh``), so a sign-out can cancel it
+//: rather than merely ignore its answer.
+let SESSION_PROBE = null;
+//: The cross-tab logout channel. Created lazily and feature-detected: a browser without
+//: ``BroadcastChannel`` keeps the single-tab behaviour, and a context that does not define the
+//: global (the Node test harness) never opens a channel that could leak between suites.
+let SESSION_CHANNEL = null;
+
+/** End the current session generation: cancel any in-flight refresh and make its late answer
+ *  a no-op. Clearing the stored session is the caller's job. */
+function abandonSession() {
+    SESSION_EPOCH += 1;
+    if (SESSION_PROBE) {
+        try { SESSION_PROBE.abort(); } catch (err) { /* already settled */ }
+        SESSION_PROBE = null;
+    }
+}
+
+/** The cross-tab channel, or ``null`` where the environment has none. */
+function sessionChannel() {
+    if (SESSION_CHANNEL) return SESSION_CHANNEL;
+    if (typeof BroadcastChannel === 'undefined') return null;
+    try {
+        SESSION_CHANNEL = new BroadcastChannel('attendance-session');
+        // Node exposes ``unref`` on a worker-thread channel and a browser does not; the guard
+        // keeps an idle channel from holding a test process open.
+        if (typeof SESSION_CHANNEL.unref === 'function') SESSION_CHANNEL.unref();
+    } catch (err) {
+        SESSION_CHANNEL = null;
+    }
+    return SESSION_CHANNEL;
+}
+
+/** Tell every other tab on this origin that the session is over. */
+function tellOtherTabsSessionEnded() {
+    const channel = sessionChannel();
+    if (!channel) return;
+    try { channel.postMessage({ type: 'session-ended', at: Date.now() }); } catch (err) { /* closed */ }
+}
+
 function isStoredSessionExpired(expiresAt) {
     if (!expiresAt) return false;   // no stamp: let the server's 401 decide
     const when = Date.parse(expiresAt);
@@ -227,6 +276,10 @@ const State = {
         saveStoredSession({ user: userData, expires_at: this.sessionExpiresAt || null });
     },
     clearUser() {
+        // Whatever refresh is in flight belongs to the session being cleared: cancel it and
+        // retire its generation so a late answer cannot write a token back (see
+        // ``SESSION_EPOCH``).
+        abandonSession();
         this.user = null;
         this.sessionExpiresAt = null;
         clearStoredSession();
@@ -1553,6 +1606,18 @@ const UI = {
         await I18n.loadStored();
         State.applyTheme();
         I18n.applyDirection();
+        // A sign-out in another tab ends the session in this one too: the token lives in
+        // ``localStorage``, which every tab on the origin shares, so a second tab left open
+        // would otherwise keep clocking in with a credential the first one discarded.
+        const channel = sessionChannel();
+        if (channel) {
+            channel.onmessage = (event) => {
+                if (event && event.data && event.data.type === 'session-ended') {
+                    State.clearUser();
+                    this.renderApp();
+                }
+            };
+        }
         // A session restored from a build that never stored the token cannot
         // authenticate anything, so clear it before the first tap rather than
         // letting every action fail with "Invalid token".
@@ -1683,18 +1748,36 @@ const UI = {
      * its session, which is the whole point of persisting it.
      */
     async confirmRestoredSession() {
+        // The generation this check belongs to. Every answer below is written back only while
+        // it is still the current one: a sign-out during the round trip has bumped it, and the
+        // answer it is holding describes a session that no longer exists.
+        const epoch = SESSION_EPOCH;
         try {
             const me = await API.request('/auth/me');
+            if (epoch !== SESSION_EPOCH) return;
             if (me && me.id) {
                 State.saveUser({ ...State.user, id: me.id, name: me.name, role: me.role });
             }
             if (State.sessionNeedsRefresh()) {
-                const res = await API.request('/auth/refresh', { method: 'POST' });
+                const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+                if (controller) SESSION_PROBE = controller;
+                let res;
+                try {
+                    res = await API.request('/auth/refresh', {
+                        method: 'POST', ...(controller ? { signal: controller.signal } : {})
+                    });
+                } finally {
+                    if (controller && SESSION_PROBE === controller) SESSION_PROBE = null;
+                }
                 const token = res.token || res.access_token;
-                if (token) State.saveUser({ ...State.user, token }, res.expires_at);
+                // Re-read the generation *after* the await - this is the whole point.
+                if (token && epoch === SESSION_EPOCH) {
+                    State.saveUser({ ...State.user, token }, res.expires_at);
+                }
             }
         } catch (err) {
-            // Network failure only; a 401 has already signed the session out above.
+            // Network failure only; a 401 has already signed the session out above - and a
+            // sign-out that aborted this request lands here too, which is the intent.
         }
     },
 
@@ -3911,6 +3994,7 @@ const UI = {
 
     logout() {
         this.stopLiveOps();
+        tellOtherTabsSessionEnded();
         State.clearUser();
         Modal.close();
         this.closeCamera();

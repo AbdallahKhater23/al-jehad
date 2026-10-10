@@ -15,6 +15,10 @@ backend/models/*.onnx.*
 # app that never boots. Both ship with the code instead of behind a deploy step.
 !backend/models/face_detection_yunet_2023mar.onnx
 !backend/models/facenet128.onnx
+# minifasnet.onnx (1.7 MB) is the passive anti-spoofing gate. It ships for the same reason,
+# and it is small enough to be read in a diff review: what it is, where it came from and the
+# contract it must be fed are pinned in backend/tests/test_liveness_model.py.
+!backend/models/minifasnet.onnx
 times.db
 # SQLite sidecar files created by WAL mode while the server runs
 times.db-wal

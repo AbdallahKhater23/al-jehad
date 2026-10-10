@@ -10,11 +10,42 @@
       content="width=device-width, initial-scale=1.0, viewport-fit=cover"
     />
     <meta name="theme-color" content="#162F29" />
-    <!-- Light first, as the web app ships: the dark palette is a token swap the
-         worker opts into on Profile, and the WebView must not paint its own form
-         controls dark behind a white card before that choice is made. -->
+    <!-- Both schemes are declared, so the WebView themes its own form controls and
+         scrollbars from the palette the page is actually wearing rather than from a
+         guess that disagrees with it for a frame. -->
     <meta name="color-scheme" content="light dark" />
     <meta name="format-detection" content="telephone=no" />
+    <!-- The stored theme and language, applied before the first frame.
+
+         This is the one deliberate duplication of two rules that live in
+         ``src/ui/theme.ts`` and ``src/core/locale.ts``: both are ES modules and
+         neither has run when the WebView paints, so a module that applied the theme
+         afterwards would show a white flash on every launch of a dark phone (and a
+         left-to-right flash before an Arabic screen). The two keys and the two
+         right-to-left codes are the only facts here, and they are named in those
+         modules as well -- change one and change the other. -->
+    <script>
+      (function () {
+        try {
+          var storedTheme = localStorage.getItem('app_theme');
+          var dark =
+            storedTheme === 'dark' ||
+            (storedTheme !== 'light' &&
+              window.matchMedia('(prefers-color-scheme: dark)').matches);
+          if (dark) document.documentElement.classList.add('dark');
+          document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+
+          var storedLang = localStorage.getItem('app_lang');
+          if (storedLang === 'ar' || storedLang === 'en' || storedLang === 'hi' || storedLang === 'ur') {
+            document.documentElement.lang = storedLang;
+            document.documentElement.dir =
+              storedLang === 'ar' || storedLang === 'ur' ? 'rtl' : 'ltr';
+          }
+        } catch (err) {
+          /* Storage disabled: the defaults in theme.ts / locale.ts stand. */
+        }
+      })();
+    </script>
     <title>Freebuff</title>
   </head>
   <body>

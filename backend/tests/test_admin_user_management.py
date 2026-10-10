@@ -11,10 +11,12 @@ Each endpoint has one rule that matters more than its happy path:
 
 1. **Editing is an update to a person, not a new identity for one.** The id cannot change
    (it is the key every attendance row, punch, device key and audit entry is written
-   against) and neither can the role: the role is chosen once, when the account is
-   created, and it is simply not a field this endpoint takes. A promotion is a new account
-   created with the new role; the old account keeps the hours, which are the part that must
-   not move.
+   against) and neither can the role: it is not a field this endpoint takes, because a role
+   is a privilege rather than a detail about somebody, and an edit form is no way to grant
+   one. The role moves through ``POST /admin/users/role`` instead - its own endpoint, with
+   the escalation rules asked and the sessions under the old role revoked
+   (``test_role_change.py``). What stays here is the part that is about *this* endpoint:
+   a payload naming a role changes none.
 2. **Deactivating removes access and keeps history.** No sign-in, no live token, no offline
    signing key on the phone, no face template left enrolled - and every shift exactly
    where it was.
@@ -180,7 +182,7 @@ def test_a_nameless_account_is_refused(client):
 
 
 def test_a_role_is_not_editable_and_a_payload_naming_one_changes_nothing(client):
-    """The role is set when the account is created; an update is not the way around it."""
+    """The role moves through ``/admin/users/role``; an edit is not a second way to set it."""
     for wanted in ("admin", "head_admin", "worker"):
         response = client.post(
             "/api/v1/admin/users/edit",
@@ -576,9 +578,10 @@ def test_deleting_an_unknown_account_is_a_404(client):
         ("post", "/api/v1/admin/users/edit", EDITED),
         ("post", "/api/v1/admin/users/status", {"user_id": MOALLEM, "active": False}),
         ("post", "/api/v1/admin/users/delete", {"user_id": MOALLEM}),
+        ("post", "/api/v1/admin/users/role", {"user_id": MOALLEM, "role": "worker"}),
         ("get", f"/api/v1/admin/users/{MOALLEM}", None),
     ],
-    ids=["edit", "status", "delete", "detail"],
+    ids=["edit", "status", "delete", "role", "detail"],
 )
 def test_the_new_endpoints_are_admin_only(client, method, path, body):
     call = getattr(client, method)

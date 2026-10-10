@@ -89,6 +89,24 @@ const results = {};
 // what a script list would do to it.
 const WORKER_SOURCE = SOURCE_PLACEHOLDER;
 
+// A file's text with its line endings normalised to LF - which is what Python's
+// ``read_text`` hands this process, and what a comparison between "the text this suite
+// passed in" and "the text on disk" has to mean.
+//
+// WHY IT IS NEEDED. The two sides of that comparison are read by two different runtimes.
+// The suite reads the file with Python, whose text mode translates CRLF (and a lone CR)
+// to LF; the harness reads it with ``fs.readFileSync``, which does not. On a checkout with
+// LF endings the two agree, and this was written and passed on one. On a Windows checkout
+// with ``core.autocrlf=true`` every line of every ``.js`` file carries an extra CR, so the
+// same file measures one character longer per line - and the assertion below, whose whole
+// subject is *which* file the context was handed, fails about line endings instead. (It
+// did: 4999 against 5115 on a checkout whose file has 116 lines.)
+//
+// ``\r\n?`` is exactly what Python's universal newlines translate, so normalising both
+// operands this way states the invariant rather than leaving it to depend on how the
+// checkout happened to write the bytes.
+const asText = (text) => text.replace(/\r\n?/g, '\n');
+
 // Every await against a modelled device goes through this, because a device that hands back a
 // promise nobody settles is the one stub mistake this process reports worst: Node's event loop
 // empties, it exits *successfully* having printed nothing, and the failure arrives as an empty
@@ -221,8 +239,11 @@ async function within(promise, label) {
     results.worker_file = {
         listed: scripts.indexOf('push-service-worker.js') >= 0,
         scripts: DEFAULT_SCRIPTS.slice(),
-        on_disk: fs.readFileSync(path.join(frontend, 'push-service-worker.js'), 'utf8').length,
-        passed_in: WORKER_SOURCE.length,
+        // Both operands go through ``asText``: the harness reads the file raw and the suite
+        // passes Python's own translation of it, so comparing them without normalising would
+        // compare line endings rather than files.
+        on_disk: asText(fs.readFileSync(path.join(frontend, 'push-service-worker.js'), 'utf8')).length,
+        passed_in: asText(WORKER_SOURCE).length,
         loaded: env.evaluate("(function () {\n"
             + "    try { eval(window.__workerSourceForContract); return 'no-throw'; }\n"
             + "    catch (err) { return err.name + ': ' + err.message; }\n"

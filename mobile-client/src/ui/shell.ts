@@ -12,9 +12,11 @@
 
 import { router, TAB_IDS, type Route, type TabId } from '../core/router.js';
 import { store } from '../core/store.js';
+import { t } from '../core/strings.js';
 import { el, esc, on, raw } from './dom.js';
 import { icon, type IconName } from './icons.js';
 import { closeSheet, sheetIsOpen } from './components/sheet.js';
+import { headerPreferences } from './components/preferences.js';
 
 export interface ScreenContext {
   /** Re-render this screen in place. */
@@ -38,12 +40,22 @@ export interface Screen {
 type ScreenFactory = (route: Route) => Screen;
 
 const factories = new Map<TabId, ScreenFactory>();
-const TAB_META: Record<TabId, { label: string; icon: IconName }> = {
-  clock: { label: 'Clock', icon: 'clock' },
-  history: { label: 'History', icon: 'history' },
-  alerts: { label: 'Alerts', icon: 'alerts' },
-  notes: { label: 'Notes', icon: 'notes' },
-  profile: { label: 'Profile', icon: 'profile' },
+
+/**
+ * The tab bar's own table.
+ *
+ * ``label`` is a getter rather than a string: it is drawn from the app's string
+ * table (``core/strings.ts``), and the language can change while the app is running,
+ * so a label captured at module load would be the one thing on screen that stayed in
+ * the language it started in. Every read goes through ``t()``, which answers in the
+ * language chosen *at that moment*.
+ */
+const TAB_META: Record<TabId, { readonly label: string; icon: IconName }> = {
+  clock: { get label() { return t('nav.clock'); }, icon: 'clock' },
+  history: { get label() { return t('nav.history'); }, icon: 'history' },
+  alerts: { get label() { return t('nav.alerts'); }, icon: 'alerts' },
+  notes: { get label() { return t('nav.notes'); }, icon: 'notes' },
+  profile: { get label() { return t('nav.profile'); }, icon: 'profile' },
 };
 
 let mounted: { screen: Screen; dispose: (() => void) | null } | null = null;
@@ -93,6 +105,9 @@ export function getBadges(): { alerts: number; notes: number } {
 
 function paintTabs(): void {
   if (!tabsHost) return;
+  // The bar's own name is a string too: it is what a screen reader announces when the
+  // worker reaches the bar, and it has to answer in the language the rest of it does.
+  tabsHost.setAttribute('aria-label', t('nav.sections'));
   const route = router.getRoute();
   for (const tab of TAB_IDS) {
     const button = tabsHost.querySelector(`[data-tab="${tab}"]`) as HTMLButtonElement | null;
@@ -102,6 +117,11 @@ function paintTabs(): void {
     // styling hangs off it, so the two can never disagree.
     if (tab === route.tab) button.setAttribute('aria-current', 'page');
     else button.removeAttribute('aria-current');
+
+    // Relabelled on every paint, so a language change relabels the bar without
+    // rebuilding it (and without moving any focus).
+    const label = button.querySelector('.hand-tab-label');
+    if (label) label.textContent = TAB_META[tab].label;
 
     const badgeCount = tab === 'alerts' ? unreadAlerts : tab === 'notes' ? unreadNotes : 0;
     let badge = button.querySelector('.hand-tab-count');
@@ -132,13 +152,13 @@ function buildTabs(): HTMLElement {
   // The web's own bar: one button per section, the icon over the word, and the unread
   // count over the icon's shoulder. The class names are the web's, so what styles this
   // is the same rule the desk uses rather than a copy of it.
-  const bar = el('<nav class="hand-tabs" aria-label="Sections"></nav>');
+  const bar = el(`<nav class="hand-tabs" aria-label="${esc(t('nav.sections'))}"></nav>`);
   for (const tab of TAB_IDS) {
     const meta = TAB_META[tab];
     const button = el(`
       <button type="button" data-tab="${tab}">
         ${icon(meta.icon)}
-        <span>${esc(meta.label)}</span>
+        <span class="hand-tab-label">${esc(meta.label)}</span>
       </button>
     `);
     on(button, 'click', () => {
@@ -172,8 +192,8 @@ const ROLE_LABELS: Record<string, string> = {
  */
 export function buildHeaderInner(actions: HTMLElement[] = []): HTMLElement {
   const session = store.getState().session;
-  const name = session?.user.name || 'Attendance';
-  const role = session ? (ROLE_LABELS[session.user.role] ?? session.user.role) : 'Sign in';
+  const name = session?.user.name || t('app.name');
+  const role = session ? (ROLE_LABELS[session.user.role] ?? session.user.role) : t('header.roleSignedOut');
   const band = el(`
     <div class="hand-header-inner">
       <span class="hand-brand" aria-hidden="true"><img src="/logo-mark.svg" alt="" /></span>
@@ -183,11 +203,13 @@ export function buildHeaderInner(actions: HTMLElement[] = []): HTMLElement {
       </div>
     </div>
   `);
-  if (actions.length) {
-    const host = el('<div class="hand-actions"></div>');
-    for (const action of actions) host.appendChild(action);
-    band.appendChild(host);
-  }
+  // The screen's own controls, then the two preference controls that belong to every
+  // screen -- and to the sign-in frame, which draws this same header. The gear that
+  // used to sit at the end of this row is gone: there is no server to configure.
+  const host = el('<div class="hand-actions"></div>');
+  for (const action of actions) host.appendChild(action);
+  for (const control of headerPreferences()) host.appendChild(control);
+  band.appendChild(host);
   return band;
 }
 
