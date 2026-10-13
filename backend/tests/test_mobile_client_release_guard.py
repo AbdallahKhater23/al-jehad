@@ -16,6 +16,10 @@ The rule is enforced in two places, and both are exercised here:
     host. The build half is tested with real ``vite build --mode release`` runs: the failure
     cases must exit non-zero *without writing a bundle*, and the success case must write a
     ``build-info.json`` recording the release profile.
+  * the **fallback** is judged too. ``VITE_API_BASE_URL`` is what a deployment configures, and
+    a checkout that configures nothing ships ``DEFAULT_API_BASE`` from ``src/core/config.ts``
+    instead - so that literal is classified by the same policy, and the built bundle is read
+    back to prove no emulator or LAN address survived into it.
   * ``android/app/build.gradle`` refuses to package a ``dist`` whose ``build-info.json`` is
     not a release build. Gradle itself is not run here (it needs the Android SDK and a
     toolchain this suite does not require); the wiring is asserted statically, and the file's
@@ -34,9 +38,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 from harness import PROJECT_ROOT
@@ -46,10 +52,27 @@ MOBILE_DIR = PROJECT_ROOT / "mobile-client"
 ESBUILD_JS = MOBILE_DIR / "node_modules" / "esbuild" / "bin" / "esbuild"
 VITE_BIN = MOBILE_DIR / "node_modules" / "vite" / "bin" / "vite.js"
 POLICY_TS = MOBILE_DIR / "src" / "build" / "api-base-policy.ts"
+CONFIG_TS = MOBILE_DIR / "src" / "core" / "config.ts"
 GRADLE_FILE = MOBILE_DIR / "android" / "app" / "build.gradle"
 
+#: The address a build with no ``VITE_API_BASE_URL`` reaches, read out of the source rather than
+#: repeated here: a literal copied into a test stops being a check the moment the two drift, and
+#: for a checkout that carries no local ``.env.release`` this is the only base the app has.
+DEFAULT_API_BASE_LITERAL = re.compile(r"""DEFAULT_API_BASE\s*=\s*['"]([^'"]+)['"]""")
+
+#: What must never appear in a shipped bundle. The emulator's alias for the developer's machine
+#: and the loopback address are the debug workflows' answer to "where is the server"; a private
+#: range is the same failure spelled as a LAN address; and ``http://`` is the scheme a release
+#: APK cannot use at all (the page is ``https://localhost``, and the cleartext switch lives under
+#: ``android/app/src/debug``, which a release build does not merge).
+FORBIDDEN_BUNDLE_LITERALS = ("10.0.2.2", "127.0.0.1", "192.168.", "http://")
+
 pytestmark = pytest.mark.skipif(
-    NODE is None or not ESBUILD_JS.exists() or not VITE_BIN.exists() or not POLICY_TS.exists(),
+    NODE is None
+    or not ESBUILD_JS.exists()
+    or not VITE_BIN.exists()
+    or not POLICY_TS.exists()
+    or not CONFIG_TS.exists(),
     reason="node + mobile-client/node_modules are required to run the client build",
 )
 
@@ -190,6 +213,16 @@ def read_build_info(out_dir: Path) -> dict:
     return json.loads((out_dir / "build-info.json").read_text(encoding="utf-8"))
 
 
+def read_default_api_base() -> str:
+    """``DEFAULT_API_BASE`` as it is written in ``src/core/config.ts``."""
+    match = DEFAULT_API_BASE_LITERAL.search(CONFIG_TS.read_text(encoding="utf-8"))
+    assert match, (
+        "DEFAULT_API_BASE is no longer a plain string literal in src/core/config.ts; the "
+        "fallback half of the release guard needs it to stay readable here"
+    )
+    return match.group(1)
+
+
 @pytest.mark.parametrize(
     "base_url",
     [
@@ -221,14 +254,77 @@ def test_a_release_build_with_a_public_https_base_marks_the_dist(tmp_path):
 
 
 def test_a_release_build_without_a_base_url_is_allowed_and_marked(tmp_path):
-    """Discovery is a supported deployment: a release may ship with no baked base URL."""
+    """A release with no ``VITE_API_BASE_URL`` is legitimate: the app has its own fallback.
+
+    No ``.env.release`` is committed, deliberately. The file would not be a secret - it holds one
+    public https address - but its *basename* is the credential shape the build already refuses
+    (``test_no_committed_credentials.py``), so the address a shipped build actually uses is the
+    one compiled into ``src/core/config.ts``. That is why ``api_base`` may be empty here: the
+    recorded value is the *configured* one, and with nothing configured there is nothing to
+    record - the fallback is in the bundle either way, and
+    ``test_the_in_bundle_fallback_is_a_shippable_address`` is the check for that half.
+    """
     out_dir = tmp_path / "dist"
     completed = run_vite("release", None, out_dir)
     assert completed.returncode == 0, completed.stdout + completed.stderr
     info = read_build_info(out_dir)
     assert info["profile"] == "release"
-    assert info["api_base"] == ""
+    # The one property the guard promises about this build: it never records an http:// or
+    # private-network base. Whether it records a base at all depends on whether this checkout
+    # keeps a local ``.env.release``.
     assert info["insecure_api_base"] is False
+    assert info["api_base"] == "" or info["api_base"].startswith("https://")
+    if info["api_base"]:
+        assert info["api_base_host"] != ""
+        assert info["api_base"].endswith("/api/v1")
+
+
+def test_the_in_bundle_fallback_is_a_shippable_address(policy_harness):
+    """The base a *fresh checkout* ships with, judged by the release rule.
+
+    ``VITE_API_BASE_URL`` is only half the story. With nothing configured - the state of every
+    clone that carries no local ``.env.release`` - the app talks to ``DEFAULT_API_BASE``, and
+    until this test nothing judged that value at all: the release guard read the env var, the
+    bundle inlined the env var, and the literal that actually answers the request rode along
+    unexamined. A LAN address there is the exact failure this module exists to prevent, reached
+    by the one path the guard was not looking at.
+    """
+    fallback = read_default_api_base()
+    answer = assess(policy_harness, [fallback])["assessments"][0]
+    assert answer["kind"] == "secure", (
+        f"DEFAULT_API_BASE is not a shippable address: {fallback!r} -> {answer['problem']}. "
+        "With no VITE_API_BASE_URL baked in, this is the URL every installed app uses."
+    )
+    assert answer["raw"].endswith("/api/v1"), answer
+
+
+def test_the_shipped_bundle_carries_no_debug_address(tmp_path):
+    """End to end, on a build with nothing configured: what the release APK would actually run.
+
+    The assets are read rather than the settings, because the question is not "was the guard
+    happy" but "is there a LAN or plaintext address in the JavaScript a worker's phone will
+    execute". ``DEFAULT_DEV_BASE`` - ``http://10.0.2.2:8000/api/v1`` - is written into the same
+    module and is dropped only because ``import.meta.env.DEV`` is false in a build, which is a
+    property of how Vite folds that branch rather than of any check here.
+    """
+    out_dir = tmp_path / "dist"
+    completed = run_vite("release", None, out_dir)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+    scripts = sorted(out_dir.glob("assets/*.js"))
+    assert scripts, "the release build produced no script to inspect"
+    bundle = "\n".join(path.read_text(encoding="utf-8") for path in scripts)
+
+    fallback_host = urlsplit(read_default_api_base()).hostname or ""
+    assert fallback_host and fallback_host in bundle, (
+        f"{fallback_host!r} is not in the shipped bundle, so an app with nothing configured "
+        "would have nowhere to send a punch"
+    )
+    for literal in FORBIDDEN_BUNDLE_LITERALS:
+        assert literal not in bundle, (
+            f"{literal!r} is in the release bundle; an installed app can reach nothing through "
+            "it"
+        )
 
 
 def test_the_debug_profile_keeps_the_lan_address(tmp_path):

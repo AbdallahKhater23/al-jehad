@@ -40,6 +40,21 @@ times.db.*
 # issue, a log or a screenshot. 
 # deploy/railway/README.md documents every value in it.
 deploy/railway/variables.env
+# Any ``.env.<mode>`` variant - ``.env.local``, ``.env.production``, ``.env.release``. The mobile
+# client's Vite files are the live example, and they are not secrets: each holds one public
+# ``VITE_API_BASE_URL`` and nothing else. They are ignored anyway, because the *name* is the
+# credential shape this project guards against - ``backend/tests/test_no_committed_credentials.py``
+# fails the build on a tracked path whose basename starts with ``.env.``, and a rule that has to
+# read a file's contents to decide is a rule that lets the next real secret through. The address
+# a shipped build talks to is the one compiled into ``mobile-client/src/core/config.ts``
+# (``DEFAULT_API_BASE``), so a checkout without these files still builds and still reaches the
+# deployment.
+.env.*
+# ...except the checked-in templates, which that same test exempts by these exact names.
+!.env.example
+!.env.sample
+!.env.template
+!.env.dist
 worker_photos
 local_references
 # Selfies taken with a quick clock link. Biometric data, like the two above: never in git.

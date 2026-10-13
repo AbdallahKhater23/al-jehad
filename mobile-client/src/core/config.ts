@@ -37,8 +37,8 @@ import { Preferences } from '@capacitor/preferences';
 
 const API_SUFFIX = '/api/v1';
 
-/** The public deployment, fronted by the Cloudflare Worker: the shipped default. */
-export const DEFAULT_API_BASE = 'https://al-jehad1.abdallahtamet281.workers.dev/api/v1';
+/** The public deployment (Railway): the shipped default. */
+export const DEFAULT_API_BASE = 'https://al-jehad-production.up.railway.app/api/v1';
 
 /** The Android emulator's alias for the developer's own machine. Dev builds only. */
 const DEFAULT_DEV_BASE = 'http://10.0.2.2:8000/api/v1';

@@ -307,6 +307,16 @@ STATUS_TYPE_REJECTED = migrations.STATUS_REJECTED_LABEL
 STATUS_FORCED_IN = "Force Clocked In by Admin"
 STATUS_FORCED_OUT = "Force Clocked Out by Admin"
 
+#: What ``users.name`` becomes when an account is **anonymised** rather than deleted.
+#:
+#: An account with attendance records cannot be removed: those rows are the record of work that
+#: was done and of hours that are owed, and ``reports`` joins ``users`` for the name it prints on
+#: every timesheet. So the row stays and its name has to become something. A word rather than a
+#: guess at who the person was, because the whole request was to stop holding that; and fixed
+#: rather than id-bearing, because an id is how the row is looked up in the first place. The
+#: shifts keep ``worker_id``, which is what a payroll week is actually reconciled against.
+ANONYMISED_ACCOUNT_NAME = "Deleted account"
+
 
 # ---------------------------------------------------------------------------
 # database bootstrap
@@ -950,6 +960,18 @@ class UserRoleRequest(BaseModel):
 class PasswordChangeRequest(BaseModel):
     current_password: str
     new_password: str
+
+
+class AccountDeleteRequest(BaseModel):
+    """A person removing their own account, confirmed with the password that authorises it.
+
+    There is no field for *which* account, and that is the point: the subject is read from the
+    bearer token (``any_authenticated``), so the only account this endpoint can address is the
+    caller's own. An ``user_id`` here would be the object-reference problem the rest of this
+    revision removed.
+    """
+
+    current_password: str
 
 
 class ShiftRulesUpdate(BaseModel):
@@ -1676,6 +1698,27 @@ def _user_snapshot(row: sqlite3.Row) -> dict:
     }
 
 
+def _anonymised_account_shape(row: sqlite3.Row) -> dict:
+    """What an account's *own* deletion records about it: its shape, and nothing personal.
+
+    ``audit_log`` rejects UPDATE and DELETE by trigger, so every value written into it is
+    written for good - the right property for a trail, and exactly the wrong one for this event.
+    Recording the name, the email or the phone here would mean the deletion kept what it was
+    asked to remove, in the one table nothing can correct afterwards. So this is not
+    ``_user_snapshot``: what is left is the part an investigation needs (which role, which
+    status, whether there was anything personal to remove), and the event stays attributable
+    through the actor id and role ``audit.record`` writes by itself.
+    """
+    return {
+        "role": row["role"],
+        "status": row["status"],
+        "had_name": bool(str(row["name"] or "").strip()),
+        "had_contact": bool(str(row["email"] or "").strip() or str(row["phone"] or "").strip()),
+        "had_translated_names": bool(names.parse(row["name_i18n"])),
+        "assigned_to_a_moallem": bool(str(row["moallem_id"] or "").strip()),
+    }
+
+
 def _revoke_user_access(conn: sqlite3.Connection, user_id: str, *, now: str) -> dict:
     """Take away everything that lets an account act, without touching its history.
 
@@ -1817,6 +1860,161 @@ async def change_own_password(
         )
         _audit(conn, action="password_change_self", actor=current, entity="users", entity_id=current.id)
     return {"status": "success", "message": "Password updated. Please sign in again."}
+
+
+@router.post("/auth/delete_account")
+async def delete_own_account(
+    request: Request,
+    payload: AccountDeleteRequest,
+    current: CurrentUser = Depends(any_authenticated),
+):
+    """Remove your own account from inside the app, without asking anybody.
+
+    WHY THIS ENDPOINT EXISTS. A product that lets somebody create an account has to let them
+    remove it without leaving, and ``/admin/users/delete`` cannot be that door twice over: it
+    needs an administrator to open it, and it refuses any account with history - which is every
+    account that has ever clocked in, i.e. most of them. A worker who has left the company
+    should not have to ask their former employer, by message, to stop holding their face.
+
+    THE PASSWORD DECIDES NOTHING ABOUT WHICH OF THE TWO OUTCOMES APPLIES, and everything about
+    whether the request is honoured. A stolen session must not be enough to remove an account
+    any more than it is enough to seize one, so the current password is required - the same rule
+    ``/auth/change_password`` enforces, for the same reason.
+
+    * An account **with attendance records is anonymised.** The canonical name, the per-language
+      names stored beside it, the email, the phone, the rate and the supervisor assignment go;
+      the face template and selfie are removed from disk; every device key and live invitation
+      is revoked; the account stops being able to sign in. The shifts stay exactly where they
+      are. They are the record of work that was done and of hours that are owed, and the reports
+      are paid from them - so removing them would delete the debt along with the person. This is
+      the branch ``/admin/users/delete`` answers with a 409 "deactivate instead", because from
+      the console the only two options are delete or keep; from here there is a third.
+    * An account **with no records is deleted outright**, the case that endpoint exists for: a
+      duplicate, a typo'd id, somebody who never worked a shift. There is nothing to keep, so
+      nothing is kept.
+
+    WHAT IS DELIBERATELY NOT WRITTEN DOWN. ``audit_log`` is append-only in the database, so the
+    trail for this event records the account's *shape* and not the person - see
+    ``_anonymised_account_shape`` for why that is not simply ``_user_snapshot``.
+
+    An open shift is refused rather than dissolved: an account that no longer exists cannot
+    clock out, so a shift still being worked would have its hours recorded nowhere.
+    """
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with db(write=True) as conn:
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (current.id,)).fetchone()
+        if row is None or not verify_password(payload.current_password, row["password_hash"]):
+            raise HTTPException(status_code=401, detail="Current password is incorrect.")
+
+        open_shift = conn.execute(
+            "SELECT site_name, clock_in_time FROM active_sessions WHERE worker_id = ?",
+            (current.id,),
+        ).fetchone()
+        if open_shift is not None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"You have been clocked in at {open_shift['site_name']} since "
+                    f"{open_shift['clock_in_time']}. Clock out first: an account that no longer "
+                    "exists cannot close a shift, so those hours would never be recorded."
+                ),
+            )
+
+        shifts = int(
+            conn.execute(
+                "SELECT COUNT(*) AS shifts FROM attendance_logs WHERE worker_id = ?",
+                (current.id,),
+            ).fetchone()["shifts"]
+        )
+
+        # The two credentials that are not columns on ``users``: the offline signing keys the
+        # phone holds, and an enrollment link that could still hand out a fresh face template.
+        # Revoked rather than deleted, because the account stays - this is the same call
+        # deactivation makes, and it is documented as "take away everything that lets an account
+        # act, without touching its history", which is precisely this branch.
+        revoked = _revoke_user_access(conn, current.id, now=stamp)
+        # The queued punches go, though. They are this worker's own unsent data and each one
+        # carries the frame of their face, which is the thing this request asked to remove.
+        queued = int(
+            conn.execute(
+                "DELETE FROM punch_queue WHERE worker_id = ?", (current.id,)
+            ).rowcount
+            or 0
+        )
+        # Whoever reported to this account is released before it changes underneath them: an
+        # assignment resolving to an anonymised row is a roster showing a crew that its
+        # supervisor is "Deleted account". The ids are named on the audit row for the reason
+        # ``delete_user`` names them - "who lost their moallem" is answered nowhere else.
+        released = [
+            str(candidate["id"])
+            for candidate in conn.execute(
+                "SELECT id FROM users WHERE moallem_id = ? ORDER BY CAST(id AS INTEGER) ASC",
+                (current.id,),
+            ).fetchall()
+        ]
+        if released:
+            conn.execute("UPDATE users SET moallem_id = NULL WHERE moallem_id = ?", (current.id,))
+
+        if shifts:
+            # ``name_i18n`` is cleared with ``name``, and that pairing is the whole reason this
+            # is one statement: ``names.display`` falls back map-first, so an account whose
+            # canonical name was cleared but whose map was left alone would still print the
+            # person's real name on any screen that reads names per language.
+            conn.execute(
+                """
+                UPDATE users SET
+                    name = ?, name_i18n = NULL, email = '', phone = '',
+                    hourly_rate = 0, moallem_id = NULL, transit_enabled = 0,
+                    status = 'inactive', token_version = COALESCE(token_version, 0) + 1
+                WHERE id = ?
+                """,
+                (ANONYMISED_ACCOUNT_NAME, current.id),
+            )
+            outcome = "anonymised"
+        else:
+            conn.execute("DELETE FROM users WHERE id = ?", (current.id,))
+            outcome = "deleted"
+
+        _audit(
+            conn,
+            action="account_delete_self",
+            actor=current,
+            entity="users",
+            entity_id=current.id,
+            before=_anonymised_account_shape(row),
+            after={
+                "outcome": outcome,
+                "attendance_records": shifts,
+                "devices_revoked": revoked.get("devices_revoked", 0),
+                "invites_revoked": revoked.get("invites_revoked", 0),
+                "punches_removed": queued,
+                "workers_released": released,
+            },
+            request=request,
+        )
+
+    # After the commit, like ``delete_user``: the files are not part of the transaction, and for
+    # the anonymising branch the face template *is* the personal data being removed - leaving it
+    # on disk would make the whole exercise decorative. A failure is reported, never swallowed.
+    removed, failed = _delete_biometric_files(current.id)
+    return {
+        "status": "success",
+        "outcome": outcome,
+        "attendance_records": shifts,
+        "face_removed": removed,
+        "face_removal_failed": failed,
+        "devices_revoked": revoked.get("devices_revoked", 0),
+        "punches_removed": queued,
+        "message": (
+            "Your account has been deleted."
+            if outcome == "deleted"
+            else (
+                "Your account has been closed and your personal details removed. The "
+                f"{shifts} shift record(s) worked on it are kept, because the hours in them "
+                "are owed to you."
+            )
+        ),
+    }
 
 
 @router.get("/auth/me")

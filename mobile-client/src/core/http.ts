@@ -20,6 +20,8 @@ export interface RequestOptions {
   timeoutMs?: number;
   auth?: boolean;
   retryOn401?: boolean;
+  /** Internal: do not set from call sites — prevents infinite cold-start loops. */
+  _coldStartRetried?: boolean;
 }
 
 export interface ApiError extends Error {
@@ -168,6 +170,44 @@ function isNetworkFailure(err: unknown): boolean {
   return msg.includes('networkerror') || msg.includes('failed to fetch') || msg.includes('load failed');
 }
 
+const DEFAULT_TIMEOUT_MS = 15_000;
+const RAILWAY_COLD_START_RETRY_MS = 1_200;
+
+function isRailwayColdStartStatus(status: number): boolean {
+  return status === 502 || status === 503 || status === 504;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Map an ApiError / network error into a user-facing string (no stack, no raw payload). */
+export function friendlyErrorMessage(err: unknown): string {
+  const e = err as ApiError & { offline?: boolean; status?: number; code?: string };
+  if (e?.offline) return 'You appear to be offline. Check your connection and try again.';
+  if (e?.code === 'timeout') return 'The server is taking too long to respond. Please try again.';
+  if (e?.status === 422) return e.message || 'Some fields need attention. Please check and try again.';
+  if (e?.status === 429) return 'Too many attempts. Please wait a moment and try again.';
+  if (e?.status && e.status >= 500) return 'The server is temporarily unavailable. Please try again shortly.';
+  if (e?.status === 401) return 'Your session has expired. Please sign in again.';
+  if (e?.status === 403) return e.message || 'You do not have permission to do that.';
+  return (e?.message as string) || 'Something went wrong. Please try again.';
+}
+
+async function doFetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function request<T = unknown>(opts: RequestOptions): Promise<T> {
   const base = await resolveApiBaseUrl();
   const url = buildUrl(base, opts.path, opts.query);
@@ -175,9 +215,7 @@ export async function request<T = unknown>(opts: RequestOptions): Promise<T> {
   let token: string | null = null;
   if (needsAuth) token = await loadToken();
 
-  const timeoutMs = opts.timeoutMs ?? 15_000;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
   const headers: Record<string, string> = {
     Accept: 'application/json',
@@ -200,14 +238,8 @@ export async function request<T = unknown>(opts: RequestOptions): Promise<T> {
 
   let res: Response;
   try {
-    res = await fetch(url, {
-      method: opts.method ?? 'GET',
-      headers,
-      body,
-      signal: controller.signal,
-    });
+    res = await doFetchWithTimeout(url, { method: opts.method ?? 'GET', headers, body }, timeoutMs);
   } catch (err) {
-    clearTimeout(timer);
     if (isNetworkFailure(err)) {
       throw makeApiError('Network unavailable', 0, 'offline', true);
     }
@@ -215,8 +247,20 @@ export async function request<T = unknown>(opts: RequestOptions): Promise<T> {
       throw makeApiError('Request timed out', 0, 'timeout');
     }
     throw makeApiError(String((err as Error).message ?? 'Network error'), 0, 'network_error', true);
-  } finally {
-    clearTimeout(timer);
+  }
+
+  // Railway rollout / cold-start: the proxy returns 502/503/504 for ~1-2s while
+  // the new instance boots. One bounded retry avoids surfacing a transient 5xx
+  // as a hard failure on a button the user just tapped. Mutations are safe to
+  // retry once here because Railway only returns these during boot — not as
+  // application errors — and the backend's punch paths are idempotent where it
+  // matters: offline POST /attendance/sync is deduped on client_punch_id UNIQUE
+  // + (device_id, nonce) UNIQUE (migrations.py, offline_sync.py INSERT OR IGNORE),
+  // and online POST /attendance/punch is gated by single-active-session
+  // (main.py) so a proxy-level retry cannot double-create an active session.
+  if (isRailwayColdStartStatus(res.status) && !opts._coldStartRetried) {
+    await sleep(RAILWAY_COLD_START_RETRY_MS);
+    return request<T>({ ...opts, _coldStartRetried: true });
   }
 
   if (res.status === 401 && needsAuth && opts.retryOn401 !== false) {

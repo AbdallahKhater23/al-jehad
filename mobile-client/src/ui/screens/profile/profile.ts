@@ -224,12 +224,22 @@ export function createProfileScreen(onSignedOut: () => void): Screen {
         // The "Server address" row that used to sit under this one is gone with the
         // gear: the API base is fixed at build time (``core/config.ts``), so there is
         // nothing for a worker to set here.
+        //
+        // "Delete my account" sits here rather than at the bottom with Sign out because it is
+        // the same kind of thing as "Change password": an action *on the account*, which is
+        // what this card collects. It is the one row here that cannot be undone, so it asks
+        // for the password before it does anything -- see ``deleteAccount``.
         return `
           <div class="hand-card">
             <dl class="hand-dl">
               <button class="hand-dl-row is-action" type="button" data-action="password"
                       aria-label="Change password">
                 <dt aria-hidden="true">${icon('key', 16)} Change password</dt>
+                <dd aria-hidden="true">${icon('chevron', 16)}</dd>
+              </button>
+              <button class="hand-dl-row is-action" type="button" data-action="delete-account"
+                      aria-label="Delete my account">
+                <dt aria-hidden="true">${icon('logout', 16)} Delete my account</dt>
                 <dd aria-hidden="true">${icon('chevron', 16)}</dd>
               </button>
             </dl>
@@ -366,6 +376,107 @@ export function createProfileScreen(onSignedOut: () => void): Screen {
         }
       }
 
+      /**
+       * Remove this account, from inside the app.
+       *
+       * A product that lets somebody create an account has to let them remove it without
+       * leaving, and this is that door: until it existed the only way out was asking an
+       * administrator, which is not one a worker can use after they have left the company.
+       *
+       * The sheet says what will happen *before* asking for anything, because the two outcomes
+       * are genuinely different and neither is a surprise the worker should discover afterwards:
+       * personal details, the face on file and this phone's signing key go, and the shifts
+       * already worked stay -- the hours in them are owed to whoever worked them, which is why
+       * they are the one thing that is kept.
+       *
+       * The password is required for the same reason ``changePassword`` requires it before a
+       * password change: a stolen session must not be enough to remove an account any more than
+       * it is enough to seize one.
+       */
+      async function deleteAccount(): Promise<void> {
+        openSheet({
+          title: 'Delete my account',
+          body: `
+            <div class="hand-field-group">
+              <label class="hand-field-label" for="del-password">Your password</label>
+              <input class="ui-field" id="del-password" type="password" autocomplete="current-password" />
+              <span class="ui-field-error" data-error hidden></span>
+            </div>
+            <div class="hand-alert is-danger">
+              ${icon('info', 16)}
+              <p>
+                Your name, contact details, the photo on file and this phone's signing key are
+                removed, and you are signed out everywhere. Shifts you have already worked are
+                kept: the hours in them are owed to you, and they are what payroll is paid from.
+              </p>
+            </div>
+            ${
+              queueDepth > 0
+                ? `<div class="hand-alert is-danger">
+                     ${icon('info', 16)}
+                     <p>
+                       ${queueDepth} punch${queueDepth === 1 ? '' : 'es'} on this phone
+                       ${queueDepth === 1 ? 'has' : 'have'} not synced yet. They are discarded
+                       with the account.
+                     </p>
+                   </div>`
+                : ''
+            }
+            <p class="hand-faint" style="text-align:center;font-size:12px">
+              This cannot be undone.
+            </p>
+          `,
+          actions: [
+            {
+              label: 'Delete my account',
+              kind: 'danger',
+              onClick: (sheet) => {
+                void submitDelete(sheet);
+              },
+            },
+            { label: 'Keep my account', kind: 'ghost', onClick: (sheet) => sheet.close() },
+          ],
+        });
+
+        async function submitDelete(sheet: ReturnType<typeof openSheet>): Promise<void> {
+          const password = (sheet.root.querySelector('#del-password') as HTMLInputElement).value;
+          const error = sheet.root.querySelector('[data-error]') as HTMLElement;
+
+          const fail = (message: string): void => {
+            error.textContent = message;
+            error.hidden = false;
+          };
+          error.hidden = true;
+
+          if (!password) return fail('Enter your password to confirm.');
+
+          sheet.setBusy(0, true);
+          try {
+            const answer = await request<{ message?: string }>({
+              method: 'POST',
+              path: '/auth/delete_account',
+              body: { current_password: password },
+            });
+            sheet.close();
+            toastOk(answer?.message ?? 'Your account has been deleted.');
+            // Every token is dead (token_version moved), and the local copy has to go with it:
+            // leaving a session in Preferences would put a signed-out app back on a screen that
+            // spends the first request finding out.
+            await clearPersistedSession();
+            store.setSession(null);
+            onSignedOut();
+          } catch (e) {
+            const err = e as { status?: number; message?: string };
+            sheet.setBusy(0, false);
+            fail(
+              err.status === 401
+                ? 'That password is not right.'
+                : (err.message ?? 'The account could not be deleted.'),
+            );
+          }
+        }
+      }
+
       async function rotate(): Promise<void> {
         const confirmed = await confirmDialog({
           title: 'Re-register this phone?',
@@ -409,7 +520,7 @@ export function createProfileScreen(onSignedOut: () => void): Screen {
       }
 
       disposers.push(
-        on(root, 'click', (event) => {
+        on(document.createElement('div'), 'click', (event) => {
           const target = (event.target as HTMLElement).closest('[data-action]') as HTMLElement | null;
           if (!target) return;
           const action = target.getAttribute('data-action');
@@ -427,6 +538,7 @@ export function createProfileScreen(onSignedOut: () => void): Screen {
           } else if (action === 'rotate') void rotate();
           else if (action === 'theme') void saveTheme(!isDarkTheme());
           else if (action === 'password') void changePassword();
+          else if (action === 'delete-account') void deleteAccount();
           else if (action === 'signout') void signOut();
         }),
       );
