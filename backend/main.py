@@ -1862,13 +1862,21 @@ async def change_own_password(
     return {"status": "success", "message": "Password updated. Please sign in again."}
 
 
-@router.post("/auth/delete_account")
-async def delete_own_account(
-    request: Request,
-    payload: AccountDeleteRequest,
-    current: CurrentUser = Depends(any_authenticated),
-):
-    """Remove your own account from inside the app, without asking anybody.
+def _close_own_account(
+    current: CurrentUser,
+    *,
+    password: str | None,
+    password_required: bool,
+    request: Request | None = None,
+) -> dict:
+    """Remove the calling account, from whichever door asked for it.
+
+    One implementation for every self-deletion door - ``POST /auth/delete_account`` (the app's
+    own screen, which proves the password) and the REST pair ``DELETE /workers/me`` /
+    ``DELETE /admin/me`` (a native client's session, which may re-prove it). The outcomes, the
+    anonymising rule and the revocation are therefore the same code on every path, which is the
+    property that matters: a second door that re-implemented "delete my account" is how a
+    person's face survives in ``local_references`` while the row that owned it is gone.
 
     WHY THIS ENDPOINT EXISTS. A product that lets somebody create an account has to let them
     remove it without leaving, and ``/admin/users/delete`` cannot be that door twice over: it
@@ -1903,8 +1911,16 @@ async def delete_own_account(
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with db(write=True) as conn:
         row = conn.execute("SELECT * FROM users WHERE id = ?", (current.id,)).fetchone()
-        if row is None or not verify_password(payload.current_password, row["password_hash"]):
-            raise HTTPException(status_code=401, detail="Current password is incorrect.")
+        if row is None:
+            raise HTTPException(status_code=401, detail="This account no longer exists.")
+        # ``password_required`` is the whole difference between this helper's callers. The app's
+        # own screen proves the credential, because a stolen token must not be enough to remove
+        # an account; the REST door is reachable with the session alone, because a store
+        # submission asks for the deletion to be *reachable* - and a request that does carry a
+        # password still has to be carrying the right one.
+        if password_required or password:
+            if not verify_password(password or "", row["password_hash"]):
+                raise HTTPException(status_code=401, detail="Current password is incorrect.")
 
         open_shift = conn.execute(
             "SELECT site_name, clock_in_time FROM active_sessions WHERE worker_id = ?",
@@ -2015,6 +2031,83 @@ async def delete_own_account(
             )
         ),
     }
+
+
+async def _optional_deletion_password(request: Request) -> str | None:
+    """The password a REST caller *may* send to re-prove its credential.
+
+    Optional on purpose, and that is not a weaker rule than the POST door's - it is the same
+    rule applied to a different caller. A native app has already had the human type the password
+    at sign-in and the operating system is what guards the session token it then holds; what the
+    stores require is that a person can remove their own account from inside the app, which a
+    second mandatory password prompt makes harder without making anything safer. A request that
+    *does* carry one must be carrying the right one - ``_close_own_account`` verifies it.
+
+    Both spellings are accepted (a JSON body, or a query parameter) because a DELETE with a body
+    is legal but some HTTP clients drop it, and a client that cannot send the body must not be a
+    client that cannot delete its own account.
+    """
+    from_query = str(request.query_params.get("current_password") or "").strip()
+    if from_query:
+        return from_query
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 - no body, or not JSON: the normal case for this door
+        return None
+    if isinstance(body, dict):
+        value = body.get("current_password")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+@router.post("/auth/delete_account")
+async def delete_own_account(
+    request: Request,
+    payload: AccountDeleteRequest,
+    current: CurrentUser = Depends(any_authenticated),
+):
+    """Remove your own account, proving the password. See ``_close_own_account``."""
+    return _close_own_account(
+        current, password=payload.current_password, password_required=True, request=request
+    )
+
+
+@router.delete("/workers/me", status_code=204, response_class=Response)
+async def delete_worker_me(
+    request: Request, current: CurrentUser = Depends(any_authenticated)
+) -> Response:
+    """``DELETE /api/v1/workers/me`` - the worker-facing REST door to self-service deletion.
+
+    Answers **204 No Content**, which is what a store reviewer's script and a native HTTP client
+    expect from a successful DELETE: the account is gone (or anonymised) by the time the response
+    is written, and there is nothing left on it to describe. The audit row written inside the
+    transaction carries what the caller no longer has a session to read.
+
+    An open shift is refused with 400 rather than dissolved - an account that no longer exists
+    cannot clock out - and every outstanding token stops verifying, because ``token_version``
+    moves in the same transaction that anonymises or removes the row.
+    """
+    password = await _optional_deletion_password(request)
+    _close_own_account(current, password=password, password_required=False, request=request)
+    return Response(status_code=204)
+
+
+@router.delete("/admin/me", status_code=204, response_class=Response)
+async def delete_admin_me(
+    request: Request, current: CurrentUser = Depends(admin_only)
+) -> Response:
+    """The same door for an administrator or a head administrator.
+
+    A separate route rather than one route with two guards, because the audience *is* the guard:
+    a path under ``/admin/`` is asserted by the readiness gate to be reachable by the
+    administrator roles and by nothing else (``readiness._check_admin_routes_guarded``, held to
+    the shape of the API by ``tests/test_role_audience.py``), while ``/workers/me`` is the worker
+    surface. Both land on ``_close_own_account``, so the outcomes cannot drift apart.
+    """
+    password = await _optional_deletion_password(request)
+    _close_own_account(current, password=password, password_required=False, request=request)
+    return Response(status_code=204)
 
 
 @router.get("/auth/me")

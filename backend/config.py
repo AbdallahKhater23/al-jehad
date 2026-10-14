@@ -137,6 +137,71 @@ PUSH_ENDPOINT_HOSTS: tuple[str, ...] = (
 )
 
 
+#: Which peers may set ``X-Forwarded-For`` / ``X-Forwarded-Proto`` on a *laptop*: loopback, and
+#: nothing else. That is what ``serve.py`` hands uvicorn as ``forwarded_allow_ips``, so the
+#: bundled TLS server and a tunnel running on the same host see the real client address and
+#: nothing on a LAN is believed.
+LOOPBACK_TRUSTED_PROXIES: tuple[str, ...] = ("127.0.0.1/32", "::1/128")
+
+#: The same list, widened by the private networks a *platform edge* connects from.
+#:
+#: WHY THE WIDER DEFAULT IS NEEDED. Railway terminates TLS at its edge and forwards plain HTTP
+#: to the container, so the peer this process sees is the edge, not the worker. With loopback
+#: only, three things silently stop working at once: uvicorn never rewrites the client (every
+#: per-IP rate limit becomes one shared bucket - the punch endpoint's 15/minute answered to a
+#: whole site), the network gate never believes ``X-Forwarded-Proto`` (so no response carries
+#: HSTS on a deployment that is entirely HTTPS), and every audit row records the edge's address
+#: as the actor.
+#:
+#: WHY IT IS NOT ``*``. ``TRUSTED_PROXIES=*`` is the other way to fix the above and the wrong
+#: one: it makes ``X-Forwarded-For`` client-controlled on every connection, so the admin
+#: allowlist checks whatever the caller typed and the per-IP limits are defeated by rotating a
+#: header. These ranges say "a peer on the platform's private network" instead, which is who an
+#: edge is: a request from the public internet arrives *through* that network and cannot present
+#: itself as one of these addresses.
+PLATFORM_TRUSTED_PROXIES: tuple[str, ...] = LOOPBACK_TRUSTED_PROXIES + (
+    "10.0.0.0/8",     # RFC 1918: a private platform network
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "100.64.0.0/10",  # CGNAT: what Railway's private network hands a container
+    "169.254.0.0/16", # link-local
+    "fc00::/7",       # unique-local v6
+    "fe80::/10",      # link-local v6
+)
+
+#: Environment variables a container platform sets for the process it starts. Presence is the
+#: whole test - this module must not reach the network to ask where it is running, and a value
+#: an operator controls would be a second way to widen the trust list by accident.
+PLATFORM_ENV_MARKERS: tuple[str, ...] = (
+    "RAILWAY_ENVIRONMENT",
+    "RAILWAY_ENVIRONMENT_ID",
+    "RAILWAY_PROJECT_ID",
+    "RAILWAY_SERVICE_ID",
+)
+
+
+def on_a_managed_platform() -> bool:
+    """Whether this process is running on a platform whose edge proxies every request.
+
+    Named for the *shape* rather than for Railway alone: the ranges above are the private
+    networks any container platform's edge lives on, and what the variables actually prove is
+    "an external party terminates TLS in front of me" - which is exactly what ``--tunnel`` means
+    in ``serve.py``.
+    """
+    return any(str(os.environ.get(name) or "").strip() for name in PLATFORM_ENV_MARKERS)
+
+
+def default_trusted_proxies() -> list[str]:
+    """The ``TRUSTED_PROXIES`` default: loopback on a laptop, the platform's ranges on a host.
+
+    One function rather than two lists, because uvicorn's ``--forwarded-allow-ips`` and the
+    application's own network gate must agree (``serve.trusted_proxies_for_uvicorn`` reads this
+    same setting): a disagreement is invisible and expensive, since uvicorn would stop rewriting
+    the client address while the gate still expected the header it can no longer see.
+    """
+    return list(PLATFORM_TRUSTED_PROXIES if on_a_managed_platform() else LOOPBACK_TRUSTED_PROXIES)
+
+
 class Settings(BaseModel):
     secret_key: str
     jwt_algorithm: str = "HS256"
@@ -205,8 +270,10 @@ class Settings(BaseModel):
     admin_ip_allowlist: list[str] = []
     admin_allowlist_paths: list[str] = ["/admin", "/api/v1/admin"]
     #: Which peers may set ``X-Forwarded-For`` / ``X-Forwarded-Proto``. Loopback by default,
-    #: matching what ``serve.py`` hands uvicorn. A proxy on another host must be listed here,
-    #: or the real client address is unknown and the allowlist above checks the proxy instead.
+    #: matching what ``serve.py`` hands uvicorn, plus the platform's private ranges when
+    #: ``default_trusted_proxies`` can see a managed platform in front of us. A proxy on another
+    #: host must be listed here, or the real client address is unknown and the allowlist above
+    #: checks the proxy instead.
     trusted_proxies: list[str] = ["127.0.0.1/32", "::1/128"]
     security_headers_enabled: bool = True
     #: Sent only over TLS (or when a *trusted* proxy reports ``X-Forwarded-Proto: https``).
@@ -863,7 +930,12 @@ def build_settings(*, env_file: Path | None = None) -> Settings:
         cors_max_age_seconds=_env_int("CORS_MAX_AGE_SECONDS", 600),
         admin_ip_allowlist=_env_list("ADMIN_IP_ALLOWLIST"),
         admin_allowlist_paths=_env_list("ADMIN_ALLOWLIST_PATHS", ["/admin", "/api/v1/admin"]),
-        trusted_proxies=_env_list("TRUSTED_PROXIES", ["127.0.0.1/32", "::1/128"]),
+        # The platform's private ranges join loopback when a managed platform is in front of
+        # us; see ``default_trusted_proxies``. One list, read by uvicorn's ``proxy_headers``
+        # handling and by ``netguard`` alike, so a deployment behind a TLS-terminating edge is
+        # fixed in one place instead of two that can disagree. An explicit ``TRUSTED_PROXIES``
+        # still wins, in full, for a proxy this deployment does not know about.
+        trusted_proxies=_env_list("TRUSTED_PROXIES", default_trusted_proxies()),
         security_headers_enabled=_env_flag("SECURITY_HEADERS", True),
         hsts_max_age_seconds=_env_int("HSTS_MAX_AGE_SECONDS", 15552000),
         csp_api=_env_str("CSP_API"),

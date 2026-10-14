@@ -96,11 +96,24 @@ log = logging.getLogger("attendance.netguard")
 #: has to be declared here - which is the point: it is a list, not a wildcard.
 DEFAULT_TRUSTED_PROXIES = ("127.0.0.1/32", "::1/128")
 
+#: That tuple is the *fallback*, used only when the setting comes through empty.
+#: ``config.default_trusted_proxies`` is what a real deployment gets, and on a managed platform
+#: it widens this to the platform's private ranges - because behind a TLS-terminating edge the
+#: peer is the edge and not the worker, and a loopback-only list silently turns every per-IP
+#: limit into one shared bucket, keeps HSTS off an entirely-HTTPS deployment, and records the
+#: edge's address as the actor on every audit row. An explicit ``TRUSTED_PROXIES`` still wins.
+
 #: Path prefixes owned by administrators. Kept as prefixes rather than route names because
 #: this is a network-level gate: it must work for a path that does not exist yet.
 DEFAULT_ADMIN_PATHS = ("/admin", "/api/v1/admin")
 
-DEFAULT_ALLOWED_METHODS = ("GET", "POST", "OPTIONS")
+#: ``DELETE`` is on this list because account deletion is the one operation the app stores
+#: require to be reachable *from inside the app* (``DELETE /api/v1/workers/me``), and this list
+#: is what a CORS preflight advertises verbatim: a cross-origin ``DELETE`` the browser has not
+#: been told about in ``Access-Control-Allow-Methods`` is a request the browser refuses to send,
+#: which the person using the app experiences as a button that does nothing. Every verb the
+#: bundled clients actually use belongs here.
+DEFAULT_ALLOWED_METHODS = ("GET", "POST", "DELETE", "OPTIONS")
 #: ``ngrok-skip-browser-warning`` is not decoration: the frontend sends it on tunnel hosts
 #: (``frontendjavascript.js``, ``offline_queue.js``) to keep a tunnel's warning page from
 #: answering a fetch, so a cross-origin console that sends it must not be preflight-refused.

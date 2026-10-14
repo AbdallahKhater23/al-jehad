@@ -20,9 +20,9 @@ So these are the assertions a typecheck cannot make, on the real DOM, with real 
 * confirming with an empty field removes nothing and says so - the guard against a mis-tap;
 * *Keep my account*, and the back key, both close the sheet without a request leaving the
   device;
-* with the password typed, exactly one ``POST /auth/delete_account`` goes out carrying that
-  password and the session's bearer token - and only then does the session leave both the
-  app's memory and the phone's storage;
+* with the password typed, exactly one ``DELETE /workers/me`` goes out carrying that password
+  and the session's bearer token - and only then does the session leave both the app's memory
+  and the phone's storage;
 * a refusal (401) leaves the sheet open with a message, leaves the account alone, and leaves
   the worker signed in;
 * and the *other* destructive control on the same screen, *Sign out*, still asks first and
@@ -79,9 +79,19 @@ REGISTERED_DEVICE = {
     "device_key": "a2V5LW1hdGVyaWFs",
 }
 
-#: A route that answers every ``POST /auth/delete_account`` with 200, for the tests that get
-#: as far as confirming. The message is the server's own, and the screen prefers it.
-DELETED = {"message": "Your account has been deleted."}
+#: What the real endpoint answers: **204 No Content**. There is no body to read, and that is
+#: part of the contract rather than an accident - the account is gone by the time the response
+#: is written, so the sentence the worker reads afterwards is the screen's own. This is the one
+#: place the two doors differ, and the pair is deliberate: the app screen posts and reads a
+#: message, the app's REST client deletes and reads nothing.
+DELETED_STATUS = 204
+
+#: The screen's own words on success, asserted verbatim - a toast built from a response body
+#: that no longer exists would leave the worker told nothing at all.
+DELETED_TOAST = (
+    "Your account has been deleted. Shifts you have already worked are kept, because the "
+    "hours in them are owed to you."
+)
 
 WORKER_ID = WORKER_SESSION["user"]["id"]
 
@@ -203,7 +213,7 @@ def test_the_delete_row_asks_for_the_password_and_removes_nothing_by_itself(hand
     assert "signing key" in sheet["body"], sheet["body"]
 
     # And the question alone removed nothing.
-    assert handset.requests_to("/auth/delete_account") == [], (
+    assert handset.requests_to("/workers/me") == [], (
         f"opening the question already sent a request.\n{handset.describe()}"
     )
     assert handset.in_memory_session() is not None, handset.describe()
@@ -229,7 +239,7 @@ def test_a_confirmation_without_the_password_removes_nothing(handset):
     assert sheet["error"] == "Enter your password to confirm.", (
         f"confirming an empty field said {sheet['error']!r}\n{handset.describe()}"
     )
-    assert handset.requests_to("/auth/delete_account") == [], (
+    assert handset.requests_to("/workers/me") == [], (
         f"an empty password still sent a request.\n{handset.describe()}"
     )
     assert handset.sheet_open(), "the sheet closed as though it had done something"
@@ -253,7 +263,7 @@ def test_keeping_the_account_closes_the_sheet_and_leaves_the_phone_signed_in(han
         f"*Keep my account* left the sheet open.\n{handset.describe()}"
     )
 
-    assert handset.requests_to("/auth/delete_account") == [], (
+    assert handset.requests_to("/workers/me") == [], (
         f"*Keep my account* sent a request.\n{handset.describe()}"
     )
     assert handset.in_memory_session() == WORKER_SESSION, handset.describe()
@@ -274,7 +284,7 @@ def test_the_back_key_closes_the_delete_sheet(handset):
     handset.press("Escape")
     assert handset.wait(NO_SHEET), f"Escape left the sheet open.\n{handset.describe()}"
 
-    assert handset.requests_to("/auth/delete_account") == [], handset.describe()
+    assert handset.requests_to("/workers/me") == [], handset.describe()
     assert handset.in_memory_session() is not None, handset.describe()
     assert handset.signed_out() == 0, handset.describe()
 
@@ -292,7 +302,7 @@ def test_confirming_with_the_password_removes_the_account_and_the_phone_s_sessio
     in-memory session is gone, the phone's storage is empty of the session, and the screen
     tells whoever mounted it to send the worker back to sign-in.
     """
-    handset.route("/auth/delete_account", DELETED)
+    handset.route("/workers/me", {}, status=DELETED_STATUS)
     open_the_delete_sheet(handset)
     handset.fill("#del-password", PASSWORD)
     assert handset.tap_sheet_button("Delete my account"), (
@@ -302,7 +312,7 @@ def test_confirming_with_the_password_removes_the_account_and_the_phone_s_sessio
         f"confirming with the password did not end the session.\n{handset.describe()}"
     )
 
-    sent = handset.requests_to("/auth/delete_account", method="POST")
+    sent = handset.requests_to("/workers/me", method="DELETE")
     assert len(sent) == 1, f"the deletion went out {len(sent)} times: {sent}\n{handset.describe()}"
     assert sent[0]["body"] == {"current_password": PASSWORD}, (
         f"the request carried {sent[0]['body']!r}, not the password that was typed.\n"
@@ -324,7 +334,7 @@ def test_confirming_with_the_password_removes_the_account_and_the_phone_s_sessio
         f"the screen never told the app to sign the worker out (called {handset.signed_out()} "
         f"times).\n{handset.describe()}"
     )
-    assert {"kind": "ok", "text": DELETED["message"]} in handset.toasts(), (
+    assert {"kind": "ok", "text": DELETED_TOAST} in handset.toasts(), (
         f"the worker was not told what happened: {handset.toasts()!r}\n{handset.describe()}"
     )
     assert handset.wait(NO_SHEET), (
@@ -344,7 +354,7 @@ def test_a_refused_password_leaves_the_account_and_the_session_alone(handset):
     the screen is still standing when they are both refused.
     """
     handset.route(
-        "/auth/delete_account",
+        "/workers/me",
         {"detail": {"error_code": "invalid_password", "message": "That password is not right."}},
         status=401,
     )
@@ -378,7 +388,7 @@ def test_a_refused_password_leaves_the_account_and_the_session_alone(handset):
         f"the confirm button was left in its loading state.\n{handset.describe()}"
     )
 
-    attempts = handset.requests_to("/auth/delete_account", method="POST")
+    attempts = handset.requests_to("/workers/me", method="DELETE")
     assert len(attempts) == 2, (
         f"a refused deletion was attempted {len(attempts)} times; the transport retries a "
         f"401 once, after refreshing.\n{handset.describe()}"

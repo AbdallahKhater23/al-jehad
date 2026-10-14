@@ -29,7 +29,7 @@ it can tap. The API is small on purpose:
         handset.tap("delete-account")
         handset.fill("#del-password", secret)
         handset.tap_sheet_button("Delete my account")
-        assert handset.requests_to("/auth/delete_account")[0]["body"] == {
+        assert handset.requests_to("/workers/me", method="DELETE")[0]["body"] == {
             "current_password": secret
         }
 
@@ -262,7 +262,7 @@ SHIMS = r"""
   });
 
   // The API prefix is stripped so a test can name the path the way the app does
-  // ('/auth/delete_account') rather than the way the transport builds it.
+  // ('/workers/me') rather than the way the transport builds it.
   const pathOf = (url) => {
     try {
       return new URL(url, window.location.href).pathname.replace(/^\/api\/v\d+/, '') || '/';

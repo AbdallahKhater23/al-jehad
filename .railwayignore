@@ -1,0 +1,46 @@
+# What `railway up` uploads, which is not the same question as what the image needs.
+#
+# `railway.json` builds from the `Dockerfile`, and that Dockerfile copies exactly four things:
+# `requirements.txt`, `backend/`, `frontend/` and `docker-entrypoint.sh`. Everything else in this
+# checkout is a test environment, local state, or the mobile client - and none of it belongs in an
+# upload. The 88 MB model under `backend/models/` is the one large artefact that has to travel;
+# `mobile-client/node_modules` alone is 120 MB of files no layer will ever read, and hashing it
+# turns a two-minute deploy into a fifteen-minute one.
+#
+# It mirrors `.dockerignore` deliberately, and for the same reason that file gives: a file that
+# travels to the builder but is never copied into the image is a file whose contents were handed
+# over for nothing. Here that includes local data (`times.db`) and the one genuine secret in the
+# checkout (`deploy/railway/variables.env`, which holds the VAPID private key).
+
+# The mobile client is a separate artefact, built and shipped on its own.
+mobile-client/
+
+# The test stack: the suite and its browser never run on the builder.
+backend/tests/
+backend/requirements-dev.txt
+
+# Local state and biometric data - never uploaded.
+times.db
+times.db-wal
+times.db-shm
+*.db.bak
+backend/certs/
+worker_photos/
+local_references/
+punch_frames/
+quick_link_photos/
+calibration_corpus/
+coverage_reports/
+temp/
+backups/
+
+# Development machinery and scratch files from the checkout.
+.freebuff/
+.vscode/
+.git/
+docs/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+*.bak
